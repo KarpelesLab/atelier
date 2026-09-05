@@ -235,11 +235,12 @@ project-confined `fs` (readFile/writeFile/readdir/exists/mkdir) + captured
 - ✅ Gated `fetch`/`httpGet`/`httpRequest` (sync, via rsurl), installed only on
   `network: true`, which is treated as unconfined and requires approval
   (per-call `Tool::requires_approval(args)`).
-- ⏳ **True CPU stop:** kataan v0.0.4-era has no JS interrupt/step budget (only
-  depth limits + WASM fuel), so a timed-out script's thread is *abandoned* (leaks
-  one CPU until exit). Real fix: add an interrupt `AtomicBool` to kataan checked
-  on loop back-edges (upstream, cleanest), or run JS in a killable subprocess
-  (needs fs proxying).
+- ✅ **True CPU stop** (kataan 0.0.9): the worker installs kataan's cooperative
+  `Interrupt` (an `Arc<AtomicBool>`); on timeout the main thread trips it, the
+  interpreter aborts on the next loop back-edge, and the worker is reaped — a
+  runaway `while(true){}` is actually halted, not abandoned. (A pathological
+  script with no back-edge to observe the flag is still abandoned after a short
+  grace rather than blocking the harness.)
 - ⏳ async `fs`; out-of-project fs via approval; `Uint8Array`/binary support.
 
 ### M9 — Safer command execution (script analysis)
