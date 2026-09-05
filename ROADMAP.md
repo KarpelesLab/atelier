@@ -37,21 +37,28 @@ change as we build.
 
 ## 2. Architecture (target shape)
 
-Cargo workspace, split so the engine is usable without the TUI (enables
-headless/scripted runs and integration tests):
+**One binary crate, organized by module.** No internal workspace — atelier is a
+single application, not a library ecosystem, so we avoid the path-dep / version /
+circular-dep friction of many small crates. The engine stays usable without the
+TUI through module discipline (nothing in `core`/`provider` imports `tui`) plus a
+`tui` feature flag for headless builds — not through crate boundaries. Any module
+whose seam proves stable can be extracted into its own crate later; merging a
+premature split back is the expensive direction, so we split late, not early.
 
 ```
 atelier/
-├─ crates/
-│  ├─ atelier-core      # agent loop, conversation state, turn orchestration
-│  ├─ atelier-provider  # OpenAI-compatible client: chat, streaming, tool-calls
-│  ├─ atelier-tools     # built-in tool implementations + tool registry/trait
-│  ├─ atelier-mcp       # MCP client (stdio + HTTP/SSE transports)
-│  ├─ atelier-context   # "helpers": context providers (git, diagnostics, …)
-│  ├─ atelier-tui       # minimal inline input + status strip; stream renderer
-│  └─ atelier-cli       # binary: arg parsing, config load, wiring, main loop
+├─ src/
+│  ├─ main.rs        # entry: arg parse, config load, wiring, run loop
+│  ├─ config.rs      # atelier.toml + env/flag overlay
+│  ├─ provider/      # OpenAI-compatible client: chat, streaming, tool-calls
+│  ├─ agent/         # agent loop, conversation state, turn orchestration
+│  ├─ tools/         # built-in tools + tool registry/trait
+│  ├─ mcp/           # MCP client (stdio + HTTP/SSE transports)
+│  ├─ context/       # "helpers": context providers (git, diagnostics, …)
+│  └─ tui/           # minimal inline input + status strip; stream renderer  [feature = "tui"]
+├─ tests/            # integration + scripted-agent regression harness
 ├─ ROADMAP.md
-└─ Cargo.toml           # workspace
+└─ Cargo.toml        # single package
 ```
 
 **Core data flow (one turn):**
@@ -68,8 +75,8 @@ user input ─▶ context helpers gather ─▶ assemble messages ─▶ provide
 
 | Concern         | Choice (initial)                          | Notes |
 |-----------------|-------------------------------------------|-------|
-| Async runtime   | `tokio`                                   | streaming + concurrent tools |
-| HTTP            | `reqwest` (+ `eventsource`-style SSE parse) | SSE for streamed chat |
+| HTTP            | **`rsurl`** (ours, pure-Rust curl)         | `Request::send_reader()` gives a blocking `Read`+`.status()` — ideal for SSE |
+| Concurrency     | `std::thread` + channels (defer `tokio`)   | rsurl's primary API is blocking; a worker thread streams into the UI. Add an async runtime only if concurrency demands it |
 | JSON            | `serde` / `serde_json`                     | provider + MCP + config |
 | Terminal        | `crossterm`                                | raw mode, inline redraw of input row only |
 | Line editing    | `reedline` (evaluate) or hand-rolled       | history, editing; must coexist with streamed output above it |

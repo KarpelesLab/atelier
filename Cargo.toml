@@ -1,0 +1,24 @@
+[package]
+name = "atelier"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Karpelès Lab Inc."]
+description = "A minimal-TUI AI coding harness over OpenAI-compatible APIs."
+license = "MIT"
+repository = "https://github.com/KarpelesLab/atelier"
+
+[dependencies]
+rsurl = "0.1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[features]
+default = ["tui"]
+# Gates the terminal interface so a headless build (scripted runs, tests,
+# CI) can drop the UI entirely. Nothing in provider/agent/core may depend on it.
+tui = []
+
+[profile.release]
+opt-level = 3
