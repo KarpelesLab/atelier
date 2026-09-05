@@ -140,6 +140,22 @@ pub struct Completion {
     pub content: String,
     /// Tool calls the model requested, if any.
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage reported by the provider, if it honored
+    /// `stream_options.include_usage`. Some servers omit this.
+    pub usage: Option<Usage>,
+}
+
+/// Token usage for a completion, as reported on the final SSE chunk when the
+/// request set `stream_options.include_usage`. Consumed by the caller.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
 }
 
 /// An incremental piece of a streamed response.
@@ -166,6 +182,7 @@ pub fn stream_chat(
         "model": cfg.model,
         "messages": messages.iter().map(Message::to_wire).collect::<Vec<_>>(),
         "stream": true,
+        "stream_options": { "include_usage": true },
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_wire).collect());
@@ -211,6 +228,12 @@ pub fn stream_chat(
         let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) else {
             continue;
         };
+        // The final chunk (when `stream_options.include_usage` is honored)
+        // carries `usage` and typically an empty `choices` array, so read it
+        // before falling through the empty-choices early-exit below.
+        if let Some(usage) = chunk.usage {
+            out.usage = Some(usage);
+        }
         let Some(choice) = chunk.choices.into_iter().next() else {
             continue;
         };
@@ -265,6 +288,8 @@ struct ToolCallAccum {
 struct ChatChunk {
     #[serde(default)]
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -372,4 +397,33 @@ struct ModelList {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A final usage-only chunk (empty `choices`) must still yield a parsed
+    /// `Usage`, matching what a real `stream_options.include_usage` response
+    /// sends as its last SSE frame.
+    #[test]
+    fn parses_usage_only_chunk() {
+        let data = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
+        assert!(chunk.choices.is_empty());
+        let usage = chunk.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    /// A normal content chunk has no `usage` field at all; it must parse
+    /// without one rather than erroring.
+    #[test]
+    fn chunk_without_usage_parses_as_none() {
+        let data = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
+        assert!(chunk.usage.is_none());
+        assert_eq!(chunk.choices.len(), 1);
+    }
 }
