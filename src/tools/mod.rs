@@ -29,6 +29,14 @@ use serde_json::Value;
 
 pub use crate::provider::ToolSpec;
 
+mod bash;
+mod edit;
+mod glob;
+mod grep;
+mod ls;
+mod read;
+mod write;
+
 /// Execution context handed to every tool call.
 pub struct ToolCtx<'a> {
     /// Absolute project root. All tool file access stays within it.
@@ -100,10 +108,16 @@ impl ToolRegistry {
 }
 
 /// Assemble the default built-in tools.
-///
-/// TODO(tools agent): register Read/Write/Edit/Bash/Grep/Glob/LS here.
 pub fn builtin_registry() -> ToolRegistry {
-    ToolRegistry::new()
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(read::ReadTool));
+    reg.register(Box::new(write::WriteTool));
+    reg.register(Box::new(edit::EditTool));
+    reg.register(Box::new(bash::BashTool));
+    reg.register(Box::new(grep::GrepTool));
+    reg.register(Box::new(glob::GlobTool));
+    reg.register(Box::new(ls::LsTool));
+    reg
 }
 
 /// Tracks the content the agent has read, so an [`Edit`] can detect that a file
