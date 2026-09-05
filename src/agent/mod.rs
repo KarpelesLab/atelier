@@ -82,12 +82,15 @@ impl Session {
         let context_msg = self.gather_context();
 
         loop {
-            // Assemble the request: system prompt, fresh context, then history.
-            let mut messages = Vec::with_capacity(self.history.len() + 2);
-            messages.push(Message::system(SYSTEM_PROMPT));
-            if let Some(ctx) = &context_msg {
-                messages.push(Message::system(ctx.clone()));
-            }
+            // Assemble the request: a single leading system message (prompt +
+            // fresh context — some servers reject a second system message), then
+            // the conversation history.
+            let mut messages = Vec::with_capacity(self.history.len() + 1);
+            let system = match &context_msg {
+                Some(ctx) => format!("{SYSTEM_PROMPT}\n\n{ctx}"),
+                None => SYSTEM_PROMPT.to_string(),
+            };
+            messages.push(Message::system(system));
             messages.extend(self.history.iter().cloned());
 
             let specs = self.tools.specs();

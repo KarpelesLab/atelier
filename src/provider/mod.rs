@@ -171,11 +171,17 @@ pub fn stream_chat(
         body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_wire).collect());
     }
     let body = serde_json::to_vec(&body)?;
+    if std::env::var_os("ATELIER_DEBUG").is_some() {
+        eprintln!("--> {}", String::from_utf8_lossy(&body));
+    }
 
     let mut req = rsurl::Request::new("POST", &cfg.endpoint("chat/completions"))
         .context("building request")?
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
+        // Use a fresh connection per request: reusing a pooled keep-alive
+        // connection here can surface a spurious EAGAIN on the next send.
+        .header("connection", "close")
         .body(body);
     if let Some(key) = &cfg.api_key {
         req = req.header("authorization", &format!("Bearer {key}"));
@@ -207,6 +213,9 @@ pub fn stream_chat(
             continue;
         }
         if data == "[DONE]" {
+            // Drain any trailing bytes so the connection is left clean rather
+            // than half-read (a half-read socket breaks the next request).
+            let _ = std::io::copy(&mut lines, &mut std::io::sink());
             break;
         }
         // Be lenient: skip keep-alives / frames we can't parse.
