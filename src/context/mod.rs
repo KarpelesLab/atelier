@@ -21,6 +21,7 @@
 // Contract surface is consumed by the providers implementation (in progress).
 #![allow(dead_code)]
 
+mod diagnostics;
 mod diff;
 mod git;
 mod layout;
@@ -55,10 +56,11 @@ pub trait ContextProvider: Send + Sync {
     fn gather(&self, root: &Path) -> Option<ContextItem>;
 }
 
-/// The default set of context providers: git status, recent diff, and
-/// project layout (in priority order).
+/// The default set of context providers: cargo-check diagnostics, git
+/// status, recent diff, and project layout (in priority order).
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
     vec![
+        Box::new(diagnostics::DiagnosticsProvider),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),
         Box::new(layout::LayoutProvider),
