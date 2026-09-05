@@ -232,9 +232,9 @@ dependencies = [
 
 [[package]]
 name = "kataan"
-version = "0.0.8"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d822c78f4261e3bb0835825c4db8d2b0e1d82c305b9b04c2a7c4f5904abe5e63"
+checksum = "7bbcaced72a4b515964e93425cdbcd0ccf5b118793ed7a5fab9f688acb4d3fe7"
 dependencies = [
  "puremp",
  "timezone-data",

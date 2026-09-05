@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use kataan::Interp;
+use kataan::interrupt::Interrupt;
 use kataan::nbexec::ExecError;
 use kataan::parser::Parser;
 
@@ -75,7 +76,7 @@ const MAX_OUTPUT: usize = 10 * 1024;
 /// `Interp` and every `NanBox` are created and dropped here, never crossing the
 /// thread boundary — only the returned `String` (which is `Send`) does. See
 /// [`super::NodeTool::call`], which drives this under a wall-clock timeout.
-pub fn execute(code: String, root: PathBuf, network: bool) -> String {
+pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt) -> String {
     // Parse every program up front so each outlives `interp` (the interpreter
     // borrows a program for its own lifetime). A user syntax error is reported
     // as a normal result, not a failure. Declared before `interp` so drop order
@@ -98,6 +99,10 @@ pub fn execute(code: String, root: PathBuf, network: bool) -> String {
     };
 
     let mut interp = Interp::new();
+    // Install the host watchdog flag: a timeout on the main thread trips this,
+    // and the interpreter aborts cooperatively (on loop back-edges) with
+    // `ExecError::Interrupted`.
+    interp.realm_mut().interrupt = Some(interrupt);
     super::fs::install(&mut interp, root);
     let out = super::console::install(&mut interp);
     if network {

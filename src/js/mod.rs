@@ -23,6 +23,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use kataan::interrupt::Interrupt;
 use serde_json::{Value, json};
 
 use crate::tools::{Tool, ToolCtx, ToolSpec};
@@ -41,6 +42,12 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 /// kataan tunes its eval-depth guard for a ~2 MB stack, so a generous stack here
 /// keeps a comfortable margin before the (catchable) `RangeError` fires.
 const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// After tripping the interrupt on a timeout, how long to wait for the worker to
+/// unwind cooperatively before abandoning it (a script with no loop back-edge to
+/// observe the flag is the pathological case; it's abandoned rather than blocking
+/// the harness).
+const INTERRUPT_GRACE_MS: u64 = 1_000;
 
 /// The `node` tool: run JavaScript with a mediated, project-confined host.
 pub struct NodeTool;
@@ -127,25 +134,19 @@ impl Tool for NodeTool {
         // and die entirely inside the worker; only the output `String` (which is
         // `Send`) crosses back over the channel.
         //
-        // ## CPU/interrupt limitation (kataan v0.0.8)
-        //
-        // On a timeout we cannot force-kill the worker: Rust has no safe thread
-        // cancellation, and kataan exposes **no JS-level interrupt or step/gas
-        // budget** to trip from a watchdog. Its `Limits` (src/limits.rs) meter
-        // only recursion depths and *WebAssembly* fuel (`DEFAULT_WASM_FUEL`) —
-        // there is no per-instruction budget for the tree-walk interpreter
-        // (src/nbexec/{mod,stmt}.rs have no interrupt check in the loop path),
-        // and no `Interp` method to signal it. So a `while(true){}` script keeps
-        // running after we return: the timed-out worker thread is **abandoned**
-        // and leaks one CPU until the process exits. A real fix requires an
-        // upstream kataan interrupt hook (an atomic flag checked on each
-        // statement/back-edge) that a watchdog could set at the deadline.
+        // On a timeout we trip a cooperative interrupt (kataan >= 0.0.9): the
+        // interpreter observes it on the next loop back-edge and aborts with
+        // `ExecError::Interrupted`, so the worker actually stops and is reaped —
+        // no leaked CPU. The `Interrupt` is an `Arc<AtomicBool>` (Send+Sync), so
+        // the main thread can trip it while the `Interp` stays on the worker.
+        let interrupt = Interrupt::new();
+        let worker_interrupt = interrupt.clone();
         let (tx, rx) = mpsc::channel::<String>();
         let worker = thread::Builder::new()
             .name("node-script".into())
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
-                let out = runtime::execute(code, root, network);
+                let out = runtime::execute(code, root, network, worker_interrupt);
                 // Ignore a send error: it only means we already timed out and
                 // the receiver is gone.
                 let _ = tx.send(out);
@@ -159,9 +160,17 @@ impl Tool for NodeTool {
                 Ok(output)
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Deliberately do NOT join: the worker is still running and
-                // cannot be interrupted (see the note above). Drop the handle to
-                // detach it; it exits with the process.
+                // Trip the interrupt and give the interpreter a moment to unwind,
+                // then reap it. If it doesn't observe the flag within the grace
+                // window (a script with no back-edge to check), abandon it rather
+                // than block the harness.
+                interrupt.trip();
+                if rx
+                    .recv_timeout(Duration::from_millis(INTERRUPT_GRACE_MS))
+                    .is_ok()
+                {
+                    let _ = worker.join();
+                }
                 Ok(format!(
                     "node: script exceeded the {timeout_ms}ms time limit and was aborted"
                 ))
@@ -313,10 +322,13 @@ mod tests {
             output.contains("exceeded the 300ms time limit"),
             "unexpected output: {output:?}"
         );
-        // The call returns near the deadline, not much later.
+        // The interrupt (kataan >= 0.0.9) actually stops the worker: the call
+        // returns near the deadline + a short grace, and the worker is reaped
+        // (not leaked). Bound it well under the grace window to prove the loop
+        // observed the interrupt rather than running free.
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "timeout took too long: {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(300 + super::INTERRUPT_GRACE_MS + 500),
+            "timeout took too long (worker may not have been interrupted): {elapsed:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
