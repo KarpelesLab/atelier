@@ -370,15 +370,17 @@ impl Session {
         }
     }
 
-    /// Whether a tool call must be approved before running: side-effecting, not
-    /// already allowed, and not in auto-approve mode.
+    /// Whether a tool call must be approved before running: the tool declares it
+    /// needs approval (unconfined — `bash`, MCP tools), it isn't already
+    /// allowed, and we're not in auto-approve mode. Tools confined to the
+    /// project directory (all file tools) never prompt.
     fn needs_approval(&self, name: &str) -> bool {
         if self.auto_approve || self.allow.contains(name) {
             return false;
         }
         self.tools
             .get(name)
-            .map(|t| t.side_effecting())
+            .map(|t| t.requires_approval())
             .unwrap_or(false)
     }
 

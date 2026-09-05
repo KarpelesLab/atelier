@@ -56,11 +56,14 @@ Type `/help` for the list. Notable ones:
 
 ## Permissions
 
-Side-effecting tools (`write`, `edit`, `bash`, and any MCP tool) ask for
-approval before running; read-only tools (`read`, `grep`, `glob`, `ls`) run
-freely. At the prompt you choose **once**, **always** (remembered and saved to
-`atelier.toml` under `[permissions] allow`), or **deny** (the model is told and
-adapts). Set `ATELIER_APPROVE=all` to skip prompts entirely for headless runs.
+Tools **confined to the project directory** run without prompting — all file
+tools (`read`, `write`, `edit`, `grep`, `glob`, `ls`) are sandboxed to the
+project root and can't escape it, so operating inside the project is automatic.
+Only tools that can run **arbitrary, unconfined code** — `bash` and MCP tools —
+ask for approval. At the prompt you choose **once**, **always** (remembered and
+saved to `atelier.toml` under `[permissions] allow`), or **deny** (the model is
+told and adapts). Set `ATELIER_APPROVE=all` to skip prompts entirely for
+headless runs.
 
 ## Project settings — `atelier.toml`
 

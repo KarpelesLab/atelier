@@ -17,7 +17,7 @@ impl Tool for GrepTool {
         "grep"
     }
 
-    fn side_effecting(&self) -> bool {
+    fn requires_approval(&self) -> bool {
         false
     }
 

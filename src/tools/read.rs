@@ -12,7 +12,7 @@ impl Tool for ReadTool {
         "read"
     }
 
-    fn side_effecting(&self) -> bool {
+    fn requires_approval(&self) -> bool {
         false
     }
 

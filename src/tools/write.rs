@@ -12,6 +12,11 @@ impl Tool for WriteTool {
         "write"
     }
 
+    fn requires_approval(&self) -> bool {
+        // Confined to the project root by `ToolCtx::resolve`; auto-approved.
+        false
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),

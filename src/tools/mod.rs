@@ -69,11 +69,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     /// The advertised schema (name, description, JSON-Schema parameters).
     fn spec(&self) -> ToolSpec;
-    /// Whether running this tool changes the world (writes files, runs commands)
-    /// and therefore needs the user's approval. Defaults to `true` — the safe
-    /// default, so unknown/MCP tools require confirmation. Read-only tools
-    /// override to `false`.
-    fn side_effecting(&self) -> bool {
+    /// Whether this tool must be approved by the user before running.
+    ///
+    /// Defaults to `true` — the safe default, so unknown/MCP tools and anything
+    /// that can run arbitrary code (`bash`) require confirmation. Tools that are
+    /// *confined to the project directory* (all file tools, sandboxed via
+    /// [`ToolCtx::resolve`]) override to `false`: operating inside the project
+    /// is automatic and never prompts.
+    fn requires_approval(&self) -> bool {
         true
     }
     /// Execute with parsed JSON `args`. The returned string is fed back to the

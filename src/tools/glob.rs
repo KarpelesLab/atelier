@@ -16,7 +16,7 @@ impl Tool for GlobTool {
         "glob"
     }
 
-    fn side_effecting(&self) -> bool {
+    fn requires_approval(&self) -> bool {
         false
     }
 
