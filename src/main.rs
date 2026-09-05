@@ -10,6 +10,7 @@ mod context;
 mod mcp;
 mod provider;
 mod settings;
+mod shlex;
 mod tools;
 #[cfg(feature = "tui")]
 mod tui;
