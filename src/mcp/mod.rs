@@ -8,22 +8,30 @@
 //! # Contract (stable — implementers must not change these signatures)
 //!
 //! [`connect_stdio`] launches a server over stdio (JSON-RPC 2.0: `initialize`,
-//! `tools/list`, `tools/call`) and returns its tools. HTTP/SSE transport comes
-//! later. `main` will call this and register the results; do not wire it into
-//! `main` yourself.
+//! `tools/list`, `tools/call`) and returns its tools. [`connect_http`] does the
+//! same over MCP's Streamable HTTP transport (see `src/mcp/http.rs` for what's
+//! covered). `main` will call these and register the results; do not wire them
+//! into `main` yourself.
 //!
 //! ## For the implementer (owns `src/mcp/`)
 //!
-//! Implement [`connect_stdio`] and the JSON-RPC plumbing. A server is spawned
-//! as a child process; frame requests/responses over its stdin/stdout. Wrap
-//! each advertised tool in a type implementing [`Tool`](crate::tools::Tool)
-//! whose `call` issues a `tools/call`. Do not edit files outside `src/mcp/`.
+//! Implement [`connect_stdio`], [`connect_http`], and the JSON-RPC plumbing. A
+//! stdio server is spawned as a child process; requests/responses are framed
+//! over its stdin/stdout. An HTTP server is a URL; requests are POSTed and
+//! responses may come back as a single JSON object or an SSE stream. Both
+//! transports implement the shared `jsonrpc::JsonRpc` trait so the handshake
+//! (`handshake_and_list_tools`) and tool-wrapping (`wrap_tools`) logic is
+//! written once. Wrap each advertised tool in a type implementing
+//! [`Tool`](crate::tools::Tool) whose `call` issues a `tools/call`. Do not
+//! edit files outside `src/mcp/`.
 
 // Contract surface is consumed by the MCP implementation (in progress) and by
 // `main` once registration is wired up.
 #![allow(dead_code)]
 
 mod conn;
+mod http;
+mod jsonrpc;
 mod tool;
 
 use std::io::BufRead;
@@ -36,7 +44,14 @@ use serde_json::{Value, json};
 
 use crate::tools::Tool;
 use conn::Conn;
+use jsonrpc::JsonRpc;
 use tool::McpTool;
+
+// Re-exported for `main` to pick up once HTTP-server registration is wired
+// in (see the module doc comment); unused within `src/mcp/` itself for now,
+// same as `connect_stdio`/`StdioServer` before this module was consumed.
+#[allow(unused_imports)]
+pub use http::{HttpServer, connect_http};
 
 /// Configuration for one stdio MCP server.
 pub struct StdioServer {
@@ -86,31 +101,55 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
 
     let mut conn = Conn::new(child, stdin, stdout);
 
+    let advertised = handshake_and_list_tools(&mut conn, &server.name, "2024-11-05")?;
+
+    let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
+    Ok(wrap_tools(conn, &server.name, advertised))
+}
+
+/// Run the `initialize` → `notifications/initialized` → `tools/list`
+/// handshake over an already-connected [`JsonRpc`] transport (stdio or HTTP)
+/// and return the raw `tools` array it advertised.
+///
+/// Shared by [`connect_stdio`] and [`connect_http`](http::connect_http) so
+/// the two transports can't drift on protocol behavior.
+pub(crate) fn handshake_and_list_tools(
+    conn: &mut dyn JsonRpc,
+    server_name: &str,
+    protocol_version: &str,
+) -> Result<Vec<Value>> {
     conn.request(
         "initialize",
         json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": protocol_version,
             "capabilities": {},
             "clientInfo": { "name": "atelier", "version": "0.0.0" },
         }),
     )
-    .with_context(|| format!("initializing MCP server `{}`", server.name))?;
+    .with_context(|| format!("initializing MCP server `{server_name}`"))?;
 
     conn.notify("notifications/initialized", json!({}))
-        .with_context(|| format!("completing handshake with MCP server `{}`", server.name))?;
+        .with_context(|| format!("completing handshake with MCP server `{server_name}`"))?;
 
     let tools_result = conn
         .request("tools/list", json!({}))
-        .with_context(|| format!("listing tools from MCP server `{}`", server.name))?;
+        .with_context(|| format!("listing tools from MCP server `{server_name}`"))?;
 
-    let advertised = tools_result
+    Ok(tools_result
         .get("tools")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
 
-    let conn = Arc::new(Mutex::new(conn));
-
+/// Wrap each raw advertised-tool object (as returned by `tools/list`) as a
+/// namespaced [`Tool`] sharing one connection. Shared by [`connect_stdio`]
+/// and [`connect_http`](http::connect_http).
+pub(crate) fn wrap_tools(
+    conn: Arc<Mutex<dyn JsonRpc>>,
+    server_name: &str,
+    advertised: Vec<Value>,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::with_capacity(advertised.len());
     for t in advertised {
         let Some(original_name) = t.get("name").and_then(Value::as_str) else {
@@ -125,7 +164,7 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-        let namespaced_name = format!("mcp__{}__{}", server.name, original_name);
+        let namespaced_name = format!("mcp__{server_name}__{original_name}");
 
         tools.push(Box::new(McpTool::new(
             conn.clone(),
@@ -135,8 +174,7 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
             parameters,
         )));
     }
-
-    Ok(tools)
+    tools
 }
 
 #[cfg(test)]

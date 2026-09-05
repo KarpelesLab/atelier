@@ -7,6 +7,8 @@ use std::process::{Child, ChildStdin, ChildStdout};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use super::jsonrpc::JsonRpc;
+
 /// A live JSON-RPC connection to an MCP server child process.
 ///
 /// Owns the child so it stays alive (and keeps running) for as long as this
@@ -115,6 +117,18 @@ impl Conn {
             }
             return Ok(trimmed.to_string());
         }
+    }
+}
+
+impl JsonRpc for Conn {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        // Fully-qualified so this calls the inherent method above, not
+        // itself (see the trait's doc comment for why both exist).
+        Conn::request(self, method, params)
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        Conn::notify(self, method, params)
     }
 }
 
