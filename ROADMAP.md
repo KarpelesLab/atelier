@@ -141,17 +141,22 @@ The intended interface.
 **Exit:** normal daily use happens through the TUI; resizing and long output
 don't garble the input line.
 
-### M3 — Permissions & safety
-Make tool execution trustworthy.
+### M3 — Permissions & safety ✅
+Make tool execution trustworthy — approval keyed on *confinement*, not
+side-effects.
 
-- Permission model for side-effecting tools (Bash, Write, Edit): prompt /
-  allow-once / allow-for-session / deny; an allowlist in config.
-- Non-interactive/headless mode respects a configured policy (no silent prompts).
-- Guardrails: confirm before overwrite/delete; never operate outside project
-  root without explicit opt-in.
+- **Confined to the project dir = automatic.** All file tools are sandboxed to
+  the project root and can't escape, so they run without prompting — including
+  `write`/`edit`. Operating inside the project is the whole point.
+- **Unconfined = ask.** Only tools that run arbitrary, unbounded code — `bash`
+  and MCP tools — prompt: once / always (persisted to `atelier.toml`) / deny
+  (the model is told and adapts).
+- Headless mode respects a policy (`ATELIER_APPROVE=all`); no silent blocking.
+- The frontier for unconfined execution is M8 (mediated scripting) and M9
+  (script analysis), which replace or illuminate the coarse yes/no for `bash`.
 
-**Exit:** a first-run user can approve/deny individual actions; a power user can
-pre-authorize common commands.
+**Exit (met):** a first-run user approves/denies each unconfined action; a power
+user pre-authorizes with "always"; in-project edits never nag.
 
 ### M4 — Context helpers
 The "feed the agent" pipeline.
@@ -196,6 +201,43 @@ the context limit.
 - Docs: quickstart, config reference, tool reference, MCP setup.
 
 **Exit:** stable enough for daily driving on real work.
+
+### M8 — Scripting via a mediated JS runtime (`Node` tool)
+
+Give the agent a real scripting surface that is *safer* than raw `bash`, by
+running JavaScript on our own engine ([kataan](https://github.com/KarpelesLab/kataan),
+pure-Rust) with **host APIs we implement and mediate**. The engine core is
+sans-I/O, so we provide `fs`, `fetch`, etc. — and check every effect at runtime.
+
+- A `Node`/`js` tool that evaluates a script in an embedded kataan runtime.
+- A Node-compatible **`fs`** whose every path is resolved and checked against the
+  project root at call time: in-project reads/writes are automatic; anything
+  outside the root (or network via `fetch`) is gated through the same approval
+  path as `bash`. This is the payoff — mediation instead of a coarse yes/no.
+- Capability gating per script run (fs / network / env), surfaced to the agent.
+- Depends on kataan's native-function / global-injection API (under
+  investigation) and its `host`/`fetch`/`crypto` features.
+
+**Why:** scripting lets the agent compose logic (loops, parsing, transforms)
+that would otherwise be brittle shell one-liners — and because we own the host,
+each capability is inspectable and revocable, unlike `bash`.
+
+**Exit:** the agent can run a non-trivial JS script that reads/writes project
+files through a mediated `fs`, with out-of-project/network access gated.
+
+### M9 — Safer command execution (script analysis)
+
+`bash` (and any future `python`) runs opaque, unconfined code. Beyond a yes/no
+prompt, analyze what a script will do before running it.
+
+- Surface risk signals in the approval prompt (network access, `sudo`, `rm -rf`,
+  writes outside the project, pipes to a shell).
+- Optionally a model- or rule-based pre-flight summary of a complex script.
+- Prefer steering the agent toward the mediated `Node` tool (M8) for anything
+  that can be expressed as script rather than raw shell.
+
+**Exit:** a risky `bash` command is flagged with *why* at the prompt, not just
+presented as an opaque string.
 
 ---
 
