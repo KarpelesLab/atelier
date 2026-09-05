@@ -187,6 +187,10 @@ pub struct Session {
     /// Skip approval prompts entirely (e.g. `ATELIER_APPROVE=all` for headless
     /// runs).
     auto_approve: bool,
+    /// Prompt+completion tokens of the most recent request (the live context
+    /// size), and the cumulative completion tokens generated this session.
+    usage_ctx: u32,
+    usage_out: u64,
     history: Vec<Message>,
     fstate: FileState,
 }
@@ -212,9 +216,20 @@ impl Session {
             settings,
             allow,
             auto_approve,
+            usage_ctx: 0,
+            usage_out: 0,
             history: Vec::new(),
             fstate: FileState::new(),
         }
+    }
+
+    /// A short token-usage summary (`<ctx> ctx · <out> out`), or `None` if the
+    /// endpoint hasn't reported usage.
+    pub fn usage_summary(&self) -> Option<String> {
+        if self.usage_ctx == 0 && self.usage_out == 0 {
+            return None;
+        }
+        Some(format!("{} ctx · {} out", self.usage_ctx, self.usage_out))
     }
 
     pub fn config(&self) -> &Config {
@@ -315,6 +330,11 @@ impl Session {
                     StreamEvent::Reasoning(t) => ui.reasoning(t),
                     StreamEvent::Content(t) => ui.content(t),
                 })?;
+
+            if let Some(u) = &completion.usage {
+                self.usage_ctx = u.total_tokens;
+                self.usage_out += u64::from(u.completion_tokens);
+            }
 
             self.history.push(Message::assistant_tool_calls(
                 completion.content.clone(),
@@ -533,6 +553,8 @@ pub fn repl(mut session: Session) -> Result<()> {
             Dispatch::Prompt => {
                 if let Err(e) = session.send(line, &mut ui) {
                     eprintln!("error: {e:#}");
+                } else if let Some(s) = session.usage_summary() {
+                    eprintln!("{DIM}[{s}]{RESET}");
                 }
             }
         }

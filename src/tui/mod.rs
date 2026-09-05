@@ -404,6 +404,10 @@ fn build_status(session: &Session, turn: u32) -> String {
         s.push_str(&branch);
     }
     s.push_str(&format!(" · turn {turn}"));
+    if let Some(u) = session.usage_summary() {
+        s.push_str(" · ");
+        s.push_str(&u);
+    }
     s
 }
 
