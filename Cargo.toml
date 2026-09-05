@@ -13,6 +13,12 @@ rsurl = "0.1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Pre-declared for the parallel work streams so module authors need not touch
+# this file: tools (grep/glob/walking), tui, context.
+regex = "1"
+ignore = "0.4"
+globset = "0.4"
+crossterm = "0.28"
 
 [features]
 default = ["tui"]
