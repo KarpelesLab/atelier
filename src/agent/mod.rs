@@ -9,6 +9,7 @@
 //! terminal interface (the `tui` module supplies one; [`repl`] uses a plain
 //! stdout one). Nothing here may depend on `tui`.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -44,9 +45,21 @@ pub trait Ui {
     /// Informational output from a command (e.g. `/models`, `/mcp`): printed to
     /// the scrollback, not part of a model turn.
     fn info(&mut self, text: &str);
+    /// Ask the user to approve a side-effecting tool call before it runs.
+    fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval;
     /// An out-of-band notice (errors, status). Used by the TUI.
     #[allow(dead_code)]
     fn notice(&mut self, text: &str);
+}
+
+/// The user's answer to a tool-approval prompt.
+pub enum Approval {
+    /// Run this once.
+    Once,
+    /// Run this and remember the tool as always-allowed (persisted).
+    Always,
+    /// Refuse; the model is told the user denied it.
+    Deny,
 }
 
 /// What a line of input turned out to be, once [`dispatch`] has looked at it.
@@ -78,8 +91,17 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
     if !trimmed.starts_with('/') {
         return Dispatch::Prompt;
     }
-    let mut parts = trimmed.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
+    let tokens = match crate::shlex::split(trimmed) {
+        Ok(t) => t,
+        Err(e) => {
+            ui.info(&format!("parse error: {e}"));
+            return Dispatch::Handled;
+        }
+    };
+    let Some(cmd) = tokens.first().map(String::as_str) else {
+        return Dispatch::Handled;
+    };
+    let args: Vec<&str> = tokens[1..].iter().map(String::as_str).collect();
     match cmd {
         "/quit" | "/exit" => return Dispatch::Quit,
         "/help" => {
@@ -96,10 +118,7 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             }
             Err(e) => ui.info(&format!("error: {e:#}")),
         },
-        "/mcp" => {
-            let args: Vec<&str> = parts.collect();
-            dispatch_mcp(session, &args, ui);
-        }
+        "/mcp" => dispatch_mcp(session, &args, ui),
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),
     }
@@ -162,6 +181,12 @@ pub struct Session {
     tools: ToolRegistry,
     context: Vec<Box<dyn ContextProvider>>,
     settings: Settings,
+    /// Tools approved for the rest of this session (seeded from settings, grown
+    /// by "always allow").
+    allow: HashSet<String>,
+    /// Skip approval prompts entirely (e.g. `ATELIER_APPROVE=all` for headless
+    /// runs).
+    auto_approve: bool,
     history: Vec<Message>,
     fstate: FileState,
 }
@@ -174,12 +199,19 @@ impl Session {
         context: Vec<Box<dyn ContextProvider>>,
         settings: Settings,
     ) -> Self {
+        let allow: HashSet<String> = settings.permissions.allow.iter().cloned().collect();
+        let auto_approve = matches!(
+            std::env::var("ATELIER_APPROVE").as_deref(),
+            Ok("all" | "yes" | "1")
+        );
         Self {
             cfg,
             root,
             tools,
             context,
             settings,
+            allow,
+            auto_approve,
             history: Vec::new(),
             fstate: FileState::new(),
         }
@@ -295,12 +327,47 @@ impl Session {
             }
 
             for call in &completion.tool_calls {
+                if self.needs_approval(&call.name) {
+                    match ui.ask_approval(&call.name, &call.arguments) {
+                        Approval::Once => {}
+                        Approval::Always => self.grant_always(&call.name),
+                        Approval::Deny => {
+                            let msg =
+                                "error: the user denied permission to run this tool.".to_string();
+                            ui.tool_end(&call.name, &msg, false);
+                            self.history
+                                .push(Message::tool_result(call.id.clone(), msg));
+                            continue;
+                        }
+                    }
+                }
                 ui.tool_start(&call.name, &call.arguments);
                 let (result, ok) = self.exec_tool(call);
                 ui.tool_end(&call.name, &result, ok);
                 self.history
                     .push(Message::tool_result(call.id.clone(), result));
             }
+        }
+    }
+
+    /// Whether a tool call must be approved before running: side-effecting, not
+    /// already allowed, and not in auto-approve mode.
+    fn needs_approval(&self, name: &str) -> bool {
+        if self.auto_approve || self.allow.contains(name) {
+            return false;
+        }
+        self.tools
+            .get(name)
+            .map(|t| t.side_effecting())
+            .unwrap_or(false)
+    }
+
+    /// Remember a tool as always-allowed for this session and persist it.
+    fn grant_always(&mut self, name: &str) {
+        self.allow.insert(name.to_string());
+        if !self.settings.permissions.allow.iter().any(|n| n == name) {
+            self.settings.permissions.allow.push(name.to_string());
+            let _ = self.settings.save(&self.root);
         }
     }
 
@@ -413,6 +480,21 @@ impl Ui for StdoutUi {
     fn info(&mut self, text: &str) {
         self.end_reasoning();
         println!("{text}");
+    }
+    fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
+        self.end_reasoning();
+        let args: String = arguments.chars().take(200).collect();
+        print!("allow tool '{tool}' {args}? [y]once / [a]lways / [n]o: ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).is_err() {
+            return Approval::Deny;
+        }
+        match line.trim().chars().next() {
+            Some('y') | Some('Y') => Approval::Once,
+            Some('a') | Some('A') => Approval::Always,
+            _ => Approval::Deny,
+        }
     }
     fn notice(&mut self, text: &str) {
         eprintln!("{text}");

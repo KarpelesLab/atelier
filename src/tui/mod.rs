@@ -359,6 +359,32 @@ impl Ui for TuiUi<'_> {
         self.r.emit_block(text, false);
         let _ = self.r.refresh();
     }
+    fn ask_approval(&mut self, tool: &str, arguments: &str) -> agent::Approval {
+        let args = truncate_tail_head(arguments, 200);
+        self.r
+            .emit_block(&format!("⚠ allow tool '{tool}'?  {args}"), false);
+        self.r
+            .emit_block("   [y] once   [a] always   [n] deny", false);
+        let _ = self.r.refresh();
+        loop {
+            match event::read() {
+                Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    match k.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => return agent::Approval::Once,
+                        KeyCode::Char('a') | KeyCode::Char('A') => return agent::Approval::Always,
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            return agent::Approval::Deny;
+                        }
+                        KeyCode::Char('c') if ctrl => return agent::Approval::Deny,
+                        _ => {}
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return agent::Approval::Deny,
+            }
+        }
+    }
     fn notice(&mut self, text: &str) {
         self.r.emit_block(&format!("! {text}"), false);
         let _ = self.r.refresh();

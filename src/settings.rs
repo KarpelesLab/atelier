@@ -26,6 +26,17 @@ pub struct Settings {
     /// Configured MCP servers, launched at startup.
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+    /// Tool-approval policy.
+    #[serde(default)]
+    pub permissions: Permissions,
+}
+
+/// Persisted tool-approval state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Permissions {
+    /// Tool names the user has approved for all future runs ("always allow").
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// One stdio MCP server the user has configured.

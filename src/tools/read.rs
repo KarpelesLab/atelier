@@ -12,6 +12,10 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn side_effecting(&self) -> bool {
+        false
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),

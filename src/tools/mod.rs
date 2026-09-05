@@ -69,6 +69,13 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     /// The advertised schema (name, description, JSON-Schema parameters).
     fn spec(&self) -> ToolSpec;
+    /// Whether running this tool changes the world (writes files, runs commands)
+    /// and therefore needs the user's approval. Defaults to `true` — the safe
+    /// default, so unknown/MCP tools require confirmation. Read-only tools
+    /// override to `false`.
+    fn side_effecting(&self) -> bool {
+        true
+    }
     /// Execute with parsed JSON `args`. The returned string is fed back to the
     /// model as the tool result; return `Err` for a failure the model should
     /// see (it is rendered as an error result, not a crash).
