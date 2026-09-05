@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::mcp::conn::Conn;
+use crate::mcp::jsonrpc::JsonRpc;
 use crate::tools::{Tool, ToolCtx, ToolSpec};
 
 /// A single MCP-advertised tool, callable through the shared connection to
-/// its server.
+/// its server. `conn` is transport-agnostic (stdio or HTTP) — see
+/// [`JsonRpc`].
 pub(crate) struct McpTool {
-    conn: Arc<Mutex<Conn>>,
+    conn: Arc<Mutex<dyn JsonRpc>>,
     /// Namespaced name exposed to the model: `mcp__<server>__<tool>`.
     namespaced_name: String,
     /// The tool's own name, as advertised by the server — used on the wire
@@ -23,7 +24,7 @@ pub(crate) struct McpTool {
 
 impl McpTool {
     pub(crate) fn new(
-        conn: Arc<Mutex<Conn>>,
+        conn: Arc<Mutex<dyn JsonRpc>>,
         namespaced_name: String,
         original_name: String,
         description: String,
