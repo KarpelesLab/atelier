@@ -17,7 +17,9 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::context::{ContextItem, ContextProvider};
+use crate::mcp::{self, StdioServer};
 use crate::provider::{self, Completion, Message, StreamEvent, ToolCall};
+use crate::settings::{McpServerConfig, Settings};
 use crate::tools::{FileState, ToolCtx, ToolRegistry};
 
 const SYSTEM_PROMPT: &str = "\
@@ -39,9 +41,118 @@ pub trait Ui {
     fn tool_end(&mut self, name: &str, result: &str, ok: bool);
     /// The turn is complete (one full assistant response).
     fn turn_end(&mut self) {}
+    /// Informational output from a command (e.g. `/models`, `/mcp`): printed to
+    /// the scrollback, not part of a model turn.
+    fn info(&mut self, text: &str);
     /// An out-of-band notice (errors, status). Used by the TUI.
     #[allow(dead_code)]
     fn notice(&mut self, text: &str);
+}
+
+/// What a line of input turned out to be, once [`dispatch`] has looked at it.
+pub enum Dispatch {
+    /// Not a command — send it to the model as a prompt.
+    Prompt,
+    /// A command that was handled in place.
+    Handled,
+    /// The user asked to quit.
+    Quit,
+}
+
+const HELP: &[&str] = &[
+    "commands:",
+    "  /help                                 show this help",
+    "  /models                               list models offered by the endpoint",
+    "  /mcp                                  list configured MCP servers",
+    "  /mcp add <name> <command> [args...]   add and connect an MCP server",
+    "  /mcp remove <name>                    remove an MCP server",
+    "  /clear                                (no-op: scrollback is append-only)",
+    "  /quit                                 exit (also Ctrl-D on an empty input)",
+];
+
+/// Interpret one line of input: run it if it is a slash command (rendering
+/// output through `ui`), otherwise report that it is a prompt for the caller to
+/// send. Shared by the REPL and the TUI so commands behave identically in both.
+pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('/') {
+        return Dispatch::Prompt;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    match cmd {
+        "/quit" | "/exit" => return Dispatch::Quit,
+        "/help" => {
+            for l in HELP {
+                ui.info(l);
+            }
+        }
+        "/models" => match provider::list_models(session.config()) {
+            Ok(models) if models.is_empty() => ui.info("(no models returned)"),
+            Ok(models) => {
+                for m in models {
+                    ui.info(&m);
+                }
+            }
+            Err(e) => ui.info(&format!("error: {e:#}")),
+        },
+        "/mcp" => {
+            let args: Vec<&str> = parts.collect();
+            dispatch_mcp(session, &args, ui);
+        }
+        "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
+        other => ui.info(&format!("unknown command '{other}' — /help for commands")),
+    }
+    Dispatch::Handled
+}
+
+fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
+    match args.first().copied() {
+        None => {
+            let list = session.mcp_list();
+            if list.is_empty() {
+                ui.info("no MCP servers configured. add one:");
+                ui.info("  /mcp add <name> <command> [args...]");
+            } else {
+                ui.info("configured MCP servers:");
+                for l in list {
+                    ui.info(&format!("  {l}"));
+                }
+            }
+        }
+        Some("add") => {
+            let rest = &args[1..];
+            if rest.len() < 2 {
+                ui.info("usage: /mcp add <name> <command> [args...]");
+                return;
+            }
+            let name = rest[0];
+            let command = rest[1];
+            let extra: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+            match session.mcp_add(name, command, extra) {
+                Ok(n) => ui.info(&format!(
+                    "added MCP server '{name}' — {n} tool(s) now available"
+                )),
+                Err(e) => ui.info(&format!("error: {e:#}")),
+            }
+        }
+        Some("remove") | Some("rm") => {
+            let Some(name) = args.get(1) else {
+                ui.info("usage: /mcp remove <name>");
+                return;
+            };
+            match session.mcp_remove(name) {
+                Ok(true) => ui.info(&format!("removed MCP server '{name}'")),
+                Ok(false) => ui.info(&format!("no MCP server named '{name}'")),
+                Err(e) => ui.info(&format!("error: {e:#}")),
+            }
+        }
+        Some(other) => {
+            ui.info(&format!(
+                "unknown /mcp subcommand '{other}' — use: add, remove, or no args to list"
+            ));
+        }
+    }
 }
 
 /// A conversation with its tools and context providers.
@@ -50,6 +161,7 @@ pub struct Session {
     root: PathBuf,
     tools: ToolRegistry,
     context: Vec<Box<dyn ContextProvider>>,
+    settings: Settings,
     history: Vec<Message>,
     fstate: FileState,
 }
@@ -60,12 +172,14 @@ impl Session {
         root: PathBuf,
         tools: ToolRegistry,
         context: Vec<Box<dyn ContextProvider>>,
+        settings: Settings,
     ) -> Self {
         Self {
             cfg,
             root,
             tools,
             context,
+            settings,
             history: Vec::new(),
             fstate: FileState::new(),
         }
@@ -73,6 +187,76 @@ impl Session {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Connect every MCP server in the settings and register its tools.
+    /// Returns human-readable status lines (one per server) for the caller to
+    /// display; a failed server is reported but does not abort the others.
+    pub fn connect_configured_mcp(&mut self) -> Vec<String> {
+        let servers = self.settings.mcp.clone();
+        let mut status = Vec::new();
+        for s in servers {
+            match mcp::connect_stdio(&to_stdio(&s)) {
+                Ok(tools) => {
+                    let n = tools.len();
+                    for t in tools {
+                        self.tools.register(t);
+                    }
+                    status.push(format!("mcp: connected '{}' ({n} tool(s))", s.name));
+                }
+                Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
+            }
+        }
+        status
+    }
+
+    /// One display line per configured MCP server.
+    pub fn mcp_list(&self) -> Vec<String> {
+        self.settings
+            .mcp
+            .iter()
+            .map(|m| {
+                if m.args.is_empty() {
+                    format!("{} → {}", m.name, m.command)
+                } else {
+                    format!("{} → {} {}", m.name, m.command, m.args.join(" "))
+                }
+            })
+            .collect()
+    }
+
+    /// Connect a new MCP server, register its tools, and persist it. Returns the
+    /// number of tools it advertised. Nothing is saved if the connection fails.
+    pub fn mcp_add(&mut self, name: &str, command: &str, args: Vec<String>) -> Result<usize> {
+        if self.settings.mcp.iter().any(|m| m.name == name) {
+            anyhow::bail!("an MCP server named '{name}' already exists");
+        }
+        let cfg = McpServerConfig {
+            name: name.to_string(),
+            command: command.to_string(),
+            args,
+        };
+        let tools = mcp::connect_stdio(&to_stdio(&cfg))?;
+        let n = tools.len();
+        for t in tools {
+            self.tools.register(t);
+        }
+        self.settings.mcp.push(cfg);
+        self.settings.save(&self.root)?;
+        Ok(n)
+    }
+
+    /// Remove a configured MCP server (and drop its live tools). Returns whether
+    /// a server by that name existed.
+    pub fn mcp_remove(&mut self, name: &str) -> Result<bool> {
+        let before = self.settings.mcp.len();
+        self.settings.mcp.retain(|m| m.name != name);
+        if self.settings.mcp.len() == before {
+            return Ok(false);
+        }
+        self.tools.remove_prefix(&format!("mcp__{name}__"));
+        self.settings.save(&self.root)?;
+        Ok(true)
     }
 
     /// Run one user turn to completion, executing tool calls until the model
@@ -162,6 +346,14 @@ impl Session {
     }
 }
 
+fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
+    StdioServer {
+        name: cfg.name.clone(),
+        command: cfg.command.clone(),
+        args: cfg.args.clone(),
+    }
+}
+
 /// A plain stdout [`Ui`]: reasoning dimmed, answer normal, tools annotated.
 pub struct StdoutUi {
     in_reasoning: bool,
@@ -218,6 +410,10 @@ impl Ui for StdoutUi {
         self.end_reasoning();
         println!();
     }
+    fn info(&mut self, text: &str) {
+        self.end_reasoning();
+        println!("{text}");
+    }
     fn notice(&mut self, text: &str) {
         eprintln!("{text}");
     }
@@ -231,7 +427,10 @@ pub fn repl(mut session: Session) -> Result<()> {
         "atelier — model {} @ {}",
         session.cfg.model, session.cfg.base_url
     );
-    eprintln!("type a message, or /quit to exit, /models to list models.\n");
+    eprintln!("type a message, or /help for commands.\n");
+    for line in session.connect_configured_mcp() {
+        eprintln!("{line}");
+    }
 
     let stdin = io::stdin();
     loop {
@@ -241,24 +440,19 @@ pub fn repl(mut session: Session) -> Result<()> {
         if stdin.read_line(&mut input)? == 0 {
             break; // EOF (Ctrl-D)
         }
-        let input = input.trim();
-        if input.is_empty() {
+        let line = input.trim();
+        if line.is_empty() {
             continue;
         }
-        match input {
-            "/quit" | "/exit" => break,
-            "/models" => {
-                match provider::list_models(session.config()) {
-                    Ok(models) => println!("{}", models.join("\n")),
-                    Err(e) => eprintln!("error: {e:#}"),
-                }
-                continue;
-            }
-            _ => {}
-        }
         let mut ui = StdoutUi::new();
-        if let Err(e) = session.send(input, &mut ui) {
-            eprintln!("error: {e:#}");
+        match dispatch(&mut session, line, &mut ui) {
+            Dispatch::Quit => break,
+            Dispatch::Handled => {}
+            Dispatch::Prompt => {
+                if let Err(e) = session.send(line, &mut ui) {
+                    eprintln!("error: {e:#}");
+                }
+            }
         }
     }
     Ok(())

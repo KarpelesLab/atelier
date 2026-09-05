@@ -55,7 +55,6 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, event, execute, queue, terminal};
 
 use crate::agent::{self, Session, Ui};
-use crate::provider;
 
 use input::LineEditor;
 
@@ -80,6 +79,9 @@ pub fn run(mut session: Session) -> Result<()> {
     let mut turn: u32 = 0;
     r.status = build_status(&session, turn);
     r.push_line("atelier — /help for commands, /quit to exit".into(), true);
+    for line in session.connect_configured_mcp() {
+        r.push_line(line, true);
+    }
     r.refresh()?;
 
     loop {
@@ -138,56 +140,29 @@ pub fn run(mut session: Session) -> Result<()> {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        match trimmed.as_str() {
-                            "/quit" | "/exit" => break,
-                            "/help" => {
-                                for line in HELP {
-                                    r.push_line((*line).to_string(), true);
-                                }
-                                r.refresh()?;
-                                continue;
-                            }
-                            "/clear" => {
-                                // Scrollback is append-only by design; there is
-                                // nothing to clear. Say so rather than lie.
-                                r.push_line(
-                                    "(scrollback is append-only — nothing to clear)".into(),
-                                    true,
-                                );
-                                r.refresh()?;
-                                continue;
-                            }
-                            "/models" => {
-                                match provider::list_models(session.config()) {
-                                    Ok(models) if models.is_empty() => {
-                                        r.push_line("(no models returned)".into(), true);
-                                    }
-                                    Ok(models) => {
-                                        for m in models {
-                                            r.push_line(m, false);
-                                        }
-                                    }
-                                    Err(e) => r.push_line(format!("error: {e:#}"), false),
-                                }
-                                r.refresh()?;
-                                continue;
-                            }
-                            _ => {}
-                        }
 
-                        // A real turn: bump the counter, refresh the status, and
-                        // drive the session. The `TuiUi` borrows the renderer and
-                        // streams output above the (empty) input line.
-                        turn += 1;
-                        r.status = build_status(&session, turn);
-                        let mut ui = TuiUi { r: &mut r };
-                        let res = session.send(&trimmed, &mut ui);
-                        if let Err(e) = res {
-                            r.push_line(format!("error: {e:#}"), false);
+                        // Commands and prompts share one dispatcher. Scope the
+                        // TuiUi borrow so `r` is free again in the match arms.
+                        let outcome = {
+                            let mut ui = TuiUi { r: &mut r };
+                            agent::dispatch(&mut session, &trimmed, &mut ui)
+                        };
+                        match outcome {
+                            agent::Dispatch::Quit => break,
+                            agent::Dispatch::Handled => {
+                                r.refresh()?;
+                            }
+                            agent::Dispatch::Prompt => {
+                                turn += 1;
+                                r.status = build_status(&session, turn);
+                                let mut ui = TuiUi { r: &mut r };
+                                if let Err(e) = session.send(&trimmed, &mut ui) {
+                                    r.push_line(format!("error: {e:#}"), false);
+                                }
+                                r.commit_pending_if_any();
+                                r.refresh()?;
+                            }
                         }
-                        // Ensure any dangling partial line is committed.
-                        r.commit_pending_if_any();
-                        r.refresh()?;
                     }
                     _ => {}
                 }
@@ -197,15 +172,6 @@ pub fn run(mut session: Session) -> Result<()> {
     }
     Ok(())
 }
-
-const HELP: &[&str] = &[
-    "commands:",
-    "  /help    show this help",
-    "  /models  list models offered by the endpoint",
-    "  /clear   (no-op: scrollback is append-only)",
-    "  /quit    exit (also Ctrl-D on an empty line)",
-    "keys: Left/Right/Home/End move · Backspace/Delete edit · Ctrl-C clears input",
-];
 
 /// One committed line of scrollback, remembered until the next [`Renderer::refresh`]
 /// prints (and thereby immortalises) it.
@@ -387,6 +353,10 @@ impl Ui for TuiUi<'_> {
         self.r.commit_pending_if_any();
         // A blank line separates turns in the scrollback.
         self.r.push_line(String::new(), false);
+        let _ = self.r.refresh();
+    }
+    fn info(&mut self, text: &str) {
+        self.r.emit_block(text, false);
         let _ = self.r.refresh();
     }
     fn notice(&mut self, text: &str) {

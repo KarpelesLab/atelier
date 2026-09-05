@@ -99,6 +99,13 @@ impl ToolRegistry {
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
     }
+    /// Drop every tool whose name starts with `prefix` (e.g. when an MCP
+    /// server is removed, its `mcp__<server>__*` tools). Returns how many.
+    pub fn remove_prefix(&mut self, prefix: &str) -> usize {
+        let before = self.tools.len();
+        self.tools.retain(|t| !t.name().starts_with(prefix));
+        before - self.tools.len()
+    }
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

@@ -41,7 +41,30 @@ Configuration is via environment (an `atelier.toml` overlay lands later):
 | `ATELIER_MODEL`     | `qwen3.8-unc:q4`                 | Model id (thinking + vision)    |
 | `ATELIER_API_KEY`   | *(unset)*                        | Optional bearer token           |
 
-In the REPL, `/models` lists the endpoint's models and `/quit` exits.
+## Commands
+
+Type `/help` for the list. Notable ones:
+
+- `/models` — list the models the endpoint offers
+- `/mcp` — list configured MCP servers
+- `/mcp add <name> <command> [args...]` — connect an MCP server and register
+  its tools (namespaced `mcp__<name>__<tool>`); the server is saved to
+  `atelier.toml`
+- `/mcp remove <name>` — drop a server and its tools
+- `/quit` — exit (also Ctrl-D on an empty input)
+
+## Project settings — `atelier.toml`
+
+Durable, user-editable settings live in `atelier.toml` at the project root
+(created and updated by `/mcp add`). MCP servers configured there are launched
+and connected at startup:
+
+```toml
+[[mcp]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+```
 
 ## Layout
 

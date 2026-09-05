@@ -9,6 +9,7 @@ mod config;
 mod context;
 mod mcp;
 mod provider;
+mod settings;
 mod tools;
 #[cfg(feature = "tui")]
 mod tui;
@@ -16,14 +17,19 @@ mod tui;
 use anyhow::Result;
 
 use config::Config;
+use settings::Settings;
 
 fn main() -> Result<()> {
     let cfg = Config::from_env();
     let root = std::env::current_dir()?;
+    let settings = Settings::load(&root).unwrap_or_else(|e| {
+        eprintln!("warning: {e:#}; using empty settings");
+        Settings::default()
+    });
 
     let tools = tools::builtin_registry();
     let context = context::default_providers();
-    let session = agent::Session::new(cfg, root, tools, context);
+    let session = agent::Session::new(cfg, root, tools, context, settings);
 
     #[cfg(feature = "tui")]
     {
