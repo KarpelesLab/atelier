@@ -15,12 +15,39 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
+
+/// Env var overriding both HTTP timeouts below (milliseconds). Read directly
+/// here rather than through `Config` since the provider is the only consumer.
+const TIMEOUT_ENV_VAR: &str = "ATELIER_HTTP_TIMEOUT_MS";
+/// Default connect timeout for the streaming chat call: generous, since a
+/// local/self-hosted model server can be slow to accept a connection under
+/// load.
+const DEFAULT_CHAT_TIMEOUT_MS: u64 = 60_000;
+/// Default connect timeout for `GET /models`: a cheap, quick call, so a
+/// shorter default fails fast.
+const DEFAULT_LIST_MODELS_TIMEOUT_MS: u64 = 15_000;
+
+/// Resolve the connect-timeout duration to use, honoring
+/// `ATELIER_HTTP_TIMEOUT_MS` (milliseconds) when set to a valid, positive
+/// integer, else falling back to `default_ms`.
+fn timeout_ms_from_env(default_ms: u64) -> u64 {
+    std::env::var(TIMEOUT_ENV_VAR)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(default_ms)
+}
+
+fn connect_timeout(default_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms_from_env(default_ms))
+}
 
 /// A chat message. Covers plain text, an assistant turn carrying tool calls,
 /// and a tool result (`role = "tool"`).
@@ -336,19 +363,68 @@ struct DeltaFunction {
     arguments: Option<String>,
 }
 
-/// POST `body` and return the streaming body reader, rebuilding the request and
-/// retrying a few times on a transient EAGAIN ("Resource temporarily
-/// unavailable", os error 35) that rsurl can surface on a sequential in-process
-/// request (e.g. the follow-up call after a tool result).
+/// Maximum number of send attempts (the original attempt plus retries) before
+/// a transient transport error is given up on.
+const MAX_SEND_ATTEMPTS: u32 = 5;
+
+/// Classifies a transport-layer error message as transient (worth rebuilding
+/// the request and retrying) versus a hard failure worth surfacing
+/// immediately.
+///
+/// This only ever sees errors from `Request::send_reader()` itself — i.e.
+/// failures to establish/send the request (DNS, connect, TLS handshake, write
+/// timeout, a stale pooled connection resurfacing as EAGAIN). An HTTP 4xx/5xx
+/// response is *not* an `Err` here: `send_reader()` returns `Ok` with a status
+/// to check once headers arrive, so a real HTTP error status never reaches
+/// (and is never accidentally retried by) this classifier.
+fn is_transient_error(msg: &str) -> bool {
+    let msg = msg.to_ascii_lowercase();
+    const TRANSIENT_PATTERNS: &[&str] = &[
+        "temporarily unavailable", // EAGAIN, spelled out
+        "os error 35",             // EAGAIN (macOS/BSD)
+        "os error 11",             // EAGAIN (Linux); also matches "os error 111"
+        "connection refused",
+        "os error 61",  // ECONNREFUSED (macOS/BSD)
+        "os error 111", // ECONNREFUSED (Linux)
+        "connection reset",
+        "os error 54",  // ECONNRESET (macOS/BSD)
+        "os error 104", // ECONNRESET (Linux)
+        "broken pipe",
+        "timed out",
+        "timeout",
+    ];
+    TRANSIENT_PATTERNS.iter().any(|p| msg.contains(p))
+}
+
+/// Small capped exponential backoff between retry attempts: 50ms, 100ms,
+/// 200ms, 400ms, capped at 800ms so a run of `MAX_SEND_ATTEMPTS` retries never
+/// stalls the harness for long.
+fn backoff_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    let ms = 50u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms.min(800))
+}
+
+/// POST `body` and return the streaming body reader, rebuilding the request
+/// and retrying a bounded number of times on a transient connect/send
+/// failure (see [`is_transient_error`]) — e.g. the EAGAIN ("Resource
+/// temporarily unavailable") that rsurl can surface on a sequential
+/// in-process request (the follow-up call after a tool result), or a
+/// connection refused/reset while a local model server is warming up.
+///
+/// The connect timeout is configurable via `ATELIER_HTTP_TIMEOUT_MS`
+/// (milliseconds), defaulting to [`DEFAULT_CHAT_TIMEOUT_MS`].
 fn send_reader_retrying(
     url: &str,
     body: &[u8],
     api_key: Option<&str>,
 ) -> Result<rsurl::BodyReader> {
+    let timeout = connect_timeout(DEFAULT_CHAT_TIMEOUT_MS);
     let mut attempt: u32 = 0;
     loop {
         let mut req = rsurl::Request::new("POST", url)
             .context("building request")?
+            .connect_timeout(timeout)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             // Fresh connection per request: reusing a pooled keep-alive
@@ -362,11 +438,9 @@ fn send_reader_retrying(
             Ok(reader) => return Ok(reader),
             Err(e) => {
                 attempt += 1;
-                let msg = e.to_string();
-                let transient =
-                    msg.contains("os error 35") || msg.contains("temporarily unavailable");
-                if transient && attempt < 5 {
-                    std::thread::sleep(std::time::Duration::from_millis(u64::from(attempt) * 50));
+                let transient = is_transient_error(&e.to_string());
+                if transient && attempt < MAX_SEND_ATTEMPTS {
+                    std::thread::sleep(backoff_delay(attempt));
                     continue;
                 }
                 return Err(anyhow::anyhow!("sending request: {e}"));
@@ -376,9 +450,13 @@ fn send_reader_retrying(
 }
 
 /// List model ids advertised by the endpoint (`GET /models`).
+///
+/// The connect timeout is configurable via `ATELIER_HTTP_TIMEOUT_MS`
+/// (milliseconds), defaulting to [`DEFAULT_LIST_MODELS_TIMEOUT_MS`].
 pub fn list_models(cfg: &Config) -> Result<Vec<String>> {
     let resp = rsurl::Request::new("GET", &cfg.endpoint("models"))
         .context("building request")?
+        .connect_timeout(connect_timeout(DEFAULT_LIST_MODELS_TIMEOUT_MS))
         .send()
         .context("sending request")?;
     if !(200..300).contains(&resp.status) {
@@ -425,5 +503,80 @@ mod tests {
         let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
         assert!(chunk.usage.is_none());
         assert_eq!(chunk.choices.len(), 1);
+    }
+
+    /// Transport-level connect/send failures that are worth retrying.
+    #[test]
+    fn transient_errors_are_recognized() {
+        assert!(is_transient_error(
+            "Resource temporarily unavailable (os error 35)"
+        ));
+        assert!(is_transient_error("temporarily unavailable"));
+        assert!(is_transient_error("Connection refused (os error 61)"));
+        assert!(is_transient_error("connection reset by peer"));
+        assert!(is_transient_error("os error 104"));
+        assert!(is_transient_error("connect timed out"));
+        assert!(is_transient_error("operation timeout"));
+        // Case-insensitivity.
+        assert!(is_transient_error("CONNECTION REFUSED"));
+    }
+
+    /// Real HTTP/application errors are not transport transients and must
+    /// never be retried.
+    #[test]
+    fn non_transient_errors_are_not_retried() {
+        assert!(!is_transient_error("provider returned HTTP 404"));
+        assert!(!is_transient_error("provider returned HTTP 500"));
+        assert!(!is_transient_error("invalid json"));
+        assert!(!is_transient_error("parsing models"));
+    }
+
+    /// Backoff is strictly increasing across the retry window and stays
+    /// bounded, so a run of `MAX_SEND_ATTEMPTS` retries can't stall the
+    /// harness for long.
+    #[test]
+    fn backoff_delay_is_bounded_and_increasing() {
+        let delays: Vec<_> = (1..MAX_SEND_ATTEMPTS).map(backoff_delay).collect();
+        for window in delays.windows(2) {
+            assert!(window[0] < window[1], "backoff must increase per attempt");
+        }
+        for d in &delays {
+            assert!(*d <= Duration::from_millis(800), "backoff must stay capped");
+        }
+    }
+
+    /// Covers unset/valid/invalid/zero cases for the timeout env var in one
+    /// test, since `std::env::set_var` is process-wide and `cargo test` runs
+    /// tests concurrently by default — splitting these across tests sharing
+    /// `TIMEOUT_ENV_VAR` would race.
+    #[test]
+    fn timeout_env_var_parsing() {
+        // SAFETY: test-only manipulation of a var no other test reads;
+        // cleared at the end of this single test so it can't leak state to
+        // (or race with) any other test.
+        unsafe {
+            std::env::remove_var(TIMEOUT_ENV_VAR);
+        }
+        assert_eq!(timeout_ms_from_env(60_000), 60_000);
+        assert_eq!(timeout_ms_from_env(15_000), 15_000);
+
+        unsafe {
+            std::env::set_var(TIMEOUT_ENV_VAR, "2500");
+        }
+        assert_eq!(timeout_ms_from_env(60_000), 2500);
+
+        unsafe {
+            std::env::set_var(TIMEOUT_ENV_VAR, "not-a-number");
+        }
+        assert_eq!(timeout_ms_from_env(60_000), 60_000);
+
+        unsafe {
+            std::env::set_var(TIMEOUT_ENV_VAR, "0");
+        }
+        assert_eq!(timeout_ms_from_env(60_000), 60_000);
+
+        unsafe {
+            std::env::remove_var(TIMEOUT_ENV_VAR);
+        }
     }
 }
