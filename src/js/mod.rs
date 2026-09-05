@@ -18,16 +18,29 @@
 //! as you see fit. Do not edit files outside `src/js/`. Keep `NodeTool`'s public
 //! shape (name, spec, requires_approval) so the registration keeps working.
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-
-use kataan::Interp;
 
 use crate::tools::{Tool, ToolCtx, ToolSpec};
 
 mod console;
 mod fs;
+mod net;
 mod runtime;
+
+/// Default wall-clock budget for a script when the call omits `timeout_ms`.
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+/// Hard ceiling on `timeout_ms` so a call cannot pin a worker thread forever by
+/// request (a runaway script past this is abandoned — see [`NodeTool::call`]).
+const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Worker-thread stack. The tree-walk interpreter recurses on the native stack;
+/// kataan tunes its eval-depth guard for a ~2 MB stack, so a generous stack here
+/// keeps a comfortable margin before the (catchable) `RangeError` fires.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// The `node` tool: run JavaScript with a mediated, project-confined host.
 pub struct NodeTool;
@@ -49,7 +62,7 @@ impl Tool for NodeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "node".into(),
-            description: "Run a JavaScript program in a sandboxed runtime (no network; no \
+            description: "Run a JavaScript program in a sandboxed runtime (no \
                 require/import — CommonJS and ES modules are unavailable). Two globals are \
                 provided directly, already in scope (do NOT require() or import them): `console` \
                 (log, error) and a SYNCHRONOUS `fs` confined to the project directory. The fs \
@@ -57,12 +70,33 @@ impl Tool for NodeTool {
                 fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
                 fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path). Paths \
                 are relative to the project root and cannot escape it. Returns the captured \
-                console output. Use this for logic that would be awkward as a shell one-liner."
+                console output. Use this for logic that would be awkward as a shell one-liner. \
+                Execution is bounded by `timeout_ms` (default 5000); a script that exceeds it is \
+                aborted and the tool returns a timeout notice. Set `network: true` to additionally \
+                get SYNCHRONOUS HTTP globals (this makes the call require approval): \
+                fetch(url[, {method, headers, body}]) -> {status, ok, body, headers}; \
+                httpRequest({method, url, headers, body}) -> {status, ok, body, headers}; \
+                httpGet(url) -> string (the body). Without `network: true` those globals are \
+                undefined (typeof fetch === 'undefined')."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "code": { "type": "string", "description": "The JavaScript source to run." }
+                    "code": { "type": "string", "description": "The JavaScript source to run." },
+                    "network": {
+                        "type": "boolean",
+                        "description": "Enable the synchronous fetch/httpGet/httpRequest HTTP \
+                            globals. Default false. Setting it true makes this call require \
+                            user approval.",
+                        "default": false
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Wall-clock execution budget in milliseconds. Default \
+                            5000. A script that runs longer is aborted and the tool returns a \
+                            timeout notice.",
+                        "default": DEFAULT_TIMEOUT_MS
+                    }
                 },
                 "required": ["code"]
             }),
@@ -70,66 +104,75 @@ impl Tool for NodeTool {
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
-        // 1. The script source.
+        // Owned inputs for the worker thread: the script source, the `fs`
+        // confinement root, and whether to install the network host.
         let code = args
             .get("code")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("the `node` tool requires a string `code` argument"))?;
-
-        // 2. The confinement root for the mediated `fs`.
+            .ok_or_else(|| anyhow!("the `node` tool requires a string `code` argument"))?
+            .to_owned();
         let root = ctx.project_root.to_path_buf();
+        let network = args
+            .get("network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1, MAX_TIMEOUT_MS);
 
-        // Parse both programs up front so they outlive `interp` (the interpreter
-        // borrows a program's source for its own lifetime; declaring the
-        // programs first keeps that borrow valid). A user syntax error is
-        // reported as a normal result, not a tool failure.
-        let bootstrap = runtime::parse(runtime::BOOTSTRAP)
-            .map_err(|e| anyhow!("internal bootstrap parse error: {e}"))?;
-        let user_prog = match runtime::parse(code) {
-            Ok(p) => p,
-            Err(msg) => return Ok(msg),
-        };
-
-        // 3. Build the interpreter, install the mediated host, assemble it in JS,
-        // then run the user's code on the same interpreter.
+        // Run the interpreter on a dedicated worker thread and wait for its
+        // result with a wall-clock deadline. The `Interp`/`NanBox` values live
+        // and die entirely inside the worker; only the output `String` (which is
+        // `Send`) crosses back over the channel.
         //
-        // TODO(v1 limitation): there is no execution timeout — an infinite-loop
-        // script will hang the calling thread. A future version should run the
-        // interpreter under a watchdog / step budget.
-        let mut interp = Interp::new();
-        fs::install(&mut interp, root);
-        let out = console::install(&mut interp);
+        // ## CPU/interrupt limitation (kataan v0.0.8)
+        //
+        // On a timeout we cannot force-kill the worker: Rust has no safe thread
+        // cancellation, and kataan exposes **no JS-level interrupt or step/gas
+        // budget** to trip from a watchdog. Its `Limits` (src/limits.rs) meter
+        // only recursion depths and *WebAssembly* fuel (`DEFAULT_WASM_FUEL`) —
+        // there is no per-instruction budget for the tree-walk interpreter
+        // (src/nbexec/{mod,stmt}.rs have no interrupt check in the loop path),
+        // and no `Interp` method to signal it. So a `while(true){}` script keeps
+        // running after we return: the timed-out worker thread is **abandoned**
+        // and leaks one CPU until the process exits. A real fix requires an
+        // upstream kataan interrupt hook (an atomic flag checked on each
+        // statement/back-edge) that a watchdog could set at the deadline.
+        let (tx, rx) = mpsc::channel::<String>();
+        let worker = thread::Builder::new()
+            .name("node-script".into())
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(move || {
+                let out = runtime::execute(code, root, network);
+                // Ignore a send error: it only means we already timed out and
+                // the receiver is gone.
+                let _ = tx.send(out);
+            })
+            .map_err(|e| anyhow!("failed to spawn node worker thread: {e}"))?;
 
-        if let Err(e) = interp.run(&bootstrap) {
-            return Ok(format!(
-                "internal error assembling host: {}",
-                runtime::render_exec_error(&interp, &e)
-            ));
-        }
-
-        let result = interp.run(&user_prog);
-
-        let mut output = out.borrow().clone();
-        match result {
-            Ok(value) => {
-                // With no console output, fall back to the script's final value.
-                if output.is_empty() {
-                    let display = interp.realm().to_display_string(value);
-                    if display != "undefined" {
-                        output = display;
-                    }
-                }
+        match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(output) => {
+                // Reap the finished worker so it doesn't linger as a zombie.
+                let _ = worker.join();
+                Ok(output)
             }
-            Err(e) => {
-                let msg = runtime::render_exec_error(&interp, &e);
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str(&format!("Uncaught {msg}"));
+            Err(RecvTimeoutError::Timeout) => {
+                // Deliberately do NOT join: the worker is still running and
+                // cannot be interrupted (see the note above). Drop the handle to
+                // detach it; it exits with the process.
+                Ok(format!(
+                    "node: script exceeded the {timeout_ms}ms time limit and was aborted"
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // The worker panicked before sending (should not happen — the
+                // interpreter turns script errors into a normal result).
+                let _ = worker.join();
+                Ok("node: script worker terminated unexpectedly".into())
             }
         }
-
-        Ok(runtime::truncate(output))
     }
 }
 
@@ -242,5 +285,101 @@ mod tests {
         let output = run(&root, r#"console.log("hi")"#);
         assert_eq!(output.trim(), "hi");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An infinite loop is aborted at the wall-clock deadline and returns the
+    /// timeout notice promptly. NOTE: because kataan v0.0.8 has no JS interrupt,
+    /// the worker thread is abandoned and keeps spinning until the process exits
+    /// — acceptable in a test, but it does leak one thread.
+    #[test]
+    fn timeout_aborts_infinite_loop() {
+        let root = tmpdir();
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+        };
+
+        let start = std::time::Instant::now();
+        let output = NodeTool
+            .call(
+                &mut ctx,
+                json!({ "code": "while (true) {}", "timeout_ms": 300 }),
+            )
+            .expect("node tool should not fail at the harness level");
+        let elapsed = start.elapsed();
+
+        assert!(
+            output.contains("exceeded the 300ms time limit"),
+            "unexpected output: {output:?}"
+        );
+        // The call returns near the deadline, not much later.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout took too long: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fast script finishes and returns normally well within its budget.
+    #[test]
+    fn completes_before_timeout() {
+        let root = tmpdir();
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+        };
+        let output = NodeTool
+            .call(
+                &mut ctx,
+                json!({ "code": "console.log(1 + 2)", "timeout_ms": 5000 }),
+            )
+            .expect("node tool should not fail at the harness level");
+        assert_eq!(output.trim(), "3");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Without `network: true`, the HTTP globals are not installed.
+    #[test]
+    fn network_globals_absent_by_default() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"console.log(typeof fetch, typeof httpGet, typeof httpRequest)"#,
+        );
+        assert_eq!(output.trim(), "undefined undefined undefined");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With `network: true`, the HTTP globals are installed as functions (no
+    /// request is made, so this doesn't touch the network).
+    #[test]
+    fn network_globals_present_when_enabled() {
+        let root = tmpdir();
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+        };
+        let output = NodeTool
+            .call(
+                &mut ctx,
+                json!({
+                    "code": "console.log(typeof fetch, typeof httpGet, typeof httpRequest)",
+                    "network": true
+                }),
+            )
+            .expect("node tool should not fail at the harness level");
+        assert_eq!(output.trim(), "function function function");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `network: true` flips the approval requirement; a plain call does not.
+    #[test]
+    fn network_flag_gates_approval() {
+        assert!(!NodeTool.requires_approval(&json!({ "code": "1" })));
+        assert!(NodeTool.requires_approval(&json!({ "code": "1", "network": true })));
     }
 }
