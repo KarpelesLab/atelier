@@ -51,13 +51,13 @@ impl Settings {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        tomlproc::serde::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Write settings back to `<root>/atelier.toml`.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
-        let text = toml::to_string_pretty(self).context("serializing settings")?;
+        let text = tomlproc::serde::to_string_pretty(self).context("serializing settings")?;
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
     }
 }
