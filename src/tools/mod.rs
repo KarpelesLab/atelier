@@ -83,7 +83,7 @@ pub trait Tool: Send + Sync {
     /// *confined to the project directory* (all file tools, sandboxed via
     /// [`ToolCtx::resolve`]) override to `false`: operating inside the project
     /// is automatic and never prompts.
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _args: &Value) -> bool {
         true
     }
     /// Execute with parsed JSON `args`. The returned string is fed back to the

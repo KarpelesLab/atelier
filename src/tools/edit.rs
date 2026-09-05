@@ -12,7 +12,7 @@ impl Tool for EditTool {
         "edit"
     }
 
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _args: &serde_json::Value) -> bool {
         // Confined to the project root by `ToolCtx::resolve`; auto-approved.
         false
     }

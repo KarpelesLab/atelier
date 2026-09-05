@@ -37,10 +37,13 @@ impl Tool for NodeTool {
         "node"
     }
 
-    fn requires_approval(&self) -> bool {
-        // v1 host is confined to the project root (fs) with no network, so the
-        // tool cannot escape the project and never prompts.
-        false
+    fn requires_approval(&self, args: &Value) -> bool {
+        // Confined by default (mediated fs stays in the project root), so a plain
+        // call is auto-approved. A call that opts into network (`network: true`)
+        // is unconfined and requires approval.
+        args.get("network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     fn spec(&self) -> ToolSpec {

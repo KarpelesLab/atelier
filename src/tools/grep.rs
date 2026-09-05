@@ -17,7 +17,7 @@ impl Tool for GrepTool {
         "grep"
     }
 
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _args: &serde_json::Value) -> bool {
         false
     }
 

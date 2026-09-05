@@ -347,7 +347,8 @@ impl Session {
             }
 
             for call in &completion.tool_calls {
-                if self.needs_approval(&call.name) {
+                let call_args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+                if self.needs_approval(&call.name, &call_args) {
                     for signal in crate::risk::signals(&call.name, &call.arguments) {
                         ui.info(&format!("⚠ {signal}"));
                     }
@@ -377,13 +378,13 @@ impl Session {
     /// needs approval (unconfined — `bash`, MCP tools), it isn't already
     /// allowed, and we're not in auto-approve mode. Tools confined to the
     /// project directory (all file tools) never prompt.
-    fn needs_approval(&self, name: &str) -> bool {
+    fn needs_approval(&self, name: &str, args: &Value) -> bool {
         if self.auto_approve || self.allow.contains(name) {
             return false;
         }
         self.tools
             .get(name)
-            .map(|t| t.requires_approval())
+            .map(|t| t.requires_approval(args))
             .unwrap_or(false)
     }
 
