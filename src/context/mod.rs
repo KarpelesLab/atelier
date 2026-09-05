@@ -21,6 +21,10 @@
 // Contract surface is consumed by the providers implementation (in progress).
 #![allow(dead_code)]
 
+mod diff;
+mod git;
+mod layout;
+
 use std::path::Path;
 
 /// A single piece of injected context.
@@ -51,9 +55,12 @@ pub trait ContextProvider: Send + Sync {
     fn gather(&self, root: &Path) -> Option<ContextItem>;
 }
 
-/// The default set of context providers.
-///
-/// TODO(context agent): return git status, recent diff, and project layout.
+/// The default set of context providers: git status, recent diff, and
+/// project layout (in priority order).
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
-    Vec::new()
+    vec![
+        Box::new(git::GitStatusProvider),
+        Box::new(diff::GitDiffProvider),
+        Box::new(layout::LayoutProvider),
+    ]
 }
