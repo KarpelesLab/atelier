@@ -46,10 +46,15 @@ impl Tool for NodeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "node".into(),
-            description: "Run a JavaScript program in a sandboxed runtime. A mediated `fs` \
-                (readFile, writeFile, readdir, exists, mkdir) confined to the project directory \
-                and `console.log`/`console.error` are available. Use this for logic that would be \
-                awkward as a shell one-liner. Returns the captured console output."
+            description: "Run a JavaScript program in a sandboxed runtime (no network; no \
+                require/import — CommonJS and ES modules are unavailable). Two globals are \
+                provided directly, already in scope (do NOT require() or import them): `console` \
+                (log, error) and a SYNCHRONOUS `fs` confined to the project directory. The fs \
+                methods return values directly — no promises, callbacks, or await: \
+                fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
+                fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path). Paths \
+                are relative to the project root and cannot escape it. Returns the captured \
+                console output. Use this for logic that would be awkward as a shell one-liner."
                 .into(),
             parameters: json!({
                 "type": "object",
