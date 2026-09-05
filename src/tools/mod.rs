@@ -49,18 +49,25 @@ impl ToolCtx<'_> {
     /// Resolve a (possibly relative) path against the project root and reject
     /// anything that escapes it. Use this in every tool that touches the fs.
     pub fn resolve(&self, path: &str) -> Result<PathBuf> {
-        let p = Path::new(path);
-        let joined = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.project_root.join(p)
-        };
-        let normalized = normalize(&joined);
-        if !normalized.starts_with(self.project_root) {
-            bail!("path {path:?} escapes the project root");
-        }
-        Ok(normalized)
+        confine(self.project_root, path)
     }
+}
+
+/// Resolve `path` against `root` and reject anything that escapes it. The shared
+/// confinement check behind [`ToolCtx::resolve`] — also used by the mediated
+/// `fs` of the `node` tool so scripts stay inside the project.
+pub fn confine(root: &Path, path: &str) -> Result<PathBuf> {
+    let p = Path::new(path);
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    };
+    let normalized = normalize(&joined);
+    if !normalized.starts_with(root) {
+        bail!("path {path:?} escapes the project root");
+    }
+    Ok(normalized)
 }
 
 /// A callable tool.
