@@ -348,6 +348,9 @@ impl Session {
 
             for call in &completion.tool_calls {
                 if self.needs_approval(&call.name) {
+                    for signal in crate::risk::signals(&call.name, &call.arguments) {
+                        ui.info(&format!("⚠ {signal}"));
+                    }
                     match ui.ask_approval(&call.name, &call.arguments) {
                         Approval::Once => {}
                         Approval::Always => self.grant_always(&call.name),

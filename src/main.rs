@@ -7,8 +7,10 @@
 mod agent;
 mod config;
 mod context;
+mod js;
 mod mcp;
 mod provider;
+mod risk;
 mod settings;
 mod shlex;
 mod tools;

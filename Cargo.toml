@@ -13,6 +13,7 @@ rsurl = "0.1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tomlproc = { version = "0.1", features = ["serde"] }
+kataan = { version = "0.0.8", default-features = false, features = ["std", "host"] }
 anyhow = "1"
 # Pre-declared for the parallel work streams so module authors need not touch
 # this file: tools (grep/glob/walking), tui, context.

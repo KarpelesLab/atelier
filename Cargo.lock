@@ -25,6 +25,7 @@ dependencies = [
  "crossterm",
  "globset",
  "ignore",
+ "kataan",
  "regex",
  "rsurl",
  "serde",
@@ -230,6 +231,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kataan"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d822c78f4261e3bb0835825c4db8d2b0e1d82c305b9b04c2a7c4f5904abe5e63"
+dependencies = [
+ "puremp",
+ "timezone-data",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -345,6 +356,12 @@ dependencies = [
  "cacrt",
  "compcol 0.4.7",
 ]
+
+[[package]]
+name = "puremp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bf29cee9bbf0341c2ea7871d76b84a6e9216fdcf46a57fe60bd04396c55d7dc"
 
 [[package]]
 name = "puressh"
@@ -567,6 +584,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "timezone-data"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aad13301ab2ef1974c3e7ea9173ec14bb35aaaf2ab6ff3e8a888aee0d4fbe119"
 
 [[package]]
 name = "tomlproc"
