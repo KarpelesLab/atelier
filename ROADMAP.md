@@ -174,7 +174,9 @@ about (e.g. notices uncommitted changes, a failing build).
 ### M5 — MCP support
 Extend the tool surface via the ecosystem.
 
-- `atelier-mcp`: MCP client — **stdio** transport first, then **HTTP/SSE**.
+- MCP client — **stdio** transport ✅ and **Streamable HTTP** transport ✅
+  (shared `JsonRpc` trait; HTTP does POST + JSON/SSE responses + `Mcp-Session-Id`).
+  HTTP servers are not yet wired into `atelier.toml`/`/mcp` config (follow-up).
 - Server config in `atelier.toml`; discovered MCP tools are merged into the tool
   registry and namespaced (`mcp__<server>__<tool>`).
 - MCP tools flow through the same permission model as local tools.
@@ -227,10 +229,18 @@ project-confined `fs` (readFile/writeFile/readdir/exists/mkdir) + captured
 `console`; out-of-project paths throw, and there is no network. Verified live
 (the model wrote/read a file and summed it).
 
-**M8.1 — follow-ups:** no execution timeout yet (an infinite-loop script hangs
-the calling thread — kataan has depth limits but no JS step budget, so this
-needs an external watchdog); async `fs`; gated `fetch`/out-of-project via the
-approval flow; `Uint8Array`/binary file support.
+**M8.1 — progress & follow-ups:**
+- ✅ Wall-clock timeout (`timeout_ms`, default 5s): runs kataan on a worker
+  thread and aborts at the deadline; the harness stays responsive.
+- ✅ Gated `fetch`/`httpGet`/`httpRequest` (sync, via rsurl), installed only on
+  `network: true`, which is treated as unconfined and requires approval
+  (per-call `Tool::requires_approval(args)`).
+- ⏳ **True CPU stop:** kataan v0.0.4-era has no JS interrupt/step budget (only
+  depth limits + WASM fuel), so a timed-out script's thread is *abandoned* (leaks
+  one CPU until exit). Real fix: add an interrupt `AtomicBool` to kataan checked
+  on loop back-edges (upstream, cleanest), or run JS in a killable subprocess
+  (needs fs proxying).
+- ⏳ async `fs`; out-of-project fs via approval; `Uint8Array`/binary support.
 
 ### M9 — Safer command execution (script analysis)
 
