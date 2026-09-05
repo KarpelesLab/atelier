@@ -40,6 +40,7 @@ Configuration is via environment (an `atelier.toml` overlay lands later):
 | `ATELIER_BASE_URL`  | `http://192.168.0.50:11400/v1`   | OpenAI-compatible endpoint base |
 | `ATELIER_MODEL`     | `qwen3.8-unc:q4`                 | Model id (thinking + vision)    |
 | `ATELIER_API_KEY`   | *(unset)*                        | Optional bearer token           |
+| `ATELIER_APPROVE`   | *(unset)*                        | `all` to auto-approve every tool (headless) |
 
 ## Commands
 
@@ -52,6 +53,14 @@ Type `/help` for the list. Notable ones:
   `atelier.toml`
 - `/mcp remove <name>` — drop a server and its tools
 - `/quit` — exit (also Ctrl-D on an empty input)
+
+## Permissions
+
+Side-effecting tools (`write`, `edit`, `bash`, and any MCP tool) ask for
+approval before running; read-only tools (`read`, `grep`, `glob`, `ls`) run
+freely. At the prompt you choose **once**, **always** (remembered and saved to
+`atelier.toml` under `[permissions] allow`), or **deny** (the model is told and
+adapts). Set `ATELIER_APPROVE=all` to skip prompts entirely for headless runs.
 
 ## Project settings — `atelier.toml`
 
