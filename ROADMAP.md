@@ -222,8 +222,15 @@ sans-I/O, so we provide `fs`, `fetch`, etc. — and check every effect at runtim
 that would otherwise be brittle shell one-liners — and because we own the host,
 each capability is inspectable and revocable, unlike `bash`.
 
-**Exit:** the agent can run a non-trivial JS script that reads/writes project
-files through a mediated `fs`, with out-of-project/network access gated.
+**Exit (v1 met):** the agent runs JS through the `node` tool with a synchronous,
+project-confined `fs` (readFile/writeFile/readdir/exists/mkdir) + captured
+`console`; out-of-project paths throw, and there is no network. Verified live
+(the model wrote/read a file and summed it).
+
+**M8.1 — follow-ups:** no execution timeout yet (an infinite-loop script hangs
+the calling thread — kataan has depth limits but no JS step budget, so this
+needs an external watchdog); async `fs`; gated `fetch`/out-of-project via the
+approval flow; `Uint8Array`/binary file support.
 
 ### M9 — Safer command execution (script analysis)
 
@@ -236,8 +243,9 @@ prompt, analyze what a script will do before running it.
 - Prefer steering the agent toward the mediated `Node` tool (M8) for anything
   that can be expressed as script rather than raw shell.
 
-**Exit:** a risky `bash` command is flagged with *why* at the prompt, not just
-presented as an opaque string.
+**Exit (v1 met):** a risky `bash` command is flagged with *why* at the prompt
+(rm -rf, sudo, `curl|sh`, out-of-project paths, force-push, …), not just an
+opaque string. Verified live. A model-based pre-flight summary is a later add.
 
 ---
 
