@@ -175,19 +175,8 @@ pub fn stream_chat(
         eprintln!("--> {}", String::from_utf8_lossy(&body));
     }
 
-    let mut req = rsurl::Request::new("POST", &cfg.endpoint("chat/completions"))
-        .context("building request")?
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        // Use a fresh connection per request: reusing a pooled keep-alive
-        // connection here can surface a spurious EAGAIN on the next send.
-        .header("connection", "close")
-        .body(body);
-    if let Some(key) = &cfg.api_key {
-        req = req.header("authorization", &format!("Bearer {key}"));
-    }
-
-    let reader = req.send_reader().context("sending request")?;
+    let url = cfg.endpoint("chat/completions");
+    let reader = send_reader_retrying(&url, &body, cfg.api_key.as_deref())?;
     let status = reader.status();
     if !(200..300).contains(&status) {
         bail!("provider returned HTTP {status}");
@@ -320,6 +309,45 @@ struct DeltaFunction {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+/// POST `body` and return the streaming body reader, rebuilding the request and
+/// retrying a few times on a transient EAGAIN ("Resource temporarily
+/// unavailable", os error 35) that rsurl can surface on a sequential in-process
+/// request (e.g. the follow-up call after a tool result).
+fn send_reader_retrying(
+    url: &str,
+    body: &[u8],
+    api_key: Option<&str>,
+) -> Result<rsurl::BodyReader> {
+    let mut attempt: u32 = 0;
+    loop {
+        let mut req = rsurl::Request::new("POST", url)
+            .context("building request")?
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            // Fresh connection per request: reusing a pooled keep-alive
+            // connection here can surface a spurious EAGAIN on the next send.
+            .header("connection", "close")
+            .body(body.to_vec());
+        if let Some(key) = api_key {
+            req = req.header("authorization", &format!("Bearer {key}"));
+        }
+        match req.send_reader() {
+            Ok(reader) => return Ok(reader),
+            Err(e) => {
+                attempt += 1;
+                let msg = e.to_string();
+                let transient =
+                    msg.contains("os error 35") || msg.contains("temporarily unavailable");
+                if transient && attempt < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(attempt) * 50));
+                    continue;
+                }
+                return Err(anyhow::anyhow!("sending request: {e}"));
+            }
+        }
+    }
 }
 
 /// List model ids advertised by the endpoint (`GET /models`).
