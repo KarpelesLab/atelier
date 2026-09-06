@@ -9,7 +9,7 @@
 //! terminal interface (the `tui` module supplies one; [`repl`] uses a plain
 //! stdout one). Nothing here may depend on `tui`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -232,6 +232,8 @@ pub struct Session {
     usage_out: u64,
     /// Images (data URLs) staged by `/image`, attached to the next user turn.
     pending_images: Vec<String>,
+    /// Last turn's context items (`title -> body`), for cross-turn dedup.
+    last_ctx: HashMap<String, String>,
     /// Rolling summary of older turns that have been compacted out of `history`.
     summary: Option<String>,
     /// Compact when the last request's total tokens exceed this.
@@ -269,6 +271,7 @@ impl Session {
             usage_ctx: 0,
             usage_out: 0,
             pending_images: Vec::new(),
+            last_ctx: HashMap::new(),
             summary: None,
             compact_threshold,
             history: Vec::new(),
@@ -303,6 +306,7 @@ impl Session {
         self.history.clear();
         self.summary = None;
         self.pending_images.clear();
+        self.last_ctx.clear();
         let _ = crate::session::clear(&self.root);
     }
 
@@ -616,13 +620,17 @@ impl Session {
     ///
     /// Providers are prioritized and truncated to a token budget so a large diff
     /// or layout can't crowd out the conversation.
-    fn gather_context(&self) -> Option<String> {
+    fn gather_context(&mut self) -> Option<String> {
         let items: Vec<ContextItem> = self
             .context
             .iter()
             .filter_map(|p| p.gather(&self.root))
             .collect();
-        crate::context::render_budgeted(items, CONTEXT_TOKEN_BUDGET)
+        // Drop items unchanged since last turn so we don't re-send identical
+        // context every turn; remember the full snapshot for next time.
+        let (kept, snapshot) = crate::context::dedup_items(&self.last_ctx, items);
+        self.last_ctx = snapshot;
+        crate::context::render_budgeted(kept, CONTEXT_TOKEN_BUDGET)
     }
 }
 
