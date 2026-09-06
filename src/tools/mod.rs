@@ -34,6 +34,7 @@ mod edit;
 mod glob;
 mod grep;
 mod ls;
+mod multiedit;
 mod read;
 mod write;
 
@@ -137,6 +138,7 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(read::ReadTool));
     reg.register(Box::new(write::WriteTool));
     reg.register(Box::new(edit::EditTool));
+    reg.register(Box::new(multiedit::MultiEditTool));
     reg.register(Box::new(bash::BashTool));
     reg.register(Box::new(grep::GrepTool));
     reg.register(Box::new(glob::GlobTool));
