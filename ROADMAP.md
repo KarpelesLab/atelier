@@ -166,8 +166,9 @@ The "feed the agent" pipeline.
 - Initial providers: **git status/branch**, **recent diff**, **project layout**,
   and a pluggable **diagnostics** hook (build/lint/test output → summarized).
 - Token budgeting ✅: providers are prioritized and truncated to a context
-  budget (`context::render_budgeted`, wired into the agent loop). Cross-turn
-  dedup of unchanged context is still a follow-up.
+  budget (`context::render_budgeted`), and unchanged context is deduped across
+  turns (`context::dedup_items`) so identical git/layout isn't re-sent — both
+  wired into the agent loop.
 
 **Exit:** the agent visibly reacts to repo state it was never explicitly told
 about (e.g. notices uncommitted changes, a failing build).
@@ -175,9 +176,10 @@ about (e.g. notices uncommitted changes, a failing build).
 ### M5 — MCP support
 Extend the tool surface via the ecosystem.
 
-- MCP client — **stdio** transport ✅ and **Streamable HTTP** transport ✅
-  (shared `JsonRpc` trait; HTTP does POST + JSON/SSE responses + `Mcp-Session-Id`).
-  HTTP servers are not yet wired into `atelier.toml`/`/mcp` config (follow-up).
+- MCP client — **stdio** ✅ and **Streamable HTTP** ✅ transports (shared
+  `JsonRpc` trait; HTTP does POST + JSON/SSE responses + `Mcp-Session-Id`), both
+  wired into `atelier.toml` (`[[mcp]]` / `[[mcp_http]]`) and `/mcp add`
+  (a `http(s)://` second arg selects HTTP), connected at startup. ✅
 - Server config in `atelier.toml`; discovered MCP tools are merged into the tool
   registry and namespaced (`mcp__<server>__<tool>`).
 - MCP tools flow through the same permission model as local tools.
@@ -208,7 +210,8 @@ the next message — OpenAI multimodal content parts) and a **`multiedit`** tool
 ### M7 — Hardening & polish
 - Provider quirks: per-model tool-calling dialects, missing SSE fields, retries,
   backoff, timeouts.
-- Config UX, better `/` commands, `--print`/pipe-friendly headless mode.
+- Config UX, better `/` commands. `--print`/`-p` pipe-friendly headless mode ✅
+  (one-shot prompt from args or stdin; answer on stdout, everything else stderr).
 - Docs: quickstart, config reference, tool reference, MCP setup.
 
 **Exit:** stable enough for daily driving on real work.
