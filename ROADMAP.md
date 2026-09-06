@@ -193,11 +193,17 @@ Make long sessions durable.
   with `--continue`; `/new` starts fresh. Verified: a fact stated in one run is
   recalled after `--continue`.
 - ✅ Cost/usage accounting surfaced (TUI status strip + REPL line).
-- ⏳ **Compaction/summarization** of older turns when approaching the context
-  limit (the remaining M6 piece — trigger off the tracked `usage_ctx`).
+- ✅ **Compaction/summarization**: when the last request's total tokens exceed
+  `ATELIER_CONTEXT_LIMIT` (default 8000), older history is summarized into a
+  rolling summary (folded into the system message) and dropped, split at a
+  user-message boundary so no tool result is orphaned.
 
-**Exit (partial):** a session survives restarts (done); graceful behavior at the
-context limit needs compaction.
+**Exit (met):** a session survives restarts and compacts older turns as it
+approaches the context limit instead of hard-failing.
+
+Also landed alongside M6: **vision input** (`/image <path>` attaches an image to
+the next message — OpenAI multimodal content parts) and a **`multiedit`** tool
+(atomic multi-edit of one file).
 
 ### M7 — Hardening & polish
 - Provider quirks: per-model tool-calling dialects, missing SSE fields, retries,
