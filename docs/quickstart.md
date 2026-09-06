@@ -42,8 +42,8 @@ type a message, or /help for commands.
 The entry point ...
 ```
 
-Type `/help` to see the available slash commands (`/models`, `/mcp`, `/quit`,
-…) — see [tools](tools.md) and [MCP](mcp.md) for what the agent itself can do,
+Type `/help` to see the available slash commands (`/models`, `/mcp`, `/new`,
+`/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the agent itself can do,
 and [permissions](permissions.md) for how tool approval works.
 
 ## The REPL vs. the inline TUI
@@ -78,6 +78,20 @@ stdin to EOF. You don't need to select this explicitly.
 
 See [configuration](configuration.md) for the full picture including
 `atelier.toml`.
+
+## Sessions
+
+The conversation is saved to `.atelier/session.json` under the project root
+after each turn. Resume it in a later run:
+
+```sh
+cargo run -- --continue   # or -c
+```
+
+`--continue` restores the prior history (you'll see `resumed session (N
+message(s))`). Start fresh at any time with the `/new` command, which clears the
+in-memory history and deletes the saved session. Add `.atelier/` to your
+project's `.gitignore`.
 
 ## Next steps
 

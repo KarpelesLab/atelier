@@ -54,6 +54,7 @@ src/
 ├─ main.rs        entry: config, wiring, run loop
 ├─ config.rs      env-based runtime config
 ├─ settings.rs    atelier.toml (MCP servers, permissions)
+├─ session.rs     conversation persistence (.atelier/session.json)
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls
 ├─ agent/         agent loop, conversation state, turn orchestration
 ├─ tools/         built-in tools + registry

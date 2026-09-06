@@ -42,6 +42,13 @@ throws a catchable JS error instead of touching the filesystem.
 | `fs.readdir` | `(path) -> string[]` | Directory entry names |
 | `fs.exists` | `(path) -> boolean` | Whether the path exists |
 | `fs.mkdir` | `(path)` | Creates the directory (and parents); no return value |
+| `fs.stat` | `(path) -> {isFile, isDirectory, size, mtimeMs}` | File metadata (follows symlinks) |
+| `fs.appendFile` | `(path, content)` | Appends text, creating the file/parents if needed |
+| `fs.rm` | `(path)` | Removes a file (throws on a directory) |
+| `fs.rmdir` | `(path)` | Removes an empty directory (non-recursive) |
+| `fs.rename` | `(from, to)` | Renames/moves within the project root |
+| `fs.readFileBytes` | `(path) -> Uint8Array` | Reads a file as raw bytes |
+| `fs.writeFileBytes` | `(path, data)` | Writes a `Uint8Array` or plain byte array |
 
 ```js
 fs.writeFile("notes/todo.txt", "buy milk\n");
