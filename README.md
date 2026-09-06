@@ -1,17 +1,11 @@
 # atelier
 
 A minimal-TUI AI coding harness written in Rust. An agent loop that talks to
-OpenAI-compatible model APIs, runs tools inside a project directory, speaks MCP,
-and continuously feeds itself fresh context (git status, diagnostics, …) — from
-a deliberately small terminal interface.
+OpenAI-compatible model APIs, runs tools inside a project directory, speaks
+MCP, and continuously feeds itself fresh context (git status, diagnostics,
+project layout) — from a deliberately small terminal interface.
 
 See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
-
-## Status
-
-Early. **M0 is working**: a streaming conversation with the configured endpoint,
-rendering the model's thinking separately from its answer. Tools, the inline
-TUI, MCP, and context helpers are in progress (see the roadmap).
 
 ## Design in one breath
 
@@ -21,75 +15,53 @@ TUI, MCP, and context helpers are in progress (see the roadmap).
   everything else prints to the terminal scrollback and is never redrawn.
 - **Project-scoped.** Launched inside a project directory; tools, context, and
   permissions are anchored there.
-- **The agent is fed, not just prompted.** Per-turn context providers inject the
-  current repo state so the model reasons about now, not a stale snapshot.
+- **The agent is fed, not just prompted.** Per-turn context providers inject
+  the current repo state (git status, diff, layout, `cargo check`
+  diagnostics) so the model reasons about now, not a stale snapshot.
+- **Confinement over coarse yes/no.** Every file tool and the `node`
+  scripting tool are sandboxed to the project root and run without
+  prompting; only genuinely unconfined execution (`bash`, MCP tools,
+  networked scripts) asks for approval.
 - **One binary, organized by module** — not an internal crate workspace.
 
-## Build & run
-
-Requires a recent Rust toolchain (edition 2024, MSRV 1.95).
+## Quickstart
 
 ```sh
-cargo run
+cargo build --release   # edition 2024, MSRV 1.95
+cargo run                # launches in the current directory as project root
 ```
 
-Configuration is via environment (an `atelier.toml` overlay lands later):
+Type a message, or `/help` for commands. Set `ATELIER_BASE_URL` /
+`ATELIER_MODEL` / `ATELIER_API_KEY` to point at your own endpoint. See
+[docs/quickstart.md](docs/quickstart.md) for the full walkthrough (env vars,
+first conversation, the REPL/TUI fallback).
 
-| Variable            | Default                          | Meaning                         |
-|---------------------|----------------------------------|---------------------------------|
-| `ATELIER_BASE_URL`  | `http://192.168.0.50:11400/v1`   | OpenAI-compatible endpoint base |
-| `ATELIER_MODEL`     | `qwen3.8-unc:q4`                 | Model id (thinking + vision)    |
-| `ATELIER_API_KEY`   | *(unset)*                        | Optional bearer token           |
-| `ATELIER_APPROVE`   | *(unset)*                        | `all` to auto-approve every tool (headless) |
+## Documentation
 
-## Commands
-
-Type `/help` for the list. Notable ones:
-
-- `/models` — list the models the endpoint offers
-- `/mcp` — list configured MCP servers
-- `/mcp add <name> <command> [args...]` — connect an MCP server and register
-  its tools (namespaced `mcp__<name>__<tool>`); the server is saved to
-  `atelier.toml`
-- `/mcp remove <name>` — drop a server and its tools
-- `/quit` — exit (also Ctrl-D on an empty input)
-
-## Permissions
-
-Tools **confined to the project directory** run without prompting — all file
-tools (`read`, `write`, `edit`, `grep`, `glob`, `ls`) are sandboxed to the
-project root and can't escape it, so operating inside the project is automatic.
-Only tools that can run **arbitrary, unconfined code** — `bash` and MCP tools —
-ask for approval. At the prompt you choose **once**, **always** (remembered and
-saved to `atelier.toml` under `[permissions] allow`), or **deny** (the model is
-told and adapts). Set `ATELIER_APPROVE=all` to skip prompts entirely for
-headless runs.
-
-## Project settings — `atelier.toml`
-
-Durable, user-editable settings live in `atelier.toml` at the project root
-(created and updated by `/mcp add`). MCP servers configured there are launched
-and connected at startup:
-
-```toml
-[[mcp]]
-name = "filesystem"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
-```
+| Doc | Covers |
+|-----|--------|
+| [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, REPL vs. inline TUI |
+| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[permissions]`) |
+| [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
+| [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |
+| [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
+| [MCP](docs/mcp.md) | Connecting MCP servers, tool namespacing |
 
 ## Layout
 
 ```
 src/
 ├─ main.rs        entry: config, wiring, run loop
-├─ config.rs      configuration
+├─ config.rs      env-based runtime config
+├─ settings.rs    atelier.toml (MCP servers, permissions)
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls
 ├─ agent/         agent loop, conversation state, turn orchestration
 ├─ tools/         built-in tools + registry
-├─ mcp/           MCP client
+├─ js/            the `node` tool: mediated JS runtime (fs, console, network)
+├─ mcp/           MCP client (stdio + HTTP transports)
 ├─ context/       per-turn context helpers
-└─ tui/           minimal inline interface  [feature = "tui"]
+├─ risk.rs        risk-signal detection for bash approval prompts
+└─ tui/           minimal inline interface  [feature = "tui", default on]
 ```
 
 ## License
