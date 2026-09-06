@@ -21,10 +21,16 @@
 // Contract surface is consumed by the providers implementation (in progress).
 #![allow(dead_code)]
 
+mod budget;
 mod diagnostics;
 mod diff;
 mod git;
 mod layout;
+
+// Not yet called from the agent loop (wiring is done separately); re-exported
+// now so that integration is a one-line change once it lands.
+#[allow(unused_imports)]
+pub use budget::{estimate_tokens, render_budgeted};
 
 use std::path::Path;
 
