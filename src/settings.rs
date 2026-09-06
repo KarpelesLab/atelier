@@ -23,9 +23,12 @@ pub const FILE_NAME: &str = "atelier.toml";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
-    /// Configured MCP servers, launched at startup.
+    /// Configured stdio MCP servers, launched at startup.
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+    /// Configured HTTP (Streamable) MCP servers, connected at startup.
+    #[serde(default)]
+    pub mcp_http: Vec<HttpServerConfig>,
     /// Tool-approval policy.
     #[serde(default)]
     pub permissions: Permissions,
@@ -46,6 +49,16 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+/// One HTTP (Streamable) MCP server the user has configured. `headers` are
+/// `"Name: Value"` strings sent on every request (e.g. an auth token).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpServerConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 impl Settings {

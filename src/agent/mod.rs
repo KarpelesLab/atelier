@@ -18,9 +18,9 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::context::{ContextItem, ContextProvider};
-use crate::mcp::{self, StdioServer};
+use crate::mcp::{self, HttpServer, StdioServer};
 use crate::provider::{self, Completion, Message, StreamEvent, ToolCall};
-use crate::settings::{McpServerConfig, Settings};
+use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
 use crate::tools::{FileState, ToolCtx, ToolRegistry};
 
 const SYSTEM_PROMPT: &str = "\
@@ -91,7 +91,8 @@ const HELP: &[&str] = &[
     "  /help                                 show this help",
     "  /models                               list models offered by the endpoint",
     "  /mcp                                  list configured MCP servers",
-    "  /mcp add <name> <command> [args...]   add and connect an MCP server",
+    "  /mcp add <name> <command> [args...]   add a stdio MCP server",
+    "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
     "  /mcp remove <name>                    remove an MCP server",
     "  /new                                  start a fresh conversation (clear saved session)",
     "  /image <path>                         attach an image to your next message (vision)",
@@ -172,12 +173,21 @@ fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
             let rest = &args[1..];
             if rest.len() < 2 {
                 ui.info("usage: /mcp add <name> <command> [args...]");
+                ui.info("       /mcp add <name> <http(s)://url> [Header: Value ...]");
                 return;
             }
             let name = rest[0];
-            let command = rest[1];
-            let extra: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
-            match session.mcp_add(name, command, extra) {
+            let target = rest[1];
+            // A URL second argument means an HTTP (Streamable) server; otherwise
+            // it's a command to launch over stdio.
+            let result = if target.starts_with("http://") || target.starts_with("https://") {
+                let headers: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+                session.mcp_add_http(name, target, headers)
+            } else {
+                let extra: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+                session.mcp_add(name, target, extra)
+            };
+            match result {
                 Ok(n) => ui.info(&format!(
                     "added MCP server '{name}' — {n} tool(s) now available"
                 )),
@@ -316,9 +326,8 @@ impl Session {
     /// Returns human-readable status lines (one per server) for the caller to
     /// display; a failed server is reported but does not abort the others.
     pub fn connect_configured_mcp(&mut self) -> Vec<String> {
-        let servers = self.settings.mcp.clone();
         let mut status = Vec::new();
-        for s in servers {
+        for s in self.settings.mcp.clone() {
             match mcp::connect_stdio(&to_stdio(&s)) {
                 Ok(tools) => {
                     let n = tools.len();
@@ -330,28 +339,47 @@ impl Session {
                 Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
             }
         }
+        for s in self.settings.mcp_http.clone() {
+            match mcp::connect_http(&to_http(&s)) {
+                Ok(tools) => {
+                    let n = tools.len();
+                    for t in tools {
+                        self.tools.register(t);
+                    }
+                    status.push(format!("mcp: connected '{}' (http, {n} tool(s))", s.name));
+                }
+                Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
+            }
+        }
         status
     }
 
-    /// One display line per configured MCP server.
+    /// One display line per configured MCP server (stdio and HTTP).
     pub fn mcp_list(&self) -> Vec<String> {
-        self.settings
-            .mcp
+        let stdio = self.settings.mcp.iter().map(|m| {
+            if m.args.is_empty() {
+                format!("{} → {}", m.name, m.command)
+            } else {
+                format!("{} → {} {}", m.name, m.command, m.args.join(" "))
+            }
+        });
+        let http = self
+            .settings
+            .mcp_http
             .iter()
-            .map(|m| {
-                if m.args.is_empty() {
-                    format!("{} → {}", m.name, m.command)
-                } else {
-                    format!("{} → {} {}", m.name, m.command, m.args.join(" "))
-                }
-            })
-            .collect()
+            .map(|m| format!("{} → {} (http)", m.name, m.url));
+        stdio.chain(http).collect()
     }
 
-    /// Connect a new MCP server, register its tools, and persist it. Returns the
-    /// number of tools it advertised. Nothing is saved if the connection fails.
+    /// Whether any configured MCP server (stdio or HTTP) already uses `name`.
+    fn mcp_name_taken(&self, name: &str) -> bool {
+        self.settings.mcp.iter().any(|m| m.name == name)
+            || self.settings.mcp_http.iter().any(|m| m.name == name)
+    }
+
+    /// Connect a new stdio MCP server, register its tools, and persist it.
     pub fn mcp_add(&mut self, name: &str, command: &str, args: Vec<String>) -> Result<usize> {
-        if self.settings.mcp.iter().any(|m| m.name == name) {
+        if self.mcp_name_taken(name) {
             anyhow::bail!("an MCP server named '{name}' already exists");
         }
         let cfg = McpServerConfig {
@@ -369,12 +397,34 @@ impl Session {
         Ok(n)
     }
 
-    /// Remove a configured MCP server (and drop its live tools). Returns whether
-    /// a server by that name existed.
+    /// Connect a new HTTP (Streamable) MCP server, register its tools, persist
+    /// it. `headers` are `"Name: Value"` strings sent on every request.
+    pub fn mcp_add_http(&mut self, name: &str, url: &str, headers: Vec<String>) -> Result<usize> {
+        if self.mcp_name_taken(name) {
+            anyhow::bail!("an MCP server named '{name}' already exists");
+        }
+        let cfg = HttpServerConfig {
+            name: name.to_string(),
+            url: url.to_string(),
+            headers,
+        };
+        let tools = mcp::connect_http(&to_http(&cfg))?;
+        let n = tools.len();
+        for t in tools {
+            self.tools.register(t);
+        }
+        self.settings.mcp_http.push(cfg);
+        self.settings.save(&self.root)?;
+        Ok(n)
+    }
+
+    /// Remove a configured MCP server (stdio or HTTP) and drop its live tools.
+    /// Returns whether a server by that name existed.
     pub fn mcp_remove(&mut self, name: &str) -> Result<bool> {
-        let before = self.settings.mcp.len();
+        let before = self.settings.mcp.len() + self.settings.mcp_http.len();
         self.settings.mcp.retain(|m| m.name != name);
-        if self.settings.mcp.len() == before {
+        self.settings.mcp_http.retain(|m| m.name != name);
+        if self.settings.mcp.len() + self.settings.mcp_http.len() == before {
             return Ok(false);
         }
         self.tools.remove_prefix(&format!("mcp__{name}__"));
@@ -662,6 +712,20 @@ fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
         name: cfg.name.clone(),
         command: cfg.command.clone(),
         args: cfg.args.clone(),
+    }
+}
+
+fn to_http(cfg: &HttpServerConfig) -> HttpServer {
+    let headers = cfg
+        .headers
+        .iter()
+        .filter_map(|h| h.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    HttpServer {
+        name: cfg.name.clone(),
+        url: cfg.url.clone(),
+        headers,
     }
 }
 
