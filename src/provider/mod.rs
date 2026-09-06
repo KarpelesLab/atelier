@@ -11,7 +11,7 @@
 //! Transport is [`rsurl`]: `Request::send_reader()` returns a blocking
 //! `Read` + `.status()`, which we drive line-by-line as an SSE stream.
 //!
-//! Not yet: multimodal content parts (vision) and a non-streaming fallback.
+//! Not yet: a non-streaming fallback.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -61,6 +61,12 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     /// Present on a `role = "tool"` result, linking it to its call.
     pub tool_call_id: Option<String>,
+    /// Image references (a `data:` URL or an http(s) URL) attached to this
+    /// message, passed straight through as `image_url.url` in the wire form.
+    /// `#[serde(default)]` so session files written before this field existed
+    /// still deserialize.
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 impl Message {
@@ -80,6 +86,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     /// An assistant turn that requested one or more tool calls.
@@ -89,6 +96,7 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     /// The result of executing a tool call, fed back to the model.
@@ -98,6 +106,20 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            images: Vec::new(),
+        }
+    }
+    /// A user turn with one or more images attached alongside text (OpenAI
+    /// multimodal `content` array). `images` entries are passed straight
+    /// through as `image_url.url` — a `data:` URL or an http(s) URL.
+    #[allow(dead_code)] // not yet wired into agent/tui callers; exercised by tests
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images,
         }
     }
 
@@ -116,6 +138,16 @@ impl Message {
                 "content": self.content,
                 "tool_calls": self.tool_calls.iter().map(ToolCall::to_wire).collect::<Vec<_>>(),
             });
+        }
+        if !self.images.is_empty() {
+            let mut parts = Vec::with_capacity(1 + self.images.len());
+            if !self.content.is_empty() {
+                parts.push(json!({ "type": "text", "text": self.content }));
+            }
+            for img in &self.images {
+                parts.push(json!({ "type": "image_url", "image_url": { "url": img } }));
+            }
+            return json!({ "role": self.role, "content": parts });
         }
         json!({ "role": self.role, "content": self.content })
     }
@@ -545,6 +577,61 @@ mod tests {
         for d in &delays {
             assert!(*d <= Duration::from_millis(800), "backoff must stay capped");
         }
+    }
+
+    /// A text-only user message must keep serializing `content` as a plain
+    /// string (regression: multimodal support must not affect this path).
+    #[test]
+    fn to_wire_text_only_user_message_has_string_content() {
+        let msg = Message::user("hello there");
+        let wire = msg.to_wire();
+        assert_eq!(wire["role"], "user");
+        assert_eq!(wire["content"], json!("hello there"));
+        assert!(wire.get("tool_calls").is_none());
+    }
+
+    /// A message built with `user_with_images` must serialize `content` as an
+    /// array: text part first, then one `image_url` part per image, with the
+    /// url passed through exactly.
+    #[test]
+    fn to_wire_user_with_images_has_array_content() {
+        let data_url = "data:image/png;base64,AAAA";
+        let msg = Message::user_with_images("hi", vec![data_url.to_string()]);
+        let wire = msg.to_wire();
+        assert_eq!(wire["role"], "user");
+        let content = wire["content"].as_array().expect("array content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0], json!({ "type": "text", "text": "hi" }));
+        assert_eq!(
+            content[1],
+            json!({ "type": "image_url", "image_url": { "url": data_url } })
+        );
+    }
+
+    /// When images are present but the text content is empty, the text part
+    /// must be omitted entirely rather than emitted as an empty string.
+    #[test]
+    fn to_wire_images_with_empty_text_omits_text_part() {
+        let data_url = "data:image/png;base64,BBBB";
+        let msg = Message::user_with_images("", vec![data_url.to_string()]);
+        let wire = msg.to_wire();
+        let content = wire["content"].as_array().expect("array content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0],
+            json!({ "type": "image_url", "image_url": { "url": data_url } })
+        );
+    }
+
+    /// A `Message` JSON blob written before the `images` field existed (i.e.
+    /// missing the key entirely) must still deserialize, defaulting `images`
+    /// to empty — this is the on-disk session-file compatibility guarantee.
+    #[test]
+    fn message_deserializes_without_images_field() {
+        let data = r#"{"role":"user","content":"hi","tool_calls":[],"tool_call_id":null}"#;
+        let msg: Message = serde_json::from_str(data).expect("deserializes");
+        assert!(msg.images.is_empty());
+        assert_eq!(msg.content, "hi");
     }
 
     /// Covers unset/valid/invalid/zero cases for the timeout env var in one
