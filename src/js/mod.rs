@@ -75,7 +75,12 @@ impl Tool for NodeTool {
                 (log, error) and a SYNCHRONOUS `fs` confined to the project directory. The fs \
                 methods return values directly — no promises, callbacks, or await: \
                 fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
-                fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path). Paths \
+                fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path); \
+                fs.stat(path) -> {isFile, isDirectory, size, mtimeMs}; \
+                fs.appendFile(path, content); fs.rm(path) (file only); fs.rmdir(path) \
+                (empty dir only, non-recursive); fs.rename(from, to). Binary I/O: \
+                fs.readFileBytes(path) -> Uint8Array; fs.writeFileBytes(path, data) where data \
+                is a Uint8Array or a plain array of byte numbers. Paths \
                 are relative to the project root and cannot escape it. Returns the captured \
                 console output. Use this for logic that would be awkward as a shell one-liner. \
                 Execution is bounded by `timeout_ms` (default 5000); a script that exceeds it is \
@@ -385,6 +390,172 @@ mod tests {
             )
             .expect("node tool should not fail at the harness level");
         assert_eq!(output.trim(), "function function function");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.stat` distinguishes a file from a directory and reports a size.
+    #[test]
+    fn fs_stat_file_and_dir() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.writeFile("f.txt", "abcde");
+                fs.mkdir("sub");
+                var f = fs.stat("f.txt");
+                var d = fs.stat("sub");
+                console.log(f.isFile, f.isDirectory, f.size, typeof f.mtimeMs);
+                console.log(d.isFile, d.isDirectory);
+            "#,
+        );
+        assert!(
+            output.contains("true false 5 number"),
+            "unexpected file stat: {output:?}"
+        );
+        assert!(
+            output.contains("false true"),
+            "unexpected dir stat: {output:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.appendFile` creates the file then appends to it.
+    #[test]
+    fn fs_append_file() {
+        let root = tmpdir();
+        run(
+            &root,
+            r#"
+                fs.appendFile("log.txt", "one\n");
+                fs.appendFile("log.txt", "two\n");
+            "#,
+        );
+        let written = std::fs::read_to_string(root.join("log.txt")).unwrap();
+        assert_eq!(written, "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.rm` removes a file; removing a directory with it throws.
+    #[test]
+    fn fs_rm_file_and_rejects_dir() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.writeFile("gone.txt", "x");
+                fs.rm("gone.txt");
+                console.log("exists:", fs.exists("gone.txt"));
+                fs.mkdir("adir");
+                try { fs.rm("adir"); console.log("NOT_CAUGHT"); }
+                catch (e) { console.log("caught"); }
+            "#,
+        );
+        assert!(
+            !root.join("gone.txt").exists(),
+            "file should have been removed"
+        );
+        assert!(output.contains("exists: false"), "unexpected: {output:?}");
+        assert!(
+            output.contains("caught"),
+            "rm on dir should throw: {output:?}"
+        );
+        assert!(!output.contains("NOT_CAUGHT"), "unexpected: {output:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.rename` moves a file within the project root.
+    #[test]
+    fn fs_rename() {
+        let root = tmpdir();
+        run(
+            &root,
+            r#"
+                fs.writeFile("a.txt", "content");
+                fs.rename("a.txt", "b.txt");
+            "#,
+        );
+        assert!(!root.join("a.txt").exists(), "source should be gone");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "content"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Binary round-trip: write raw bytes, read them back as a Uint8Array, and
+    /// assert equality inside the script.
+    #[test]
+    fn fs_binary_round_trip() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                var src = [0, 1, 2, 127, 128, 254, 255];
+                fs.writeFileBytes("bin.dat", src);
+                var back = fs.readFileBytes("bin.dat");
+                var isU8 = (back instanceof Uint8Array);
+                var eq = (back.length === src.length);
+                for (var i = 0; i < src.length; i++) if (back[i] !== src[i]) eq = false;
+                console.log("u8:", isU8, "eq:", eq, "len:", back.length);
+            "#,
+        );
+        assert!(
+            output.contains("u8: true eq: true len: 7"),
+            "binary round-trip failed: {output:?}"
+        );
+        // The bytes really landed on disk.
+        assert_eq!(
+            std::fs::read(root.join("bin.dat")).unwrap(),
+            vec![0u8, 1, 2, 127, 128, 254, 255]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A confined write of a Uint8Array (not a plain array) also round-trips,
+    /// exercising the bootstrap's normalization path.
+    #[test]
+    fn fs_binary_write_from_uint8array() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                var u = new Uint8Array([10, 20, 30]);
+                fs.writeFileBytes("u.dat", u);
+                var back = fs.readFileBytes("u.dat");
+                console.log(back[0], back[1], back[2], back.length);
+            "#,
+        );
+        assert!(output.contains("10 20 30 3"), "unexpected: {output:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The new methods stay confined: an escaping path throws.
+    #[test]
+    fn fs_new_methods_reject_escape() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                function esc(fn) {
+                    try { fn(); return "NOT_CAUGHT"; } catch (e) { return "caught"; }
+                }
+                console.log(esc(function () { fs.stat("../../etc/passwd"); }));
+                console.log(esc(function () { fs.appendFile("../x", "y"); }));
+                console.log(esc(function () { fs.rm("../x"); }));
+                console.log(esc(function () { fs.rename("../a", "b"); }));
+                console.log(esc(function () { fs.readFileBytes("../../etc/passwd"); }));
+                console.log(esc(function () { fs.writeFileBytes("../x", [1]); }));
+            "#,
+        );
+        assert!(
+            !output.contains("NOT_CAUGHT"),
+            "escape must throw: {output:?}"
+        );
+        assert_eq!(
+            output.matches("caught").count(),
+            6,
+            "all six escapes should throw: {output:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
