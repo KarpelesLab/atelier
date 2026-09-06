@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::Config;
@@ -50,8 +50,10 @@ fn connect_timeout(default_ms: u64) -> Duration {
 }
 
 /// A chat message. Covers plain text, an assistant turn carrying tool calls,
-/// and a tool result (`role = "tool"`).
-#[derive(Debug, Clone)]
+/// and a tool result (`role = "tool"`). Serializable for session persistence
+/// (this is atelier's own on-disk shape, distinct from the OpenAI wire form
+/// produced by [`Message::to_wire`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -143,7 +145,7 @@ impl ToolSpec {
 
 /// A fully-assembled tool call requested by the model. `arguments` is a raw
 /// JSON string (OpenAI convention), parsed by the caller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

@@ -11,6 +11,7 @@ mod js;
 mod mcp;
 mod provider;
 mod risk;
+mod session;
 mod settings;
 mod shlex;
 mod tools;
@@ -30,9 +31,16 @@ fn main() -> Result<()> {
         Settings::default()
     });
 
+    // Minimal flag handling: `--continue`/`-c` resumes the saved session.
+    let resume = std::env::args().any(|a| a == "--continue" || a == "-c");
+
     let tools = tools::builtin_registry();
     let context = context::default_providers();
-    let session = agent::Session::new(cfg, root, tools, context, settings);
+    let mut session = agent::Session::new(cfg, root, tools, context, settings);
+    if resume {
+        let n = session.resume();
+        eprintln!("resumed session ({n} message(s))");
+    }
 
     #[cfg(feature = "tui")]
     {

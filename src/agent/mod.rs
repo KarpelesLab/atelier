@@ -79,6 +79,7 @@ const HELP: &[&str] = &[
     "  /mcp                                  list configured MCP servers",
     "  /mcp add <name> <command> [args...]   add and connect an MCP server",
     "  /mcp remove <name>                    remove an MCP server",
+    "  /new                                  start a fresh conversation (clear saved session)",
     "  /clear                                (no-op: scrollback is append-only)",
     "  /quit                                 exit (also Ctrl-D on an empty input)",
 ];
@@ -119,6 +120,10 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             Err(e) => ui.info(&format!("error: {e:#}")),
         },
         "/mcp" => dispatch_mcp(session, &args, ui),
+        "/new" => {
+            session.new_conversation();
+            ui.info("started a new conversation (previous session cleared)");
+        }
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),
     }
@@ -236,6 +241,24 @@ impl Session {
         &self.cfg
     }
 
+    /// Load a previously-saved conversation for this project (for `--continue`).
+    /// Returns the number of messages restored.
+    pub fn resume(&mut self) -> usize {
+        self.history = crate::session::load(&self.root);
+        self.history.len()
+    }
+
+    /// Start a fresh conversation, discarding history and the saved session.
+    pub fn new_conversation(&mut self) {
+        self.history.clear();
+        let _ = crate::session::clear(&self.root);
+    }
+
+    /// Persist the current conversation to disk (best-effort).
+    fn persist(&self) {
+        let _ = crate::session::save(&self.root, &self.history);
+    }
+
     /// Connect every MCP server in the settings and register its tools.
     /// Returns human-readable status lines (one per server) for the caller to
     /// display; a failed server is reported but does not abort the others.
@@ -343,6 +366,7 @@ impl Session {
 
             if completion.tool_calls.is_empty() {
                 ui.turn_end();
+                self.persist();
                 return Ok(());
             }
 
