@@ -165,8 +165,9 @@ The "feed the agent" pipeline.
   and inject compact, structured context.
 - Initial providers: **git status/branch**, **recent diff**, **project layout**,
   and a pluggable **diagnostics** hook (build/lint/test output → summarized).
-- Token budgeting: providers are prioritized and truncated to a context budget;
-  stale/unchanged context is deduped so we don't re-send it every turn.
+- Token budgeting ✅: providers are prioritized and truncated to a context
+  budget (`context::render_budgeted`, wired into the agent loop). Cross-turn
+  dedup of unchanged context is still a follow-up.
 
 **Exit:** the agent visibly reacts to repo state it was never explicitly told
 about (e.g. notices uncommitted changes, a failing build).
@@ -188,13 +189,15 @@ from built-in tools to the agent.
 ### M6 — Session & context management
 Make long sessions durable.
 
-- Persist conversation/session to disk; resume a session.
-- Context-window management: track token usage; **compaction/summarization** of
-  older turns when approaching the model's limit.
-- Cost/usage accounting surfaced in the status strip.
+- ✅ Persist conversation to `.atelier/session.json` after each turn; resume
+  with `--continue`; `/new` starts fresh. Verified: a fact stated in one run is
+  recalled after `--continue`.
+- ✅ Cost/usage accounting surfaced (TUI status strip + REPL line).
+- ⏳ **Compaction/summarization** of older turns when approaching the context
+  limit (the remaining M6 piece — trigger off the tracked `usage_ctx`).
 
-**Exit:** a long, multi-hour session survives restarts and doesn't hard-fail at
-the context limit.
+**Exit (partial):** a session survives restarts (done); graceful behavior at the
+context limit needs compaction.
 
 ### M7 — Hardening & polish
 - Provider quirks: per-model tool-calling dialects, missing SSE fields, retries,
@@ -241,7 +244,9 @@ project-confined `fs` (readFile/writeFile/readdir/exists/mkdir) + captured
   runaway `while(true){}` is actually halted, not abandoned. (A pathological
   script with no back-edge to observe the flag is still abandoned after a short
   grace rather than blocking the harness.)
-- ⏳ async `fs`; out-of-project fs via approval; `Uint8Array`/binary support.
+- ✅ Expanded mediated `fs`: stat/appendFile/rm/rmdir/rename + binary
+  (`readFileBytes`/`writeFileBytes` via a real `Uint8Array`).
+- ⏳ async `fs`; out-of-project fs via approval.
 
 ### M9 — Safer command execution (script analysis)
 
