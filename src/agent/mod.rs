@@ -34,6 +34,16 @@ answer.";
 /// diagnostics), prioritized and truncated to fit.
 const CONTEXT_TOKEN_BUDGET: usize = 2_000;
 
+/// Default context-size threshold (last request's total tokens) past which older
+/// history is compacted into a summary. Override with `ATELIER_CONTEXT_LIMIT`.
+const DEFAULT_CONTEXT_LIMIT: u32 = 8_000;
+
+/// When compacting, keep at least this many of the most recent messages intact.
+const COMPACT_KEEP_RECENT: usize = 6;
+
+/// Don't bother compacting until the history has at least this many messages.
+const COMPACT_MIN_MESSAGES: usize = 10;
+
 /// How the loop reports progress. Implemented by the TUI and by the plain REPL.
 pub trait Ui {
     /// A chunk of the model's reasoning ("thinking").
@@ -200,6 +210,10 @@ pub struct Session {
     /// size), and the cumulative completion tokens generated this session.
     usage_ctx: u32,
     usage_out: u64,
+    /// Rolling summary of older turns that have been compacted out of `history`.
+    summary: Option<String>,
+    /// Compact when the last request's total tokens exceed this.
+    compact_threshold: u32,
     history: Vec<Message>,
     fstate: FileState,
 }
@@ -217,6 +231,11 @@ impl Session {
             std::env::var("ATELIER_APPROVE").as_deref(),
             Ok("all" | "yes" | "1")
         );
+        let compact_threshold = std::env::var("ATELIER_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CONTEXT_LIMIT);
         Self {
             cfg,
             root,
@@ -227,6 +246,8 @@ impl Session {
             auto_approve,
             usage_ctx: 0,
             usage_out: 0,
+            summary: None,
+            compact_threshold,
             history: Vec::new(),
             fstate: FileState::new(),
         }
@@ -248,19 +269,22 @@ impl Session {
     /// Load a previously-saved conversation for this project (for `--continue`).
     /// Returns the number of messages restored.
     pub fn resume(&mut self) -> usize {
-        self.history = crate::session::load(&self.root);
+        let data = crate::session::load(&self.root);
+        self.summary = data.summary;
+        self.history = data.messages;
         self.history.len()
     }
 
     /// Start a fresh conversation, discarding history and the saved session.
     pub fn new_conversation(&mut self) {
         self.history.clear();
+        self.summary = None;
         let _ = crate::session::clear(&self.root);
     }
 
-    /// Persist the current conversation to disk (best-effort).
+    /// Persist the current conversation (summary + history) to disk (best-effort).
     fn persist(&self) {
-        let _ = crate::session::save(&self.root, &self.history);
+        let _ = crate::session::save(&self.root, self.summary.as_deref(), &self.history);
     }
 
     /// Connect every MCP server in the settings and register its tools.
@@ -344,10 +368,18 @@ impl Session {
             // fresh context — some servers reject a second system message), then
             // the conversation history.
             let mut messages = Vec::with_capacity(self.history.len() + 1);
-            let system = match &context_msg {
-                Some(ctx) => format!("{SYSTEM_PROMPT}\n\n{ctx}"),
-                None => SYSTEM_PROMPT.to_string(),
-            };
+            // One leading system message (some servers reject a second): the
+            // prompt, then the rolling summary of compacted turns, then fresh
+            // per-turn context.
+            let mut system = SYSTEM_PROMPT.to_string();
+            if let Some(s) = &self.summary {
+                system.push_str("\n\nSummary of earlier conversation:\n");
+                system.push_str(s);
+            }
+            if let Some(ctx) = &context_msg {
+                system.push_str("\n\n");
+                system.push_str(ctx);
+            }
             messages.push(Message::system(system));
             messages.extend(self.history.iter().cloned());
 
@@ -370,6 +402,7 @@ impl Session {
 
             if completion.tool_calls.is_empty() {
                 ui.turn_end();
+                self.maybe_compact(ui);
                 self.persist();
                 return Ok(());
             }
@@ -448,6 +481,65 @@ impl Session {
         }
     }
 
+    /// If the context has grown past the threshold, summarize the older part of
+    /// the history into the rolling summary and drop it from `history`.
+    fn maybe_compact(&mut self, ui: &mut dyn Ui) {
+        if self.usage_ctx <= self.compact_threshold || self.history.len() < COMPACT_MIN_MESSAGES {
+            return;
+        }
+        let Some(split) = self.compact_split_point() else {
+            return;
+        };
+        let excerpt = render_excerpt(self.summary.as_deref(), &self.history[..split]);
+        match self.summarize(&excerpt) {
+            Ok(summary) => {
+                self.summary = Some(summary);
+                self.history.drain(0..split);
+                // Avoid re-compacting immediately; the next real turn recomputes.
+                self.usage_ctx = 0;
+                ui.info(&format!(
+                    "compacted {split} earlier message(s) into a summary"
+                ));
+            }
+            Err(e) => ui.notice(&format!("compaction failed: {e:#}")),
+        }
+    }
+
+    /// Choose where to split history for compaction: summarize everything before
+    /// the returned index, keep the rest. The kept suffix must start at a `user`
+    /// message so the request stays well-formed (no orphan tool result). Returns
+    /// `None` if there's nothing sensible to compact.
+    fn compact_split_point(&self) -> Option<usize> {
+        let n = self.history.len();
+        let target = n.saturating_sub(COMPACT_KEEP_RECENT);
+        if target == 0 {
+            return None;
+        }
+        let mut i = target;
+        while i < n && self.history[i].role != "user" {
+            i += 1;
+        }
+        if i == 0 || i >= n { None } else { Some(i) }
+    }
+
+    /// Summarize a rendered conversation excerpt via the provider (no tools).
+    fn summarize(&self, excerpt: &str) -> Result<String> {
+        let messages = vec![
+            Message::system(
+                "You compress a conversation transcript into a concise summary. Preserve concrete \
+                 facts, decisions, file paths touched, and any open tasks, as short bullet points. \
+                 No preamble or commentary.",
+            ),
+            Message::user(format!("Summarize this conversation excerpt:\n\n{excerpt}")),
+        ];
+        let completion = provider::stream_chat(&self.cfg, &messages, &[], |_| {})?;
+        let s = completion.content.trim().to_string();
+        if s.is_empty() {
+            anyhow::bail!("model returned an empty summary");
+        }
+        Ok(s)
+    }
+
     /// Gather per-turn context into a single injected block, or `None`.
     ///
     /// Providers are prioritized and truncated to a token budget so a large diff
@@ -460,6 +552,26 @@ impl Session {
             .collect();
         crate::context::render_budgeted(items, CONTEXT_TOKEN_BUDGET)
     }
+}
+
+/// Render history messages (and any prior summary) into a plain-text excerpt for
+/// summarization.
+fn render_excerpt(prev_summary: Option<&str>, msgs: &[Message]) -> String {
+    let mut s = String::new();
+    if let Some(p) = prev_summary {
+        s.push_str("Earlier summary:\n");
+        s.push_str(p);
+        s.push_str("\n\n");
+    }
+    for m in msgs {
+        if !m.content.is_empty() {
+            s.push_str(&format!("{}: {}\n", m.role, m.content));
+        }
+        for c in &m.tool_calls {
+            s.push_str(&format!("assistant called {}({})\n", c.name, c.arguments));
+        }
+    }
+    s
 }
 
 fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
