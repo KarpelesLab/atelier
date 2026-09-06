@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 mod budget;
+mod dedup;
 mod diagnostics;
 mod diff;
 mod git;
@@ -31,6 +32,8 @@ mod layout;
 // now so that integration is a one-line change once it lands.
 #[allow(unused_imports)]
 pub use budget::{estimate_tokens, render_budgeted};
+#[allow(unused_imports)]
+pub use dedup::dedup_items;
 
 use std::path::Path;
 
