@@ -30,6 +30,10 @@ the project and make changes rather than guessing. Keep responses concise. \
 When you have completed the request, stop calling tools and give a short final \
 answer.";
 
+/// Token budget for per-turn injected context (git status, diff, layout,
+/// diagnostics), prioritized and truncated to fit.
+const CONTEXT_TOKEN_BUDGET: usize = 2_000;
+
 /// How the loop reports progress. Implemented by the TUI and by the plain REPL.
 pub trait Ui {
     /// A chunk of the model's reasoning ("thinking").
@@ -445,21 +449,16 @@ impl Session {
     }
 
     /// Gather per-turn context into a single injected block, or `None`.
+    ///
+    /// Providers are prioritized and truncated to a token budget so a large diff
+    /// or layout can't crowd out the conversation.
     fn gather_context(&self) -> Option<String> {
-        let mut items: Vec<ContextItem> = self
+        let items: Vec<ContextItem> = self
             .context
             .iter()
             .filter_map(|p| p.gather(&self.root))
             .collect();
-        if items.is_empty() {
-            return None;
-        }
-        items.sort_by_key(|b| std::cmp::Reverse(b.priority));
-        let mut s = String::from("Current project context:\n");
-        for it in items {
-            s.push_str(&format!("\n## {}\n{}\n", it.title, it.body));
-        }
-        Some(s)
+        crate::context::render_budgeted(items, CONTEXT_TOKEN_BUDGET)
     }
 }
 
