@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -94,6 +94,7 @@ const HELP: &[&str] = &[
     "  /mcp add <name> <command> [args...]   add and connect an MCP server",
     "  /mcp remove <name>                    remove an MCP server",
     "  /new                                  start a fresh conversation (clear saved session)",
+    "  /image <path>                         attach an image to your next message (vision)",
     "  /clear                                (no-op: scrollback is append-only)",
     "  /quit                                 exit (also Ctrl-D on an empty input)",
 ];
@@ -138,6 +139,15 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             session.new_conversation();
             ui.info("started a new conversation (previous session cleared)");
         }
+        "/image" => match args.first() {
+            Some(path) => match session.stage_image(path) {
+                Ok(n) => ui.info(&format!(
+                    "attached image ({n} staged) — it will be sent with your next message"
+                )),
+                Err(e) => ui.info(&format!("error: {e:#}")),
+            },
+            None => ui.info("usage: /image <path>"),
+        },
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),
     }
@@ -210,6 +220,8 @@ pub struct Session {
     /// size), and the cumulative completion tokens generated this session.
     usage_ctx: u32,
     usage_out: u64,
+    /// Images (data URLs) staged by `/image`, attached to the next user turn.
+    pending_images: Vec<String>,
     /// Rolling summary of older turns that have been compacted out of `history`.
     summary: Option<String>,
     /// Compact when the last request's total tokens exceed this.
@@ -246,6 +258,7 @@ impl Session {
             auto_approve,
             usage_ctx: 0,
             usage_out: 0,
+            pending_images: Vec::new(),
             summary: None,
             compact_threshold,
             history: Vec::new(),
@@ -279,7 +292,19 @@ impl Session {
     pub fn new_conversation(&mut self) {
         self.history.clear();
         self.summary = None;
+        self.pending_images.clear();
         let _ = crate::session::clear(&self.root);
+    }
+
+    /// Stage an image file to attach to the next user message (for `/image`).
+    /// Returns the number of images now staged. The path is the user's own, so
+    /// it isn't confined to the project root.
+    pub fn stage_image(&mut self, path: &str) -> Result<usize> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading image {path:?}"))?;
+        let mime = image_mime(path);
+        let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
+        self.pending_images.push(data_url);
+        Ok(self.pending_images.len())
     }
 
     /// Persist the current conversation (summary + history) to disk (best-effort).
@@ -360,7 +385,13 @@ impl Session {
     /// Run one user turn to completion, executing tool calls until the model
     /// stops requesting them. Progress is reported through `ui`.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
-        self.history.push(Message::user(user_input));
+        if self.pending_images.is_empty() {
+            self.history.push(Message::user(user_input));
+        } else {
+            let images = std::mem::take(&mut self.pending_images);
+            self.history
+                .push(Message::user_with_images(user_input, images));
+        }
         let context_msg = self.gather_context();
 
         loop {
@@ -510,16 +541,7 @@ impl Session {
     /// message so the request stays well-formed (no orphan tool result). Returns
     /// `None` if there's nothing sensible to compact.
     fn compact_split_point(&self) -> Option<usize> {
-        let n = self.history.len();
-        let target = n.saturating_sub(COMPACT_KEEP_RECENT);
-        if target == 0 {
-            return None;
-        }
-        let mut i = target;
-        while i < n && self.history[i].role != "user" {
-            i += 1;
-        }
-        if i == 0 || i >= n { None } else { Some(i) }
+        split_point(&self.history, COMPACT_KEEP_RECENT)
     }
 
     /// Summarize a rendered conversation excerpt via the provider (no tools).
@@ -554,6 +576,23 @@ impl Session {
     }
 }
 
+/// Pick a compaction split index: summarize `history[..i]`, keep `history[i..]`,
+/// where `i` is the first `user` message at or after `len - keep` (so the kept
+/// suffix starts cleanly and no tool result is orphaned). `None` if there's
+/// nothing sensible to compact.
+fn split_point(history: &[Message], keep: usize) -> Option<usize> {
+    let n = history.len();
+    let target = n.saturating_sub(keep);
+    if target == 0 {
+        return None;
+    }
+    let mut i = target;
+    while i < n && history[i].role != "user" {
+        i += 1;
+    }
+    if i == 0 || i >= n { None } else { Some(i) }
+}
+
 /// Render history messages (and any prior summary) into a plain-text excerpt for
 /// summarization.
 fn render_excerpt(prev_summary: Option<&str>, msgs: &[Message]) -> String {
@@ -572,6 +611,50 @@ fn render_excerpt(prev_summary: Option<&str>, msgs: &[Message]) -> String {
         }
     }
     s
+}
+
+/// Guess an image MIME type from a file extension (defaults to PNG).
+fn image_mime(path: &str) -> &'static str {
+    match path
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// Standard base64 encoding (no line breaks). Small hand-rolled encoder to avoid
+/// a dependency, used for `data:` image URLs.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
@@ -701,4 +784,84 @@ pub fn repl(mut session: Session) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_point_finds_user_boundary() {
+        // 12 messages, alternating user/assistant. keep=6 -> target index 6,
+        // which is a user message (even indices are users here).
+        let mut h = Vec::new();
+        for i in 0..12 {
+            h.push(if i % 2 == 0 {
+                Message::user(format!("u{i}"))
+            } else {
+                Message::assistant(format!("a{i}"))
+            });
+        }
+        let i = split_point(&h, 6).expect("should find a split");
+        assert_eq!(h[i].role, "user");
+        assert!((6..12).contains(&i));
+    }
+
+    #[test]
+    fn split_point_advances_past_non_user() {
+        // target lands on an assistant/tool run; must advance to the next user.
+        let h = vec![
+            Message::user("u0"),
+            Message::assistant("a1"),
+            Message::assistant("a2"), // target (keep=2 -> target 1) region is non-user
+            Message::user("u3"),
+        ];
+        let i = split_point(&h, 2).expect("split");
+        assert_eq!(h[i].role, "user");
+        assert_eq!(i, 3);
+    }
+
+    #[test]
+    fn split_point_none_when_short() {
+        let h = vec![Message::user("u0"), Message::assistant("a1")];
+        assert!(split_point(&h, 6).is_none());
+    }
+
+    #[test]
+    fn split_point_none_when_no_user_in_tail() {
+        let h = vec![
+            Message::user("u0"),
+            Message::assistant("a1"),
+            Message::assistant("a2"),
+        ];
+        // keep=1 -> target 2 (assistant), no user after -> None.
+        assert!(split_point(&h, 1).is_none());
+    }
+
+    #[test]
+    fn render_excerpt_includes_summary_and_roles() {
+        let h = vec![Message::user("hi"), Message::assistant("hello")];
+        let s = render_excerpt(Some("prior summary"), &h);
+        assert!(s.contains("Earlier summary:\nprior summary"));
+        assert!(s.contains("user: hi"));
+        assert!(s.contains("assistant: hello"));
+    }
+
+    #[test]
+    fn base64_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn image_mime_from_extension() {
+        assert_eq!(image_mime("a.jpg"), "image/jpeg");
+        assert_eq!(image_mime("a.JPEG"), "image/jpeg");
+        assert_eq!(image_mime("a.gif"), "image/gif");
+        assert_eq!(image_mime("a.png"), "image/png");
+        assert_eq!(image_mime("noext"), "image/png");
+    }
 }
