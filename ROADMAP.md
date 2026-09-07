@@ -188,7 +188,9 @@ Extend the tool surface via the ecosystem.
 - Server config in `atelier.toml`; discovered MCP tools are merged into the tool
   registry and namespaced (`mcp__<server>__<tool>`).
 - MCP tools flow through the same permission model as local tools.
-- (Later) MCP resources/prompts surfaced to the agent.
+- MCP **resources** ✅: a server that advertises resources gets a
+  `mcp__<server>__read_resource` tool (lists URIs, reads by `uri`). Prompts are
+  still a follow-up.
 
 **Exit:** a configured MCP server's tools are callable in a task, indistinguishable
 from built-in tools to the agent.
