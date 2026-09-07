@@ -36,6 +36,8 @@ mod grep;
 mod ls;
 mod multiedit;
 mod read;
+mod tree;
+mod web_fetch;
 mod write;
 
 /// Execution context handed to every tool call.
@@ -140,9 +142,11 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(edit::EditTool));
     reg.register(Box::new(multiedit::MultiEditTool));
     reg.register(Box::new(bash::BashTool));
+    reg.register(Box::new(web_fetch::WebFetchTool));
     reg.register(Box::new(grep::GrepTool));
     reg.register(Box::new(glob::GlobTool));
     reg.register(Box::new(ls::LsTool));
+    reg.register(Box::new(tree::TreeTool));
     reg.register(Box::new(crate::js::NodeTool));
     reg
 }
