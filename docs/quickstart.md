@@ -56,6 +56,12 @@ agent loop:
   turn count · token usage). Everything else — assistant text, reasoning,
   tool activity — is printed once to the terminal scrollback and never
   redrawn. Ctrl-C clears the current input; Ctrl-D on an empty line exits.
+  While the model is working the strip shows a spinner and elapsed time
+  (`⠋ working 12s`) and the input line stays live: press Enter to **queue**
+  a message (echoed as `(queued)`, counted in the strip). Queued messages are
+  handed to the model at its next step — between tool calls — or, if the
+  turn has already ended, sent as the next turn; queued slash commands run
+  once the turn is over. Ctrl-C on an empty input drops the queue.
 - **Plain REPL** (`src/agent::repl`) — reads lines from stdin with a `›`
   prompt and prints straight to stdout, no raw mode, no redraw. Used for
   headless/scripted runs.

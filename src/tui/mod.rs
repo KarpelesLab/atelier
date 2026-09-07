@@ -31,25 +31,40 @@
 //!
 //! ## Known limitations (see also `input.rs`)
 //!
-//! - **Ctrl-C cannot cancel an in-flight turn.** [`Session::send`] is a blocking,
-//!   single-threaded call and the frozen [`Ui`] trait exposes no cancellation
-//!   channel, so while a turn streams there is no thread reading the keyboard.
-//!   Ctrl-C is handled only at the prompt (it clears the current input). Bytes
-//!   typed mid-turn are buffered by the terminal and simply ignored — they never
-//!   corrupt the display. Ctrl-D on an empty line exits between turns.
+//! - **Ctrl-C cannot cancel an in-flight turn.** The [`Ui`] trait exposes no
+//!   cancellation channel, so a running turn always completes. Ctrl-C clears
+//!   the current input; while a turn runs, Ctrl-C on an empty input drops the
+//!   queued messages instead. Ctrl-D on an empty line exits between turns.
 //! - **Terminal height must be ≥ 3 rows.** The live region occupies up to three
 //!   rows and the redraw moves the cursor up by up to two; on a 1–2 row terminal
 //!   the accounting degrades (no crash, but the strip may be clipped).
 //! - Column math is one-per-`char` (no Unicode width); wide/combining glyphs
 //!   mis-place the cursor. Mid-turn resizes are absorbed because [`Renderer::refresh`]
 //!   re-reads the terminal width every time rather than caching it.
+//!
+//! ## Working state & queued input
+//!
+//! A turn runs on a scoped worker thread ([`run_turn`]) that owns the
+//! [`Session`] for its duration and reports through a channel-backed [`Ui`]
+//! ([`ChanUi`]). The main thread keeps reading the keyboard, so the input line
+//! stays live: the status strip shows a spinner (`⠋ working 12s`) and Enter
+//! *queues* the line instead of sending it. Queued messages are handed to the
+//! agent loop between steps (see [`Ui::take_queued`]) so the model sees them
+//! at its next request, and whatever is still queued when the turn ends is
+//! served in order as if it had just been typed — commands run, prompts start
+//! new turns. Approval prompts arrive over the same channel and are answered
+//! from the main thread, so the keyboard is never read by two threads.
 
 mod input;
 
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, event, execute, queue, terminal};
@@ -61,6 +76,18 @@ use input::LineEditor;
 /// The input prompt and its width in columns (`›` + space, both single-width).
 const PROMPT: &str = "› ";
 const PROMPT_COLS: usize = 2;
+
+/// Messages typed while a turn was running, waiting to be delivered — shared
+/// between the renderer (which enqueues on Enter and serves leftovers after the
+/// turn) and the worker's [`ChanUi`] (which drains it between steps).
+type Queue = Arc<Mutex<VecDeque<String>>>;
+
+/// How often the status strip repaints while a turn runs (spinner + elapsed).
+const SPINNER_TICK: Duration = Duration::from_millis(100);
+/// How long one keyboard poll blocks while a turn runs; this is also the pump
+/// loop's sleep, so it bounds output latency.
+const KEY_POLL: Duration = Duration::from_millis(30);
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Drive a session through the inline terminal interface.
 pub fn run(mut session: Session) -> Result<()> {
@@ -85,92 +112,364 @@ pub fn run(mut session: Session) -> Result<()> {
     r.refresh()?;
 
     loop {
-        match event::read()? {
-            // A resize just needs a repaint; `refresh` re-reads the width.
-            Event::Resize(_, _) => r.refresh()?,
-            Event::Key(k) => {
-                // Ignore key-release events (some platforms emit them).
-                if k.kind == KeyEventKind::Release {
-                    continue;
-                }
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                match k.code {
-                    // Ctrl-D on an empty line exits.
-                    KeyCode::Char('d') if ctrl && r.editor.is_empty() => break,
-                    // Ctrl-C cancels the current (unsent) input.
-                    KeyCode::Char('c') if ctrl => {
-                        r.editor.clear();
-                        r.refresh()?;
-                    }
-                    KeyCode::Char(c) if !ctrl => {
-                        r.editor.insert(c);
-                        r.refresh()?;
-                    }
-                    KeyCode::Backspace => {
-                        r.editor.backspace();
-                        r.refresh()?;
-                    }
-                    KeyCode::Delete => {
-                        r.editor.delete();
-                        r.refresh()?;
-                    }
-                    KeyCode::Left => {
-                        r.editor.left();
-                        r.refresh()?;
-                    }
-                    KeyCode::Right => {
-                        r.editor.right();
-                        r.refresh()?;
-                    }
-                    KeyCode::Home => {
-                        r.editor.home();
-                        r.refresh()?;
-                    }
-                    KeyCode::End => {
-                        r.editor.end();
-                        r.refresh()?;
-                    }
-                    KeyCode::Enter => {
-                        let input = r.editor.take();
-                        // Echo the submitted prompt into the scrollback record.
-                        r.push_line(format!("{PROMPT}{input}"), false);
-                        r.refresh()?;
-
-                        let trimmed = input.trim().to_string();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-
-                        // Commands and prompts share one dispatcher. Scope the
-                        // TuiUi borrow so `r` is free again in the match arms.
-                        let outcome = {
-                            let mut ui = TuiUi { r: &mut r };
-                            agent::dispatch(&mut session, &trimmed, &mut ui)
-                        };
-                        match outcome {
-                            agent::Dispatch::Quit => break,
-                            agent::Dispatch::Handled => {
-                                r.refresh()?;
-                            }
-                            agent::Dispatch::Prompt => {
-                                turn += 1;
-                                r.status = build_status(&session, turn);
-                                let mut ui = TuiUi { r: &mut r };
-                                if let Err(e) = session.send(&trimmed, &mut ui) {
-                                    r.push_line(format!("error: {e:#}"), false);
-                                }
-                                r.commit_pending_if_any();
-                                r.refresh()?;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+        // Whatever was queued during the last turn is served first, in order,
+        // exactly as if it had just been typed (echoed, then dispatched).
+        let input = match r.pop_queued() {
+            Some(line) => {
+                r.push_line(format!("{PROMPT}{line}"), false);
+                line
             }
-            _ => {}
+            None => match read_line(&mut r)? {
+                Some(line) => line,
+                None => break, // Ctrl-D
+            },
+        };
+        r.refresh()?;
+
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Commands and prompts share one dispatcher. Scope the TuiUi borrow so
+        // `r` is free again in the match arms.
+        let outcome = {
+            let mut ui = TuiUi { r: &mut r };
+            agent::dispatch(&mut session, &trimmed, &mut ui)
+        };
+        match outcome {
+            agent::Dispatch::Quit => break,
+            agent::Dispatch::Handled => {
+                r.refresh()?;
+            }
+            agent::Dispatch::Prompt => {
+                turn += 1;
+                r.status = build_status(&session, turn);
+                run_turn(&mut session, &mut r, &trimmed)?;
+                // Usage counters moved; recompute the strip now that we can
+                // borrow the session again.
+                r.status = build_status(&session, turn);
+                r.refresh()?;
+            }
         }
     }
     Ok(())
+}
+
+/// Block at the idle prompt until the user submits a line (`Some`) or asks to
+/// exit with Ctrl-D on an empty input (`None`). The submitted line is echoed
+/// into the scrollback record.
+fn read_line(r: &mut Renderer) -> Result<Option<String>> {
+    loop {
+        match event::read()? {
+            // A resize just needs a repaint; `refresh` re-reads the width.
+            Event::Resize(_, _) => r.refresh()?,
+            Event::Key(k) if k.kind != KeyEventKind::Release => match edit_key(r, k) {
+                KeyAction::Exit => return Ok(None),
+                KeyAction::Submit(line) => {
+                    r.push_line(format!("{PROMPT}{line}"), false);
+                    return Ok(Some(line));
+                }
+                KeyAction::Edited => r.refresh()?,
+            },
+            _ => {}
+        }
+    }
+}
+
+/// What a keystroke on the input line amounted to.
+enum KeyAction {
+    /// The editor changed (or the key was ignored); repaint.
+    Edited,
+    /// Enter: the line was taken out of the editor.
+    Submit(String),
+    /// Ctrl-D on an empty line.
+    Exit,
+}
+
+/// Apply one key to the line editor. Shared by the idle prompt and the
+/// working-state pump so editing feels identical in both.
+fn edit_key(r: &mut Renderer, k: KeyEvent) -> KeyAction {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Char('d') if ctrl && r.editor.is_empty() => return KeyAction::Exit,
+        // Ctrl-C cancels the current (unsent) input.
+        KeyCode::Char('c') if ctrl => r.editor.clear(),
+        KeyCode::Char(c) if !ctrl => r.editor.insert(c),
+        KeyCode::Backspace => r.editor.backspace(),
+        KeyCode::Delete => r.editor.delete(),
+        KeyCode::Left => r.editor.left(),
+        KeyCode::Right => r.editor.right(),
+        KeyCode::Home => r.editor.home(),
+        KeyCode::End => r.editor.end(),
+        KeyCode::Enter => return KeyAction::Submit(r.editor.take()),
+        _ => {}
+    }
+    KeyAction::Edited
+}
+
+/// Progress reported by the worker thread to the main thread, one variant per
+/// [`Ui`] callback plus the terminal `Finished`.
+enum UiEvent {
+    Reasoning(String),
+    Content(String),
+    ToolStart {
+        name: String,
+        arguments: String,
+    },
+    ToolEnd {
+        result: String,
+        ok: bool,
+    },
+    TurnEnd,
+    Info(String),
+    Notice(String),
+    /// A queued message was appended to the conversation.
+    Delivered(String),
+    /// The worker is blocked waiting for an approval answer.
+    AskApproval {
+        tool: String,
+        arguments: String,
+    },
+    /// The turn is over; `Err` carries the rendered error, if any. Always the
+    /// last event a worker sends.
+    Finished(Result<(), String>),
+}
+
+/// Run one model turn on a scoped worker thread while the main thread keeps
+/// the keyboard and the screen. Returns once the turn is over (or the worker
+/// vanished); the renderer is left idle.
+fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> {
+    let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
+    let (ans_tx, ans_rx) = mpsc::channel::<agent::Approval>();
+    let queue = Arc::clone(&r.queue);
+
+    r.working = Some(Instant::now());
+    r.approval_pending = false;
+    r.refresh()?;
+
+    let result = std::thread::scope(|s| {
+        s.spawn(move || {
+            let mut ui = ChanUi {
+                tx: ev_tx.clone(),
+                answers: ans_rx,
+                queue,
+            };
+            let outcome = session.send(input, &mut ui).map_err(|e| format!("{e:#}"));
+            // The receiver only disappears if the pump failed; nothing to do.
+            let _ = ev_tx.send(UiEvent::Finished(outcome));
+        });
+        // If the pump errors out, `ans_tx` drops with it, which unblocks a
+        // worker waiting on an approval (it sees `Deny`) so the scope can join.
+        pump(r, &ev_rx, &ans_tx)
+    });
+
+    r.working = None;
+    r.approval_pending = false;
+    r.commit_pending_if_any();
+    result
+}
+
+/// The working-state event loop: interleave keyboard input (edit/queue lines,
+/// answer approvals) with the worker's output until it reports `Finished`.
+fn pump(
+    r: &mut Renderer,
+    events: &Receiver<UiEvent>,
+    answers: &Sender<agent::Approval>,
+) -> Result<()> {
+    let mut last_paint = Instant::now();
+    loop {
+        // Keyboard first; the poll timeout doubles as the loop's sleep.
+        if event::poll(KEY_POLL)? {
+            match event::read()? {
+                Event::Resize(_, _) => r.refresh()?,
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    if r.approval_pending {
+                        if let Some(a) = approval_key(k) {
+                            r.approval_pending = false;
+                            let _ = answers.send(a);
+                        }
+                    } else {
+                        working_key(r, k);
+                    }
+                    r.refresh()?;
+                }
+                _ => {}
+            }
+        }
+
+        // Then everything the worker produced meanwhile, painted once.
+        let mut dirty = false;
+        loop {
+            match events.try_recv() {
+                Ok(UiEvent::Finished(outcome)) => {
+                    if let Err(e) = outcome {
+                        r.push_line(format!("error: {e}"), false);
+                    }
+                    return Ok(());
+                }
+                Ok(ev) => {
+                    apply_event(r, ev);
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                // The worker died without saying goodbye (a panic — which the
+                // scope re-raises once we return).
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        if dirty || last_paint.elapsed() >= SPINNER_TICK {
+            r.refresh()?;
+            last_paint = Instant::now();
+        }
+    }
+}
+
+/// A keystroke while a turn is running: edit the line as usual, but Enter
+/// queues it rather than sending, and Ctrl-C on an empty line drops the queue.
+fn working_key(r: &mut Renderer, k: KeyEvent) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && k.code == KeyCode::Char('c') && r.editor.is_empty() {
+        let dropped = r.clear_queue();
+        if dropped > 0 {
+            r.push_line(format!("! dropped {dropped} queued message(s)"), true);
+        }
+        return;
+    }
+    match edit_key(r, k) {
+        KeyAction::Submit(line) => {
+            if !line.trim().is_empty() {
+                r.enqueue(line);
+            }
+        }
+        // Ctrl-D never exits mid-turn: the worker must finish first.
+        KeyAction::Exit | KeyAction::Edited => {}
+    }
+}
+
+/// Map a key to an approval answer; `None` for keys that don't answer.
+fn approval_key(k: KeyEvent) -> Option<agent::Approval> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(agent::Approval::Once),
+        KeyCode::Char('a') | KeyCode::Char('A') => Some(agent::Approval::Always),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(agent::Approval::Deny),
+        KeyCode::Char('c') if ctrl => Some(agent::Approval::Deny),
+        _ => None,
+    }
+}
+
+/// Render one worker event into the scrollback / live region. Reasoning is
+/// dimmed, the answer is normal, tool activity is annotated — mirroring
+/// [`crate::agent::StdoutUi`].
+fn apply_event(r: &mut Renderer, ev: UiEvent) {
+    match ev {
+        UiEvent::Reasoning(t) => r.emit(&t, true),
+        UiEvent::Content(t) => r.emit(&t, false),
+        UiEvent::ToolStart { name, arguments } => {
+            let args = truncate_tail_head(&arguments, 200);
+            r.emit_block(&format!("⚙ {name} {args}"), true);
+        }
+        UiEvent::ToolEnd { result, ok } => {
+            let mark = if ok { "✓" } else { "✗" };
+            let preview: String = result.chars().take(200).collect();
+            r.emit_block(&format!("{mark} {preview}"), true);
+        }
+        UiEvent::TurnEnd => {
+            r.commit_pending_if_any();
+            // A blank line separates turns in the scrollback.
+            r.push_line(String::new(), false);
+        }
+        UiEvent::Info(t) => r.emit_block(&t, false),
+        UiEvent::Notice(t) => r.emit_block(&format!("! {t}"), false),
+        UiEvent::Delivered(t) => {
+            // Record the message where the model actually received it.
+            r.commit_pending_if_any();
+            r.push_line(format!("{PROMPT}{t}"), false);
+        }
+        UiEvent::AskApproval { tool, arguments } => {
+            let args = truncate_tail_head(&arguments, 200);
+            r.emit_block(&format!("⚠ allow tool '{tool}'?  {args}"), false);
+            r.emit_block("   [y] once   [a] always   [n] deny", false);
+            r.approval_pending = true;
+        }
+        UiEvent::Finished(_) => {} // consumed by the pump
+    }
+}
+
+/// The worker-side [`Ui`]: forwards every callback to the main thread and
+/// blocks only for approval answers. Queued input is read straight from the
+/// shared queue.
+struct ChanUi {
+    tx: Sender<UiEvent>,
+    answers: Receiver<agent::Approval>,
+    queue: Queue,
+}
+
+impl ChanUi {
+    fn send(&self, ev: UiEvent) {
+        let _ = self.tx.send(ev);
+    }
+}
+
+impl Ui for ChanUi {
+    fn reasoning(&mut self, text: &str) {
+        self.send(UiEvent::Reasoning(text.to_string()));
+    }
+    fn content(&mut self, text: &str) {
+        self.send(UiEvent::Content(text.to_string()));
+    }
+    fn tool_start(&mut self, name: &str, arguments: &str) {
+        self.send(UiEvent::ToolStart {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        });
+    }
+    fn tool_end(&mut self, _name: &str, result: &str, ok: bool) {
+        self.send(UiEvent::ToolEnd {
+            result: result.to_string(),
+            ok,
+        });
+    }
+    fn turn_end(&mut self) {
+        self.send(UiEvent::TurnEnd);
+    }
+    fn info(&mut self, text: &str) {
+        self.send(UiEvent::Info(text.to_string()));
+    }
+    fn ask_approval(&mut self, tool: &str, arguments: &str) -> agent::Approval {
+        self.send(UiEvent::AskApproval {
+            tool: tool.to_string(),
+            arguments: arguments.to_string(),
+        });
+        // A vanished main thread means no one can approve: deny.
+        self.answers.recv().unwrap_or(agent::Approval::Deny)
+    }
+    fn notice(&mut self, text: &str) {
+        self.send(UiEvent::Notice(text.to_string()));
+    }
+    fn take_queued(&mut self) -> Vec<String> {
+        take_leading_prompts(&mut lock(&self.queue))
+    }
+    fn queued_delivered(&mut self, text: &str) {
+        self.send(UiEvent::Delivered(text.to_string()));
+    }
+}
+
+/// Pop queued lines from the front up to (not including) the first slash
+/// command. Prompts are delivered to the running turn; commands, and anything
+/// queued behind them, wait for the turn to end so they run in order.
+fn take_leading_prompts(q: &mut VecDeque<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    while q.front().is_some_and(|l| !l.trim_start().starts_with('/')) {
+        out.extend(q.pop_front());
+    }
+    out
+}
+
+/// Lock the queue, tolerating a poisoned mutex (the data is plain strings).
+fn lock(q: &Queue) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+    q.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// One committed line of scrollback, remembered until the next [`Renderer::refresh`]
@@ -194,6 +493,14 @@ struct Renderer {
     /// Row count of the live region as last drawn, so the next refresh knows
     /// how far up to walk before clearing.
     live_height: u16,
+    /// When the running turn started; `None` while idle. Drives the spinner
+    /// and elapsed counter in the status strip.
+    working: Option<Instant>,
+    /// The worker is blocked on an approval prompt: keys answer it instead of
+    /// editing the line.
+    approval_pending: bool,
+    /// Lines submitted while working, awaiting delivery.
+    queue: Queue,
 }
 
 impl Renderer {
@@ -205,6 +512,61 @@ impl Renderer {
             pending: String::new(),
             pending_dim: false,
             live_height: 0,
+            working: None,
+            approval_pending: false,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Queue a line typed while a turn runs, echoing it (dimmed, marked) so
+    /// the user sees it was accepted. It is echoed again, undimmed, when it is
+    /// actually delivered.
+    fn enqueue(&mut self, line: String) {
+        self.push_line(format!("{PROMPT}{line}  (queued)"), true);
+        lock(&self.queue).push_back(line);
+    }
+
+    /// The next queued line, if any, in submission order.
+    fn pop_queued(&mut self) -> Option<String> {
+        lock(&self.queue).pop_front()
+    }
+
+    fn queued_len(&self) -> usize {
+        lock(&self.queue).len()
+    }
+
+    /// Drop everything queued; returns how many lines were discarded.
+    fn clear_queue(&mut self) -> usize {
+        let mut q = lock(&self.queue);
+        let n = q.len();
+        q.clear();
+        n
+    }
+
+    /// The status strip as shown: the working indicator (spinner, elapsed,
+    /// pending approval) and queue depth lead, so they survive clipping on a
+    /// narrow terminal; then the per-turn `status` (model · cwd · …).
+    fn status_line(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.approval_pending {
+            parts.push("⚠ approval needed [y/a/n]".into());
+        } else if let Some(t0) = self.working {
+            let elapsed = t0.elapsed();
+            parts.push(format!(
+                "{} working {}s",
+                spinner_frame(elapsed),
+                elapsed.as_secs()
+            ));
+        }
+        let queued = self.queued_len();
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
+        if parts.is_empty() {
+            self.status.clone()
+        } else {
+            // `status` carries its own leading space.
+            format!(" {} ·{}", parts.join(" · "), self.status)
         }
     }
 
@@ -300,7 +662,7 @@ impl Renderer {
         }
 
         // 2. The status strip: a reverse-video bar padded to full width.
-        let bar = pad_to(&self.status, width as usize);
+        let bar = pad_to(&self.status_line(), width as usize);
         queue!(
             out,
             SetAttribute(Attribute::Reverse),
@@ -322,9 +684,9 @@ impl Renderer {
     }
 }
 
-/// A [`Ui`] that streams into the renderer's scrollback and keeps the input
-/// line pinned below. Reasoning is dimmed, the answer is normal, tool activity
-/// is annotated — mirroring [`crate::agent::StdoutUi`].
+/// A synchronous [`Ui`] over the renderer, used on the main thread for slash
+/// commands (`/help`, `/mcp`, …) whose output is printed in place. Model turns
+/// go through [`ChanUi`] instead, so the styling here mirrors [`apply_event`].
 struct TuiUi<'a> {
     r: &'a mut Renderer,
 }
@@ -426,6 +788,12 @@ fn git_branch() -> Option<String> {
     } else {
         Some(branch)
     }
+}
+
+/// The spinner glyph for a given time since the turn started.
+fn spinner_frame(elapsed: Duration) -> char {
+    let idx = (elapsed.as_millis() / SPINNER_TICK.as_millis()) as usize % SPINNER.len();
+    SPINNER[idx]
 }
 
 /// Truncate `s` to `width` columns, keeping the tail (with a leading `…` when
@@ -544,6 +912,46 @@ mod tests {
         assert!(r.scroll[0].dim);
         assert_eq!(r.pending, "answer");
         assert!(!r.pending_dim);
+    }
+
+    #[test]
+    fn take_leading_prompts_stops_at_commands() {
+        let mut q: VecDeque<String> = ["a", "b", "/help", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(take_leading_prompts(&mut q), vec!["a", "b"]);
+        // The command and everything behind it wait for the turn to end.
+        assert_eq!(q, ["/help", "c"]);
+        assert!(take_leading_prompts(&mut q).is_empty());
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn enqueue_echoes_and_status_counts() {
+        let mut r = Renderer::new();
+        r.status = " m · d".into();
+        assert_eq!(r.status_line(), " m · d");
+        r.enqueue("later".into());
+        assert_eq!(r.scroll.len(), 1);
+        assert!(r.scroll[0].dim);
+        assert!(r.scroll[0].text.ends_with("(queued)"));
+        r.working = Some(Instant::now());
+        let line = r.status_line();
+        assert!(line.contains("working"), "{line}");
+        assert!(line.contains("1 queued"), "{line}");
+        assert!(line.ends_with(" m · d"), "{line}");
+        assert_eq!(r.pop_queued().as_deref(), Some("later"));
+        assert_eq!(r.pop_queued(), None);
+        assert_eq!(r.clear_queue(), 0);
+    }
+
+    #[test]
+    fn spinner_cycles() {
+        assert_eq!(spinner_frame(Duration::ZERO), SPINNER[0]);
+        assert_eq!(spinner_frame(SPINNER_TICK), SPINNER[1]);
+        let full = SPINNER_TICK * SPINNER.len() as u32;
+        assert_eq!(spinner_frame(full), SPINNER[0]);
     }
 
     #[test]

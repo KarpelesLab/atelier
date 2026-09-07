@@ -64,6 +64,18 @@ pub trait Ui {
     /// An out-of-band notice (errors, status). Used by the TUI.
     #[allow(dead_code)]
     fn notice(&mut self, text: &str);
+    /// Messages the user submitted while the turn was still running, in the
+    /// order they were typed. The loop drains this between steps — right
+    /// before each model request, i.e. after a batch of tool results — and
+    /// appends them to the conversation so the model sees them at its next
+    /// step (mid-turn steering). Interfaces without a live input line simply
+    /// have nothing to hand over.
+    fn take_queued(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// A queued message was just appended to the conversation, so the UI can
+    /// record it in the transcript at the point it was actually delivered.
+    fn queued_delivered(&mut self, _text: &str) {}
 }
 
 /// The user's answer to a tool-approval prompt.
@@ -449,6 +461,14 @@ impl Session {
         let context_msg = self.gather_context();
 
         loop {
+            // Mid-turn steering: anything the user typed while we were busy is
+            // delivered now, before the next model request. This sits right
+            // after a batch of tool results (never between an assistant
+            // tool-call message and its results), so the request stays
+            // well-formed. Several messages merge into one user turn since
+            // some chat templates reject consecutive same-role messages.
+            self.deliver_queued(ui);
+
             // Assemble the request: a single leading system message (prompt +
             // fresh context — some servers reject a second system message), then
             // the conversation history.
@@ -518,6 +538,20 @@ impl Session {
                     .push(Message::tool_result(call.id.clone(), result));
             }
         }
+    }
+
+    /// Append any messages queued in the UI as one user message; returns how
+    /// many were delivered.
+    fn deliver_queued(&mut self, ui: &mut dyn Ui) -> usize {
+        let queued = ui.take_queued();
+        if queued.is_empty() {
+            return 0;
+        }
+        for text in &queued {
+            ui.queued_delivered(text);
+        }
+        self.history.push(Message::user(merge_queued(&queued)));
+        queued.len()
     }
 
     /// Whether a tool call must be approved before running: the tool declares it
@@ -669,6 +703,16 @@ fn render_excerpt(prev_summary: Option<&str>, msgs: &[Message]) -> String {
         }
     }
     s
+}
+
+/// Merge several queued user messages into the content of a single user
+/// message, one per paragraph.
+fn merge_queued(queued: &[String]) -> String {
+    queued
+        .iter()
+        .map(|s| s.trim())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Guess an image MIME type from a file extension (defaults to PNG).
@@ -917,6 +961,12 @@ mod tests {
         assert!(s.contains("Earlier summary:\nprior summary"));
         assert!(s.contains("user: hi"));
         assert!(s.contains("assistant: hello"));
+    }
+
+    #[test]
+    fn merge_queued_joins_paragraphs() {
+        assert_eq!(merge_queued(&["one".into()]), "one");
+        assert_eq!(merge_queued(&[" one ".into(), "two".into()]), "one\n\ntwo");
     }
 
     #[test]

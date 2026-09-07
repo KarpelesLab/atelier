@@ -137,6 +137,11 @@ The intended interface.
   corrupting it (line-discipline / cursor management is the hard part here).
 - Interrupt (Ctrl-C) cancels the in-flight turn cleanly; Ctrl-D exits.
 - Slash commands: `/model`, `/help`, `/clear`, `/quit` to start.
+- ✅ **Working state.** A turn runs on a worker thread while the main thread
+  keeps the keyboard: the status strip shows a spinner + elapsed time
+  (`⠋ working 12s`), and the input line stays live. Enter *queues* a message
+  (`N queued` in the strip); queued prompts are delivered to the agent
+  between steps, and whatever is left when the turn ends runs in order.
 
 **Exit:** normal daily use happens through the TUI; resizing and long output
 don't garble the input line.
@@ -307,9 +312,11 @@ truth. Each item maps to a milestone.
   in-flight intent. What the agent decided survives a compaction.
 
 **Flow & control**
-- **Mid-turn steering (M2).** Let the user inject guidance into a running turn
+- ✅ **Mid-turn steering (M2).** Let the user inject guidance into a running turn
   without aborting it — queued and surfaced to the agent at the next step.
   *(This very roadmap was steered that way mid-turn; the pattern works.)*
+  Landed: `Ui::take_queued` is drained before each model request (i.e. right
+  after a batch of tool results) and appended as a user message.
 - **Concurrent independent tools (M1/M4).** Run tool calls in parallel when they
   don't depend on each other. Serial execution is pure latency.
 - **Batchable permissions (M3).** Pre-authorize classes of safe actions and
