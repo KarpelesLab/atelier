@@ -24,6 +24,14 @@
 //! written once. Wrap each advertised tool in a type implementing
 //! [`Tool`](crate::tools::Tool) whose `call` issues a `tools/call`. Do not
 //! edit files outside `src/mcp/`.
+//!
+//! Both transports also probe the optional MCP *resources* capability after
+//! the `tools/list` handshake (`list_resources`, shared): if the server
+//! answers `resources/list` with at least one resource, one extra
+//! `mcp__<server>__read_resource` tool ([`resource::McpResourceTool`]) is
+//! appended, which reads any of them by `uri` via `resources/read`. A server
+//! that doesn't support resources (an erroring or empty `resources/list`)
+//! simply gets no such tool — the connection still succeeds.
 
 // Contract surface is consumed by the MCP implementation (in progress) and by
 // `main` once registration is wired up.
@@ -32,6 +40,7 @@
 mod conn;
 mod http;
 mod jsonrpc;
+mod resource;
 mod tool;
 
 use std::io::BufRead;
@@ -45,6 +54,7 @@ use serde_json::{Value, json};
 use crate::tools::Tool;
 use conn::Conn;
 use jsonrpc::JsonRpc;
+use resource::McpResourceTool;
 use tool::McpTool;
 
 // Re-exported for `main` to pick up once HTTP-server registration is wired
@@ -102,9 +112,14 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
     let mut conn = Conn::new(child, stdin, stdout);
 
     let advertised = handshake_and_list_tools(&mut conn, &server.name, "2024-11-05")?;
+    let resources = list_resources(&mut conn);
 
     let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
-    Ok(wrap_tools(conn, &server.name, advertised))
+    let mut tools = wrap_tools(conn.clone(), &server.name, advertised);
+    if let Some(resource_tool) = maybe_resource_tool(conn, &server.name, resources) {
+        tools.push(resource_tool);
+    }
+    Ok(tools)
 }
 
 /// Run the `initialize` → `notifications/initialized` → `tools/list`
@@ -177,6 +192,70 @@ pub(crate) fn wrap_tools(
     tools
 }
 
+/// Try `resources/list` on an already-connected transport and return the raw
+/// `resources` array. Resource support is optional per the MCP spec: a
+/// server that doesn't implement it (or errors for any other reason) simply
+/// yields no resources here, rather than failing the whole connection.
+/// Shared by [`connect_stdio`] and [`connect_http`](http::connect_http).
+pub(crate) fn list_resources(conn: &mut dyn JsonRpc) -> Vec<Value> {
+    conn.request("resources/list", json!({}))
+        .ok()
+        .and_then(|result| result.get("resources").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+/// If `resources` is non-empty, build the one namespaced
+/// `mcp__<server>__read_resource` [`Tool`] that reads any of them by URI.
+/// Returns `None` when the server advertised no resources (including when
+/// `resources/list` isn't supported at all). Shared by [`connect_stdio`] and
+/// [`connect_http`](http::connect_http).
+pub(crate) fn maybe_resource_tool(
+    conn: Arc<Mutex<dyn JsonRpc>>,
+    server_name: &str,
+    resources: Vec<Value>,
+) -> Option<Box<dyn Tool>> {
+    if resources.is_empty() {
+        return None;
+    }
+
+    let namespaced_name = format!("mcp__{server_name}__read_resource");
+    let description = describe_resources(&resources);
+
+    Some(Box::new(McpResourceTool::new(
+        conn,
+        namespaced_name,
+        description,
+    )))
+}
+
+/// Build the `read_resource` tool's description: an instruction plus a
+/// capped listing of the resources discovered via `resources/list`, so the
+/// model knows what URIs are actually available to read.
+fn describe_resources(resources: &[Value]) -> String {
+    const CAP: usize = 30;
+
+    let mut lines: Vec<String> = resources
+        .iter()
+        .take(CAP)
+        .map(|r| {
+            let uri = r.get("uri").and_then(Value::as_str).unwrap_or("");
+            match r.get("name").and_then(Value::as_str) {
+                Some(name) if !name.is_empty() => format!("- {uri} ({name})"),
+                _ => format!("- {uri}"),
+            }
+        })
+        .collect();
+    if resources.len() > CAP {
+        lines.push(format!("- ... and {} more", resources.len() - CAP));
+    }
+
+    format!(
+        "Read the content of an MCP resource by its `uri`. Available resources ({} total):\n{}",
+        resources.len(),
+        lines.join("\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,19 +264,39 @@ mod tests {
 
     /// A tiny POSIX-shell "MCP server" driven purely by `read`/`printf`, used
     /// to exercise `connect_stdio` end-to-end (spawn, handshake, tools/list,
-    /// tools/call) without depending on any real MCP server being installed.
-    /// It expects exactly the request sequence `connect_stdio` + one
-    /// `tools/call` produce, and replies with fixed, valid JSON-RPC frames.
+    /// resources/list, tools/call, resources/read) without depending on any
+    /// real MCP server being installed. It expects exactly the request
+    /// sequence `connect_stdio` + one `tools/call` per tool + one
+    /// `resources/read` produce, and replies with fixed, valid JSON-RPC
+    /// frames.
     const FAKE_SERVER_SCRIPT: &str = r#"
 IFS= read -r _init
 printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0.0.0"}}}'
 IFS= read -r _initialized_notification
 IFS= read -r _tools_list
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echoes the input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"Always fails","inputSchema":{}}]}}'
+IFS= read -r _resources_list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"file:///hello.txt","name":"hello","description":"A greeting","mimeType":"text/plain"}]}}'
 IFS= read -r _call
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}'
 IFS= read -r _call2
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":"kaboom"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"isError":true,"content":[{"type":"text","text":"kaboom"}]}}'
+IFS= read -r _resource_read
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"contents":[{"uri":"file:///hello.txt","mimeType":"text/plain","text":"hello resource"}]}}'
+"#;
+
+    /// Same handshake as [`FAKE_SERVER_SCRIPT`], but `resources/list`
+    /// returns a JSON-RPC error (as a server that doesn't support resources
+    /// might) instead of a result. Used to check that this doesn't fail the
+    /// connection and simply yields no `read_resource` tool.
+    const FAKE_SERVER_NO_RESOURCES_SCRIPT: &str = r#"
+IFS= read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0.0.0"}}}'
+IFS= read -r _initialized_notification
+IFS= read -r _tools_list
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echoes the input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
+IFS= read -r _resources_list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}'
 "#;
 
     fn fake_server() -> StdioServer {
@@ -213,7 +312,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"typ
         let server = fake_server();
         let tools = connect_stdio(&server).expect("connect_stdio should succeed");
 
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
 
         let echo = tools
             .iter()
@@ -248,6 +347,45 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"typ
             .call(&mut ctx, json!({}))
             .expect_err("isError result should surface as Err");
         assert!(err.to_string().contains("kaboom"));
+
+        let read_resource = tools
+            .iter()
+            .find(|t| t.name() == "mcp__fake__read_resource")
+            .expect("read_resource tool should be present when resources/list is non-empty");
+        let spec = read_resource.spec();
+        assert_eq!(spec.name, "mcp__fake__read_resource");
+        // The description should list the discovered resource so the model
+        // knows what it can read.
+        assert!(spec.description.contains("file:///hello.txt"));
+        assert!(spec.description.contains("hello"));
+        assert_eq!(spec.parameters["type"], "object");
+        assert_eq!(spec.parameters["required"], json!(["uri"]));
+
+        let mut ctx = ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+        };
+        let out = read_resource
+            .call(&mut ctx, json!({"uri": "file:///hello.txt"}))
+            .expect("resources/read should succeed");
+        assert_eq!(out, "hello resource");
+    }
+
+    #[test]
+    fn resources_list_error_yields_no_resource_tool() {
+        let server = StdioServer {
+            name: "fake".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), FAKE_SERVER_NO_RESOURCES_SCRIPT.into()],
+        };
+        let tools = connect_stdio(&server)
+            .expect("connect_stdio should succeed even when resources/list errors");
+
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools.iter().all(|t| t.name() != "mcp__fake__read_resource"),
+            "no read_resource tool should be added when resources/list fails"
+        );
     }
 
     #[test]
