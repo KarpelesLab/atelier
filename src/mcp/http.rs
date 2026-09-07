@@ -61,9 +61,14 @@ pub fn connect_http(server: &HttpServer) -> Result<Vec<Box<dyn Tool>>> {
     // servers speaking the older "2024-11-05" revision still accept this
     // value in `initialize` and negotiate down themselves per the spec.
     let advertised = super::handshake_and_list_tools(&mut conn, &server.name, "2025-03-26")?;
+    let resources = super::list_resources(&mut conn);
 
     let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
-    Ok(super::wrap_tools(conn, &server.name, advertised))
+    let mut tools = super::wrap_tools(conn.clone(), &server.name, advertised);
+    if let Some(resource_tool) = super::maybe_resource_tool(conn, &server.name, resources) {
+        tools.push(resource_tool);
+    }
+    Ok(tools)
 }
 
 /// A JSON-RPC connection to an MCP server over Streamable HTTP: every message
@@ -339,10 +344,12 @@ mod tests {
 
     /// End-to-end exercise of [`connect_http`] against a hand-rolled HTTP/1.1
     /// server (no real MCP server needed): runs the full `initialize` →
-    /// `notifications/initialized` → `tools/list` → `tools/call` sequence over
-    /// real TCP sockets, checks the `Mcp-Session-Id` returned on `initialize`
-    /// is echoed back on every later request, and that a plain
-    /// `application/json` response is parsed correctly end to end.
+    /// `notifications/initialized` → `tools/list` → `resources/list` →
+    /// `tools/call` → `resources/read` sequence over real TCP sockets, checks
+    /// the `Mcp-Session-Id` returned on `initialize` is echoed back on every
+    /// later request, and that a plain `application/json` response is parsed
+    /// correctly end to end — including the `read_resource` tool built from
+    /// `resources/list`.
     #[test]
     fn connect_http_end_to_end_with_session_id() {
         use std::net::TcpListener;
@@ -401,8 +408,30 @@ mod tests {
             .to_string();
             write_http_response(&mut stream, 200, &[], &body);
 
-            // tools/call
+            // resources/list
             let (mut stream, _) = listener.accept().expect("accept #4");
+            let (headers, req) = read_http_request(&mut stream);
+            assert_eq!(req["method"], "resources/list");
+            assert_eq!(
+                headers.get("mcp-session-id").map(String::as_str),
+                Some("sess-123")
+            );
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "resources": [{
+                        "uri": "file:///hello.txt",
+                        "name": "hello",
+                        "mimeType": "text/plain",
+                    }],
+                },
+            })
+            .to_string();
+            write_http_response(&mut stream, 200, &[], &body);
+
+            // tools/call
+            let (mut stream, _) = listener.accept().expect("accept #5");
             let (headers, req) = read_http_request(&mut stream);
             assert_eq!(req["method"], "tools/call");
             assert_eq!(
@@ -417,6 +446,29 @@ mod tests {
             })
             .to_string();
             write_http_response(&mut stream, 200, &[], &body);
+
+            // resources/read
+            let (mut stream, _) = listener.accept().expect("accept #6");
+            let (headers, req) = read_http_request(&mut stream);
+            assert_eq!(req["method"], "resources/read");
+            assert_eq!(
+                headers.get("mcp-session-id").map(String::as_str),
+                Some("sess-123")
+            );
+            assert_eq!(req["params"]["uri"], "file:///hello.txt");
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "contents": [{
+                        "uri": "file:///hello.txt",
+                        "mimeType": "text/plain",
+                        "text": "hello resource",
+                    }],
+                },
+            })
+            .to_string();
+            write_http_response(&mut stream, 200, &[], &body);
         });
 
         let server = HttpServer {
@@ -425,10 +477,12 @@ mod tests {
             headers: vec![],
         };
         let tools = connect_http(&server).expect("connect_http should succeed");
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
 
-        let echo = &tools[0];
-        assert_eq!(echo.name(), "mcp__fake__echo");
+        let echo = tools
+            .iter()
+            .find(|t| t.name() == "mcp__fake__echo")
+            .expect("echo tool should be present");
         assert_eq!(echo.spec().description, "Echoes the input");
 
         let root = std::path::Path::new("/");
@@ -441,6 +495,25 @@ mod tests {
             .call(&mut ctx, json!({"text": "hi"}))
             .expect("tools/call should succeed");
         assert_eq!(out, "hello http");
+
+        let read_resource = tools
+            .iter()
+            .find(|t| t.name() == "mcp__fake__read_resource")
+            .expect("read_resource tool should be present when resources/list is non-empty");
+        assert!(
+            read_resource
+                .spec()
+                .description
+                .contains("file:///hello.txt")
+        );
+        let mut ctx = crate::tools::ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+        };
+        let out = read_resource
+            .call(&mut ctx, json!({"uri": "file:///hello.txt"}))
+            .expect("resources/read should succeed");
+        assert_eq!(out, "hello resource");
 
         server_thread
             .join()
