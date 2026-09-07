@@ -430,6 +430,15 @@ fn is_transient_error(msg: &str) -> bool {
     TRANSIENT_PATTERNS.iter().any(|p| msg.contains(p))
 }
 
+/// Classifies an HTTP response status as a transient server-side failure
+/// worth retrying — 5xx generally (502/503/504 explicitly, but any 500-599
+/// counts, matching the sporadic bare 500s observed from the local server) —
+/// versus a client error (4xx) or success (2xx/3xx) that must be surfaced to
+/// the caller as-is rather than retried.
+fn is_retryable_status(status: u16) -> bool {
+    (500..600).contains(&status)
+}
+
 /// Small capped exponential backoff between retry attempts: 50ms, 100ms,
 /// 200ms, 400ms, capped at 800ms so a run of `MAX_SEND_ATTEMPTS` retries never
 /// stalls the harness for long.
@@ -440,11 +449,22 @@ fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// POST `body` and return the streaming body reader, rebuilding the request
-/// and retrying a bounded number of times on a transient connect/send
-/// failure (see [`is_transient_error`]) — e.g. the EAGAIN ("Resource
-/// temporarily unavailable") that rsurl can surface on a sequential
-/// in-process request (the follow-up call after a tool result), or a
-/// connection refused/reset while a local model server is warming up.
+/// and retrying a bounded number of times on either:
+///
+/// - a transient connect/send failure (see [`is_transient_error`]) — e.g. the
+///   EAGAIN ("Resource temporarily unavailable") that rsurl can surface on a
+///   sequential in-process request (the follow-up call after a tool result),
+///   or a connection refused/reset while a local model server is warming up;
+///   or
+/// - a response that came back with a transient server status (see
+///   [`is_retryable_status`]) — e.g. a sporadic bare 500 from a local model
+///   server. In this case `send_reader()` itself succeeded (headers arrived),
+///   so the reader is dropped and the request is rebuilt and resent rather
+///   than being handed to the caller, which would just `bail!` on the status.
+///
+/// Only once attempts are exhausted is the last reader/error handed back to
+/// the caller, which reports the failure (a non-2xx status via `bail!`, or
+/// the transport error).
 ///
 /// The connect timeout is configurable via `ATELIER_HTTP_TIMEOUT_MS`
 /// (milliseconds), defaulting to [`DEFAULT_CHAT_TIMEOUT_MS`].
@@ -469,7 +489,16 @@ fn send_reader_retrying(
             req = req.header("authorization", &format!("Bearer {key}"));
         }
         match req.send_reader() {
-            Ok(reader) => return Ok(reader),
+            Ok(reader) => {
+                if is_retryable_status(reader.status()) {
+                    attempt += 1;
+                    if attempt < MAX_SEND_ATTEMPTS {
+                        std::thread::sleep(backoff_delay(attempt));
+                        continue;
+                    }
+                }
+                return Ok(reader);
+            }
             Err(e) => {
                 attempt += 1;
                 let transient = is_transient_error(&e.to_string());
@@ -485,14 +514,32 @@ fn send_reader_retrying(
 
 /// List model ids advertised by the endpoint (`GET /models`).
 ///
+/// Like [`send_reader_retrying`], a response with a transient server status
+/// (see [`is_retryable_status`]) is retried (rebuilding the request, capped
+/// at [`MAX_SEND_ATTEMPTS`]) rather than immediately surfaced — this is a
+/// cheap, idempotent GET, so retrying it is straightforward.
+///
 /// The connect timeout is configurable via `ATELIER_HTTP_TIMEOUT_MS`
 /// (milliseconds), defaulting to [`DEFAULT_LIST_MODELS_TIMEOUT_MS`].
 pub fn list_models(cfg: &Config) -> Result<Vec<String>> {
-    let resp = rsurl::Request::new("GET", &cfg.endpoint("models"))
-        .context("building request")?
-        .connect_timeout(connect_timeout(DEFAULT_LIST_MODELS_TIMEOUT_MS))
-        .send()
-        .context("sending request")?;
+    let url = cfg.endpoint("models");
+    let timeout = connect_timeout(DEFAULT_LIST_MODELS_TIMEOUT_MS);
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        let resp = rsurl::Request::new("GET", &url)
+            .context("building request")?
+            .connect_timeout(timeout)
+            .send()
+            .context("sending request")?;
+        if is_retryable_status(resp.status) {
+            attempt += 1;
+            if attempt < MAX_SEND_ATTEMPTS {
+                std::thread::sleep(backoff_delay(attempt));
+                continue;
+            }
+        }
+        break resp;
+    };
     if !(200..300).contains(&resp.status) {
         bail!("provider returned HTTP {}", resp.status);
     }
@@ -563,6 +610,27 @@ mod tests {
         assert!(!is_transient_error("provider returned HTTP 500"));
         assert!(!is_transient_error("invalid json"));
         assert!(!is_transient_error("parsing models"));
+    }
+
+    /// 5xx statuses (the ones we've observed sporadically from a local
+    /// server) must be classified as retryable.
+    #[test]
+    fn retryable_statuses_include_5xx() {
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+    }
+
+    /// 4xx (client error), 2xx (success), and 3xx (redirect) statuses must
+    /// never be retried.
+    #[test]
+    fn non_retryable_statuses_are_rejected() {
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(301));
     }
 
     /// Backoff is strictly increasing across the retry window and stays
