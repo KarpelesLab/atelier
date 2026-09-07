@@ -25,8 +25,10 @@ mod budget;
 mod dedup;
 mod diagnostics;
 mod diff;
+mod environment;
 mod git;
 mod layout;
+mod todos;
 
 // Not yet called from the agent loop (wiring is done separately); re-exported
 // now so that integration is a one-line change once it lands.
@@ -66,12 +68,15 @@ pub trait ContextProvider: Send + Sync {
 }
 
 /// The default set of context providers: cargo-check diagnostics, git
-/// status, recent diff, and project layout (in priority order).
+/// status, recent diff, project layout, open TODOs, and environment facts
+/// (in priority order).
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
     vec![
         Box::new(diagnostics::DiagnosticsProvider),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),
+        Box::new(todos::TodosProvider),
         Box::new(layout::LayoutProvider),
+        Box::new(environment::EnvironmentProvider),
     ]
 }
