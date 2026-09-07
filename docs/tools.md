@@ -6,14 +6,15 @@ model verbatim as the tool result.
 
 | Tool    | Approval | Confined to project root |
 |---------|----------|----------------------------|
-| `read`  | auto     | yes |
-| `write` | auto     | yes |
-| `edit`  | auto     | yes |
-| `grep`  | auto     | yes |
-| `glob`  | auto     | yes |
-| `ls`    | auto     | yes |
-| `bash`  | **required** | no (arbitrary shell) |
-| `node`  | auto, unless `network: true` (then required) | fs yes; network no |
+| `read`      | auto     | yes |
+| `write`     | auto     | yes |
+| `edit`      | auto     | yes |
+| `multiedit` | auto     | yes |
+| `grep`      | auto     | yes |
+| `glob`      | auto     | yes |
+| `ls`        | auto     | yes |
+| `bash`      | **required** | no (arbitrary shell) |
+| `node`      | auto, unless `network: true` (then required) | fs yes; network no |
 
 "Confined" tools resolve every path with `ToolCtx::resolve` /
 `tools::confine`: a relative path is joined against the project root, `.`/`..`
@@ -76,6 +77,27 @@ Exact-string replacement in a file that was read earlier in the session.
 
 A successful edit re-records the new content, so consecutive edits to the
 same file don't need re-reading in between.
+
+## `multiedit`
+
+Apply several exact-string edits to one file in a single call — the same
+rules as `edit`, but batched, so a file needing multiple changes doesn't cost
+one round-trip per change.
+
+| Param   | Type    | Required | Meaning |
+|---------|---------|----------|---------|
+| `path`  | string  | yes      | File path |
+| `edits` | array   | yes      | The edits to apply, in order (at least one); each is `{old_string, new_string, replace_all?}` — same fields as `edit`'s |
+
+Same file-state rules as `edit` (must have been read this session; rejected
+if the file changed on disk since). Edits are applied **in order** to an
+in-memory copy, each seeing the result of the ones before it — so a later
+edit's `old_string` may only exist because an earlier edit in the same call
+produced it. The whole call is **atomic**: if any edit in the sequence fails
+(its `old_string` is missing, or appears more than once without
+`replace_all`), none of the edits are written and the file is left
+untouched. Returns `"applied N edit(s) to <path>"` and re-records the final
+content, same as `edit`.
 
 ## `bash`
 
