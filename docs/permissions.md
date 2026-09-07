@@ -7,11 +7,12 @@ always asks (or is pre-authorized).
 
 ## Confined vs. unconfined
 
-- **Confined = automatic.** `read`, `write`, `edit`, `grep`, `glob`, and `ls`
-  all resolve paths through `tools::confine` (`ToolCtx::resolve`), which
-  rejects anything that normalizes outside the project root. Because they
-  cannot escape, they override `Tool::requires_approval` to `false` and never
-  prompt — including `write` and `edit`. The `node` tool's `fs` is confined
+- **Confined = automatic.** `read`, `write`, `edit`, `multiedit`, `grep`,
+  `glob`, and `ls` all resolve paths through `tools::confine`
+  (`ToolCtx::resolve`), which rejects anything that normalizes outside the
+  project root. Because they cannot escape, they override
+  `Tool::requires_approval` to `false` and never prompt — including `write`
+  and `edit`/`multiedit`. The `node` tool's `fs` is confined
   the same way (see [Scripting](scripting.md)), so a plain `node` call (no
   `network`) is also auto-approved.
 - **Unconfined = ask.** `Tool::requires_approval` defaults to `true`, and
@@ -42,12 +43,19 @@ approves every future `bash` call (any command), and approving one MCP
 server's tool doesn't approve another tool from the same or a different
 server — each `mcp__<server>__<tool>` name is independent.
 
-## Headless mode: `ATELIER_APPROVE`
+## Headless mode: `ATELIER_APPROVE` and `--print`
 
 Set `ATELIER_APPROVE=all` (also accepts `yes` or `1`) to skip every approval
 prompt for the session — for CI or scripted/unattended runs. This is checked
 before the per-tool `allow` set, so it overrides everything unconditionally;
 there is no way to auto-approve only some tool classes via this variable.
+
+`--print`/`-p` (see [Quickstart](quickstart.md)) runs one prompt to
+completion with no human able to answer a prompt, so its `Ui::ask_approval`
+always answers **Deny** rather than blocking on stdin — the model is told the
+tool was denied and can try to proceed without it. Set `ATELIER_APPROVE=all`
+alongside `--print` if the run needs unconfined tools (`bash`, MCP,
+networked `node` calls) to actually execute.
 
 ## Risk signals (`bash` only)
 

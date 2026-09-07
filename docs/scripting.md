@@ -29,11 +29,11 @@ them directly.
 
 ## `fs` — synchronous, project-confined
 
-All five methods are synchronous (no promises/callbacks/await) and every
-path argument is resolved against the project root the same way built-in
-file tools are (`tools::confine`): relative paths are joined to the root,
-`.`/`..` are normalized, and anything that still doesn't stay under the root
-throws a catchable JS error instead of touching the filesystem.
+Every method is synchronous (no promises/callbacks/await) and every path
+argument is resolved against the project root the same way built-in file
+tools are (`tools::confine`): relative paths are joined to the root, `.`/`..`
+are normalized, and anything that still doesn't stay under the root throws a
+catchable JS error instead of touching the filesystem.
 
 | Method | Signature | Behavior |
 |--------|-----------|----------|
