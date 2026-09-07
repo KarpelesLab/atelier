@@ -31,6 +31,7 @@ use crate::tools::{Tool, ToolCtx, ToolSpec};
 mod console;
 mod fs;
 mod net;
+mod os;
 mod runtime;
 
 /// Default wall-clock budget for a script when the call omits `timeout_ms`.
@@ -70,10 +71,11 @@ impl Tool for NodeTool {
         ToolSpec {
             name: "node".into(),
             description: "Run a JavaScript program in a sandboxed runtime (no \
-                require/import — CommonJS and ES modules are unavailable). Two globals are \
+                require/import — CommonJS and ES modules are unavailable). Four globals are \
                 provided directly, already in scope (do NOT require() or import them): `console` \
-                (log, error) and a SYNCHRONOUS `fs` confined to the project directory. The fs \
-                methods return values directly — no promises, callbacks, or await: \
+                (log, error), a SYNCHRONOUS `fs` confined to the project directory, a pure \
+                `path` (POSIX-style path utilities, no I/O), and a pure `os` (host facts, no \
+                I/O). The fs methods return values directly — no promises, callbacks, or await: \
                 fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
                 fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path); \
                 fs.stat(path) -> {isFile, isDirectory, size, mtimeMs}; \
@@ -81,7 +83,12 @@ impl Tool for NodeTool {
                 (empty dir only, non-recursive); fs.rename(from, to). Binary I/O: \
                 fs.readFileBytes(path) -> Uint8Array; fs.writeFileBytes(path, data) where data \
                 is a Uint8Array or a plain array of byte numbers. Paths \
-                are relative to the project root and cannot escape it. Returns the captured \
+                are relative to the project root and cannot escape it. `path` (always \
+                available, no filesystem access of its own): path.join(...parts), \
+                path.dirname(p), path.basename(p[, ext]), path.extname(p), path.normalize(p), \
+                path.isAbsolute(p), path.sep ('/'). `os` (always available): os.platform() \
+                (e.g. 'darwin'/'linux'/'win32'), os.arch(), os.type() (e.g. 'Darwin'), \
+                os.EOL ('\\n'). Returns the captured \
                 console output. Use this for logic that would be awkward as a shell one-liner. \
                 Execution is bounded by `timeout_ms` (default 5000); a script that exceeds it is \
                 aborted and the tool returns a timeout notice. Set `network: true` to additionally \
@@ -564,5 +571,76 @@ mod tests {
     fn network_flag_gates_approval() {
         assert!(!NodeTool.requires_approval(&json!({ "code": "1" })));
         assert!(NodeTool.requires_approval(&json!({ "code": "1", "network": true })));
+    }
+
+    /// `path` is a pure, always-available global: exercise the common cases
+    /// for join/dirname/basename/extname/normalize/isAbsolute/sep.
+    #[test]
+    fn path_utilities() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                console.log(path.join("a", "b", "c.txt"));
+                console.log(path.join("/a/", "b"));
+                console.log(path.join("a", "", "b"));
+                console.log(path.join());
+                console.log(path.dirname("/foo/bar/baz.js"));
+                console.log(path.dirname("foo"));
+                console.log(path.dirname("/"));
+                console.log(path.basename("/foo/bar/baz.js"));
+                console.log(path.basename("/foo/bar/baz.js", ".js"));
+                console.log(path.basename("/foo/bar/"));
+                console.log(path.extname("index.html"));
+                console.log(path.extname(".gitignore"));
+                console.log(path.extname("noext"));
+                console.log(path.normalize("/foo/../bar//baz/./"));
+                console.log(path.isAbsolute("/foo"));
+                console.log(path.isAbsolute("foo"));
+                console.log(path.sep);
+            "#,
+        );
+        let expected = "\
+a/b/c.txt
+/a/b
+a/b
+.
+/foo/bar
+.
+/
+baz.js
+baz
+bar
+.html
+
+
+/bar/baz/
+true
+false
+/
+";
+        assert_eq!(output, expected, "unexpected path output: {output:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `os` is a pure, always-available global exposing host facts. Don't
+    /// assert a specific platform string — just that it's non-empty and that
+    /// the deterministic bits (`EOL`, the types of the functions) hold.
+    #[test]
+    fn os_facts() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                console.log(typeof os.platform, typeof os.arch, typeof os.type);
+                console.log(os.platform().length > 0, os.arch().length > 0, os.type().length > 0);
+                console.log(os.EOL === "\n");
+            "#,
+        );
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("function function function"));
+        assert_eq!(lines.next(), Some("true true true"));
+        assert_eq!(lines.next(), Some("true"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

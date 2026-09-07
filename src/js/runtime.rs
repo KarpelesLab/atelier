@@ -9,7 +9,8 @@ use kataan::nbexec::ExecError;
 use kataan::parser::Parser;
 
 /// JS run before the user's code. It gathers the mangled `__atelier_*` globals
-/// (registered from Rust) into the `fs` / `console` objects the script sees.
+/// (registered from Rust) into the `fs` / `console` / `os` objects the script
+/// sees, and defines the pure, dependency-free `path` object entirely in JS.
 ///
 /// The methods are assembled here — in JS — rather than stashed as `NanBox`
 /// handles on the Rust side, because kataan has a **moving** garbage collector:
@@ -19,6 +20,11 @@ use kataan::parser::Parser;
 /// builtin `console` as a global *scope binding*, which a bare `console`
 /// reference resolves to in preference to a `globalThis` property — so we must
 /// reassign the binding itself to make the script see our capturing console.
+///
+/// `path` and `os` are pure helpers (no filesystem or network access), so —
+/// unlike `fs` and the network globals — they're always assembled here,
+/// regardless of the `network` flag; they don't affect the tool's
+/// confinement or approval requirement.
 pub const BOOTSTRAP: &str = r#"
 fs = {
   readFile: __atelier_fs_readFile,
@@ -45,6 +51,112 @@ console = {
   log: __atelier_console_log,
   error: __atelier_console_error,
 };
+os = {
+  platform: __atelier_os_platform,
+  arch: __atelier_os_arch,
+  type: __atelier_os_type,
+  EOL: "\n",
+};
+// path — pure POSIX-style path utilities. No filesystem access: these are
+// string manipulations only, so (unlike fs) they need no Rust host call.
+path = (function () {
+  function isAbs(p) {
+    return p.length > 0 && p.charAt(0) === "/";
+  }
+
+  // Collapse a split path into its resolved segments, dropping "." entries
+  // and resolving ".." against what's already collected. `allowAboveRoot`
+  // keeps a leading ".." instead of dropping it (used for relative paths).
+  function normalizeArray(parts, allowAboveRoot) {
+    var res = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (!p || p === ".") continue;
+      if (p === "..") {
+        if (res.length && res[res.length - 1] !== "..") {
+          res.pop();
+        } else if (allowAboveRoot) {
+          res.push("..");
+        }
+      } else {
+        res.push(p);
+      }
+    }
+    return res;
+  }
+
+  function normalize(p) {
+    p = String(p);
+    if (p === "") return ".";
+    var absolute = isAbs(p);
+    var trailingSlash = p.length > 1 && p.charAt(p.length - 1) === "/";
+    var parts = normalizeArray(p.split("/"), !absolute);
+    var out = parts.join("/");
+    if (!out && !absolute) out = ".";
+    if (out && trailingSlash) out += "/";
+    return (absolute ? "/" : "") + out;
+  }
+
+  function join() {
+    var parts = [];
+    for (var i = 0; i < arguments.length; i++) {
+      var a = arguments[i];
+      if (a === undefined || a === null) continue;
+      a = String(a);
+      if (a.length) parts.push(a);
+    }
+    var joined = parts.join("/");
+    return joined ? normalize(joined) : ".";
+  }
+
+  function dirname(p) {
+    p = String(p);
+    if (p === "") return ".";
+    var absolute = isAbs(p);
+    var end = p.length;
+    while (end > 1 && p.charAt(end - 1) === "/") end--;
+    p = p.substring(0, end);
+    var idx = p.lastIndexOf("/");
+    if (idx === -1) return absolute ? "/" : ".";
+    if (idx === 0) return "/";
+    return p.substring(0, idx);
+  }
+
+  function basename(p, ext) {
+    p = String(p);
+    var end = p.length;
+    while (end > 0 && p.charAt(end - 1) === "/") end--;
+    p = p.substring(0, end);
+    var idx = p.lastIndexOf("/");
+    var base = idx === -1 ? p : p.substring(idx + 1);
+    if (ext && base.length > ext.length && base.substring(base.length - ext.length) === ext) {
+      base = base.substring(0, base.length - ext.length);
+    }
+    return base;
+  }
+
+  function extname(p) {
+    var base = basename(p);
+    var idx = base.lastIndexOf(".");
+    // No extension for a dotfile (leading dot) or when there's no dot.
+    if (idx <= 0) return "";
+    return base.substring(idx);
+  }
+
+  function isAbsolute(p) {
+    return isAbs(String(p));
+  }
+
+  return {
+    join: join,
+    dirname: dirname,
+    basename: basename,
+    extname: extname,
+    normalize: normalize,
+    isAbsolute: isAbsolute,
+    sep: "/",
+  };
+})();
 "#;
 
 /// JS run **only** when the call opts into network (`network: true`), after
@@ -118,6 +230,7 @@ pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt)
     // `ExecError::Interrupted`.
     interp.realm_mut().interrupt = Some(interrupt);
     super::fs::install(&mut interp, root);
+    super::os::install(&mut interp);
     let out = super::console::install(&mut interp);
     if network {
         super::net::install(&mut interp);
