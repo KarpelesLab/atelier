@@ -75,6 +75,22 @@ lines are prefixed `error: `). That's the entire API — no `console.warn`,
 console.log("sum:", 2 + 3);
 ```
 
+## `path` and `os`
+
+Two more always-available globals (pure, no I/O — not gated by `network`):
+
+- **`path`** — POSIX path helpers: `path.join(...parts)`, `path.dirname(p)`,
+  `path.basename(p[, ext])`, `path.extname(p)`, `path.normalize(p)`,
+  `path.isAbsolute(p)`, and `path.sep` (`"/"`).
+- **`os`** — host facts (Node naming): `os.platform()` (e.g. `"darwin"`,
+  `"linux"`, `"win32"`), `os.arch()`, `os.type()` (e.g. `"Darwin"`), and
+  `os.EOL` (`"\n"`).
+
+```js
+console.log(path.join("a", "b", "..", "c.txt")); // a/c.txt
+console.log(os.platform(), os.arch());
+```
+
 ## Timeouts and interruption
 
 A script gets `timeout_ms` (default 5000ms, hard ceiling 600000ms) of

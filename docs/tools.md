@@ -13,7 +13,9 @@ model verbatim as the tool result.
 | `grep`      | auto     | yes |
 | `glob`      | auto     | yes |
 | `ls`        | auto     | yes |
+| `tree`      | auto     | yes |
 | `bash`      | **required** | no (arbitrary shell) |
+| `web_fetch` | **required** | no (network) |
 | `node`      | auto, unless `network: true` (then required) | fs yes; network no |
 
 "Confined" tools resolve every path with `ToolCtx::resolve` /
@@ -161,3 +163,27 @@ Runs a JavaScript snippet on an embedded interpreter with a mediated,
 project-confined `fs` and an optional network capability. See
 [Scripting](scripting.md) for the full reference — it's substantial enough to
 warrant its own page.
+
+## `tree`
+
+Print an indented directory tree, respecting `.gitignore`.
+
+| Param   | Type    | Required | Meaning |
+|---------|---------|----------|---------|
+| `path`  | string  | no       | Root to print (default: project root) |
+| `depth` | integer | no       | Max depth (default 3) |
+
+Directories get a trailing `/`; capped at 200 entries with a truncation note.
+Confined to the project root and auto-approved.
+
+## `web_fetch`
+
+Fetch a URL over HTTP(S) and return the response body as text. **Requires
+approval** (network access, unconfined).
+
+| Param    | Type   | Required | Meaning |
+|----------|--------|----------|---------|
+| `url`    | string | yes      | `http(s)://` URL (redirects followed) |
+| `method` | string | no       | HTTP method (default `GET`) |
+
+Returns a `HTTP <status> <reason>` line then the body, truncated to ~20KB.

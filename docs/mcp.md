@@ -115,3 +115,11 @@ long-lived GET SSE stream (only the SSE embedded in the direct response to
 our own POST is read), no resumable-stream replay (`Last-Event-ID`), and no
 batched JSON-RPC requests (an array of messages in one POST). These cover
 the common path most current MCP servers implement.
+
+## Resources
+
+If a connected MCP server advertises **resources** (`resources/list`), atelier
+adds one extra tool per server, `mcp__<server>__read_resource`, whose
+description lists the available resource URIs. The model calls it with a
+`uri` argument to read a resource's text content. Servers without resources
+get no such tool (and the connection still succeeds).
