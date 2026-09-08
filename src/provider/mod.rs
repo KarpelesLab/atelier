@@ -26,6 +26,11 @@ use crate::config::Config;
 /// Env var overriding both HTTP timeouts below (milliseconds). Read directly
 /// here rather than through `Config` since the provider is the only consumer.
 const TIMEOUT_ENV_VAR: &str = "ATELIER_HTTP_TIMEOUT_MS";
+/// Env var naming a file to append one JSONL trace record to per
+/// [`stream_chat`] call (request + final response). Unset by default (no
+/// tracing). Best-effort: a write failure never fails the request. Never
+/// includes the `Authorization` header/api key.
+const TRACE_ENV_VAR: &str = "ATELIER_TRACE";
 /// Default connect timeout for the streaming chat call: generous, since a
 /// local/self-hosted model server can be slow to accept a connection under
 /// load.
@@ -209,7 +214,7 @@ pub struct Completion {
 /// Token usage for a completion, as reported on the final SSE chunk when the
 /// request set `stream_options.include_usage`. Consumed by the caller.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub prompt_tokens: u32,
@@ -248,13 +253,13 @@ pub fn stream_chat(
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_wire).collect());
     }
-    let body = serde_json::to_vec(&body)?;
+    let body_bytes = serde_json::to_vec(&body)?;
     if std::env::var_os("ATELIER_DEBUG").is_some() {
-        eprintln!("--> {}", String::from_utf8_lossy(&body));
+        eprintln!("--> {}", String::from_utf8_lossy(&body_bytes));
     }
 
     let url = cfg.endpoint("chat/completions");
-    let reader = send_reader_retrying(&url, &body, cfg.api_key.as_deref())?;
+    let reader = send_reader_retrying(&url, &body_bytes, cfg.api_key.as_deref())?;
     let status = reader.status();
     if !(200..300).contains(&status) {
         bail!("provider returned HTTP {status}");
@@ -335,7 +340,71 @@ pub fn stream_chat(
             arguments: a.arguments,
         })
         .collect();
+
+    if let Ok(path) = std::env::var(TRACE_ENV_VAR) {
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let entry = build_trace_entry(&cfg.model, &body, &tool_names, &out);
+        trace(&path, &entry);
+    }
+
     Ok(out)
+}
+
+/// Build one JSONL trace record for a [`stream_chat`] call: the request
+/// `messages` (taken from the already-built request body, so this observes
+/// rather than reconstructs the wire form), the names of tools advertised,
+/// and the resulting [`Completion`] (content, tool calls, usage). Pure and
+/// deterministic aside from the timestamp, so it's unit-testable without
+/// touching the filesystem — [`trace`] is the only side-effecting part.
+///
+/// Deliberately omits headers/credentials: the request body never contains
+/// the `Authorization` header or api key, so nothing needs to be redacted
+/// from it here.
+fn build_trace_entry(
+    model: &str,
+    request: &Value,
+    tool_names: &[&str],
+    completion: &Completion,
+) -> Value {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    json!({
+        "timestamp_ms": timestamp_ms,
+        "model": model,
+        "request": {
+            "messages": request.get("messages").cloned().unwrap_or(Value::Null),
+        },
+        "tools": tool_names,
+        "response": {
+            "content": completion.content,
+            "tool_calls": completion.tool_calls.iter().map(|tc| json!({
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })).collect::<Vec<_>>(),
+            "usage": completion.usage,
+        },
+    })
+}
+
+/// Append `entry` as one JSON line to the file at `path`, creating it (and
+/// appending, not truncating, if it already exists) as needed. Best-effort:
+/// any failure — bad path, missing parent dir, permissions, serialization —
+/// is silently ignored so tracing can never fail a request.
+fn trace(path: &str, entry: &Value) {
+    use std::io::Write as _;
+    let Ok(mut line) = serde_json::to_string(entry) else {
+        return;
+    };
+    line.push('\n');
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 #[derive(Default)]
@@ -735,5 +804,115 @@ mod tests {
         unsafe {
             std::env::remove_var(TIMEOUT_ENV_VAR);
         }
+    }
+
+    /// `build_trace_entry` must produce a valid JSON object carrying the
+    /// model, the request `messages` (pulled from the already-built request
+    /// body), the advertised tool names, and the completion's content, tool
+    /// calls (name + arguments), and usage.
+    #[test]
+    fn build_trace_entry_has_expected_fields() {
+        let request = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let completion = Completion {
+            content: "hello there".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+        };
+        let tool_names = ["read_file", "write_file"];
+        let entry = build_trace_entry("test-model", &request, &tool_names, &completion);
+
+        // Round-trips through a string, confirming it's valid JSON.
+        let line = serde_json::to_string(&entry).expect("serializes");
+        let reparsed: Value = serde_json::from_str(&line).expect("valid json");
+
+        assert!(reparsed["timestamp_ms"].as_u64().is_some());
+        assert_eq!(reparsed["model"], json!("test-model"));
+        assert_eq!(
+            reparsed["request"]["messages"],
+            json!([{"role": "user", "content": "hi"}])
+        );
+        assert_eq!(reparsed["tools"], json!(["read_file", "write_file"]));
+        assert_eq!(reparsed["response"]["content"], json!("hello there"));
+        assert_eq!(
+            reparsed["response"]["tool_calls"],
+            json!([{"name": "read_file", "arguments": r#"{"path":"a.txt"}"#}])
+        );
+        assert_eq!(
+            reparsed["response"]["usage"],
+            json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        );
+
+        // Redaction: nothing resembling an api key/auth header ever appears.
+        assert!(!line.to_ascii_lowercase().contains("authorization"));
+    }
+
+    /// A request with no `messages` key (shouldn't happen in practice, but
+    /// `build_trace_entry` must degrade to `null` rather than panicking).
+    #[test]
+    fn build_trace_entry_handles_missing_messages() {
+        let request = json!({ "model": "test-model" });
+        let completion = Completion::default();
+        let entry = build_trace_entry("test-model", &request, &[], &completion);
+        assert_eq!(entry["request"]["messages"], Value::Null);
+        assert_eq!(entry["response"]["usage"], Value::Null);
+        assert_eq!(entry["response"]["tool_calls"], json!([]));
+    }
+
+    /// `trace` is best-effort: writing to an unwritable path (a directory
+    /// nested under a nonexistent parent) must not panic.
+    #[test]
+    fn trace_ignores_unwritable_path() {
+        let entry = json!({"ok": true});
+        trace("/nonexistent-dir-for-atelier-trace-test/x/y.jsonl", &entry);
+        // No panic is the assertion; nothing else to check.
+    }
+
+    /// `trace` appends one JSON line per call to a real file, and each line
+    /// parses back as the entry that was written.
+    #[test]
+    fn trace_appends_jsonl_lines_to_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "atelier-trace-test-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().expect("utf8 path").to_string();
+
+        trace(&path_str, &json!({"n": 1}));
+        trace(&path_str, &json!({"n": 2}));
+
+        let contents = std::fs::read_to_string(&path).expect("file written");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected two appended lines, got: {contents:?}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap(),
+            json!({"n": 1})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[1]).unwrap(),
+            json!({"n": 2})
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
