@@ -37,6 +37,8 @@ fs = {
   rm: __atelier_fs_rm,
   rmdir: __atelier_fs_rmdir,
   rename: __atelier_fs_rename,
+  glob: __atelier_fs_glob,
+  copyFile: __atelier_fs_copyFile,
   // Binary I/O uses a REAL Uint8Array: readFileBytes wraps the host-returned
   // byte-number array in `new Uint8Array(...)`, and writeFileBytes normalizes a
   // Uint8Array (or plain byte array) to a plain array before crossing to Rust.
