@@ -8,7 +8,14 @@
 
 use std::path::{Path, PathBuf};
 
+use globset::Glob;
+use ignore::WalkBuilder;
 use kataan::{Ctx, Interp, NanBox};
+
+/// Cap on the number of paths [`__atelier_fs_glob`](install) returns, mirroring
+/// the `glob` tool's own cap (`src/tools/glob.rs`) in spirit (a smaller number
+/// here since script output also flows through the console-output truncation).
+const GLOB_MAX_RESULTS: usize = 500;
 
 /// Read the first argument as a string path.
 fn arg_path(cx: &mut Ctx, args: &[NanBox]) -> Result<String, NanBox> {
@@ -178,7 +185,7 @@ pub fn install(interp: &mut Interp, root: PathBuf) {
     // The bootstrap normalizes `data` (a Uint8Array or a plain array of byte
     // numbers) into a plain array before calling this, so here we just read
     // `length` and each indexed element and coerce to a byte.
-    let r = root;
+    let r = root.clone();
     interp.register_global_fn("__atelier_fs_writeFileBytes", 2, move |cx, _this, args| {
         let p = arg_path(cx, args)?;
         let data = args.get(1).copied().unwrap_or_else(|| cx.undefined());
@@ -203,6 +210,57 @@ pub fn install(interp: &mut Interp, root: PathBuf) {
                 .map_err(|e| cx.error(&format!("writeFileBytes (mkdir): {e}")))?;
         }
         std::fs::write(&path, bytes).map_err(|e| cx.error(&format!("writeFileBytes: {e}")))?;
+        Ok(cx.undefined())
+    });
+
+    // glob(pattern) -> string[] — list project files matching a glob pattern
+    // (e.g. "src/**/*.rs"), respecting .gitignore. Mirrors `src/tools/glob.rs`:
+    // walk the project root with `ignore::WalkBuilder` (which skips
+    // gitignored/hidden-by-default entries the same way `git status` would),
+    // match each file's project-relative path (or bare file name) against a
+    // compiled `globset::Glob`, and return sorted, capped results.
+    let r = root.clone();
+    interp.register_global_fn("__atelier_fs_glob", 1, move |cx, _this, args| {
+        let pattern = arg_path(cx, args)?;
+        let matcher = Glob::new(&pattern)
+            .map_err(|e| cx.error(&format!("glob: invalid pattern {pattern:?}: {e}")))?
+            .compile_matcher();
+
+        let mut results = Vec::new();
+        for entry in WalkBuilder::new(&r).hidden(false).build() {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let file_path = entry.path();
+            let rel = file_path.strip_prefix(&r).unwrap_or(file_path);
+            if matcher.is_match(rel) || matcher.is_match(file_path.file_name().unwrap_or_default())
+            {
+                results.push(rel.to_string_lossy().into_owned());
+                if results.len() >= GLOB_MAX_RESULTS {
+                    break;
+                }
+            }
+        }
+        results.sort();
+
+        let items: Vec<NanBox> = results.iter().map(|s| cx.string(s)).collect();
+        Ok(cx.new_array(items))
+    });
+
+    // copyFile(src, dst) — copy a file; both paths are confined to the project
+    // root. Creates dst's parent directories first (mirroring writeFile).
+    let r = root;
+    interp.register_global_fn("__atelier_fs_copyFile", 2, move |cx, _this, args| {
+        let src = arg_path(cx, args)?;
+        let dst = arg_str(cx, args, 1)?;
+        let src_path = resolve(cx, &r, &src)?;
+        let dst_path = resolve(cx, &r, &dst)?;
+        if let Some(parent) = dst_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| cx.error(&format!("copyFile (mkdir): {e}")))?;
+        }
+        std::fs::copy(&src_path, &dst_path).map_err(|e| cx.error(&format!("copyFile: {e}")))?;
         Ok(cx.undefined())
     });
 }

@@ -80,7 +80,11 @@ impl Tool for NodeTool {
                 fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path); \
                 fs.stat(path) -> {isFile, isDirectory, size, mtimeMs}; \
                 fs.appendFile(path, content); fs.rm(path) (file only); fs.rmdir(path) \
-                (empty dir only, non-recursive); fs.rename(from, to). Binary I/O: \
+                (empty dir only, non-recursive); fs.rename(from, to); \
+                fs.glob(pattern) -> string[] (e.g. 'src/**/*.rs'; lists project files matching \
+                the pattern, respecting .gitignore, sorted and capped at 500 results); \
+                fs.copyFile(src, dst) (copies a file, creating dst's parent directories). \
+                Binary I/O: \
                 fs.readFileBytes(path) -> Uint8Array; fs.writeFileBytes(path, data) where data \
                 is a Uint8Array or a plain array of byte numbers. Paths \
                 are relative to the project root and cannot escape it. `path` (always \
@@ -552,6 +556,8 @@ mod tests {
                 console.log(esc(function () { fs.rename("../a", "b"); }));
                 console.log(esc(function () { fs.readFileBytes("../../etc/passwd"); }));
                 console.log(esc(function () { fs.writeFileBytes("../x", [1]); }));
+                console.log(esc(function () { fs.copyFile("../../etc/passwd", "x"); }));
+                console.log(esc(function () { fs.copyFile("a.txt", "../x"); }));
             "#,
         );
         assert!(
@@ -560,8 +566,81 @@ mod tests {
         );
         assert_eq!(
             output.matches("caught").count(),
-            6,
-            "all six escapes should throw: {output:?}"
+            8,
+            "all eight escapes should throw: {output:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.glob` lists project files matching a pattern, sorted.
+    #[test]
+    fn fs_glob_lists_matching_files() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.writeFile("b.txt", "b");
+                fs.writeFile("a.txt", "a");
+                fs.writeFile("d.rs", "d");
+                var matches = fs.glob("*.txt");
+                console.log(Array.isArray(matches), matches.length);
+                console.log(matches.join(","));
+            "#,
+        );
+        assert!(
+            output.contains("true 2"),
+            "expected exactly the two top-level .txt files: {output:?}"
+        );
+        assert!(
+            output.contains("a.txt,b.txt"),
+            "expected sorted results: {output:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.glob` with `**` reaches into subdirectories too.
+    #[test]
+    fn fs_glob_recursive_pattern() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.writeFile("top.txt", "x");
+                fs.writeFile("sub/deep.txt", "y");
+                var matches = fs.glob("**/*.txt");
+                console.log(matches.length, matches.indexOf("top.txt") >= 0, matches.indexOf("sub/deep.txt") >= 0);
+            "#,
+        );
+        assert!(
+            output.contains("2 true true"),
+            "unexpected recursive glob result: {output:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `fs.copyFile` copies a file's contents to a new path, creating parent
+    /// directories, and leaves the source untouched.
+    #[test]
+    fn fs_copy_file() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.writeFile("src.txt", "copy me");
+                fs.copyFile("src.txt", "nested/dst.txt");
+                console.log(fs.readFile("src.txt"));
+                console.log(fs.readFile("nested/dst.txt"));
+            "#,
+        );
+        assert!(output.contains("copy me"), "unexpected output: {output:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/dst.txt")).unwrap(),
+            "copy me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.txt")).unwrap(),
+            "copy me",
+            "source should be unchanged"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
