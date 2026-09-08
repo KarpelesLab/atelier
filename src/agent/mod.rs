@@ -102,6 +102,8 @@ const HELP: &[&str] = &[
     "commands:",
     "  /help                                 show this help",
     "  /models                               list models offered by the endpoint",
+    "  /model [name]                         show or switch the active model",
+    "  /tools                                list available tools",
     "  /mcp                                  list configured MCP servers",
     "  /mcp add <name> <command> [args...]   add a stdio MCP server",
     "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
@@ -148,6 +150,20 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             Err(e) => ui.info(&format!("error: {e:#}")),
         },
         "/mcp" => dispatch_mcp(session, &args, ui),
+        "/model" => match args.first() {
+            None => ui.info(&format!("model: {}", session.config().model)),
+            Some(name) => {
+                session.set_model(name);
+                ui.info(&format!("model set to {name}"));
+            }
+        },
+        "/tools" => {
+            let names = session.tool_names();
+            ui.info(&format!("{} tools available:", names.len()));
+            for n in names {
+                ui.info(&format!("  {n}"));
+            }
+        }
         "/new" => {
             session.new_conversation();
             ui.info("started a new conversation (previous session cleared)");
@@ -302,6 +318,18 @@ impl Session {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Switch the model used for subsequent requests (for `/model`).
+    pub fn set_model(&mut self, name: &str) {
+        self.cfg.model = name.to_string();
+    }
+
+    /// Names of all registered tools, sorted (for `/tools`).
+    pub fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tools.specs().into_iter().map(|s| s.name).collect();
+        names.sort();
+        names
     }
 
     /// Load a previously-saved conversation for this project (for `--continue`).
