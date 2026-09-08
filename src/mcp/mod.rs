@@ -32,6 +32,14 @@
 //! appended, which reads any of them by `uri` via `resources/read`. A server
 //! that doesn't support resources (an erroring or empty `resources/list`)
 //! simply gets no such tool — the connection still succeeds.
+//!
+//! Both transports likewise probe the optional MCP *prompts* capability
+//! (`list_prompts`, shared): if the server answers `prompts/list` with at
+//! least one prompt, one extra `mcp__<server>__get_prompt` tool
+//! ([`prompt::McpPromptTool`]) is appended, which renders any of them by
+//! `name` (plus optional `arguments`) via `prompts/get` into a readable
+//! transcript. A server that doesn't support prompts (an erroring or empty
+//! `prompts/list`) simply gets no such tool — the connection still succeeds.
 
 // Contract surface is consumed by the MCP implementation (in progress) and by
 // `main` once registration is wired up.
@@ -40,6 +48,7 @@
 mod conn;
 mod http;
 mod jsonrpc;
+mod prompt;
 mod resource;
 mod tool;
 
@@ -54,6 +63,7 @@ use serde_json::{Value, json};
 use crate::tools::Tool;
 use conn::Conn;
 use jsonrpc::JsonRpc;
+use prompt::McpPromptTool;
 use resource::McpResourceTool;
 use tool::McpTool;
 
@@ -113,11 +123,15 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
 
     let advertised = handshake_and_list_tools(&mut conn, &server.name, "2024-11-05")?;
     let resources = list_resources(&mut conn);
+    let prompts = list_prompts(&mut conn);
 
     let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
     let mut tools = wrap_tools(conn.clone(), &server.name, advertised);
-    if let Some(resource_tool) = maybe_resource_tool(conn, &server.name, resources) {
+    if let Some(resource_tool) = maybe_resource_tool(conn.clone(), &server.name, resources) {
         tools.push(resource_tool);
+    }
+    if let Some(prompt_tool) = maybe_prompt_tool(conn, &server.name, prompts) {
+        tools.push(prompt_tool);
     }
     Ok(tools)
 }
@@ -256,6 +270,89 @@ fn describe_resources(resources: &[Value]) -> String {
     )
 }
 
+/// Try `prompts/list` on an already-connected transport and return the raw
+/// `prompts` array. Prompt support is optional per the MCP spec: a server
+/// that doesn't implement it (or errors for any other reason) simply yields
+/// no prompts here, rather than failing the whole connection. Shared by
+/// [`connect_stdio`] and [`connect_http`](http::connect_http).
+pub(crate) fn list_prompts(conn: &mut dyn JsonRpc) -> Vec<Value> {
+    conn.request("prompts/list", json!({}))
+        .ok()
+        .and_then(|result| result.get("prompts").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+/// If `prompts` is non-empty, build the one namespaced
+/// `mcp__<server>__get_prompt` [`Tool`] that renders any of them by `name`
+/// via `prompts/get`. Returns `None` when the server advertised no prompts
+/// (including when `prompts/list` isn't supported at all). Shared by
+/// [`connect_stdio`] and [`connect_http`](http::connect_http).
+pub(crate) fn maybe_prompt_tool(
+    conn: Arc<Mutex<dyn JsonRpc>>,
+    server_name: &str,
+    prompts: Vec<Value>,
+) -> Option<Box<dyn Tool>> {
+    if prompts.is_empty() {
+        return None;
+    }
+
+    let namespaced_name = format!("mcp__{server_name}__get_prompt");
+    let description = describe_prompts(&prompts);
+
+    Some(Box::new(McpPromptTool::new(
+        conn,
+        namespaced_name,
+        description,
+    )))
+}
+
+/// Build the `get_prompt` tool's description: an instruction plus a capped
+/// listing of the prompts discovered via `prompts/list` (name, description,
+/// and argument names), so the model knows what's actually available and
+/// what arguments each prompt expects.
+fn describe_prompts(prompts: &[Value]) -> String {
+    const CAP: usize = 30;
+
+    let mut lines: Vec<String> = prompts
+        .iter()
+        .take(CAP)
+        .map(|p| {
+            let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+            let mut line = match p.get("description").and_then(Value::as_str) {
+                Some(desc) if !desc.is_empty() => format!("- {name}: {desc}"),
+                _ => format!("- {name}"),
+            };
+            if let Some(args) = p.get("arguments").and_then(Value::as_array)
+                && !args.is_empty()
+            {
+                let arg_strs: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let arg_name = a.get("name").and_then(Value::as_str).unwrap_or("");
+                        let required = a.get("required").and_then(Value::as_bool).unwrap_or(false);
+                        if required {
+                            format!("{arg_name} (required)")
+                        } else {
+                            arg_name.to_string()
+                        }
+                    })
+                    .collect();
+                line.push_str(&format!(" [arguments: {}]", arg_strs.join(", ")));
+            }
+            line
+        })
+        .collect();
+    if prompts.len() > CAP {
+        lines.push(format!("- ... and {} more", prompts.len() - CAP));
+    }
+
+    format!(
+        "Get an MCP prompt by `name` (optionally with `arguments`). Available prompts ({} total):\n{}",
+        prompts.len(),
+        lines.join("\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,11 +361,11 @@ mod tests {
 
     /// A tiny POSIX-shell "MCP server" driven purely by `read`/`printf`, used
     /// to exercise `connect_stdio` end-to-end (spawn, handshake, tools/list,
-    /// resources/list, tools/call, resources/read) without depending on any
-    /// real MCP server being installed. It expects exactly the request
-    /// sequence `connect_stdio` + one `tools/call` per tool + one
-    /// `resources/read` produce, and replies with fixed, valid JSON-RPC
-    /// frames.
+    /// resources/list, prompts/list, tools/call, resources/read,
+    /// prompts/get) without depending on any real MCP server being
+    /// installed. It expects exactly the request sequence `connect_stdio` +
+    /// one `tools/call` per tool + one `resources/read` + one `prompts/get`
+    /// produce, and replies with fixed, valid JSON-RPC frames.
     const FAKE_SERVER_SCRIPT: &str = r#"
 IFS= read -r _init
 printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0.0.0"}}}'
@@ -277,18 +374,23 @@ IFS= read -r _tools_list
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echoes the input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"Always fails","inputSchema":{}}]}}'
 IFS= read -r _resources_list
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"file:///hello.txt","name":"hello","description":"A greeting","mimeType":"text/plain"}]}}'
+IFS= read -r _prompts_list
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"prompts":[{"name":"greet","description":"Greets someone","arguments":[{"name":"who","description":"Who to greet","required":true}]}]}}'
 IFS= read -r _call
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}'
 IFS= read -r _call2
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"isError":true,"content":[{"type":"text","text":"kaboom"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"type":"text","text":"kaboom"}]}}'
 IFS= read -r _resource_read
-printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"contents":[{"uri":"file:///hello.txt","mimeType":"text/plain","text":"hello resource"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"contents":[{"uri":"file:///hello.txt","mimeType":"text/plain","text":"hello resource"}]}}'
+IFS= read -r _prompt_get
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"messages":[{"role":"user","content":{"type":"text","text":"Hello, world!"}}]}}'
 "#;
 
-    /// Same handshake as [`FAKE_SERVER_SCRIPT`], but `resources/list`
-    /// returns a JSON-RPC error (as a server that doesn't support resources
-    /// might) instead of a result. Used to check that this doesn't fail the
-    /// connection and simply yields no `read_resource` tool.
+    /// Same handshake as [`FAKE_SERVER_SCRIPT`], but `resources/list` and
+    /// `prompts/list` both return a JSON-RPC error (as a server that doesn't
+    /// support either capability might) instead of a result. Used to check
+    /// that this doesn't fail the connection and simply yields no
+    /// `read_resource`/`get_prompt` tools.
     const FAKE_SERVER_NO_RESOURCES_SCRIPT: &str = r#"
 IFS= read -r _init
 printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0.0.0"}}}'
@@ -297,6 +399,8 @@ IFS= read -r _tools_list
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echoes the input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
 IFS= read -r _resources_list
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}'
+IFS= read -r _prompts_list
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}'
 "#;
 
     fn fake_server() -> StdioServer {
@@ -312,7 +416,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method 
         let server = fake_server();
         let tools = connect_stdio(&server).expect("connect_stdio should succeed");
 
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
 
         let echo = tools
             .iter()
@@ -369,10 +473,36 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method 
             .call(&mut ctx, json!({"uri": "file:///hello.txt"}))
             .expect("resources/read should succeed");
         assert_eq!(out, "hello resource");
+
+        let get_prompt = tools
+            .iter()
+            .find(|t| t.name() == "mcp__fake__get_prompt")
+            .expect("get_prompt tool should be present when prompts/list is non-empty");
+        let spec = get_prompt.spec();
+        assert_eq!(spec.name, "mcp__fake__get_prompt");
+        // The description should list the discovered prompt (and its
+        // arguments) so the model knows what it can request.
+        assert!(spec.description.contains("greet"));
+        assert!(spec.description.contains("Greets someone"));
+        assert!(spec.description.contains("who (required)"));
+        assert_eq!(spec.parameters["type"], "object");
+        assert_eq!(spec.parameters["required"], json!(["name"]));
+
+        let mut ctx = ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+        };
+        let out = get_prompt
+            .call(
+                &mut ctx,
+                json!({"name": "greet", "arguments": {"who": "world"}}),
+            )
+            .expect("prompts/get should succeed");
+        assert_eq!(out, "user: Hello, world!");
     }
 
     #[test]
-    fn resources_list_error_yields_no_resource_tool() {
+    fn resources_and_prompts_list_error_yields_no_extra_tools() {
         let server = StdioServer {
             name: "fake".into(),
             command: "sh".into(),
@@ -385,6 +515,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method 
         assert!(
             tools.iter().all(|t| t.name() != "mcp__fake__read_resource"),
             "no read_resource tool should be added when resources/list fails"
+        );
+        assert!(
+            tools.iter().all(|t| t.name() != "mcp__fake__get_prompt"),
+            "no get_prompt tool should be added when prompts/list fails"
         );
     }
 

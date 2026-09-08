@@ -62,11 +62,15 @@ pub fn connect_http(server: &HttpServer) -> Result<Vec<Box<dyn Tool>>> {
     // value in `initialize` and negotiate down themselves per the spec.
     let advertised = super::handshake_and_list_tools(&mut conn, &server.name, "2025-03-26")?;
     let resources = super::list_resources(&mut conn);
+    let prompts = super::list_prompts(&mut conn);
 
     let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
     let mut tools = super::wrap_tools(conn.clone(), &server.name, advertised);
-    if let Some(resource_tool) = super::maybe_resource_tool(conn, &server.name, resources) {
+    if let Some(resource_tool) = super::maybe_resource_tool(conn.clone(), &server.name, resources) {
         tools.push(resource_tool);
+    }
+    if let Some(prompt_tool) = super::maybe_prompt_tool(conn, &server.name, prompts) {
+        tools.push(prompt_tool);
     }
     Ok(tools)
 }
@@ -345,11 +349,12 @@ mod tests {
     /// End-to-end exercise of [`connect_http`] against a hand-rolled HTTP/1.1
     /// server (no real MCP server needed): runs the full `initialize` →
     /// `notifications/initialized` → `tools/list` → `resources/list` →
-    /// `tools/call` → `resources/read` sequence over real TCP sockets, checks
-    /// the `Mcp-Session-Id` returned on `initialize` is echoed back on every
-    /// later request, and that a plain `application/json` response is parsed
-    /// correctly end to end — including the `read_resource` tool built from
-    /// `resources/list`.
+    /// `prompts/list` → `tools/call` → `resources/read` → `prompts/get`
+    /// sequence over real TCP sockets, checks the `Mcp-Session-Id` returned
+    /// on `initialize` is echoed back on every later request, and that a
+    /// plain `application/json` response is parsed correctly end to end —
+    /// including the `read_resource` tool built from `resources/list` and
+    /// the `get_prompt` tool built from `prompts/list`.
     #[test]
     fn connect_http_end_to_end_with_session_id() {
         use std::net::TcpListener;
@@ -430,8 +435,30 @@ mod tests {
             .to_string();
             write_http_response(&mut stream, 200, &[], &body);
 
-            // tools/call
+            // prompts/list
             let (mut stream, _) = listener.accept().expect("accept #5");
+            let (headers, req) = read_http_request(&mut stream);
+            assert_eq!(req["method"], "prompts/list");
+            assert_eq!(
+                headers.get("mcp-session-id").map(String::as_str),
+                Some("sess-123")
+            );
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "prompts": [{
+                        "name": "greet",
+                        "description": "Greets someone",
+                        "arguments": [{"name": "who", "description": "Who to greet", "required": true}],
+                    }],
+                },
+            })
+            .to_string();
+            write_http_response(&mut stream, 200, &[], &body);
+
+            // tools/call
+            let (mut stream, _) = listener.accept().expect("accept #6");
             let (headers, req) = read_http_request(&mut stream);
             assert_eq!(req["method"], "tools/call");
             assert_eq!(
@@ -448,7 +475,7 @@ mod tests {
             write_http_response(&mut stream, 200, &[], &body);
 
             // resources/read
-            let (mut stream, _) = listener.accept().expect("accept #6");
+            let (mut stream, _) = listener.accept().expect("accept #7");
             let (headers, req) = read_http_request(&mut stream);
             assert_eq!(req["method"], "resources/read");
             assert_eq!(
@@ -469,6 +496,29 @@ mod tests {
             })
             .to_string();
             write_http_response(&mut stream, 200, &[], &body);
+
+            // prompts/get
+            let (mut stream, _) = listener.accept().expect("accept #8");
+            let (headers, req) = read_http_request(&mut stream);
+            assert_eq!(req["method"], "prompts/get");
+            assert_eq!(
+                headers.get("mcp-session-id").map(String::as_str),
+                Some("sess-123")
+            );
+            assert_eq!(req["params"]["name"], "greet");
+            assert_eq!(req["params"]["arguments"]["who"], "http world");
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "messages": [{
+                        "role": "user",
+                        "content": {"type": "text", "text": "Hello, http world!"},
+                    }],
+                },
+            })
+            .to_string();
+            write_http_response(&mut stream, 200, &[], &body);
         });
 
         let server = HttpServer {
@@ -477,7 +527,7 @@ mod tests {
             headers: vec![],
         };
         let tools = connect_http(&server).expect("connect_http should succeed");
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
 
         let echo = tools
             .iter()
@@ -514,6 +564,23 @@ mod tests {
             .call(&mut ctx, json!({"uri": "file:///hello.txt"}))
             .expect("resources/read should succeed");
         assert_eq!(out, "hello resource");
+
+        let get_prompt = tools
+            .iter()
+            .find(|t| t.name() == "mcp__fake__get_prompt")
+            .expect("get_prompt tool should be present when prompts/list is non-empty");
+        assert!(get_prompt.spec().description.contains("greet"));
+        let mut ctx = crate::tools::ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+        };
+        let out = get_prompt
+            .call(
+                &mut ctx,
+                json!({"name": "greet", "arguments": {"who": "http world"}}),
+            )
+            .expect("prompts/get should succeed");
+        assert_eq!(out, "user: Hello, http world!");
 
         server_thread
             .join()
