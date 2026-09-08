@@ -22,11 +22,13 @@
 #![allow(dead_code)]
 
 mod budget;
+mod commits;
 mod dedup;
 mod diagnostics;
 mod diff;
 mod environment;
 mod git;
+mod instructions;
 mod layout;
 mod todos;
 
@@ -67,14 +69,16 @@ pub trait ContextProvider: Send + Sync {
     fn gather(&self, root: &Path) -> Option<ContextItem>;
 }
 
-/// The default set of context providers: cargo-check diagnostics, git
-/// status, recent diff, project layout, open TODOs, and environment facts
-/// (in priority order).
+/// The default set of context providers: project instructions, cargo-check
+/// diagnostics, git status, recent diff, recent commits, project layout,
+/// open TODOs, and environment facts (in priority order).
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
     vec![
+        Box::new(instructions::InstructionsProvider),
         Box::new(diagnostics::DiagnosticsProvider),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),
+        Box::new(commits::RecentCommitsProvider),
         Box::new(todos::TodosProvider),
         Box::new(layout::LayoutProvider),
         Box::new(environment::EnvironmentProvider),
