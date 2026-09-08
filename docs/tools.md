@@ -10,6 +10,7 @@ model verbatim as the tool result.
 | `write`     | auto     | yes |
 | `edit`      | auto     | yes |
 | `multiedit` | auto     | yes |
+| `apply_patch` | auto   | yes |
 | `grep`      | auto     | yes |
 | `glob`      | auto     | yes |
 | `ls`        | auto     | yes |
@@ -187,3 +188,19 @@ approval** (network access, unconfined).
 | `method` | string | no       | HTTP method (default `GET`) |
 
 Returns a `HTTP <status> <reason>` line then the body, truncated to ~20KB.
+
+## `apply_patch`
+
+Apply a **unified diff** spanning one or more files in a single atomic call —
+the natural way to express a multi-file change.
+
+| Param   | Type   | Required | Meaning |
+|---------|--------|----------|---------|
+| `patch` | string | yes      | A unified diff (`--- a/… / +++ b/…` headers, `@@` hunks) |
+
+Supports modify, create (`--- /dev/null`), and delete (`+++ /dev/null`).
+Hunks are located by the `@@` line hint, falling back to a unique content
+search, so slightly-off line numbers still apply. Modified files must have
+been read this session and not be stale (same `FileState` rules as `edit`).
+**Atomic**: if any hunk of any file fails, nothing is written. Confined and
+auto-approved.

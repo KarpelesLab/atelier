@@ -42,7 +42,7 @@ type a message, or /help for commands.
 The entry point ...
 ```
 
-Type `/help` to see the available slash commands (`/models`, `/mcp`, `/new`,
+Type `/help` to see the available slash commands (`/models`, `/model`, `/tools`, `/mcp`, `/new`,
 `/image`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for
 what the agent itself can do, and [permissions](permissions.md) for how tool
 approval works.
@@ -122,6 +122,7 @@ stdin to EOF. You don't need to select this explicitly.
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | Token threshold past which older history is compacted into a summary (see [Sessions](sessions.md)) |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | Overrides the HTTP connect timeout (ms) for both chat streaming (default 60000ms) and `GET /models` (default 15000ms). Ignored if not a positive integer |
 | `ATELIER_DEBUG`           | *(unset)*                        | If set (to anything), prints the raw outgoing chat-completion request JSON to stderr |
+| `ATELIER_TRACE`           | *(unset)*                        | File path; appends one JSONL line per model request (messages + response) for after-the-fact inspection |
 
 See [configuration](configuration.md) for the full picture including
 `atelier.toml`.

@@ -123,3 +123,10 @@ adds one extra tool per server, `mcp__<server>__read_resource`, whose
 description lists the available resource URIs. The model calls it with a
 `uri` argument to read a resource's text content. Servers without resources
 get no such tool (and the connection still succeeds).
+
+## Prompts
+
+If a server advertises **prompts** (`prompts/list`), atelier adds a
+`mcp__<server>__get_prompt` tool whose description lists the prompt names and
+arguments. The model calls it with `{ name, arguments }` to expand a prompt
+template into text. Servers without prompts get no such tool.

@@ -87,3 +87,5 @@ transport details and its known gaps.
 Populated automatically — you don't hand-author this list, though you may
 pre-seed it. See [Permissions](permissions.md) for how entries land here and
 how they're used.
+
+- `ATELIER_TRACE` — file path to append a JSONL trace (one line per model request: messages, tool calls, usage) for debugging.

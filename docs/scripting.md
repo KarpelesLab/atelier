@@ -49,6 +49,8 @@ catchable JS error instead of touching the filesystem.
 | `fs.rename` | `(from, to)` | Renames/moves within the project root |
 | `fs.readFileBytes` | `(path) -> Uint8Array` | Reads a file as raw bytes |
 | `fs.writeFileBytes` | `(path, data)` | Writes a `Uint8Array` or plain byte array |
+| `fs.glob` | `(pattern) -> string[]` | Project files matching a glob (respects .gitignore) |
+| `fs.copyFile` | `(src, dst)` | Copy a file (both confined; creates dst dirs) |
 
 ```js
 fs.writeFile("notes/todo.txt", "buy milk\n");

@@ -189,8 +189,8 @@ Extend the tool surface via the ecosystem.
   registry and namespaced (`mcp__<server>__<tool>`).
 - MCP tools flow through the same permission model as local tools.
 - MCP **resources** ✅: a server that advertises resources gets a
-  `mcp__<server>__read_resource` tool (lists URIs, reads by `uri`). Prompts are
-  still a follow-up.
+  `mcp__<server>__read_resource` tool (lists URIs, reads by `uri`), and
+  **prompts** ✅ as a `mcp__<server>__get_prompt` tool.
 
 **Exit:** a configured MCP server's tools are callable in a task, indistinguishable
 from built-in tools to the agent.
