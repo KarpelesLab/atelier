@@ -29,7 +29,9 @@ use serde_json::{Value, json};
 use crate::tools::{Tool, ToolCtx, ToolSpec};
 
 mod console;
+mod encoding;
 mod fs;
+mod hash;
 mod net;
 mod os;
 mod runtime;
@@ -71,11 +73,12 @@ impl Tool for NodeTool {
         ToolSpec {
             name: "node".into(),
             description: "Run a JavaScript program in a sandboxed runtime (no \
-                require/import — CommonJS and ES modules are unavailable). Four globals are \
+                require/import — CommonJS and ES modules are unavailable). Six globals are \
                 provided directly, already in scope (do NOT require() or import them): `console` \
                 (log, error), a SYNCHRONOUS `fs` confined to the project directory, a pure \
-                `path` (POSIX-style path utilities, no I/O), and a pure `os` (host facts, no \
-                I/O). The fs methods return values directly — no promises, callbacks, or await: \
+                `path` (POSIX-style path utilities, no I/O), a pure `os` (host facts, no \
+                I/O), a pure `encoding` (base64/hex string conversions, no I/O), and a pure \
+                `hash` (SHA-256, no I/O). The fs methods return values directly — no promises, callbacks, or await: \
                 fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
                 fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path); \
                 fs.stat(path) -> {isFile, isDirectory, size, mtimeMs}; \
@@ -92,7 +95,13 @@ impl Tool for NodeTool {
                 path.dirname(p), path.basename(p[, ext]), path.extname(p), path.normalize(p), \
                 path.isAbsolute(p), path.sep ('/'). `os` (always available): os.platform() \
                 (e.g. 'darwin'/'linux'/'win32'), os.arch(), os.type() (e.g. 'Darwin'), \
-                os.EOL ('\\n'). Returns the captured \
+                os.EOL ('\\n'). `encoding` (always available, no I/O): \
+                encoding.base64Encode(str) -> string; encoding.base64Decode(b64) -> string \
+                (UTF-8 lossy on the decoded bytes); encoding.hexEncode(str) -> string; \
+                encoding.hexDecode(hex) -> string (UTF-8 lossy on the decoded bytes) — all \
+                operate on the UTF-8 bytes of the input string and throw on invalid input. \
+                `hash` (always available, no I/O): hash.sha256(str) -> string (lowercase hex \
+                digest of the UTF-8 bytes of the input). Returns the captured \
                 console output. Use this for logic that would be awkward as a shell one-liner. \
                 Execution is bounded by `timeout_ms` (default 5000); a script that exceeds it is \
                 aborted and the tool returns a timeout notice. Set `network: true` to additionally \
@@ -720,6 +729,65 @@ false
         assert_eq!(lines.next(), Some("function function function"));
         assert_eq!(lines.next(), Some("true true true"));
         assert_eq!(lines.next(), Some("true"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `encoding` and `hash` are pure, always-available globals: a base64
+    /// round-trip, a hex round-trip, and a known SHA-256 digest.
+    #[test]
+    fn encoding_and_hash_globals() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                var b64 = encoding.base64Encode("hello world");
+                console.log(b64);
+                console.log(encoding.base64Decode(b64));
+
+                var hex = encoding.hexEncode("hello world");
+                console.log(hex);
+                console.log(encoding.hexDecode(hex));
+
+                console.log(hash.sha256("abc"));
+            "#,
+        );
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("aGVsbG8gd29ybGQ="));
+        assert_eq!(lines.next(), Some("hello world"));
+        assert_eq!(lines.next(), Some("68656c6c6f20776f726c64"));
+        assert_eq!(lines.next(), Some("hello world"));
+        assert_eq!(
+            lines.next(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Invalid base64/hex input throws a catchable JS error rather than
+    /// panicking the worker.
+    #[test]
+    fn encoding_rejects_invalid_input() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                function esc(fn) {
+                    try { fn(); return "NOT_CAUGHT"; } catch (e) { return "caught"; }
+                }
+                console.log(esc(function () { encoding.base64Decode("not valid base64!!"); }));
+                console.log(esc(function () { encoding.hexDecode("zz"); }));
+                console.log(esc(function () { encoding.hexDecode("abc"); }));
+            "#,
+        );
+        assert!(
+            !output.contains("NOT_CAUGHT"),
+            "invalid input must throw: {output:?}"
+        );
+        assert_eq!(
+            output.matches("caught").count(),
+            3,
+            "all three invalid inputs should throw: {output:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
