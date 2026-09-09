@@ -37,6 +37,7 @@ mod grep;
 mod ls;
 mod multiedit;
 mod read;
+mod todo;
 mod tree;
 mod web_fetch;
 mod write;
@@ -148,6 +149,7 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(grep::GrepTool));
     reg.register(Box::new(glob::GlobTool));
     reg.register(Box::new(ls::LsTool));
+    reg.register(Box::new(todo::TodoTool));
     reg.register(Box::new(tree::TreeTool));
     reg.register(Box::new(crate::js::NodeTool));
     reg
