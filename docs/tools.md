@@ -15,6 +15,7 @@ model verbatim as the tool result.
 | `glob`      | auto     | yes |
 | `ls`        | auto     | yes |
 | `tree`      | auto     | yes |
+| `todo`      | auto     | yes |
 | `bash`      | **required** | no (arbitrary shell) |
 | `web_fetch` | **required** | no (network) |
 | `node`      | auto, unless `network: true` (then required) | fs yes; network no |
@@ -203,4 +204,18 @@ Hunks are located by the `@@` line hint, falling back to a unique content
 search, so slightly-off line numbers still apply. Modified files must have
 been read this session and not be stale (same `FileState` rules as `edit`).
 **Atomic**: if any hunk of any file fails, nothing is written. Confined and
+auto-approved.
+
+## `todo`
+
+A durable checklist stored at `.atelier/todos.json`, for tracking multi-step
+work across turns (and across compaction).
+
+| Param    | Type   | Required | Meaning |
+|----------|--------|----------|---------|
+| `action` | string | yes      | `list` · `add` · `complete` · `set` · `clear` |
+| `items`  | array  | for add/set | task strings |
+| `ids`    | array  | for complete | 1-based ids to mark done |
+
+Renders as `[x] 1. done` / `[ ] 2. pending` with a count summary. Confined and
 auto-approved.

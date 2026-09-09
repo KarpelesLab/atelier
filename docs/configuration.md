@@ -89,3 +89,15 @@ pre-seed it. See [Permissions](permissions.md) for how entries land here and
 how they're used.
 
 - `ATELIER_TRACE` — file path to append a JSONL trace (one line per model request: messages, tool calls, usage) for debugging.
+
+## `[defaults]`
+
+Per-project defaults in `atelier.toml`, each overridden by its environment
+variable when set:
+
+```toml
+[defaults]
+model = "qwen3-coder:30b"   # overridden by ATELIER_MODEL
+approve = false             # overridden by ATELIER_APPROVE
+context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
+```

@@ -93,6 +93,19 @@ console.log(path.join("a", "b", "..", "c.txt")); // a/c.txt
 console.log(os.platform(), os.arch());
 ```
 
+## `encoding` and `hash`
+
+Pure, always-available (not gated by `network`):
+
+- **`encoding`** — `base64Encode(str)`, `base64Decode(b64)`, `hexEncode(str)`,
+  `hexDecode(hex)` (operate on the string's UTF-8 bytes; decode throws on
+  invalid input).
+- **`hash`** — `hash.sha256(str)` → lowercase hex digest.
+
+```js
+console.log(encoding.base64Encode("hi"), hash.sha256("abc"));
+```
+
 ## Timeouts and interruption
 
 A script gets `timeout_ms` (default 5000ms, hard ceiling 600000ms) of
