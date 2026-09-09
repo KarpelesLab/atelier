@@ -279,14 +279,16 @@ impl Session {
         settings: Settings,
     ) -> Self {
         let allow: HashSet<String> = settings.permissions.allow.iter().cloned().collect();
-        let auto_approve = matches!(
-            std::env::var("ATELIER_APPROVE").as_deref(),
-            Ok("all" | "yes" | "1")
-        );
+        // env wins; else the project's [defaults]; else the built-in default.
+        let auto_approve = match std::env::var("ATELIER_APPROVE") {
+            Ok(v) => matches!(v.as_str(), "all" | "yes" | "1"),
+            Err(_) => settings.defaults.approve.unwrap_or(false),
+        };
         let compact_threshold = std::env::var("ATELIER_CONTEXT_LIMIT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&n| n > 0)
+            .or(settings.defaults.context_limit.filter(|&n| n > 0))
             .unwrap_or(DEFAULT_CONTEXT_LIMIT);
         Self {
             cfg,

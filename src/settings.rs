@@ -32,6 +32,21 @@ pub struct Settings {
     /// Tool-approval policy.
     #[serde(default)]
     pub permissions: Permissions,
+    /// Project defaults, overridden by the matching environment variables.
+    #[serde(default)]
+    pub defaults: Defaults,
+}
+
+/// Per-project defaults from `[defaults]`. Each is overridden by its env var
+/// (`ATELIER_MODEL`, `ATELIER_APPROVE`, `ATELIER_CONTEXT_LIMIT`) when that's set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Defaults {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub approve: Option<bool>,
+    #[serde(default)]
+    pub context_limit: Option<u32>,
 }
 
 /// Persisted tool-approval state.

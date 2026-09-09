@@ -25,12 +25,19 @@ use config::Config;
 use settings::Settings;
 
 fn main() -> Result<()> {
-    let cfg = Config::from_env();
+    let mut cfg = Config::from_env();
     let root = std::env::current_dir()?;
     let settings = Settings::load(&root).unwrap_or_else(|e| {
         eprintln!("warning: {e:#}; using empty settings");
         Settings::default()
     });
+
+    // `[defaults] model` fills in when ATELIER_MODEL isn't set in the env.
+    if std::env::var_os("ATELIER_MODEL").is_none()
+        && let Some(m) = &settings.defaults.model
+    {
+        cfg.model = m.clone();
+    }
 
     // Minimal flag handling: `--continue`/`-c` resumes the saved session;
     // `--print`/`-p` runs one prompt non-interactively and exits (see
