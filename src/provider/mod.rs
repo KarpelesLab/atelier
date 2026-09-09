@@ -38,6 +38,10 @@ const DEFAULT_CHAT_TIMEOUT_MS: u64 = 60_000;
 /// Default connect timeout for `GET /models`: a cheap, quick call, so a
 /// shorter default fails fast.
 const DEFAULT_LIST_MODELS_TIMEOUT_MS: u64 = 15_000;
+/// Appended to `Completion::content` when the response was cut off by the
+/// model's output token limit (`finish_reason == "length"`, no tool calls) —
+/// see [`should_append_truncation_note`].
+const TRUNCATION_NOTE: &str = "\n\n[response truncated: reached the model's output token limit]";
 
 /// Resolve the connect-timeout duration to use, honoring
 /// `ATELIER_HTTP_TIMEOUT_MS` (milliseconds) when set to a valid, positive
@@ -202,13 +206,20 @@ impl ToolCall {
 /// The outcome of a streamed completion.
 #[derive(Debug, Clone, Default)]
 pub struct Completion {
-    /// Accumulated answer text (reasoning excluded).
+    /// Accumulated answer text (reasoning excluded). When the response was
+    /// cut off by the model's output token limit (`finish_reason ==
+    /// "length"`, no tool calls), a truncation note is appended — see
+    /// [`TRUNCATION_NOTE`].
     pub content: String,
     /// Tool calls the model requested, if any.
     pub tool_calls: Vec<ToolCall>,
     /// Token usage reported by the provider, if it honored
     /// `stream_options.include_usage`. Some servers omit this.
     pub usage: Option<Usage>,
+    /// The last non-null `finish_reason` seen across streamed chunks (e.g.
+    /// `"stop"`, `"tool_calls"`, `"length"`, `"content_filter"`). `None` if
+    /// the provider never sent one.
+    pub finish_reason: Option<String>,
 }
 
 /// Token usage for a completion, as reported on the final SSE chunk when the
@@ -268,6 +279,8 @@ pub fn stream_chat(
     let mut out = Completion::default();
     // Tool-call fragments, keyed by their streamed `index`.
     let mut calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
+    // The last non-null `finish_reason` seen across chunks.
+    let mut finish_reason: Option<String> = None;
 
     let mut lines = BufReader::new(reader);
     let mut line = String::new();
@@ -304,6 +317,9 @@ pub fn stream_chat(
             continue;
         };
         let delta = choice.delta;
+        if let Some(fr) = choice.finish_reason {
+            finish_reason = Some(fr);
+        }
 
         if let Some(r) = delta.reasoning()
             && !r.is_empty()
@@ -340,6 +356,10 @@ pub fn stream_chat(
             arguments: a.arguments,
         })
         .collect();
+    out.finish_reason = finish_reason;
+    if should_append_truncation_note(&out.finish_reason, &out.tool_calls) {
+        out.content.push_str(TRUNCATION_NOTE);
+    }
 
     if let Ok(path) = std::env::var(TRACE_ENV_VAR) {
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -348,6 +368,17 @@ pub fn stream_chat(
     }
 
     Ok(out)
+}
+
+/// Whether [`stream_chat`] should append [`TRUNCATION_NOTE`] to the
+/// accumulated content: only when the provider's last `finish_reason` was
+/// `"length"` (the response was cut off by the output token limit) and no
+/// tool calls were requested. A `"length"` finish alongside tool calls
+/// usually means the call's *arguments* were truncated mid-stream rather than
+/// the answer text, so it's left untouched here — `"stop"`, `"tool_calls"`,
+/// `"content_filter"`, and `None` are all left untouched too.
+fn should_append_truncation_note(finish_reason: &Option<String>, tool_calls: &[ToolCall]) -> bool {
+    finish_reason.as_deref() == Some("length") && tool_calls.is_empty()
 }
 
 /// Build one JSONL trace record for a [`stream_chat`] call: the request
@@ -426,6 +457,11 @@ struct ChatChunk {
 struct Choice {
     #[serde(default)]
     delta: Delta,
+    /// Set on the chunk carrying the last delta for this choice: `"stop"`,
+    /// `"tool_calls"`, `"length"` (hit the output token limit),
+    /// `"content_filter"`, etc. `None` on every chunk before that.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -655,6 +691,58 @@ mod tests {
         assert_eq!(chunk.choices.len(), 1);
     }
 
+    /// A chunk carrying `finish_reason: "length"` on its choice (what a
+    /// server sends on the final chunk when the response was cut off by the
+    /// output token limit) must parse, with the field surfaced rather than
+    /// dropped.
+    #[test]
+    fn parses_finish_reason_length() {
+        let data = r#"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":null}"#;
+        let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    /// A normal mid-stream content chunk has no `finish_reason` at all; it
+    /// must parse with the field defaulting to `None` rather than erroring.
+    #[test]
+    fn chunk_without_finish_reason_parses_as_none() {
+        let data = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
+        assert_eq!(chunk.choices[0].finish_reason, None);
+    }
+
+    /// `should_append_truncation_note` is true only for `"length"` with no
+    /// tool calls; `"stop"`, `"tool_calls"`, `"length"` alongside tool calls,
+    /// and a missing finish reason must all leave content untouched.
+    #[test]
+    fn truncation_note_only_for_length_without_tool_calls() {
+        let no_calls: Vec<ToolCall> = Vec::new();
+        let with_call = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        }];
+
+        assert!(should_append_truncation_note(
+            &Some("length".to_string()),
+            &no_calls
+        ));
+        assert!(!should_append_truncation_note(
+            &Some("length".to_string()),
+            &with_call
+        ));
+        assert!(!should_append_truncation_note(
+            &Some("stop".to_string()),
+            &no_calls
+        ));
+        assert!(!should_append_truncation_note(
+            &Some("tool_calls".to_string()),
+            &with_call
+        ));
+        assert!(!should_append_truncation_note(&None, &no_calls));
+    }
+
     /// Transport-level connect/send failures that are worth retrying.
     #[test]
     fn transient_errors_are_recognized() {
@@ -829,6 +917,7 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 15,
             }),
+            finish_reason: Some("tool_calls".to_string()),
         };
         let tool_names = ["read_file", "write_file"];
         let entry = build_trace_entry("test-model", &request, &tool_names, &completion);
