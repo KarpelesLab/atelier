@@ -9,8 +9,9 @@ use kataan::nbexec::ExecError;
 use kataan::parser::Parser;
 
 /// JS run before the user's code. It gathers the mangled `__atelier_*` globals
-/// (registered from Rust) into the `fs` / `console` / `os` objects the script
-/// sees, and defines the pure, dependency-free `path` object entirely in JS.
+/// (registered from Rust) into the `fs` / `console` / `os` / `encoding` /
+/// `hash` objects the script sees, and defines the pure, dependency-free
+/// `path` object entirely in JS.
 ///
 /// The methods are assembled here — in JS — rather than stashed as `NanBox`
 /// handles on the Rust side, because kataan has a **moving** garbage collector:
@@ -21,10 +22,10 @@ use kataan::parser::Parser;
 /// reference resolves to in preference to a `globalThis` property — so we must
 /// reassign the binding itself to make the script see our capturing console.
 ///
-/// `path` and `os` are pure helpers (no filesystem or network access), so —
-/// unlike `fs` and the network globals — they're always assembled here,
-/// regardless of the `network` flag; they don't affect the tool's
-/// confinement or approval requirement.
+/// `path`, `os`, `encoding`, and `hash` are pure helpers (no filesystem or
+/// network access), so — unlike `fs` and the network globals — they're always
+/// assembled here, regardless of the `network` flag; they don't affect the
+/// tool's confinement or approval requirement.
 pub const BOOTSTRAP: &str = r#"
 fs = {
   readFile: __atelier_fs_readFile,
@@ -58,6 +59,15 @@ os = {
   arch: __atelier_os_arch,
   type: __atelier_os_type,
   EOL: "\n",
+};
+encoding = {
+  base64Encode: __atelier_encoding_base64Encode,
+  base64Decode: __atelier_encoding_base64Decode,
+  hexEncode: __atelier_encoding_hexEncode,
+  hexDecode: __atelier_encoding_hexDecode,
+};
+hash = {
+  sha256: __atelier_hash_sha256,
 };
 // path — pure POSIX-style path utilities. No filesystem access: these are
 // string manipulations only, so (unlike fs) they need no Rust host call.
@@ -233,6 +243,8 @@ pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt)
     interp.realm_mut().interrupt = Some(interrupt);
     super::fs::install(&mut interp, root);
     super::os::install(&mut interp);
+    super::encoding::install(&mut interp);
+    super::hash::install(&mut interp);
     let out = super::console::install(&mut interp);
     if network {
         super::net::install(&mut interp);
