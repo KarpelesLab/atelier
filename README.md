@@ -26,6 +26,9 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   `.atelier/session.json` and resumable with `--continue`; once a
   conversation grows past a token threshold, older turns are summarized
   automatically instead of being sent in full on every request.
+- **A parallel reviewer, opt-in.** Turn on the "subconscious" (`/review on`)
+  and a second, read-only model pass watches the exchange and edits,
+  posting short 💭 notes into the dialog — it can comment but never act.
 - **One binary, organized by module** — not an internal crate workspace.
 
 ## Quickstart
@@ -48,11 +51,12 @@ first conversation, the REPL/TUI fallback).
 |-----|--------|
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
-| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`) |
+| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
 | [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
+| [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` |
 
 ## Layout
 
