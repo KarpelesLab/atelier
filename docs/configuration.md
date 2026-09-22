@@ -5,9 +5,10 @@ atelier has two configuration layers:
 - **`Config`** (`src/config.rs`) — ephemeral connection info read from the
   environment at startup. Not persisted.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
-  `atelier.toml` at the project root: configured MCP servers and the
-  always-allow permission list. Read at startup and rewritten whenever it
-  changes (`/mcp add`/`/mcp remove`, granting "always" on a tool approval).
+  `atelier.toml` at the project root: configured MCP servers, the
+  always-allow permission list, `[defaults]`, and `[review]`. Read at startup
+  and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
+  "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
 There is currently no project-vs-user-global precedence: `atelier.toml` is
 read only from the current project root, and `Config`'s environment variables
@@ -22,6 +23,7 @@ have no `atelier.toml` equivalent.
 | `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token; sent as `Authorization: Bearer <key>` when set to a non-empty value |
 | `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
+| `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000). Non-numeric or `<= 0` values are ignored and the default is used |
 | `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending |
 
@@ -101,3 +103,27 @@ model = "qwen3-coder:30b"   # overridden by ATELIER_MODEL
 approve = false             # overridden by ATELIER_APPROVE
 context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
 ```
+
+## `[review]`
+
+The parallel "subconscious" reviewer — see [Review mode](review.md) for what
+it does and how its notes appear.
+
+```toml
+[review]
+enabled = false              # overridden by ATELIER_REVIEW
+model = "qwen3-coder:30b"    # optional; defaults to the main model
+```
+
+| Field     | Type   | Meaning |
+|-----------|--------|---------|
+| `enabled` | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
+| `model`   | string | Model override for the reviewer; unset reuses the active model |
+
+## `/config`
+
+`/config` opens a settings view covering the model, auto-approve, the context
+limit, and review mode. In the inline TUI it's a full-screen editor
+(alternate screen) — edit the values and save & exit to write them back to
+`atelier.toml`; in the plain REPL, which has no alternate screen, it instead
+prints a read-only text summary of the same settings.

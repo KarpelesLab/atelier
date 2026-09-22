@@ -42,10 +42,11 @@ type a message, or /help for commands.
 The entry point ...
 ```
 
-Type `/help` to see the available slash commands (`/models`, `/model`, `/tools`, `/mcp`, `/new`,
-`/image`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for
-what the agent itself can do, and [permissions](permissions.md) for how tool
-approval works.
+Type `/help` to see the available slash commands (`/models`, `/model`, `/tools`, `/mcp`, `/review`,
+`/config`, `/new`, `/image`, `/clear`, `/quit`, …) — see [tools](tools.md) and
+[MCP](mcp.md) for what the agent itself can do, [permissions](permissions.md)
+for how tool approval works, and [review mode](review.md) for the parallel
+"subconscious" reviewer behind `/review`.
 
 ## Vision: `/image`
 
@@ -62,6 +63,26 @@ message (as OpenAI multimodal `image_url` content parts) and then cleared;
 call `/image` more than once before sending to attach several at once. The
 path is your own — unlike file tools, it isn't confined to the project root.
 Vision support depends on the model behind your endpoint.
+
+## Review mode: `/review`
+
+```
+› /review on
+review mode on
+```
+
+`/review [on|off]` toggles the parallel "subconscious" reviewer — a
+read-only pass that watches the exchange and posts short 💭 notes into the
+dialog after tool calls. With no argument it reports the current state.
+`ATELIER_REVIEW` and `[review] enabled` in `atelier.toml` do the same; see
+[Review mode](review.md) for the full picture.
+
+## Settings screen: `/config`
+
+`/config` opens a settings view for the model, auto-approve, the context
+limit, and review mode. In the inline TUI it's a full-screen editor; in the
+plain REPL it prints a read-only text summary of the same settings instead.
+See [Configuration](configuration.md#config) for details.
 
 ## Flags: `--continue` and `--print`
 
@@ -120,6 +141,7 @@ stdin to EOF. You don't need to select this explicitly.
 | `ATELIER_API_KEY`         | *(unset)*                        | Optional bearer token sent as `Authorization: Bearer <key>` |
 | `ATELIER_APPROVE`         | *(unset)*                        | Set to `all`, `yes`, or `1` to auto-approve every tool call (headless/CI runs, or `--print` with unconfined tools) |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | Token threshold past which older history is compacted into a summary (see [Sessions](sessions.md)) |
+| `ATELIER_REVIEW`          | *(unset)*                        | Set to `on`, `yes`, `1`, or `true` to turn on the parallel "subconscious" reviewer (see [Review mode](review.md)) |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | Overrides the HTTP connect timeout (ms) for both chat streaming (default 60000ms) and `GET /models` (default 15000ms). Ignored if not a positive integer |
 | `ATELIER_DEBUG`           | *(unset)*                        | If set (to anything), prints the raw outgoing chat-completion request JSON to stderr |
 | `ATELIER_TRACE`           | *(unset)*                        | File path; appends one JSONL line per model request (messages + response) for after-the-fact inspection |
@@ -146,3 +168,4 @@ hand. Add `.atelier/` to your project's `.gitignore`. See
 - [Permissions](permissions.md) — the approval model
 - [Scripting](scripting.md) — the `node` tool
 - [MCP](mcp.md) — connecting external tool servers
+- [Review mode](review.md) — the parallel "subconscious" reviewer
