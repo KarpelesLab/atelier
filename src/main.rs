@@ -11,6 +11,7 @@ mod headless;
 mod js;
 mod mcp;
 mod provider;
+mod review;
 mod risk;
 mod session;
 mod settings;

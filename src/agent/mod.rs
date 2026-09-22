@@ -64,6 +64,9 @@ pub trait Ui {
     /// An out-of-band notice (errors, status). Used by the TUI.
     #[allow(dead_code)]
     fn notice(&mut self, text: &str);
+    /// A note from the parallel "subconscious" reviewer, surfaced in the main
+    /// dialog after tool calls. Default no-op for interfaces without it.
+    fn subconscious(&mut self, _text: &str) {}
     /// Messages the user submitted while the turn was still running, in the
     /// order they were typed. The loop drains this between steps — right
     /// before each model request, i.e. after a batch of tool results — and
@@ -96,6 +99,9 @@ pub enum Dispatch {
     Handled,
     /// The user asked to quit.
     Quit,
+    /// Open the full-screen configuration editor (TUI only; the REPL prints a
+    /// text summary instead).
+    Config,
 }
 
 const HELP: &[&str] = &[
@@ -104,6 +110,8 @@ const HELP: &[&str] = &[
     "  /models                               list models offered by the endpoint",
     "  /model [name]                         show or switch the active model",
     "  /tools                                list available tools",
+    "  /review [on|off]                      the parallel reviewer (\"subconscious\")",
+    "  /config                               open the settings screen (full-screen in the TUI)",
     "  /mcp                                  list configured MCP servers",
     "  /mcp add <name> <command> [args...]   add a stdio MCP server",
     "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
@@ -164,6 +172,23 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 ui.info(&format!("  {n}"));
             }
         }
+        "/review" => match args.first().copied() {
+            None => ui.info(&format!(
+                "review (subconscious) mode: {}",
+                if session.review_enabled() {
+                    "on"
+                } else {
+                    "off"
+                }
+            )),
+            Some(v @ ("on" | "off")) => {
+                session.set_review_enabled(v == "on");
+                let _ = session.save_settings();
+                ui.info(&format!("review mode {v}"));
+            }
+            Some(_) => ui.info("usage: /review [on|off]"),
+        },
+        "/config" => return Dispatch::Config,
         "/new" => {
             session.new_conversation();
             ui.info("started a new conversation (previous session cleared)");
@@ -266,6 +291,10 @@ pub struct Session {
     summary: Option<String>,
     /// Compact when the last request's total tokens exceed this.
     compact_threshold: u32,
+    /// Whether the parallel "subconscious" reviewer runs.
+    review_enabled: bool,
+    /// Pending background reviews; drained (non-blocking) between steps.
+    reviews: Vec<std::sync::mpsc::Receiver<String>>,
     history: Vec<Message>,
     fstate: FileState,
 }
@@ -290,6 +319,10 @@ impl Session {
             .filter(|&n| n > 0)
             .or(settings.defaults.context_limit.filter(|&n| n > 0))
             .unwrap_or(DEFAULT_CONTEXT_LIMIT);
+        let review_enabled = match std::env::var("ATELIER_REVIEW") {
+            Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
+            Err(_) => settings.review.enabled,
+        };
         Self {
             cfg,
             root,
@@ -304,9 +337,50 @@ impl Session {
             last_ctx: HashMap::new(),
             summary: None,
             compact_threshold,
+            review_enabled,
+            reviews: Vec::new(),
             history: Vec::new(),
             fstate: FileState::new(),
         }
+    }
+
+    // ---- accessors + setters used by the /config screen ----
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+    pub fn auto_approve(&self) -> bool {
+        self.auto_approve
+    }
+    pub fn context_limit(&self) -> u32 {
+        self.compact_threshold
+    }
+    pub fn review_enabled(&self) -> bool {
+        self.review_enabled
+    }
+    #[allow(dead_code)] // used by the /config screen
+    pub fn set_auto_approve(&mut self, on: bool) {
+        self.auto_approve = on;
+        self.settings.defaults.approve = Some(on);
+    }
+    #[allow(dead_code)] // used by the /config screen
+    pub fn set_context_limit(&mut self, n: u32) {
+        self.compact_threshold = n.max(1);
+        self.settings.defaults.context_limit = Some(self.compact_threshold);
+    }
+    pub fn set_review_enabled(&mut self, on: bool) {
+        self.review_enabled = on;
+        self.settings.review.enabled = on;
+    }
+    /// Set the default model (updates the live model and the persisted default).
+    #[allow(dead_code)] // used by the /config screen
+    pub fn set_default_model(&mut self, name: &str) {
+        self.cfg.model = name.to_string();
+        self.settings.defaults.model = Some(name.to_string());
+    }
+    /// Persist current settings to `atelier.toml`.
+    pub fn save_settings(&self) -> Result<()> {
+        self.settings.save(&self.root)
     }
 
     /// A short token-usage summary (`<ctx> ctx · <out> out`), or `None` if the
@@ -498,6 +572,8 @@ impl Session {
             // well-formed. Several messages merge into one user turn since
             // some chat templates reject consecutive same-role messages.
             self.deliver_queued(ui);
+            // Surface any finished background reviews (non-blocking).
+            self.drain_reviews(ui);
 
             // Assemble the request: a single leading system message (prompt +
             // fresh context — some servers reject a second system message), then
@@ -537,6 +613,7 @@ impl Session {
 
             if completion.tool_calls.is_empty() {
                 ui.turn_end();
+                self.collect_reviews(ui);
                 self.maybe_compact(ui);
                 self.persist();
                 return Ok(());
@@ -567,7 +644,77 @@ impl Session {
                 self.history
                     .push(Message::tool_result(call.id.clone(), result));
             }
+            // Kick off a parallel review of this tool batch; its note is
+            // surfaced by a later `drain_reviews`/`collect_reviews`.
+            self.spawn_review();
         }
+    }
+
+    /// Spawn a background reviewer over the recent exchange (if review mode is
+    /// on). Runs on its own thread; the note is collected later via the channel.
+    fn spawn_review(&mut self) {
+        if !self.review_enabled {
+            return;
+        }
+        let excerpt = self.review_excerpt();
+        let cfg = self.cfg.clone();
+        let model = self.settings.review.model.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Some(note) = crate::review::review(&cfg, model.as_deref(), &excerpt) {
+                let _ = tx.send(note);
+            }
+        });
+        self.reviews.push(rx);
+    }
+
+    /// Emit any finished reviews without blocking; keep the rest pending.
+    fn drain_reviews(&mut self, ui: &mut dyn Ui) {
+        let mut pending = Vec::new();
+        for rx in std::mem::take(&mut self.reviews) {
+            match rx.try_recv() {
+                Ok(note) => ui.subconscious(&note),
+                Err(std::sync::mpsc::TryRecvError::Empty) => pending.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        self.reviews = pending;
+    }
+
+    /// Block on remaining reviews (turn end) and emit their notes.
+    fn collect_reviews(&mut self, ui: &mut dyn Ui) {
+        for rx in std::mem::take(&mut self.reviews) {
+            if let Ok(note) = rx.recv() {
+                ui.subconscious(&note);
+            }
+        }
+    }
+
+    /// A compact text excerpt of the exchange since the last user message, for
+    /// the reviewer (capped to keep the review request small).
+    fn review_excerpt(&self) -> String {
+        let start = self
+            .history
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(0);
+        let mut s = String::new();
+        for m in &self.history[start..] {
+            if !m.content.is_empty() {
+                s.push_str(&format!("{}: {}\n", m.role, m.content));
+            }
+            for c in &m.tool_calls {
+                s.push_str(&format!("[tool call] {}({})\n", c.name, c.arguments));
+            }
+        }
+        if s.len() > 4000 {
+            let mut end = 4000;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+        s
     }
 
     /// Append any messages queued in the UI as one user message; returns how
@@ -889,6 +1036,29 @@ impl Ui for StdoutUi {
     fn notice(&mut self, text: &str) {
         eprintln!("{text}");
     }
+    fn subconscious(&mut self, text: &str) {
+        self.end_reasoning();
+        println!("{DIM}💭 {text}{RESET}");
+    }
+}
+
+/// Render the current settings as text (for `/config` outside the TUI).
+fn config_summary(session: &Session) -> Vec<String> {
+    let s = session.settings();
+    let mut out = vec![
+        "settings:".to_string(),
+        format!("  model:          {}", session.config().model),
+        format!("  auto-approve:   {}", session.auto_approve()),
+        format!("  context limit:  {}", session.context_limit()),
+        format!("  review mode:    {}", session.review_enabled()),
+    ];
+    if !s.mcp.is_empty() || !s.mcp_http.is_empty() {
+        out.push(format!(
+            "  mcp servers:    {}",
+            s.mcp.len() + s.mcp_http.len()
+        ));
+    }
+    out
 }
 
 /// A minimal stdin REPL driving a [`Session`] with [`StdoutUi`].
@@ -920,6 +1090,13 @@ pub fn repl(mut session: Session) -> Result<()> {
         match dispatch(&mut session, line, &mut ui) {
             Dispatch::Quit => break,
             Dispatch::Handled => {}
+            Dispatch::Config => {
+                // No alternate screen here; print a text summary.
+                for l in config_summary(&session) {
+                    ui.info(&l);
+                }
+                ui.info("(edit atelier.toml or use /model, /review; the TUI has a full editor)");
+            }
             Dispatch::Prompt => {
                 if let Err(e) = session.send(line, &mut ui) {
                     eprintln!("error: {e:#}");

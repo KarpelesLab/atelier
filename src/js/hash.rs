@@ -50,6 +50,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// Compute the raw 32-byte SHA-256 digest of `data`.
+#[allow(clippy::chunks_exact_to_as_chunks)] // clearer as fixed-size iteration here
 fn sha256(data: &[u8]) -> [u8; 32] {
     // Padding: append 0x80, then zero bytes, then the 64-bit big-endian bit
     // length, so the total is a multiple of 64 bytes.

@@ -55,6 +55,7 @@
 //! new turns. Approval prompts arrive over the same channel and are answered
 //! from the main thread, so the keyboard is never read by two threads.
 
+mod config;
 mod input;
 
 use std::collections::VecDeque;
@@ -142,6 +143,11 @@ pub fn run(mut session: Session) -> Result<()> {
             agent::Dispatch::Handled => {
                 r.refresh()?;
             }
+            agent::Dispatch::Config => {
+                config::run(&mut session)?;
+                r.status = build_status(&session, turn);
+                r.refresh()?;
+            }
             agent::Dispatch::Prompt => {
                 turn += 1;
                 r.status = build_status(&session, turn);
@@ -224,6 +230,8 @@ enum UiEvent {
     TurnEnd,
     Info(String),
     Notice(String),
+    /// A note from the parallel reviewer ("subconscious").
+    Subconscious(String),
     /// A queued message was appended to the conversation.
     Delivered(String),
     /// The worker is blocked waiting for an approval answer.
@@ -382,6 +390,7 @@ fn apply_event(r: &mut Renderer, ev: UiEvent) {
         }
         UiEvent::Info(t) => r.emit_block(&t, false),
         UiEvent::Notice(t) => r.emit_block(&format!("! {t}"), false),
+        UiEvent::Subconscious(t) => r.emit_block(&format!("💭 {t}"), true),
         UiEvent::Delivered(t) => {
             // Record the message where the model actually received it.
             r.commit_pending_if_any();
@@ -447,6 +456,9 @@ impl Ui for ChanUi {
     }
     fn notice(&mut self, text: &str) {
         self.send(UiEvent::Notice(text.to_string()));
+    }
+    fn subconscious(&mut self, text: &str) {
+        self.send(UiEvent::Subconscious(text.to_string()));
     }
     fn take_queued(&mut self) -> Vec<String> {
         take_leading_prompts(&mut lock(&self.queue))
@@ -749,6 +761,10 @@ impl Ui for TuiUi<'_> {
     }
     fn notice(&mut self, text: &str) {
         self.r.emit_block(&format!("! {text}"), false);
+        let _ = self.r.refresh();
+    }
+    fn subconscious(&mut self, text: &str) {
+        self.r.emit_block(&format!("💭 {text}"), true);
         let _ = self.r.refresh();
     }
 }

@@ -35,6 +35,22 @@ pub struct Settings {
     /// Project defaults, overridden by the matching environment variables.
     #[serde(default)]
     pub defaults: Defaults,
+    /// The parallel "subconscious" reviewer.
+    #[serde(default)]
+    pub review: ReviewSettings,
+}
+
+/// The background reviewer ("subconscious"): a parallel, read-only pass that
+/// watches the exchange and its edits and posts short notes into the main
+/// dialog after tool calls. It can do nothing but observe and comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewSettings {
+    /// Whether the reviewer runs.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model for the reviewer (defaults to the main model when unset).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Per-project defaults from `[defaults]`. Each is overridden by its env var
