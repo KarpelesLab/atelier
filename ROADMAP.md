@@ -279,6 +279,20 @@ prompt, analyze what a script will do before running it.
 (rm -rf, sudo, `curl|sh`, out-of-project paths, force-push, …), not just an
 opaque string. Verified live. A model-based pre-flight summary is a later add.
 
+### M10 — Subconscious reviewer & settings screen ✅
+
+- ✅ **Parallel "subconscious" reviewer.** With review mode on (`/review on`,
+  `[review] enabled`, or `ATELIER_REVIEW=on`), the loop spawns a read-only
+  reviewer on a worker thread after each tool batch; it watches the exchange +
+  edits and can do nothing but post short `💭` notes into the main dialog (via
+  the `Ui::subconscious` channel), drained between steps and at turn end.
+  Verified live — it flagged a missing `chmod +x` and warned about an
+  `rm -rf /`.
+- ✅ **`/config` settings screen.** `Dispatch::Config` opens a full-screen
+  alternate-screen editor in the TUI (model, auto-approve, context limit,
+  review mode; save & exit, alt screen always restored); the REPL prints a text
+  summary. Backed by `[defaults]`/`[review]` in `atelier.toml`.
+
 ---
 
 ## 4. Harness ergonomics — designing for the agent's experience
