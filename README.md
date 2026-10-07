@@ -9,8 +9,13 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
 
 ## Design in one breath
 
-- **Bring your own API.** OpenAI-compatible endpoints only (no Claude/ChatGPT
-  subscription backends — their ToS forbids it). HTTP is [`rsurl`](https://crates.io/crates/rsurl).
+- **Bring your own API.** OpenAI-compatible endpoints by default — no
+  subscription backend required. HTTP is [`rsurl`](https://crates.io/crates/rsurl).
+- **Sign in with ChatGPT.** `/login` runs OpenAI's own sanctioned OAuth flow
+  so you can run atelier on your own ChatGPT plan instead of an API key —
+  a separate backend over the Responses API, distinct from the
+  bring-your-own-API default above. See
+  [docs/chatgpt.md](docs/chatgpt.md).
 - **Minimal, append-only interface.** One input line plus a status strip;
   everything else prints to the terminal scrollback and is never redrawn.
 - **Project-scoped.** Launched inside a project directory; tools, context, and
@@ -57,6 +62,7 @@ first conversation, the REPL/TUI fallback).
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` |
+| [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |
 
 ## Layout
 

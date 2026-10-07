@@ -126,4 +126,14 @@ model = "qwen3-coder:30b"    # optional; defaults to the main model
 limit, and review mode. In the inline TUI it's a full-screen editor
 (alternate screen) — edit the values and save & exit to write them back to
 `atelier.toml`; in the plain REPL, which has no alternate screen, it instead
-prints a read-only text summary of the same settings.
+prints a read-only text summary of the same settings. Either way it shows
+the active **backend** — the configured chat/completions endpoint, or
+`chatgpt:<model>` while [signed in with ChatGPT](chatgpt.md) via `/login`.
+
+## `/login` and `/logout`
+
+`/login` runs [Sign in with ChatGPT](chatgpt.md) — OpenAI's OAuth flow for
+using your own ChatGPT plan, no API key needed — and switches the session to
+the Responses API backend. `/logout` signs out and reverts to the configured
+endpoint. See [Sign in with ChatGPT](chatgpt.md) for the full picture,
+including where tokens are stored and how login is restored on launch.

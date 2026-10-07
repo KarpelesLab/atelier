@@ -42,11 +42,12 @@ type a message, or /help for commands.
 The entry point ...
 ```
 
-Type `/help` to see the available slash commands (`/models`, `/model`, `/tools`, `/mcp`, `/review`,
-`/config`, `/new`, `/image`, `/clear`, `/quit`, …) — see [tools](tools.md) and
-[MCP](mcp.md) for what the agent itself can do, [permissions](permissions.md)
-for how tool approval works, and [review mode](review.md) for the parallel
-"subconscious" reviewer behind `/review`.
+Type `/help` to see the available slash commands (`/models`, `/model`,
+`/login`, `/logout`, `/tools`, `/mcp`, `/review`, `/config`, `/new`, `/image`,
+`/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the
+agent itself can do, [permissions](permissions.md) for how tool approval
+works, [review mode](review.md) for the parallel "subconscious" reviewer
+behind `/review`, and [Sign in with ChatGPT](chatgpt.md) for `/login`/`/logout`.
 
 ## Vision: `/image`
 
@@ -82,7 +83,23 @@ dialog after tool calls. With no argument it reports the current state.
 `/config` opens a settings view for the model, auto-approve, the context
 limit, and review mode. In the inline TUI it's a full-screen editor; in the
 plain REPL it prints a read-only text summary of the same settings instead.
-See [Configuration](configuration.md#config) for details.
+Either way it shows the active backend — the configured endpoint, or
+`chatgpt:<model>` once you've signed in with ChatGPT. See
+[Configuration](configuration.md#config) for details.
+
+## Sign in with ChatGPT: `/login`
+
+```
+› /login
+opening your browser to sign in with ChatGPT…
+signed in — requests now use your ChatGPT plan (Responses API)
+```
+
+`/login` lets you run atelier on your own ChatGPT plan instead of an API
+key, via OpenAI's own OAuth flow; `/logout` signs out. This switches to a
+separate backend (the Responses API) with its own model choice (`/model`,
+default `gpt-5`), and the sign-in is remembered across runs. See [Sign in
+with ChatGPT](chatgpt.md) for the full picture.
 
 ## Flags: `--continue` and `--print`
 
@@ -169,3 +186,4 @@ hand. Add `.atelier/` to your project's `.gitignore`. See
 - [Scripting](scripting.md) — the `node` tool
 - [MCP](mcp.md) — connecting external tool servers
 - [Review mode](review.md) — the parallel "subconscious" reviewer
+- [Sign in with ChatGPT](chatgpt.md) — `/login`/`/logout`, the Responses API backend
