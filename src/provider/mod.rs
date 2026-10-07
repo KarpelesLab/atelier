@@ -13,6 +13,8 @@
 //!
 //! Not yet: a non-streaming fallback.
 
+pub mod responses;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;

@@ -10,6 +10,7 @@ repository = "https://github.com/KarpelesLab/atelier"
 
 [dependencies]
 rsurl = "0.1.12"
+purecrypto = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tomlproc = { version = "0.1", features = ["serde"] }

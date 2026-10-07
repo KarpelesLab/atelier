@@ -5,6 +5,7 @@
 //! `src/tui`) takes over.
 
 mod agent;
+mod auth;
 mod config;
 mod context;
 mod headless;
@@ -51,6 +52,10 @@ fn main() -> Result<()> {
     let tools = tools::builtin_registry();
     let context = context::default_providers();
     let mut session = agent::Session::new(cfg, root, tools, context, settings);
+    // Restore a prior Sign-in-with-ChatGPT session, if any.
+    if let Some(tokens) = auth::load() {
+        session.use_chatgpt(tokens, None);
+    }
     if resume {
         let n = session.resume();
         eprintln!("resumed session ({n} message(s))");

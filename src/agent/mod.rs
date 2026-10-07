@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::auth;
 use crate::config::Config;
 use crate::context::{ContextItem, ContextProvider};
 use crate::mcp::{self, HttpServer, StdioServer};
@@ -43,6 +44,18 @@ const COMPACT_KEEP_RECENT: usize = 6;
 
 /// Don't bother compacting until the history has at least this many messages.
 const COMPACT_MIN_MESSAGES: usize = 10;
+
+/// OpenAI API base for the Sign-in-with-ChatGPT (Responses API) backend.
+const OPENAI_BASE: &str = "https://api.openai.com/v1";
+/// Default model when signed in with ChatGPT (override with `/model`).
+const DEFAULT_CHATGPT_MODEL: &str = "gpt-5";
+
+/// The ChatGPT-plan backend: OAuth tokens + the model to request via the
+/// Responses API. Present only while signed in (see `/login`).
+pub struct ChatgptBackend {
+    pub tokens: auth::Tokens,
+    pub model: String,
+}
 
 /// How the loop reports progress. Implemented by the TUI and by the plain REPL.
 pub trait Ui {
@@ -109,6 +122,8 @@ const HELP: &[&str] = &[
     "  /help                                 show this help",
     "  /models                               list models offered by the endpoint",
     "  /model [name]                         show or switch the active model",
+    "  /login                                sign in with ChatGPT (use your ChatGPT plan)",
+    "  /logout                               sign out of ChatGPT",
     "  /tools                                list available tools",
     "  /review [on|off]                      the parallel reviewer (\"subconscious\")",
     "  /config                               open the settings screen (full-screen in the TUI)",
@@ -159,12 +174,27 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         },
         "/mcp" => dispatch_mcp(session, &args, ui),
         "/model" => match args.first() {
-            None => ui.info(&format!("model: {}", session.config().model)),
+            None => ui.info(&format!("model: {}", session.backend_label())),
             Some(name) => {
                 session.set_model(name);
                 ui.info(&format!("model set to {name}"));
             }
         },
+        "/login" => {
+            ui.info("opening your browser to sign in with ChatGPT…");
+            match auth::login() {
+                Ok(tokens) => {
+                    session.use_chatgpt(tokens, None);
+                    ui.info("signed in — requests now use your ChatGPT plan (Responses API)");
+                }
+                Err(e) => ui.info(&format!("login failed: {e:#}")),
+            }
+        }
+        "/logout" => {
+            let _ = auth::logout();
+            session.logout_chatgpt();
+            ui.info("signed out — using the configured endpoint");
+        }
         "/tools" => {
             let names = session.tool_names();
             ui.info(&format!("{} tools available:", names.len()));
@@ -295,6 +325,8 @@ pub struct Session {
     review_enabled: bool,
     /// Pending background reviews; drained (non-blocking) between steps.
     reviews: Vec<std::sync::mpsc::Receiver<String>>,
+    /// When signed in with ChatGPT, requests go through the Responses backend.
+    chatgpt: Option<ChatgptBackend>,
     history: Vec<Message>,
     fstate: FileState,
 }
@@ -339,8 +371,28 @@ impl Session {
             compact_threshold,
             review_enabled,
             reviews: Vec::new(),
+            chatgpt: None,
             history: Vec::new(),
             fstate: FileState::new(),
+        }
+    }
+
+    /// Activate the ChatGPT (Responses API) backend with the given tokens.
+    pub fn use_chatgpt(&mut self, tokens: auth::Tokens, model: Option<String>) {
+        let model = model.unwrap_or_else(|| DEFAULT_CHATGPT_MODEL.to_string());
+        self.chatgpt = Some(ChatgptBackend { tokens, model });
+    }
+
+    /// Drop the ChatGPT backend (back to the configured chat/completions one).
+    pub fn logout_chatgpt(&mut self) {
+        self.chatgpt = None;
+    }
+
+    /// Short label for the active backend (for the status strip / `/config`).
+    pub fn backend_label(&self) -> String {
+        match &self.chatgpt {
+            Some(cg) => format!("chatgpt:{}", cg.model),
+            None => self.cfg.model.clone(),
         }
     }
 
@@ -396,9 +448,14 @@ impl Session {
         &self.cfg
     }
 
-    /// Switch the model used for subsequent requests (for `/model`).
+    /// Switch the model used for subsequent requests (for `/model`). Targets the
+    /// ChatGPT backend's model when signed in, otherwise the configured model.
     pub fn set_model(&mut self, name: &str) {
-        self.cfg.model = name.to_string();
+        if let Some(cg) = self.chatgpt.as_mut() {
+            cg.model = name.to_string();
+        } else {
+            self.cfg.model = name.to_string();
+        }
     }
 
     /// Names of all registered tools, sorted (for `/tools`).
@@ -595,11 +652,27 @@ impl Session {
             messages.extend(self.history.iter().cloned());
 
             let specs = self.tools.specs();
-            let completion: Completion =
+            // Route to the ChatGPT (Responses API) backend when signed in,
+            // otherwise the configured chat/completions endpoint.
+            let completion: Completion = if let Some(cg) = self.chatgpt.as_mut() {
+                let token = auth::access_token(&mut cg.tokens)?;
+                provider::responses::stream_responses(
+                    OPENAI_BASE,
+                    &token,
+                    &cg.model,
+                    &messages,
+                    &specs,
+                    |ev| match ev {
+                        StreamEvent::Reasoning(t) => ui.reasoning(t),
+                        StreamEvent::Content(t) => ui.content(t),
+                    },
+                )?
+            } else {
                 provider::stream_chat(&self.cfg, &messages, &specs, |ev| match ev {
                     StreamEvent::Reasoning(t) => ui.reasoning(t),
                     StreamEvent::Content(t) => ui.content(t),
-                })?;
+                })?
+            };
 
             if let Some(u) = &completion.usage {
                 self.usage_ctx = u.total_tokens;
@@ -1047,6 +1120,7 @@ fn config_summary(session: &Session) -> Vec<String> {
     let s = session.settings();
     let mut out = vec![
         "settings:".to_string(),
+        format!("  backend:        {}", session.backend_label()),
         format!("  model:          {}", session.config().model),
         format!("  auto-approve:   {}", session.auto_approve()),
         format!("  context limit:  {}", session.context_limit()),
