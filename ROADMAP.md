@@ -16,8 +16,12 @@ change as we build.
   line with a status strip (active model, cwd, token/cost counters). Assistant
   and tool output is *printed to the terminal scrollback and never redrawn*.
   No panes, no mouse, no alt-screen. What scrolls past is history.
-- **Bring-your-own API.** We target OpenAI-compatible endpoints only. No
-  Claude/ChatGPT subscription backends — their ToS forbids it. First-class
+- **Bring-your-own API.** We target OpenAI-compatible endpoints by default.
+  Subscription backends are only allowed where the vendor *sanctions* it: we do
+  **not** reach Claude/ChatGPT subscriptions through unofficial means (ToS), but
+  OpenAI's official **Sign in with ChatGPT** (SIWC) open-source OAuth is
+  supported (`/login`) — it runs on the user's own ChatGPT plan via the
+  Responses API. First-class
   target is our own server at `http://192.168.0.50:11400/v1` (currently serving
   `qwen3.8-unc:q4`, `qwen3-coder:30b`, `gpt-oss:120b`, `qwen3.8:27b`,
   `qwen3:0.6b`, …). **Default test/dev model: `qwen3.8-unc:q4`** — it is
@@ -292,6 +296,25 @@ opaque string. Verified live. A model-based pre-flight summary is a later add.
   alternate-screen editor in the TUI (model, auto-approve, context limit,
   review mode; save & exit, alt screen always restored); the REPL prints a text
   summary. Backed by `[defaults]`/`[review]` in `atelier.toml`.
+
+### M11 — Sign in with ChatGPT (SIWC) ✅ (pending live validation)
+
+OpenAI's sanctioned open-source OAuth, so a user can run on their **own ChatGPT
+plan** without an API key — a second, separately-sanctioned backend alongside
+bring-your-own-API.
+
+- ✅ **`auth`**: PKCE (S256) authorization-code flow — loopback `127.0.0.1/callback`
+  listener, browser open, token exchange + rotating refresh; tokens stored
+  `$XDG_CONFIG_HOME/atelier/chatgpt-auth.json` (0600), restored at startup.
+  Crypto via **purecrypto**.
+- ✅ **Responses API backend** (`provider::responses`): the ChatGPT-plan token is
+  only valid for `/v1/responses`, so this maps our `Message`/`ToolSpec`/
+  `Completion` onto the Responses request + typed `response.*` SSE events.
+- ✅ **Wiring**: `/login`/`/logout`; `send()` routes to Responses when signed in,
+  else chat/completions; `/model` + `/config` + status show the backend.
+- ⏳ **Live validation** needs a real ChatGPT account (the OAuth round-trip and
+  the available model ids can't be exercised from CI). Default model `gpt-5`,
+  changeable with `/model`.
 
 ---
 
