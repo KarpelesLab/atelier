@@ -345,7 +345,8 @@ servers, and per-turn context.
   `cargo test --test claude_live -- --ignored`.
 - ✅ **atelier's tools replace claude's** by default (`--disallowedTools`;
   `ATELIER_CLAUDE_BUILTINS=keep` opts out), with parity where claude's were
-  stronger: `read` does images, PDFs, notebooks and (approved) outside paths;
+  stronger: `read` does images, PDFs (pure-Rust `oxideav-pdf`), notebooks
+  and (approved) outside paths;
   `bash` background jobs + `bash_output`/`bash_kill` cover Monitor;
   `notebook_edit`; `web_fetch` converts HTML and pages. Tools are marked
   `anthropic/alwaysLoad` so claude doesn't defer them.

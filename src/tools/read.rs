@@ -2,13 +2,13 @@
 //!
 //! Beyond plain text it handles what a coding agent runs into: images are
 //! returned as images (the model sees them), PDFs as their extracted text
-//! (via poppler's `pdftotext`, page ranges supported), and Jupyter notebooks
+//! (pure Rust, via `oxideav-pdf`; page ranges supported), and Jupyter notebooks
 //! as rendered cells with their outputs. Reading outside the project is
 //! possible but needs approval ([`Tool::requires_approval_in`]) — e.g. a
 //! screenshot path the user pasted, or a temp file another tool wrote.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -194,31 +194,89 @@ fn read_image(resolved: &Path, path: &str, mime: &str) -> Result<ToolOutput> {
     })
 }
 
-/// Text of a PDF (or of `pages`, e.g. "3" or "2-5"), via `pdftotext`.
+/// Text of a PDF (or of `pages`, e.g. "3" or "2-5"), page by page.
+///
+/// `oxideav-pdf` yields positioned text runs; each page's runs are grouped
+/// into lines by baseline (top to bottom) and ordered left to right within
+/// a line. Runs on a line are concatenated as-is: producers put real space
+/// glyphs (or `TJ` gaps, which the extractor turns into spaces) between
+/// words, so adding separators would split words that span runs.
 fn pdf_text(resolved: &Path, pages: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("pdftotext");
-    cmd.arg("-layout");
-    if let Some(pages) = pages {
-        let (first, last) = parse_pages(pages)?;
-        cmd.args(["-f", &first.to_string(), "-l", &last.to_string()]);
+    let range = pages.map(parse_pages).transpose()?;
+    let bytes =
+        std::fs::read(resolved).with_context(|| format!("reading {}", resolved.display()))?;
+    let mut reader = oxideav_pdf::reader::DocumentReader::open(&bytes)
+        .map_err(|e| anyhow::anyhow!("not a readable PDF: {e}"))?;
+    let extraction = reader
+        .marked_text_extraction()
+        .map_err(|e| anyhow::anyhow!("extracting PDF text: {e}"))?;
+
+    let mut by_page: BTreeMap<u32, Vec<&oxideav_pdf::TextRun>> = BTreeMap::new();
+    for m in &extraction.runs {
+        let page = m.page_index + 1;
+        if range.is_none_or(|(first, last)| (first..=last).contains(&page)) {
+            by_page.entry(page).or_default().push(&m.run);
+        }
     }
-    let out = cmd.arg(resolved).arg("-").output().map_err(|e| {
-        anyhow::anyhow!(
-            "reading PDFs needs `pdftotext` (poppler-utils), which couldn't be run: {e}"
-        )
-    })?;
-    if !out.status.success() {
-        bail!(
-            "pdftotext failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+
+    let mut out = String::new();
+    for (page, runs) in by_page {
+        out.push_str(&format!("[page {page}]\n"));
+        for line in layout_lines(runs) {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
-    // Pages are separated by form feeds; make them visible.
-    let text = String::from_utf8_lossy(&out.stdout).replace('\x0c', "\n[page break]\n");
-    if text.trim().is_empty() {
+    if out.trim().is_empty() {
         return Ok("[no extractable text: the PDF may be scanned images]".to_string());
     }
-    Ok(text)
+    Ok(out)
+}
+
+/// A page's runs as text lines, in the order the page draws them — which
+/// is reading order for the producers that matter (and keeps columns
+/// apart), and doesn't depend on which way the page's y axis points (run
+/// positions don't include the page's transform, and many producers flip
+/// it). A run whose baseline differs from the current line's (by more than
+/// half the font size) starts a new line; runs within a line are ordered
+/// left to right.
+fn layout_lines(runs: Vec<&oxideav_pdf::TextRun>) -> Vec<String> {
+    let mut lines: Vec<(f32, Vec<&oxideav_pdf::TextRun>)> = Vec::new();
+    for run in runs {
+        let tolerance = (run.font_size.abs() * 0.5).max(1.0);
+        match lines.last_mut() {
+            Some((y, line)) if (*y - run.position.1).abs() <= tolerance => line.push(run),
+            _ => lines.push((run.position.1, vec![run])),
+        }
+    }
+    lines
+        .into_iter()
+        .filter_map(|(_, mut line)| {
+            line.sort_by(|a, b| a.position.0.total_cmp(&b.position.0));
+            let text: String = line.iter().map(|r| r.text.as_str()).collect();
+            let text = expand_ligatures(&text);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!text.is_empty()).then_some(text)
+        })
+        .collect()
+}
+
+/// Spell out typographic ligature glyphs (ﬁ → fi, …), so the text reads
+/// and searches like what it says.
+fn expand_ligatures(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// "3" -> (3, 3); "2-5" -> (2, 5).
@@ -488,10 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_pdf_text_when_pdftotext_exists() {
-        if Command::new("pdftotext").arg("-v").output().is_err() {
-            return; // poppler not installed here
-        }
+    fn reads_pdf_text() {
         // A one-page PDF saying "ZEBRA42".
         let stream = b"BT /F1 24 Tf 20 40 Td (ZEBRA42) Tj ET";
         let objs: Vec<Vec<u8>> = vec![
@@ -537,6 +592,45 @@ mod tests {
             approved: false,
         };
         let out = ReadTool.call(&mut ctx, json!({"path": "d.pdf"})).unwrap();
-        assert!(out.contains("ZEBRA42"), "{out}");
+        assert!(out.contains("[page 1]") && out.contains("ZEBRA42"), "{out}");
+        // A range past the last page: nothing to extract.
+        let out = ReadTool
+            .call(&mut ctx, json!({"path": "d.pdf", "pages": "2-3"}))
+            .unwrap();
+        assert!(!out.contains("ZEBRA42"), "{out}");
+        // Not a PDF at all.
+        std::fs::write(root.join("bad.pdf"), "nope").unwrap();
+        assert!(ReadTool.call(&mut ctx, json!({"path": "bad.pdf"})).is_err());
+    }
+
+    #[test]
+    fn pdf_runs_become_lines() {
+        let run = |text: &str, x: f32, y: f32| oxideav_pdf::TextRun {
+            text: text.into(),
+            position: (x, y),
+            font_name: "F1".into(),
+            font_size: 10.0,
+            render_mode: Default::default(),
+            text_rise: 0.0,
+        };
+        // Lines come out in drawing order whichever way y points (this page
+        // draws its first line at the larger y; a flipped one wouldn't);
+        // within a line, runs are ordered by x, with their own space glyphs
+        // (one baseline slightly jittered); blank lines are dropped.
+        let runs = [
+            run("e\u{FB00}ect", 40.0, 100.0),
+            run("ond ", 15.0, 100.0),
+            run("Sec", 0.0, 100.0),
+            run("Line", 0.0, 80.0),
+            run("ne", 25.0, 80.0),
+            run(" li", 20.0, 80.4),
+            run("d", 30.0, 80.0),
+            run("   ", 50.0, 60.0),
+            run("Third", 0.0, 120.0),
+        ];
+        assert_eq!(
+            layout_lines(runs.iter().collect()),
+            ["Second effect", "Line lined", "Third"]
+        );
     }
 }

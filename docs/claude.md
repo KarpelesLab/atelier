@@ -68,7 +68,7 @@ them; the system prompt tells claude which is which:
 
 | claude built-in | atelier replacement |
 |---|---|
-| `Read` | `read` — text, images, PDFs (`pdftotext`), notebooks; outside the project with approval |
+| `Read` | `read` — text, images, PDFs (text via `oxideav-pdf`), notebooks; outside the project with approval |
 | `Write`, `Edit`, `MultiEdit` | `write`, `edit`, `multiedit`, `apply_patch` |
 | `NotebookEdit` | `notebook_edit` |
 | `Bash` | `bash` (`background: true` for long-running commands) |

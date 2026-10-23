@@ -47,8 +47,10 @@ By file type:
 - **Images** (`png`, `jpg`/`jpeg`, `gif`, `webp`, up to ~3.75MB) come back as
   images the model sees (an MCP image result for claude; for an
   OpenAI-compatible endpoint, a follow-up user message carrying them).
-- **PDFs** come back as their text, via poppler's `pdftotext` (an error says
-  so if it isn't installed); page breaks are marked.
+- **PDFs** come back as their text, page by page (`[page N]`), extracted in
+  pure Rust by `oxideav-pdf`: lines in the order the page draws them,
+  ligatures spelled out. Scanned PDFs without a text layer have nothing to
+  extract.
 - **Notebooks** (`.ipynb`) come back rendered: each cell as
   `<cell N id="…" type=…>` with its source and outputs.
 - Anything else is read as UTF-8 text.
