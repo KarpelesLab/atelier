@@ -433,6 +433,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
         let mut ctx = ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = echo
             .call(&mut ctx, json!({"text": "hi"}))
@@ -446,6 +447,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
         let mut ctx = ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = boom
             .call(&mut ctx, json!({}))
@@ -468,6 +470,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
         let mut ctx = ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = read_resource
             .call(&mut ctx, json!({"uri": "file:///hello.txt"}))
@@ -491,6 +494,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
         let mut ctx = ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = get_prompt
             .call(

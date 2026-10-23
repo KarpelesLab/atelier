@@ -343,8 +343,12 @@ servers, and per-turn context.
   with the session's tools, read tracking and approval policy (claude allows
   `mcp__atelier` wholesale; atelier decides). Live-tested:
   `cargo test --test claude_live -- --ignored`.
-- ⏳ Optionally switch off claude's overlapping built-ins in favor of
-  atelier's.
+- ✅ **atelier's tools replace claude's** by default (`--disallowedTools`;
+  `ATELIER_CLAUDE_BUILTINS=keep` opts out), with parity where claude's were
+  stronger: `read` does images, PDFs, notebooks and (approved) outside paths;
+  `bash` background jobs + `bash_output`/`bash_kill` cover Monitor;
+  `notebook_edit`; `web_fetch` converts HTML and pages. Tools are marked
+  `anthropic/alwaysLoad` so claude doesn't defer them.
 - ⏳ Inject messages queued mid-turn into the running claude turn.
 
 ---

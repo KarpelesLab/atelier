@@ -90,6 +90,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = LsTool.call(&mut ctx, json!({})).unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -103,6 +104,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = LsTool.call(&mut ctx, json!({})).unwrap();
         assert_eq!(out, "(empty directory)");
@@ -115,6 +117,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(LsTool.call(&mut ctx, json!({"path": "nope"})).is_err());
     }
@@ -127,6 +130,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(LsTool.call(&mut ctx, json!({"path": "f.txt"})).is_err());
     }
@@ -138,6 +142,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(LsTool.call(&mut ctx, json!({"path": "../"})).is_err());
     }

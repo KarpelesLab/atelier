@@ -65,9 +65,54 @@ The user is talking to you through atelier, a terminal frontend. A user \
 message may begin with an <atelier-context> block that atelier gathered \
 automatically just before sending (git status, diff, project layout, build \
 diagnostics). Treat it as the current state of the project; the user did \
-not type it. atelier's own tools are available as `mcp__atelier__*` (file \
-tools confined to the project, with read-before-edit tracking; a sandboxed \
-`node` scripting tool; and more); use them where they fit.";
+not type it.";
+
+/// Added when atelier's tools are offered alongside claude's own.
+const TOOLS_ALONGSIDE: &str = "\
+atelier's own tools are available as `mcp__atelier__*` (file tools confined \
+to the project with read-before-edit tracking, a sandboxed `node` scripting \
+tool, and more); use them where they fit.";
+
+/// Added when atelier's tools replace claude's overlapping built-ins.
+const TOOLS_REPLACING: &str = "\
+In this session your built-in file, shell and fetch tools (Read, Write, \
+Edit, NotebookEdit, Bash, Monitor, WebFetch, …) are switched off; atelier's \
+tools (`mcp__atelier__*`) replace them, and run with atelier's own \
+approval policy. They take a `path` argument relative to the project root. \
+- `read` instead of Read: text with line numbers, images (you see them), \
+PDFs (`pages` for large ones), notebooks; files outside the project need \
+the user's approval. \
+- `write`, `edit`, `multiedit`, `apply_patch` (unified diff) instead of \
+Write/Edit; `notebook_edit` instead of NotebookEdit. Read a file before \
+editing it. \
+- `bash` instead of Bash. For long-running commands (servers, watchers, big \
+builds) pass `background: true`, then `bash_output` to read new output or \
+wait for it to finish or print a pattern (`wait_ms`, `until`) — instead of \
+Monitor — and `bash_kill` to stop it. \
+- `grep`, `glob`, `ls`, `tree` to search and explore; `web_fetch` instead \
+of WebFetch; `todo` for a task list; `node` for sandboxed JavaScript.";
+
+/// claude's built-ins that atelier's tools replace, switched off when those
+/// are offered (unless the user keeps them). Names from several claude
+/// versions; ones a given version lacks are ignored.
+const REPLACED_BUILTINS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "NotebookRead",
+    "Bash",
+    "BashOutput",
+    "KillBash",
+    "KillShell",
+    "Monitor",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "TodoWrite",
+];
 
 /// Delivered (preempting the running turn) when the user presses Ctrl-C.
 const STOP_MESSAGE: &str = "\
@@ -90,6 +135,9 @@ pub struct Launch<'a> {
     pub model: Option<&'a str>,
     /// Claude session to continue (`--resume`).
     pub resume: Option<&'a str>,
+    /// Keep claude's built-ins that overlap atelier's tools, instead of
+    /// switching them off.
+    pub keep_builtins: bool,
 }
 
 /// A running `claude` child speaking stream-json.
@@ -152,8 +200,13 @@ pub trait ToolHost {
     /// Skip every approval prompt (claude's permission requests included).
     fn auto_approve(&self) -> bool;
     /// Run tool `name` (asking approval if its policy says so), returning
-    /// `(result_text, ok)`.
-    fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (String, bool);
+    /// its output and whether it succeeded.
+    fn call(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        ui: &mut dyn Ui,
+    ) -> (crate::tools::ToolOutput, bool);
 }
 
 /// How atelier's tools appear in claude: `mcp__atelier__<tool>`.
@@ -181,8 +234,6 @@ impl Bridge {
             "--include-partial-messages",
             "--permission-prompt-tool",
             "stdio",
-            "--append-system-prompt",
-            APPEND_SYSTEM_PROMPT,
         ]);
         if let Some(m) = launch.model {
             cmd.args(["--model", m]);
@@ -209,7 +260,18 @@ impl Bridge {
             Some(h)
         };
         #[cfg(not(unix))]
-        let _ = tools;
+        let (host, _) = (None::<()>, tools);
+        // Only take claude's tools away when atelier's are there instead.
+        let replacing = host.is_some() && !launch.keep_builtins;
+        if replacing {
+            cmd.arg("--disallowedTools").args(REPLACED_BUILTINS);
+        }
+        let prompt = match (host.is_some(), replacing) {
+            (_, true) => format!("{APPEND_SYSTEM_PROMPT}\n\n{TOOLS_REPLACING}"),
+            (true, false) => format!("{APPEND_SYSTEM_PROMPT}\n\n{TOOLS_ALONGSIDE}"),
+            (false, _) => APPEND_SYSTEM_PROMPT.to_string(),
+        };
+        cmd.args(["--append-system-prompt", &prompt]);
         if let Some(cfg) = mcp {
             cmd.args(["--mcp-config", &cfg.to_string()]);
         }
@@ -556,7 +618,7 @@ impl Drop for Bridge {
 
 /// A random (v4-format) uuid, without pulling in a crate: std's per-instance
 /// random hasher keys, mixed with a counter and the clock.
-fn new_uuid() -> String {
+pub(crate) fn new_uuid() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1077,7 +1139,12 @@ mod tests {
         fn auto_approve(&self) -> bool {
             true
         }
-        fn call(&mut self, name: &str, _: Value, _: &mut dyn Ui) -> (String, bool) {
+        fn call(
+            &mut self,
+            name: &str,
+            _: Value,
+            _: &mut dyn Ui,
+        ) -> (crate::tools::ToolOutput, bool) {
             panic!("unexpected tool call: {name}")
         }
     }
@@ -1094,6 +1161,7 @@ mod tests {
             bin: "claude",
             model: Some("haiku"),
             resume: None,
+            keep_builtins: false,
         };
         let mut b = Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()).unwrap();
         let mut ui = LiveUi {

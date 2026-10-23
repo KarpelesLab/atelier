@@ -240,6 +240,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         NodeTool
             .call(&mut ctx, json!({ "code": code }))
@@ -332,6 +333,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
 
         let start = std::time::Instant::now();
@@ -367,6 +369,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let output = NodeTool
             .call(
@@ -399,6 +402,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let output = NodeTool
             .call(

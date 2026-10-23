@@ -6,7 +6,7 @@ model verbatim as the tool result.
 
 | Tool    | Approval | Confined to project root |
 |---------|----------|----------------------------|
-| `read`      | auto     | yes |
+| `read`      | auto; **required** outside the project | yes, unless approved |
 | `write`     | auto     | yes |
 | `edit`      | auto     | yes |
 | `multiedit` | auto     | yes |
@@ -16,7 +16,9 @@ model verbatim as the tool result.
 | `ls`        | auto     | yes |
 | `tree`      | auto     | yes |
 | `todo`      | auto     | yes |
+| `notebook_edit` | auto | yes |
 | `bash`      | **required** | no (arbitrary shell) |
+| `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
 | `web_fetch` | **required** | no (network) |
 | `node`      | auto, unless `network: true` (then required) | fs yes; network no |
 
@@ -35,13 +37,29 @@ per line).
 
 | Param    | Type    | Required | Meaning |
 |----------|---------|----------|---------|
-| `path`   | string  | yes      | File path, relative to the project root (or absolute within it) |
+| `path`   | string  | yes      | File path, relative to the project root (or absolute) |
 | `offset` | integer | no       | 1-based line to start from (default 1) |
 | `limit`  | integer | no       | Max lines to return (default: rest of file) |
+| `pages`  | string  | no       | PDF only: page range, e.g. `"3"` or `"1-5"` |
 
-Errors if the path is a directory or doesn't exist. **Every successful read
-records the file's full content in `FileState`**, which `edit` later checks
-for staleness.
+By file type:
+
+- **Images** (`png`, `jpg`/`jpeg`, `gif`, `webp`, up to ~3.75MB) come back as
+  images the model sees (an MCP image result for claude; for an
+  OpenAI-compatible endpoint, a follow-up user message carrying them).
+- **PDFs** come back as their text, via poppler's `pdftotext` (an error says
+  so if it isn't installed); page breaks are marked.
+- **Notebooks** (`.ipynb`) come back rendered: each cell as
+  `<cell N id="…" type=…>` with its source and outputs.
+- Anything else is read as UTF-8 text.
+
+**Outside the project**, `read` asks for approval first (a pasted screenshot
+path, a temp file another tool wrote); inside it, it never does.
+
+Errors if the path is a directory or doesn't exist. **Every successful text
+or notebook read records the file's full content in `FileState`**, which
+`edit`/`notebook_edit` later check for staleness. Like the other file tools,
+`read` also accepts `file_path` for `path`.
 
 ## `write`
 
@@ -121,6 +139,31 @@ either limit is hit. **`bash` is the one built-in tool that is not confined**
 [Permissions](permissions.md), including the risk-signal warnings shown
 alongside the prompt).
 
+With `background: true` (or `run_in_background: true`) the command starts as
+a **background job** instead and the call returns its id (`job-N`) at once —
+for servers, watchers, and long builds. Jobs run in their own process group
+and are stopped when atelier exits.
+
+## `bash_output`
+
+Read a background job's output since the last call, and its status — or
+wait on it.
+
+| Param     | Type    | Required | Meaning |
+|-----------|---------|----------|---------|
+| `id`      | string  | no       | The job (`job-N`). Omitted: with `wait_ms`/`until`, the latest job; otherwise list all jobs |
+| `wait_ms` | integer | no       | Block up to this long (max 600000) until the job exits… |
+| `until`   | string  | no       | …or its new output matches this regex |
+
+Returns `[job-N: running|exit status: … after Ns]` then the new output (its
+last 20,000 bytes if longer). This is how to wait for a build to finish or a
+server to print "listening".
+
+## `bash_kill`
+
+Stop a background job and everything it spawned (`TERM` to its process
+group, then `KILL` if it lingers). Param: `id`.
+
 ## `grep`
 
 Regex search over file contents, respecting `.gitignore` (via the `ignore`
@@ -188,7 +231,30 @@ approval** (network access, unconfined).
 | `url`    | string | yes      | `http(s)://` URL (redirects followed) |
 | `method` | string | no       | HTTP method (default `GET`) |
 
-Returns a `HTTP <status> <reason>` line then the body, truncated to ~20KB.
+| `offset` | integer | no | Character offset to start from (default 0) |
+| `max_chars` | integer | no | Characters to return (default 30000) |
+| `raw` | boolean | no | Return HTML as-is instead of converting it |
+
+Returns a `HTTP <status> <reason>` line then the body. **HTML is converted to
+readable text** — scripts, styles and markup dropped, headings as `#` lines,
+list items as `- `, links as `[text](url)`, entities decoded. A longer result
+says `[characters A-B of N]` and ends with how to fetch the next page.
+
+## `notebook_edit`
+
+Edit a Jupyter notebook cell. The notebook must have been `read` this session
+and be unchanged on disk since (like `edit`).
+
+| Param        | Type   | Required | Meaning |
+|--------------|--------|----------|---------|
+| `path`       | string | yes      | The `.ipynb` file |
+| `cell`       | string | for replace/delete | Cell id, or 0-based index (`cell_id` also accepted) |
+| `new_source` | string | for replace/insert | The cell's new source |
+| `cell_type`  | string | no       | `code` or `markdown` (insert default `code`) |
+| `edit_mode`  | string | no       | `replace` (default), `insert` (after `cell`, or at the top), or `delete` |
+
+Replacing a code cell's source clears its stale outputs and execution count.
+The file is written as Jupyter writes it (sorted keys, one-space indent).
 
 ## `apply_patch`
 

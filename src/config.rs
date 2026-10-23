@@ -25,6 +25,9 @@ pub enum Backend {
         bin: String,
         /// `--model` to pass, if the user chose one.
         model: Option<String>,
+        /// Keep claude's built-in tools that overlap atelier's (by default
+        /// they're switched off in favor of atelier's).
+        keep_builtins: bool,
     },
 }
 
@@ -52,6 +55,8 @@ impl Config {
     /// - `ATELIER_API_KEY`    — bearer token (optional)
     /// - `ATELIER_CLAUDE_BIN` — Claude Code executable (default
     ///   [`DEFAULT_CLAUDE_BIN`])
+    /// - `ATELIER_CLAUDE_BUILTINS` — `keep` to leave claude's own file/shell/
+    ///   fetch tools enabled next to atelier's (default: switched off)
     pub fn from_env(claude: bool) -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         let base_url = env("ATELIER_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
@@ -65,6 +70,10 @@ impl Config {
                 Backend::Claude {
                     bin,
                     model: model_env,
+                    keep_builtins: matches!(
+                        env("ATELIER_CLAUDE_BUILTINS").as_deref(),
+                        Some("keep" | "on" | "1" | "yes")
+                    ),
                 },
                 label,
             )

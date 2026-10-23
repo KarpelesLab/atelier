@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct EditTool;
 
@@ -51,10 +51,7 @@ impl Tool for EditTool {
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("missing required argument 'path'"))?;
+        let path = path_arg(&args)?;
         let old_string = args
             .get("old_string")
             .and_then(Value::as_str)
@@ -138,6 +135,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = EditTool
             .call(
@@ -160,6 +158,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = EditTool
             .call(
@@ -180,6 +179,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         EditTool
             .call(
@@ -200,6 +200,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = EditTool
             .call(
@@ -220,6 +221,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         EditTool
             .call(
@@ -240,6 +242,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = EditTool
             .call(
@@ -248,5 +251,26 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn accepts_file_path_alias() {
+        let root = tempdir("edit-alias");
+        let file = root.join("f.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut fstate = FileState::new();
+        fstate.record(&file, "hello world");
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        EditTool
+            .call(
+                &mut ctx,
+                json!({"file_path": "f.txt", "old_string": "world", "new_string": "there"}),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello there");
     }
 }

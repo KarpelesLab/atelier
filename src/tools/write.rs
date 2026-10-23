@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct WriteTool;
 
@@ -41,10 +41,7 @@ impl Tool for WriteTool {
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("missing required argument 'path'"))?;
+        let path = path_arg(&args)?;
         let content = args
             .get("content")
             .and_then(Value::as_str)
@@ -90,6 +87,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = WriteTool
             .call(&mut ctx, json!({"path": "a/b/f.txt", "content": "hello"}))
@@ -110,6 +108,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         WriteTool
             .call(&mut ctx, json!({"path": "f.txt", "content": "new"}))
@@ -124,6 +123,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(
             WriteTool

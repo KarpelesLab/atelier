@@ -30,12 +30,13 @@ use serde_json::Value;
 pub use crate::provider::ToolSpec;
 
 mod apply_patch;
-mod bash;
+pub mod bash;
 mod edit;
 mod glob;
 mod grep;
 mod ls;
 mod multiedit;
+mod notebook;
 mod read;
 mod todo;
 mod tree;
@@ -48,6 +49,11 @@ pub struct ToolCtx<'a> {
     pub project_root: &'a Path,
     /// Read-state tracker, shared across a session.
     pub fstate: &'a mut FileState,
+    /// This call went through approval (the user said yes, or policy allows
+    /// it). A tool whose [`Tool::requires_approval_in`] asks for approval only
+    /// in some cases — `read` outside the project — checks this before doing
+    /// the unconfined thing, so calling it directly can't skip the prompt.
+    pub approved: bool,
 }
 
 impl ToolCtx<'_> {
@@ -75,6 +81,68 @@ pub fn confine(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+/// The `path` argument, also accepting the names Claude models are used to
+/// (`file_path`, `notebook_path`) so a habitual call still lands.
+pub fn path_arg(args: &Value) -> Result<&str> {
+    ["path", "file_path", "notebook_path"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(Value::as_str))
+        .ok_or_else(|| anyhow::anyhow!("missing required argument 'path'"))
+}
+
+/// What a tool call produced: text for the model, plus any images it should
+/// see (e.g. `read` on a picture).
+#[derive(Debug, Default)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<ToolImage>,
+}
+
+/// An image in a tool result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolImage {
+    /// e.g. `image/png`.
+    pub mime: String,
+    /// Base64 (standard alphabet, padded).
+    pub data: String,
+}
+
+impl ToolOutput {
+    pub fn text(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// Standard base64 (padded, no line breaks).
+pub fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// A callable tool.
 pub trait Tool: Send + Sync {
     /// Unique tool name (what the model calls).
@@ -91,10 +159,21 @@ pub trait Tool: Send + Sync {
     fn requires_approval(&self, _args: &Value) -> bool {
         true
     }
+    /// [`requires_approval`](Tool::requires_approval) with the project root
+    /// known, for tools whose answer depends on where a path points. This is
+    /// what the agent consults; the default defers to `requires_approval`.
+    fn requires_approval_in(&self, args: &Value, _root: &Path) -> bool {
+        self.requires_approval(args)
+    }
     /// Execute with parsed JSON `args`. The returned string is fed back to the
     /// model as the tool result; return `Err` for a failure the model should
     /// see (it is rendered as an error result, not a crash).
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String>;
+    /// [`call`](Tool::call), for tools that can also return images. The
+    /// agent uses this; the default wraps `call`'s text.
+    fn call_output(&self, ctx: &mut ToolCtx, args: Value) -> Result<ToolOutput> {
+        self.call(ctx, args).map(ToolOutput::text)
+    }
 }
 
 /// The set of tools available to a session.
@@ -145,6 +224,9 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(multiedit::MultiEditTool));
     reg.register(Box::new(apply_patch::ApplyPatchTool));
     reg.register(Box::new(bash::BashTool));
+    reg.register(Box::new(bash::BashOutputTool));
+    reg.register(Box::new(bash::BashKillTool));
+    reg.register(Box::new(notebook::NotebookEditTool));
     reg.register(Box::new(web_fetch::WebFetchTool));
     reg.register(Box::new(grep::GrepTool));
     reg.register(Box::new(glob::GlobTool));

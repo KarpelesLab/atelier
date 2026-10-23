@@ -24,7 +24,7 @@ use crate::context::{ContextItem, ContextProvider};
 use crate::mcp::{self, HttpServer, StdioServer};
 use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
-use crate::tools::{FileState, ToolCtx, ToolRegistry};
+use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 
 const SYSTEM_PROMPT: &str = "\
 You are atelier, an AI coding assistant operating inside a project directory. \
@@ -884,6 +884,10 @@ impl Session {
             }
 
             let mut stopped = false;
+            // Images tools returned (e.g. `read` on a picture). Chat
+            // completions tool results are text, so they follow as a user
+            // message once every call has its result.
+            let mut images: Vec<String> = Vec::new();
             for call in &completion.tool_calls {
                 // Once stopped, the remaining calls still need a result each
                 // to keep the history well-formed; they just don't run.
@@ -902,10 +906,21 @@ impl Session {
                     continue;
                 }
                 ui.tool_start(&call.name, &call.arguments);
-                let (result, ok) = self.runner().exec_json(&call.name, &call.arguments);
-                ui.tool_end(&call.name, &result, ok);
+                let (out, ok) = self.runner().exec_json(&call.name, &call.arguments);
+                ui.tool_end(&call.name, &out.text, ok);
+                images.extend(
+                    out.images
+                        .iter()
+                        .map(|i| format!("data:{};base64,{}", i.mime, i.data)),
+                );
                 self.history
-                    .push(Message::tool_result(call.id.clone(), result));
+                    .push(Message::tool_result(call.id.clone(), out.text));
+            }
+            if !images.is_empty() {
+                self.history.push(Message::user_with_images(
+                    "[images returned by the tool calls above]",
+                    images,
+                ));
             }
             if stopped || ui.interrupted() {
                 return self.end_turn(ui);
@@ -1012,13 +1027,19 @@ impl Session {
             }
         }
         if self.claude.is_none() {
-            let Backend::Claude { bin, model } = &self.cfg.backend else {
+            let Backend::Claude {
+                bin,
+                model,
+                keep_builtins,
+            } = &self.cfg.backend
+            else {
                 unreachable!("send_claude without the Claude backend");
             };
             let launch = claude::Launch {
                 bin,
                 model: model.as_deref(),
                 resume: self.claude_session.as_deref(),
+                keep_builtins: *keep_builtins,
             };
             self.claude = Some(Bridge::spawn(
                 &launch,
@@ -1183,7 +1204,7 @@ impl ToolRunner<'_> {
         let needs = self
             .tools
             .get(name)
-            .is_some_and(|t| t.requires_approval(&args));
+            .is_some_and(|t| t.requires_approval_in(&args, self.root));
         if !needs {
             return true;
         }
@@ -1205,30 +1226,38 @@ impl ToolRunner<'_> {
     }
 
     /// Execute a call whose arguments are a JSON string (as models send).
-    fn exec_json(&mut self, name: &str, arguments: &str) -> (String, bool) {
+    fn exec_json(&mut self, name: &str, arguments: &str) -> (ToolOutput, bool) {
         let args = if arguments.trim().is_empty() {
             Value::Null
         } else {
             match serde_json::from_str(arguments) {
                 Ok(v) => v,
-                Err(e) => return (format!("error: invalid arguments JSON: {e}"), false),
+                Err(e) => {
+                    let msg = format!("error: invalid arguments JSON: {e}");
+                    return (ToolOutput::text(msg), false);
+                }
             }
         };
         self.exec(name, args)
     }
 
-    /// Execute a call, returning `(result_text, ok)`.
-    fn exec(&mut self, name: &str, args: Value) -> (String, bool) {
+    /// Execute a call that has passed [`approve`](Self::approve), returning
+    /// its output and whether it succeeded.
+    fn exec(&mut self, name: &str, args: Value) -> (ToolOutput, bool) {
         let Some(tool) = self.tools.get(name) else {
-            return (format!("error: unknown tool '{name}'"), false);
+            return (
+                ToolOutput::text(format!("error: unknown tool '{name}'")),
+                false,
+            );
         };
         let mut ctx = ToolCtx {
             project_root: self.root,
             fstate: self.fstate,
+            approved: true,
         };
-        match tool.call(&mut ctx, args) {
-            Ok(s) => (s, true),
-            Err(e) => (format!("error: {e:#}"), false),
+        match tool.call_output(&mut ctx, args) {
+            Ok(out) => (out, true),
+            Err(e) => (ToolOutput::text(format!("error: {e:#}")), false),
         }
     }
 }
@@ -1238,9 +1267,9 @@ impl claude::ToolHost for ToolRunner<'_> {
         self.auto_approve
     }
 
-    fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (String, bool) {
+    fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
         if !self.approve(name, &arguments.to_string(), ui) {
-            return (DENIED.to_string(), false);
+            return (ToolOutput::text(DENIED.to_string()), false);
         }
         self.exec(name, arguments)
     }
@@ -1307,34 +1336,6 @@ fn image_mime(path: &str) -> &'static str {
         Some("bmp") => "image/bmp",
         _ => "image/png",
     }
-}
-
-/// Standard base64 encoding (no line breaks). Small hand-rolled encoder to avoid
-/// a dependency, used for `data:` image URLs.
-fn base64_encode(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(T[((n >> 18) & 63) as usize] as char);
-        out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            T[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 fn to_stdio(cfg: &McpServerConfig) -> StdioServer {

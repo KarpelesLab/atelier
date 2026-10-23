@@ -84,15 +84,19 @@ fn main() -> Result<()> {
             Some(p) => p,
             None => headless::read_stdin_prompt()?,
         };
-        return headless::run(session, &prompt);
+        return finish(headless::run(session, &prompt));
     }
 
     #[cfg(feature = "tui")]
-    {
-        tui::run(session)
-    }
+    let result = tui::run(session);
     #[cfg(not(feature = "tui"))]
-    {
-        agent::repl(session)
-    }
+    let result = agent::repl(session);
+    finish(result)
+}
+
+/// On the way out: stop the `bash` tool's background jobs, which would
+/// otherwise outlive atelier.
+fn finish(result: Result<()>) -> Result<()> {
+    tools::bash::kill_all();
+    result
 }

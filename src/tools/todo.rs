@@ -218,6 +218,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         TodoTool.call(&mut ctx, args).unwrap()
     }
@@ -256,6 +257,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(
             TodoTool
@@ -292,6 +294,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = TodoTool.call(&mut ctx, json!({"action": "list"})).unwrap();
         assert!(out.contains("persisted"));
@@ -320,6 +323,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(TodoTool.call(&mut ctx, json!({})).is_err());
     }
@@ -331,6 +335,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(TodoTool.call(&mut ctx, json!({"action": "bogus"})).is_err());
     }

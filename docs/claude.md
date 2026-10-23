@@ -43,10 +43,11 @@ atelier only keeps the session id in `.atelier/claude-session`).
 **What atelier adds:**
 
 - **The interface.** Same TUI/REPL/`--print` as the OpenAI backend.
-- **Its own tools.** atelier's built-in tools (project-confined file tools
-  with read-before-edit tracking, `apply_patch`, the sandboxed `node`
-  runtime, `bash`, …) are offered to claude as the `mcp__atelier__*` MCP
-  server, alongside claude's own. They run *in the atelier process*, with its
+- **Its own tools, in place of claude's.** atelier's built-in tools
+  (project-confined file tools with read-before-edit tracking,
+  `apply_patch`, the sandboxed `node` runtime, `bash`, …) are offered to
+  claude as the `mcp__atelier__*` MCP server, and **claude's overlapping
+  built-ins are switched off** (see [Tools](#tools)). They run *in the atelier process*, with its
   approval policy: confined tools run without asking, `bash` and other
   unconfined tools ask through atelier's prompt (claude is told to allow the
   server wholesale, so nothing is asked twice). They show under their atelier
@@ -58,6 +59,33 @@ atelier only keeps the session id in `.atelier/claude-session`).
 - **Per-turn context.** atelier's context providers (git status, diff,
   layout, diagnostics) are prepended to each message in an
   `<atelier-context>` block, deduplicated across turns.
+
+## Tools
+
+If you're using atelier you expect atelier's tools, so by default claude's
+own versions are switched off (`--disallowedTools`) and atelier's replace
+them; the system prompt tells claude which is which:
+
+| claude built-in | atelier replacement |
+|---|---|
+| `Read` | `read` — text, images, PDFs (`pdftotext`), notebooks; outside the project with approval |
+| `Write`, `Edit`, `MultiEdit` | `write`, `edit`, `multiedit`, `apply_patch` |
+| `NotebookEdit` | `notebook_edit` |
+| `Bash` | `bash` (`background: true` for long-running commands) |
+| `Monitor`, `BashOutput`, `KillShell` | `bash_output` (`wait_ms`, `until`), `bash_kill` |
+| `Glob`, `Grep`, `LS` | `glob`, `grep`, `ls`, `tree` |
+| `WebFetch` | `web_fetch` (HTML → text, paged) |
+| `TodoWrite` | `todo` |
+
+Everything without an atelier counterpart stays: subagents (`Agent`/`Task`),
+`WebSearch`, `LSP`, `AskUserQuestion`, plan mode, skills, worktrees, cron, …
+Subagents get the same set (atelier's tools included). atelier's tools are
+marked to load up front (`anthropic/alwaysLoad`), not deferred behind
+`ToolSearch`.
+
+`ATELIER_CLAUDE_BUILTINS=keep` leaves claude's built-ins on, next to
+atelier's. If atelier's tools can't be offered (no Unix sockets, or an MCP
+server already named `atelier`), claude's are never switched off.
 
 ## How atelier's tools reach claude
 
@@ -101,7 +129,8 @@ Ctrl-C). So atelier never sends a plain interrupt:
 
 `cargo test live_stop -- --ignored` checks the Ctrl-C property against the
 real CLI, and `cargo test --test claude_live -- --ignored` checks atelier's
-tools through the relay (both run a few cheap Haiku turns on your account).
+tools through the relay and as replacements — reading, images, background
+jobs, approval policy (both run a few cheap Haiku turns on your account).
 
 ## Permissions
 
@@ -113,10 +142,9 @@ without it, requests are denied (nobody is there to answer).
 
 ## Limitations (for now)
 
-- claude's own overlapping built-ins (`Read`, `Edit`, `Bash`, …) stay
-  enabled next to atelier's; nothing yet switches them off.
-- claude loads MCP tools on demand (`ToolSearch`), so it tends to reach for
-  its built-ins first unless asked.
+- atelier's tools can't push notifications into claude's turn, so a
+  background job is waited on with `bash_output` rather than reporting in by
+  itself the way claude's own background shells do.
 - Messages typed mid-turn are sent as the next prompt after the turn ends,
   not injected into the running turn.
 - Ctrl-C while claude is still on a *queued* message (behind a turn it

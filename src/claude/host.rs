@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use super::Incoming;
 use crate::provider::ToolSpec;
+use crate::tools::ToolOutput;
 
 /// The MCP server name; claude exposes the tools as `mcp__atelier__<tool>`.
 pub const SERVER_NAME: &str = "atelier";
@@ -40,8 +41,8 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 pub struct ToolRequest {
     pub name: String,
     pub arguments: Value,
-    /// `(result_text, ok)`.
-    pub reply: Sender<(String, bool)>,
+    /// The output, and whether the call succeeded.
+    pub reply: Sender<(ToolOutput, bool)>,
 }
 
 /// The socket end of the relay, owned by the bridge. Dropping it removes the
@@ -121,11 +122,12 @@ fn serve(
                 arguments,
                 reply: tx,
             };
+            let failed = |msg: &str| (ToolOutput::text(msg.to_string()), false);
             if calls.send(Incoming::Call(req)).is_err() {
-                return ("error: atelier is shutting down".to_string(), false);
+                return failed("error: atelier is shutting down");
             }
             rx.recv()
-                .unwrap_or_else(|_| ("error: atelier dropped the call".to_string(), false))
+                .unwrap_or_else(|_| failed("error: atelier dropped the call"))
         });
         if let Some(reply) = reply {
             writeln!(out, "{reply}")?;
@@ -136,11 +138,11 @@ fn serve(
 }
 
 /// Answer one MCP JSON-RPC message; `None` for notifications. Tool calls go
-/// through `call(name, arguments) -> (text, ok)`.
+/// through `call(name, arguments) -> (output, ok)`.
 fn handle(
     msg: &Value,
     specs: &[ToolSpec],
-    call: impl FnOnce(&str, Value) -> (String, bool),
+    call: impl FnOnce(&str, Value) -> (ToolOutput, bool),
 ) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let params = &msg["params"];
@@ -151,11 +153,14 @@ fn handle(
             "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
         }),
         "ping" => json!({}),
+        // `alwaysLoad`: claude otherwise defers MCP tools behind a search
+        // step, and these replace its everyday built-ins.
         "tools/list" => json!({
             "tools": specs.iter().map(|s| json!({
                 "name": s.name,
                 "description": s.description,
                 "inputSchema": s.parameters,
+                "_meta": { "anthropic/alwaysLoad": true },
             })).collect::<Vec<_>>(),
         }),
         "tools/call" => {
@@ -166,11 +171,14 @@ fn handle(
                 Value::Null => json!({}),
                 a => a.clone(),
             };
-            let (text, ok) = call(name, arguments);
-            json!({
-                "content": [{ "type": "text", "text": text }],
-                "isError": !ok,
-            })
+            let (out, ok) = call(name, arguments);
+            let mut content = vec![json!({ "type": "text", "text": out.text })];
+            content.extend(
+                out.images
+                    .iter()
+                    .map(|i| json!({ "type": "image", "data": i.data, "mimeType": i.mime })),
+            );
+            json!({ "content": content, "isError": !ok })
         }
         other => return Some(error(id, -32601, &format!("method not found: {other}"))),
     };
@@ -212,7 +220,7 @@ mod tests {
         }]
     }
 
-    fn no_call(_: &str, _: Value) -> (String, bool) {
+    fn no_call(_: &str, _: Value) -> (ToolOutput, bool) {
         panic!("unexpected tool call")
     }
 
@@ -243,6 +251,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "read");
         assert_eq!(tools[0]["inputSchema"]["type"], "object");
+        assert_eq!(tools[0]["_meta"]["anthropic/alwaysLoad"], true);
     }
 
     #[test]
@@ -252,13 +261,16 @@ mod tests {
         let r = handle(&call, &specs(), |name, args| {
             assert_eq!(name, "read");
             assert_eq!(args, json!({"path": "a"}));
-            ("contents".into(), true)
+            (ToolOutput::text("contents".into()), true)
         })
         .unwrap();
         assert_eq!(r["result"]["content"][0]["text"], "contents");
         assert_eq!(r["result"]["isError"], false);
 
-        let r = handle(&call, &specs(), |_, _| ("error: nope".into(), false)).unwrap();
+        let r = handle(&call, &specs(), |_, _| {
+            (ToolOutput::text("error: nope".into()), false)
+        })
+        .unwrap();
         assert_eq!(r["result"]["isError"], true);
 
         // Missing arguments become an empty object.
@@ -266,8 +278,25 @@ mod tests {
                           "params": {"name": "read"}});
         handle(&bare, &specs(), |_, args| {
             assert_eq!(args, json!({}));
-            (String::new(), true)
+            (ToolOutput::default(), true)
         });
+
+        // Images ride along as MCP image content.
+        let r = handle(&call, &specs(), |_, _| {
+            let out = ToolOutput {
+                text: "[image]".into(),
+                images: vec![crate::tools::ToolImage {
+                    mime: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            };
+            (out, true)
+        })
+        .unwrap();
+        assert_eq!(
+            r["result"]["content"][1],
+            json!({"type": "image", "data": "AAAA", "mimeType": "image/png"})
+        );
     }
 
     #[test]
@@ -291,7 +320,9 @@ mod tests {
         std::thread::spawn(move || {
             for inc in rx {
                 if let Incoming::Call(req) = inc {
-                    let _ = req.reply.send((format!("ran {}", req.name), true));
+                    let _ = req
+                        .reply
+                        .send((ToolOutput::text(format!("ran {}", req.name)), true));
                 }
             }
         });

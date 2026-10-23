@@ -540,6 +540,7 @@ mod tests {
         let mut ctx = crate::tools::ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = echo
             .call(&mut ctx, json!({"text": "hi"}))
@@ -559,6 +560,7 @@ mod tests {
         let mut ctx = crate::tools::ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = read_resource
             .call(&mut ctx, json!({"uri": "file:///hello.txt"}))
@@ -573,6 +575,7 @@ mod tests {
         let mut ctx = crate::tools::ToolCtx {
             project_root: root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = get_prompt
             .call(

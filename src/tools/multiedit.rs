@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct MultiEditTool;
 
@@ -103,10 +103,7 @@ impl Tool for MultiEditTool {
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("missing required argument 'path'"))?;
+        let path = path_arg(&args)?;
         let edits = args
             .get("edits")
             .and_then(Value::as_array)
@@ -203,6 +200,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = MultiEditTool
             .call(
@@ -225,6 +223,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = MultiEditTool
             .call(
@@ -245,6 +244,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = MultiEditTool
             .call(&mut ctx, json!({"path": "f.txt", "edits": []}))
@@ -264,6 +264,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let result = MultiEditTool
             .call(
@@ -289,6 +290,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         MultiEditTool
             .call(
@@ -312,6 +314,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = MultiEditTool
             .call(
@@ -338,6 +341,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         MultiEditTool
             .call(
@@ -360,6 +364,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let err = MultiEditTool
             .call(

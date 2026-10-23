@@ -141,6 +141,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = TreeTool.call(&mut ctx, json!({})).unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -160,6 +161,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = TreeTool.call(&mut ctx, json!({"depth": 1})).unwrap();
         assert!(out.contains("a/"));
@@ -177,6 +179,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = TreeTool.call(&mut ctx, json!({})).unwrap();
         assert!(out.contains("kept.txt"));
@@ -190,6 +193,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(TreeTool.call(&mut ctx, json!({"path": "nope"})).is_err());
     }
@@ -202,6 +206,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(TreeTool.call(&mut ctx, json!({"path": "f.txt"})).is_err());
     }
@@ -213,6 +218,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         assert!(TreeTool.call(&mut ctx, json!({"path": "../"})).is_err());
     }

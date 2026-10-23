@@ -575,6 +575,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- a/f.txt
@@ -608,6 +609,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- a/a.txt
@@ -636,6 +638,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- /dev/null
@@ -664,6 +667,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- a/old.txt
@@ -689,6 +693,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         // The @@ line numbers are wildly wrong, but the context is unique.
         let patch = "\
@@ -719,6 +724,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         // file1's hunk is valid; file2's context does not exist -> whole call aborts.
         let patch = "\
@@ -753,6 +759,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- a/f.txt
@@ -781,6 +788,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- a/f.txt
@@ -803,6 +811,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let patch = "\
 --- /dev/null

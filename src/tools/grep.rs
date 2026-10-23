@@ -146,6 +146,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = GrepTool
             .call(&mut ctx, json!({"pattern": "hello"}))
@@ -164,6 +165,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = GrepTool
             .call(&mut ctx, json!({"pattern": "needle", "glob": "*.rs"}))
@@ -180,6 +182,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = GrepTool.call(&mut ctx, json!({"pattern": "zzz"})).unwrap();
         assert_eq!(out, "no matches found");

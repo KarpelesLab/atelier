@@ -124,6 +124,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = GlobTool
             .call(&mut ctx, json!({"pattern": "**/*.rs"}))
@@ -140,6 +141,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = GlobTool.call(&mut ctx, json!({"pattern": "*.rs"})).unwrap();
         assert_eq!(out, "no files matched");
@@ -154,6 +156,7 @@ mod tests {
         let mut ctx = ToolCtx {
             project_root: &root,
             fstate: &mut fstate,
+            approved: false,
         };
         let out = GlobTool.call(&mut ctx, json!({"pattern": "*.rs"})).unwrap();
         let lines: Vec<&str> = out.lines().collect();
