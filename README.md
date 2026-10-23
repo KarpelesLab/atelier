@@ -16,6 +16,9 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   a separate backend over the Responses API, distinct from the
   bring-your-own-API default above. See
   [docs/chatgpt.md](docs/chatgpt.md).
+- **Or front your Claude Code.** `--claude` makes atelier a frontend for your
+  own installed Claude Code CLI: the unmodified `claude` binary does its own
+  auth and model calls. See [docs/claude.md](docs/claude.md).
 - **Minimal, append-only interface.** One input line plus a status strip;
   everything else prints to the terminal scrollback and is never redrawn.
 - **Project-scoped.** Launched inside a project directory; tools, context, and
@@ -63,6 +66,7 @@ first conversation, the REPL/TUI fallback).
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` |
 | [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |
+| [Claude backend](docs/claude.md) | `--claude`: driving your Claude Code CLI from atelier |
 
 ## Layout
 
@@ -74,6 +78,7 @@ src/
 ├─ session.rs     on-disk session persistence (.atelier/session.json)
 ├─ headless.rs    --print: one-shot non-interactive mode
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls, vision
+├─ claude/        Claude backend: drives the `claude` CLI over stream-json
 ├─ agent/         agent loop, conversation state, turn orchestration, compaction
 ├─ tools/         built-in tools + registry (read/write/edit/multiedit/bash/…)
 ├─ js/            the `node` tool: mediated JS runtime (fs, console, network)

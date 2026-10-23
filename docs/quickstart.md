@@ -136,10 +136,11 @@ agent loop:
   without waiting for the turn to end. Queued messages are handed to the
   model at its next step — between tool calls — or, if the turn has already
   ended, sent as the next turn; queued slash commands run once the turn is
-  over, in order, exactly as if just typed. Note there is no way to cancel a
-  turn already in flight — Ctrl-C never interrupts the model mid-response,
-  it only clears the current (unsent) input, or — on an empty input while a
-  turn runs — drops whatever is queued so far.
+  over, in order, exactly as if just typed. While working, each Ctrl-C does
+  one thing: clear the input if it has text, else drop queued messages if
+  any, else **stop the turn** (at the next streamed chunk or between tool
+  calls; with the [Claude backend](claude.md), background agents keep
+  running).
 - **Plain REPL** (`src/agent::repl`) — reads lines from stdin with a `›`
   prompt and prints straight to stdout, no raw mode, no redraw. Used for
   headless/scripted runs.

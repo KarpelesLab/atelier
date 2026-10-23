@@ -15,6 +15,10 @@ use crate::provider::Message;
 /// Session file, relative to the project root.
 pub const SESSION_FILE: &str = ".atelier/session.json";
 
+/// Claude backend: the id of the Claude Code session to `--resume`. The
+/// conversation itself lives in Claude Code's own store.
+pub const CLAUDE_SESSION_FILE: &str = ".atelier/claude-session";
+
 /// A restored session: the compaction summary (if any) and the recent history.
 #[derive(Default)]
 pub struct SessionData {
@@ -76,14 +80,32 @@ pub fn save(root: &Path, summary: Option<&str>, messages: &[Message]) -> Result<
     std::fs::write(&p, text).with_context(|| format!("writing {}", p.display()))
 }
 
-/// Delete the saved session, if any.
+/// Delete the saved session (both backends), if any.
 pub fn clear(root: &Path) -> Result<()> {
-    let p = path(root);
-    match std::fs::remove_file(&p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("removing {}", p.display())),
+    for p in [path(root), root.join(CLAUDE_SESSION_FILE)] {
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
+        }
     }
+    Ok(())
+}
+
+/// The saved Claude session id, if any.
+pub fn load_claude(root: &Path) -> Option<String> {
+    let id = std::fs::read_to_string(root.join(CLAUDE_SESSION_FILE)).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Remember the Claude session id for `--continue`.
+pub fn save_claude(root: &Path, id: &str) -> Result<()> {
+    let p = root.join(CLAUDE_SESSION_FILE);
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&p, id).with_context(|| format!("writing {}", p.display()))
 }
 
 #[cfg(test)]

@@ -36,7 +36,10 @@ pub fn review(cfg: &Config, model: Option<&str>, excerpt: &str) -> Option<String
         Message::user(excerpt),
     ];
 
-    let completion = provider::stream_chat(&cfg_for_review, &messages, &[], |_ev| {}).ok()?;
+    let completion = provider::stream_chat(&cfg_for_review, &messages, &[], |_ev| {
+        std::ops::ControlFlow::Continue(())
+    })
+    .ok()?;
     note_from_reply(&completion.content)
 }
 

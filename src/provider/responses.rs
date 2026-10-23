@@ -46,6 +46,7 @@
 //! blocking `Read` + status to drive the SSE line-by-line.
 
 use std::io::{BufRead, BufReader};
+use std::ops::ControlFlow;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -70,7 +71,7 @@ pub fn stream_responses(
     model: &str,
     messages: &[Message],
     tools: &[ToolSpec],
-    mut on_event: impl FnMut(StreamEvent),
+    mut on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
 ) -> Result<Completion> {
     let body = build_body(model, messages, tools);
     let body_bytes = serde_json::to_vec(&body)?;
@@ -115,7 +116,18 @@ pub fn stream_responses(
         let Ok(ev) = serde_json::from_str::<RespEvent>(data) else {
             continue;
         };
-        accum.handle_event(&ev, &mut on_event)?;
+        // As in `stream_chat`, a `Break` from the caller ends the stream:
+        // partial text is kept, possibly-incomplete tool calls are not.
+        let mut stop = false;
+        accum.handle_event(&ev, &mut |e| {
+            stop = stop || on_event(e).is_break();
+        })?;
+        if stop {
+            let mut out = accum.finish();
+            out.tool_calls.clear();
+            out.interrupted = true;
+            return Ok(out);
+        }
     }
 
     Ok(accum.finish())
@@ -363,6 +375,7 @@ impl ResponsesAccum {
             tool_calls,
             usage: self.usage,
             finish_reason: None,
+            interrupted: false,
         }
     }
 }

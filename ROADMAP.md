@@ -21,7 +21,9 @@ change as we build.
   **not** reach Claude/ChatGPT subscriptions through unofficial means (ToS), but
   OpenAI's official **Sign in with ChatGPT** (SIWC) open-source OAuth is
   supported (`/login`) — it runs on the user's own ChatGPT plan via the
-  Responses API. First-class
+  Responses API. Separately, atelier can act as a frontend for the user's own
+  installed Claude Code CLI ([docs/claude.md](docs/claude.md)): the
+  unmodified `claude` binary does its own auth and model calls. First-class
   target is our own server at `http://192.168.0.50:11400/v1` (currently serving
   `qwen3.8-unc:q4`, `qwen3-coder:30b`, `gpt-oss:120b`, `qwen3.8:27b`,
   `qwen3:0.6b`, …). **Default test/dev model: `qwen3.8-unc:q4`** — it is
@@ -139,7 +141,9 @@ The intended interface.
   scrollback and is never touched again**.
 - Streamed assistant text and tool activity render above the live input without
   corrupting it (line-discipline / cursor management is the hard part here).
-- Interrupt (Ctrl-C) cancels the in-flight turn cleanly; Ctrl-D exits.
+- ✅ Interrupt (Ctrl-C) stops the in-flight turn (next streamed chunk or
+  between tool calls; claude's background agents are never stopped by it);
+  Ctrl-D exits.
 - Slash commands: `/model`, `/help`, `/clear`, `/quit` to start.
 - ✅ **Working state.** A turn runs on a worker thread while the main thread
   keeps the keyboard: the status strip shows a spinner + elapsed time
@@ -316,6 +320,27 @@ bring-your-own-API.
   the available model ids can't be exercised from CI). Default model `gpt-5`,
   changeable with `/model`.
 
+### M12 — Claude backend ✅
+
+atelier as a frontend for the user's own installed Claude Code CLI
+([docs/claude.md](docs/claude.md)): the unmodified `claude` binary keeps its
+own auth, agent loop and tools; atelier supplies the interface, its MCP
+servers, and per-turn context.
+
+- ✅ **Bridge** (`src/claude`): one long-lived `claude -p` stream-json process
+  per conversation; text/thinking/tool/permission events rendered through `Ui`;
+  `can_use_tool` answered by atelier's approval prompt; `--mcp-config` from
+  `atelier.toml`; session id kept for `--continue`; `/model` relaunches with
+  `--model`. Turns tracked by message uuid (`command_lifecycle`).
+- ✅ **Ctrl-C without collateral damage**: preempts the turn (`interrupt` +
+  `send_now`) instead of claude's plain interrupt, which kills background
+  agents. Background work is never ended unless explicitly requested (`/new
+  force`, repeated quit); claude's own reports on it render while idle.
+  Live-tested: `cargo test live_stop -- --ignored`.
+- ⏳ Offer atelier's own tools to claude (atelier as an MCP server), optionally
+  in place of claude's overlapping built-ins.
+- ⏳ Inject messages queued mid-turn into the running claude turn.
+
 ---
 
 ## 4. Harness ergonomics — designing for the agent's experience
@@ -404,7 +429,9 @@ truth. Each item maps to a milestone.
 
 ## 7. Non-goals (for now)
 
-- Claude/ChatGPT subscription backends (ToS).
+- Reaching Claude/ChatGPT subscriptions through unofficial means (ToS). SIWC
+  is the sanctioned ChatGPT path; for Claude, the Claude backend drives the
+  user's own `claude` CLI rather than its credentials.
 - Full-screen / mouse-driven / multi-pane TUI.
 - Editing or reflowing output already committed to scrollback.
 - A plugin marketplace, web UI, or multi-user server.

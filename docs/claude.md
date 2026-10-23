@@ -1,0 +1,103 @@
+# Claude backend
+
+With `--claude` (or `ATELIER_BACKEND=claude`), atelier stops calling a model
+API itself and instead acts as a frontend for the **Claude Code CLI you have
+already installed and signed in to**:
+
+```sh
+atelier --claude                         # interactive
+ATELIER_MODEL=sonnet atelier --claude    # pick a model (passed as --model)
+atelier --claude --continue              # resume the last Claude session here
+atelier --claude -p "explain src/main.rs"
+```
+
+## How it works
+
+atelier launches the unmodified `claude` binary in headless stream-json mode
+(`src/claude/mod.rs`):
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose \
+       --include-partial-messages --permission-prompt-tool stdio \
+       --append-system-prompt <...> [--model M] [--resume ID] [--mcp-config JSON]
+```
+
+One process serves the whole conversation. Each turn is written to its stdin
+as a JSON line (tagged with a `uuid`, whose `command_lifecycle` events mark
+when that turn is done), and its events are rendered through the normal
+interface:
+
+| CLI event | atelier |
+|-----------|---------|
+| `stream_event` text / thinking deltas | streamed answer / dimmed reasoning |
+| `assistant` message `tool_use` blocks | `⚙ tool args` |
+| `user` message `tool_result` blocks | `✓` / `✗ result` |
+| `control_request` `can_use_tool` | the usual approval prompt (`⚠` risk signals for `Bash`) |
+| `result` | end of turn, token usage |
+
+**What Claude Code owns:** authentication, the model, the agent loop, its
+built-in tools, its permission rules (`~/.claude/settings.json`, project
+`.claude/`), compaction, and the conversation itself (stored by Claude Code;
+atelier only keeps the session id in `.atelier/claude-session`).
+
+**What atelier adds:**
+
+- **The interface.** Same TUI/REPL/`--print` as the OpenAI backend.
+- **MCP servers.** Everything in `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`)
+  is passed via `--mcp-config` instead of being connected by atelier.
+  `/mcp add`/`remove` relaunch claude on the next message, resuming the same
+  session.
+- **Per-turn context.** atelier's context providers (git status, diff,
+  layout, diagnostics) are prepended to each message in an
+  `<atelier-context>` block, deduplicated across turns.
+
+## Stopping a turn, and background agents
+
+**Background work is never killed unless you explicitly ask.** Background
+subagents and shells live inside the `claude` process, and claude's own
+`interrupt` request stops them along with the turn (as its TUI does on
+Ctrl-C). So atelier never sends a plain interrupt:
+
+- **Ctrl-C** (on an empty input with nothing queued) *preempts* the turn: it
+  queues a short stop message and asks claude to deliver it now
+  (`interrupt` with `send_now`). The running turn ends the way it would for
+  a newly typed message, claude replies with one line, and background work
+  carries on.
+- When background work finishes, claude reports back in a turn of its own;
+  atelier shows it as it arrives, even while idle at the prompt.
+- Anything that would end the `claude` process waits for, or asks about,
+  running background tasks: `/new` needs `/new force`; quitting (`/quit`,
+  Ctrl-D) has to be repeated; an `/mcp` change applies once they finish;
+  `--print` and piped input wait for them before exiting. The process is
+  only relaunched after an error if it actually died.
+
+`cargo test live_stop -- --ignored` checks the Ctrl-C property against the
+real CLI (it runs a few cheap Haiku turns on your account).
+
+## Permissions
+
+claude only asks when its own permission rules say a call needs approval;
+those requests come to atelier's prompt. "Always" applies the permission
+update Claude Code suggests, so it is remembered the way Claude Code would
+remember it. `ATELIER_APPROVE=all` allows every request. In `--print` mode
+without it, requests are denied (nobody is there to answer).
+
+## Limitations (for now)
+
+- atelier's built-in tools (sandboxed file tools, `node`) are not offered to
+  claude; it uses its own.
+- Messages typed mid-turn are sent as the next prompt after the turn ends,
+  not injected into the running turn.
+- Ctrl-C while claude is still on a *queued* message (behind a turn it
+  started itself) stops that turn, and the queued message then runs.
+- Subagent activity is shown only as its single top-level tool call.
+- `/models` doesn't list anything; use `ATELIER_MODEL`.
+
+## Terms of use
+
+atelier never handles Claude credentials or offers a sign-in: `claude`
+authenticates however you configured it, and requests go from your `claude`
+process to Anthropic. Using an API key (`ANTHROPIC_API_KEY`) with Claude Code
+is unambiguous. For use with a Claude subscription, review Anthropic's
+current terms ([Claude Code legal and compliance](https://code.claude.com/docs/en/legal-and-compliance))
+for your situation.

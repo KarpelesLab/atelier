@@ -6,6 +6,7 @@
 
 mod agent;
 mod auth;
+mod claude;
 mod config;
 mod context;
 mod headless;
@@ -27,7 +28,10 @@ use config::Config;
 use settings::Settings;
 
 fn main() -> Result<()> {
-    let mut cfg = Config::from_env();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
+    let mut cfg = Config::from_env(args.iter().any(|a| a == "--claude"));
+    let claude = matches!(cfg.backend, config::Backend::Claude { .. });
     let root = std::env::current_dir()?;
     let settings = Settings::load(&root).unwrap_or_else(|e| {
         eprintln!("warning: {e:#}; using empty settings");
@@ -35,7 +39,10 @@ fn main() -> Result<()> {
     });
 
     // `[defaults] model` fills in when ATELIER_MODEL isn't set in the env.
-    if std::env::var_os("ATELIER_MODEL").is_none()
+    // It names a model on the configured endpoint, so it doesn't apply to
+    // the Claude backend (where claude picks unless ATELIER_MODEL says).
+    if !claude
+        && std::env::var_os("ATELIER_MODEL").is_none()
         && let Some(m) = &settings.defaults.model
     {
         cfg.model = m.clone();
@@ -45,20 +52,19 @@ fn main() -> Result<()> {
     // `--print`/`-p` runs one prompt non-interactively and exits (see
     // `headless::run`). The two combine (`--continue --print ...`) to resume
     // history and then run a single prompt against it.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let resume = args.iter().any(|a| a == "--continue" || a == "-c");
     let print_at = args.iter().position(|a| a == "--print" || a == "-p");
 
     let tools = tools::builtin_registry();
     let context = context::default_providers();
     let mut session = agent::Session::new(cfg, root, tools, context, settings);
-    // Restore a prior Sign-in-with-ChatGPT session, if any.
-    if let Some(tokens) = auth::load() {
+    // Restore a prior Sign-in-with-ChatGPT session, if any (it routes
+    // atelier's own loop, which the Claude backend doesn't use).
+    if !claude && let Some(tokens) = auth::load() {
         session.use_chatgpt(tokens, None);
     }
     if resume {
-        let n = session.resume();
-        eprintln!("resumed session ({n} message(s))");
+        eprintln!("{}", session.resume());
     }
 
     // Handled before the interactive TUI/REPL branch below, and unconditional

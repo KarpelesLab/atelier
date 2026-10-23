@@ -18,8 +18,10 @@ have no `atelier.toml` equivalent.
 
 | Variable                  | Default                          | Read by | Meaning |
 |----------------------------|-----------------------------------|---------|---------|
+| `ATELIER_BACKEND`         | *(unset)*                        | `Config::from_env` | `claude` selects the [Claude backend](claude.md) (same as `--claude`); otherwise OpenAI-compatible |
+| `ATELIER_CLAUDE_BIN`      | `claude`                         | `Config::from_env` | Claude backend: the Claude Code executable to launch |
 | `ATELIER_BASE_URL`        | `http://192.168.0.50:11400/v1`   | `Config::from_env` | OpenAI-compatible endpoint base; every request path is appended to it |
-| `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | `Config::from_env` | Model id sent in every request |
+| `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | `Config::from_env` | Model id sent in every request. Claude backend: passed as `--model` when set (e.g. `opus`, `sonnet`); unset leaves the choice to claude |
 | `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token; sent as `Authorization: Bearer <key>` when set to a non-empty value |
 | `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |

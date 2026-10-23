@@ -17,6 +17,7 @@ pub mod responses;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -222,6 +223,9 @@ pub struct Completion {
     /// `"stop"`, `"tool_calls"`, `"length"`, `"content_filter"`). `None` if
     /// the provider never sent one.
     pub finish_reason: Option<String>,
+    /// The caller stopped the stream early (see [`stream_chat`]): `content`
+    /// is partial and `tool_calls` is empty.
+    pub interrupted: bool,
 }
 
 /// Token usage for a completion, as reported on the final SSE chunk when the
@@ -250,12 +254,16 @@ pub enum StreamEvent<'a> {
 /// Stream a chat completion, invoking `on_event` for each text delta as it
 /// arrives. Advertises `tools` to the model and reassembles any tool calls.
 ///
+/// `on_event` returning [`ControlFlow::Break`] stops the stream there (the
+/// connection is dropped): the result is marked `interrupted`, keeps the
+/// partial text, and carries no tool calls, since those may be incomplete.
+///
 /// Returns the accumulated [`Completion`] once the stream ends.
 pub fn stream_chat(
     cfg: &Config,
     messages: &[Message],
     tools: &[ToolSpec],
-    mut on_event: impl FnMut(StreamEvent),
+    mut on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
 ) -> Result<Completion> {
     let mut body = json!({
         "model": cfg.model,
@@ -323,16 +331,22 @@ pub fn stream_chat(
             finish_reason = Some(fr);
         }
 
+        let mut flow = ControlFlow::Continue(());
         if let Some(r) = delta.reasoning()
             && !r.is_empty()
         {
-            on_event(StreamEvent::Reasoning(r));
+            flow = on_event(StreamEvent::Reasoning(r));
         }
         if let Some(c) = &delta.content
             && !c.is_empty()
+            && flow.is_continue()
         {
             out.content.push_str(c);
-            on_event(StreamEvent::Content(c));
+            flow = on_event(StreamEvent::Content(c));
+        }
+        if flow.is_break() {
+            out.interrupted = true;
+            return Ok(out);
         }
         for tc in delta.tool_calls {
             let slot = calls.entry(tc.index).or_default();
@@ -920,6 +934,7 @@ mod tests {
                 total_tokens: 15,
             }),
             finish_reason: Some("tool_calls".to_string()),
+            interrupted: false,
         };
         let tool_names = ["read_file", "write_file"];
         let entry = build_trace_entry("test-model", &request, &tool_names, &completion);

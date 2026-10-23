@@ -34,9 +34,14 @@ pub fn read_stdin_prompt() -> Result<String> {
 /// Run `prompt` to completion against `session` and print the answer to
 /// stdout. Any error from the send (network, provider, etc.) propagates to
 /// the caller, which prints it.
+///
+/// With the Claude backend, this then waits for any background work claude
+/// started (subagents, background shells) and prints its reports: exiting
+/// earlier would end the claude process and kill that work.
 pub fn run(mut session: Session, prompt: &str) -> Result<()> {
     let mut ui = PrintUi;
-    session.send(prompt, &mut ui)
+    session.send(prompt, &mut ui)?;
+    session.wait_background(&mut ui)
 }
 
 /// A [`Ui`] for `--print`: only the model's answer goes to stdout so it stays

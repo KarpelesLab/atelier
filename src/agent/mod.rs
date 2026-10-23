@@ -11,13 +11,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::auth;
-use crate::config::Config;
+use crate::claude::{self, Bridge};
+use crate::config::{Backend, Config};
 use crate::context::{ContextItem, ContextProvider};
 use crate::mcp::{self, HttpServer, StdioServer};
 use crate::provider::{self, Completion, Message, StreamEvent, ToolCall};
@@ -92,6 +94,11 @@ pub trait Ui {
     /// A queued message was just appended to the conversation, so the UI can
     /// record it in the transcript at the point it was actually delivered.
     fn queued_delivered(&mut self, _text: &str) {}
+    /// Whether the user asked to stop the running turn (Ctrl-C). Polled by
+    /// the loop while a turn runs; interfaces without a way to ask never do.
+    fn interrupted(&mut self) -> bool {
+        false
+    }
 }
 
 /// The user's answer to a tool-approval prompt.
@@ -131,7 +138,8 @@ const HELP: &[&str] = &[
     "  /mcp add <name> <command> [args...]   add a stdio MCP server",
     "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
     "  /mcp remove <name>                    remove an MCP server",
-    "  /new                                  start a fresh conversation (clear saved session)",
+    "  /new [force]                          start a fresh conversation (clear saved session);",
+    "                                        force: even if claude has background tasks running",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /clear                                (no-op: scrollback is append-only)",
     "  /quit                                 exit (also Ctrl-D on an empty input)",
@@ -157,11 +165,19 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
     };
     let args: Vec<&str> = tokens[1..].iter().map(String::as_str).collect();
     match cmd {
-        "/quit" | "/exit" => return Dispatch::Quit,
+        "/quit" | "/exit" => {
+            if session.confirm_quit(ui) {
+                return Dispatch::Quit;
+            }
+        }
         "/help" => {
             for l in HELP {
                 ui.info(l);
             }
+        }
+        "/models" if session.is_claude() => {
+            ui.info("Claude backend: the model is chosen by claude itself;");
+            ui.info("set ATELIER_MODEL (e.g. opus, sonnet) to pass --model");
         }
         "/models" => match provider::list_models(session.config()) {
             Ok(models) if models.is_empty() => ui.info("(no models returned)"),
@@ -180,6 +196,9 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 ui.info(&format!("model set to {name}"));
             }
         },
+        "/login" | "/logout" if session.is_claude() => {
+            ui.info("not used with the Claude backend: claude signs in on its own (run `claude` to manage it)");
+        }
         "/login" => {
             ui.info("opening your browser to sign in with ChatGPT…");
             match auth::login() {
@@ -196,6 +215,11 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             ui.info("signed out — using the configured endpoint");
         }
         "/tools" => {
+            if session.is_claude() {
+                ui.info(
+                    "Claude backend: claude uses its own tools plus the configured MCP servers.",
+                );
+            }
             let names = session.tool_names();
             ui.info(&format!("{} tools available:", names.len()));
             for n in names {
@@ -220,8 +244,16 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         },
         "/config" => return Dispatch::Config,
         "/new" => {
-            session.new_conversation();
-            ui.info("started a new conversation (previous session cleared)");
+            let n = session.background_tasks();
+            if n > 0 && args.first() != Some(&"force") {
+                ui.info(&format!(
+                    "claude has {n} background task(s) running; a new conversation would stop them."
+                ));
+                ui.info("wait for them to finish, or /new force to stop them");
+            } else {
+                session.new_conversation();
+                ui.info("started a new conversation (previous session cleared)");
+            }
         }
         "/image" => match args.first() {
             Some(path) => match session.stage_image(path) {
@@ -271,6 +303,10 @@ fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
                 session.mcp_add(name, target, extra)
             };
             match result {
+                Ok(_) if session.is_claude() => ui.info(&format!(
+                    "added MCP server '{name}' — claude picks it up from the next message \
+                     (once no background tasks are running)"
+                )),
                 Ok(n) => ui.info(&format!(
                     "added MCP server '{name}' — {n} tool(s) now available"
                 )),
@@ -329,6 +365,16 @@ pub struct Session {
     chatgpt: Option<ChatgptBackend>,
     history: Vec<Message>,
     fstate: FileState,
+    /// Claude backend: the running CLI (spawned on the first turn, dropped to
+    /// relaunch it) and the Claude session it continues.
+    claude: Option<Bridge>,
+    claude_session: Option<String>,
+    /// The MCP config or model changed: relaunch claude before the next turn — but
+    /// only once no background task is running in it.
+    claude_restart: bool,
+    /// The user was warned that quitting stops claude's background tasks; a
+    /// second quit goes ahead.
+    quit_warned: bool,
 }
 
 impl Session {
@@ -374,6 +420,10 @@ impl Session {
             chatgpt: None,
             history: Vec::new(),
             fstate: FileState::new(),
+            claude: None,
+            claude_session: None,
+            claude_restart: false,
+            quit_warned: false,
         }
     }
 
@@ -435,6 +485,85 @@ impl Session {
         self.settings.save(&self.root)
     }
 
+    /// Whether turns go to the Claude Code CLI rather than atelier's own loop.
+    pub fn is_claude(&self) -> bool {
+        matches!(self.cfg.backend, Backend::Claude { .. })
+    }
+
+    /// Background tasks (subagents, background shells) running in claude.
+    /// Always 0 for the OpenAI backend.
+    pub fn background_tasks(&self) -> usize {
+        self.claude.as_ref().map_or(0, Bridge::background)
+    }
+
+    /// Whether exiting may proceed. Exiting ends claude and any background
+    /// work in it, so with work running the first attempt only warns; asking
+    /// again confirms.
+    pub fn confirm_quit(&mut self, ui: &mut dyn Ui) -> bool {
+        let n = self.background_tasks();
+        if n == 0 || self.quit_warned {
+            return true;
+        }
+        self.quit_warned = true;
+        ui.info(&format!(
+            "claude has {n} background task(s) running; quitting would stop them."
+        ));
+        ui.info("quit again to quit anyway");
+        false
+    }
+
+    /// Render what claude produced between turns (reports on background
+    /// work). Cheap when there's nothing; a no-op for the OpenAI backend.
+    /// Returns whether anything arrived.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub fn poll_background(&mut self, ui: &mut dyn Ui) -> bool {
+        let Some(bridge) = self.claude.as_mut() else {
+            return false;
+        };
+        let result = bridge.pump(ui, self.auto_approve);
+        self.sync_claude();
+        match result {
+            Ok(any) => any,
+            Err(e) => {
+                ui.notice(&format!("{e:#}"));
+                self.claude = None;
+                true
+            }
+        }
+    }
+
+    /// Block until claude's background work is done, rendering its reports.
+    /// For one-shot runs, whose exit would otherwise kill that work.
+    pub fn wait_background(&mut self, ui: &mut dyn Ui) -> Result<()> {
+        let Some(bridge) = self.claude.as_mut() else {
+            return Ok(());
+        };
+        let result = bridge.wait_background(ui, self.auto_approve);
+        self.sync_claude();
+        result
+    }
+
+    /// Pick up what the bridge learned: session id (persisted for
+    /// `--continue`), serving model, token usage.
+    fn sync_claude(&mut self) {
+        let Some(bridge) = self.claude.as_mut() else {
+            return;
+        };
+        if let Some(id) = bridge.session_id()
+            && self.claude_session.as_deref() != Some(id)
+        {
+            self.claude_session = Some(id.to_string());
+            let _ = crate::session::save_claude(&self.root, id);
+        }
+        if let Some(m) = bridge.model() {
+            self.cfg.model = m.to_string();
+        }
+        if bridge.context() > 0 {
+            self.usage_ctx = bridge.context();
+        }
+        self.usage_out += bridge.take_output();
+    }
+
     /// A short token-usage summary (`<ctx> ctx · <out> out`), or `None` if the
     /// endpoint hasn't reported usage.
     pub fn usage_summary(&self) -> Option<String> {
@@ -450,8 +579,14 @@ impl Session {
 
     /// Switch the model used for subsequent requests (for `/model`). Targets the
     /// ChatGPT backend's model when signed in, otherwise the configured model.
+    /// With the Claude backend, claude is relaunched with `--model` before the
+    /// next turn (resuming the session; deferred while background tasks run).
     pub fn set_model(&mut self, name: &str) {
-        if let Some(cg) = self.chatgpt.as_mut() {
+        if let Backend::Claude { model, .. } = &mut self.cfg.backend {
+            *model = Some(name.to_string());
+            self.cfg.model = name.to_string();
+            self.claude_restart = true;
+        } else if let Some(cg) = self.chatgpt.as_mut() {
             cg.model = name.to_string();
         } else {
             self.cfg.model = name.to_string();
@@ -466,12 +601,19 @@ impl Session {
     }
 
     /// Load a previously-saved conversation for this project (for `--continue`).
-    /// Returns the number of messages restored.
-    pub fn resume(&mut self) -> usize {
+    /// Returns a one-line description of what was restored.
+    pub fn resume(&mut self) -> String {
+        if self.is_claude() {
+            self.claude_session = crate::session::load_claude(&self.root);
+            return match &self.claude_session {
+                Some(id) => format!("resuming Claude session {id}"),
+                None => "no saved Claude session; starting fresh".to_string(),
+            };
+        }
         let data = crate::session::load(&self.root);
         self.summary = data.summary;
         self.history = data.messages;
-        self.history.len()
+        format!("resumed session ({} message(s))", self.history.len())
     }
 
     /// Start a fresh conversation, discarding history and the saved session.
@@ -480,6 +622,8 @@ impl Session {
         self.summary = None;
         self.pending_images.clear();
         self.last_ctx.clear();
+        self.claude = None;
+        self.claude_session = None;
         let _ = crate::session::clear(&self.root);
     }
 
@@ -504,6 +648,17 @@ impl Session {
     /// display; a failed server is reported but does not abort the others.
     pub fn connect_configured_mcp(&mut self) -> Vec<String> {
         let mut status = Vec::new();
+        // With the Claude backend the servers are handed to claude itself
+        // (`--mcp-config`); connecting them here too would run them twice.
+        if self.is_claude() {
+            for name in self.settings.mcp.iter().map(|m| &m.name) {
+                status.push(format!("mcp: '{name}' will be passed to claude"));
+            }
+            for name in self.settings.mcp_http.iter().map(|m| &m.name) {
+                status.push(format!("mcp: '{name}' (http) will be passed to claude"));
+            }
+            return status;
+        }
         for s in self.settings.mcp.clone() {
             match mcp::connect_stdio(&to_stdio(&s)) {
                 Ok(tools) => {
@@ -564,6 +719,10 @@ impl Session {
             command: command.to_string(),
             args,
         };
+        if self.is_claude() {
+            self.settings.mcp.push(cfg);
+            return self.claude_mcp_changed().map(|_| 0);
+        }
         let tools = mcp::connect_stdio(&to_stdio(&cfg))?;
         let n = tools.len();
         for t in tools {
@@ -585,6 +744,10 @@ impl Session {
             url: url.to_string(),
             headers,
         };
+        if self.is_claude() {
+            self.settings.mcp_http.push(cfg);
+            return self.claude_mcp_changed().map(|_| 0);
+        }
         let tools = mcp::connect_http(&to_http(&cfg))?;
         let n = tools.len();
         for t in tools {
@@ -604,14 +767,28 @@ impl Session {
         if self.settings.mcp.len() + self.settings.mcp_http.len() == before {
             return Ok(false);
         }
+        if self.is_claude() {
+            return self.claude_mcp_changed().map(|_| true);
+        }
         self.tools.remove_prefix(&format!("mcp__{name}__"));
         self.settings.save(&self.root)?;
         Ok(true)
     }
 
+    /// Persist an MCP change under the Claude backend and have the next turn
+    /// relaunch the CLI (resuming the same Claude session) with the new
+    /// `--mcp-config`.
+    fn claude_mcp_changed(&mut self) -> Result<()> {
+        self.claude_restart = true;
+        self.settings.save(&self.root)
+    }
+
     /// Run one user turn to completion, executing tool calls until the model
     /// stops requesting them. Progress is reported through `ui`.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
+        if self.is_claude() {
+            return self.send_claude(user_input, ui);
+        }
         if self.pending_images.is_empty() {
             self.history.push(Message::user(user_input));
         } else {
@@ -652,6 +829,18 @@ impl Session {
             messages.extend(self.history.iter().cloned());
 
             let specs = self.tools.specs();
+            // Stream into the UI, stopping early if the user asks (Ctrl-C).
+            let mut on_event = |ev: StreamEvent| {
+                match ev {
+                    StreamEvent::Reasoning(t) => ui.reasoning(t),
+                    StreamEvent::Content(t) => ui.content(t),
+                }
+                if ui.interrupted() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            };
             // Route to the ChatGPT (Responses API) backend when signed in,
             // otherwise the configured chat/completions endpoint.
             let completion: Completion = if let Some(cg) = self.chatgpt.as_mut() {
@@ -662,21 +851,23 @@ impl Session {
                     &cg.model,
                     &messages,
                     &specs,
-                    |ev| match ev {
-                        StreamEvent::Reasoning(t) => ui.reasoning(t),
-                        StreamEvent::Content(t) => ui.content(t),
-                    },
+                    &mut on_event,
                 )?
             } else {
-                provider::stream_chat(&self.cfg, &messages, &specs, |ev| match ev {
-                    StreamEvent::Reasoning(t) => ui.reasoning(t),
-                    StreamEvent::Content(t) => ui.content(t),
-                })?
+                provider::stream_chat(&self.cfg, &messages, &specs, &mut on_event)?
             };
 
             if let Some(u) = &completion.usage {
                 self.usage_ctx = u.total_tokens;
                 self.usage_out += u64::from(u.completion_tokens);
+            }
+
+            if completion.interrupted {
+                // Keep what was said, marked, so the model knows next turn.
+                let mut content = completion.content;
+                content.push_str("\n\n[stopped by the user]");
+                self.history.push(Message::assistant(content));
+                return self.end_turn(ui);
             }
 
             self.history.push(Message::assistant_tool_calls(
@@ -692,7 +883,17 @@ impl Session {
                 return Ok(());
             }
 
+            let mut stopped = false;
             for call in &completion.tool_calls {
+                // Once stopped, the remaining calls still need a result each
+                // to keep the history well-formed; they just don't run.
+                stopped = stopped || ui.interrupted();
+                if stopped {
+                    let msg = "error: not run — the user stopped the turn.".to_string();
+                    self.history
+                        .push(Message::tool_result(call.id.clone(), msg));
+                    continue;
+                }
                 let call_args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
                 if self.needs_approval(&call.name, &call_args) {
                     for signal in crate::risk::signals(&call.name, &call.arguments) {
@@ -717,10 +918,23 @@ impl Session {
                 self.history
                     .push(Message::tool_result(call.id.clone(), result));
             }
+            if stopped || ui.interrupted() {
+                return self.end_turn(ui);
+            }
             // Kick off a parallel review of this tool batch; its note is
             // surfaced by a later `drain_reviews`/`collect_reviews`.
             self.spawn_review();
         }
+    }
+
+    /// Close a turn the user stopped: no compaction or waiting on reviews
+    /// (model calls they just asked to end; pending reviews are dropped),
+    /// just persist.
+    fn end_turn(&mut self, ui: &mut dyn Ui) -> Result<()> {
+        self.reviews.clear();
+        ui.turn_end();
+        self.persist();
+        Ok(())
     }
 
     /// Spawn a background reviewer over the recent exchange (if review mode is
@@ -788,6 +1002,57 @@ impl Session {
             s.truncate(end);
         }
         s
+    }
+
+    /// One user turn under the Claude backend: the CLI runs the agent loop;
+    /// atelier contributes the per-turn context and renders the events.
+    ///
+    /// Messages queued mid-turn aren't delivered early here; the interface
+    /// sends them as ordinary prompts once the turn ends.
+    fn send_claude(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
+        // Relaunching ends the process and whatever runs in it, so a pending
+        // MCP or model change waits for background work to finish.
+        if self.claude_restart && self.claude.is_some() {
+            let n = self.background_tasks();
+            if n == 0 {
+                self.claude = None;
+            } else {
+                ui.info(&format!(
+                    "MCP/model changes apply once claude's {n} background task(s) finish"
+                ));
+            }
+        }
+        if self.claude.is_none() {
+            let Backend::Claude { bin, model } = &self.cfg.backend else {
+                unreachable!("send_claude without the Claude backend");
+            };
+            let launch = claude::Launch {
+                bin,
+                model: model.as_deref(),
+                resume: self.claude_session.as_deref(),
+            };
+            self.claude = Some(Bridge::spawn(&launch, &self.root, &self.settings)?);
+            self.claude_restart = false;
+        }
+        self.quit_warned = false;
+
+        let text = match self.gather_context() {
+            Some(ctx) => format!("<atelier-context>\n{ctx}\n</atelier-context>\n\n{user_input}"),
+            None => user_input.to_string(),
+        };
+        let images = std::mem::take(&mut self.pending_images);
+        let content = claude::user_content(&text, &images);
+
+        let bridge = self.claude.as_mut().expect("spawned above");
+        let result = bridge.turn(content, ui, self.auto_approve);
+        // Only relaunch (next turn, resuming) if the child actually died; a
+        // live one may be running background work.
+        let dead = !bridge.is_alive();
+        self.sync_claude();
+        if dead {
+            self.claude = None;
+        }
+        result
     }
 
     /// Append any messages queued in the UI as one user message; returns how
@@ -892,7 +1157,8 @@ impl Session {
             ),
             Message::user(format!("Summarize this conversation excerpt:\n\n{excerpt}")),
         ];
-        let completion = provider::stream_chat(&self.cfg, &messages, &[], |_| {})?;
+        let completion =
+            provider::stream_chat(&self.cfg, &messages, &[], |_| ControlFlow::Continue(()))?;
         let s = completion.content.trim().to_string();
         if s.is_empty() {
             anyhow::bail!("model returned an empty summary");
@@ -1139,10 +1405,14 @@ fn config_summary(session: &Session) -> Vec<String> {
 ///
 /// Used for headless runs and until the inline TUI (M2) lands.
 pub fn repl(mut session: Session) -> Result<()> {
-    eprintln!(
-        "atelier — model {} @ {}",
-        session.cfg.model, session.cfg.base_url
-    );
+    if session.is_claude() {
+        eprintln!("atelier — Claude backend (your Claude Code CLI)");
+    } else {
+        eprintln!(
+            "atelier — model {} @ {}",
+            session.cfg.model, session.cfg.base_url
+        );
+    }
     eprintln!("type a message, or /help for commands.\n");
     for line in session.connect_configured_mcp() {
         eprintln!("{line}");
@@ -1154,7 +1424,11 @@ pub fn repl(mut session: Session) -> Result<()> {
         io::stdout().flush().ok();
         let mut input = String::new();
         if stdin.read_line(&mut input)? == 0 {
-            break; // EOF (Ctrl-D)
+            // EOF (Ctrl-D, or the end of piped input). Exiting would end
+            // claude's background work, and there's no one left to confirm
+            // that, so let it finish first.
+            session.wait_background(&mut StdoutUi::new())?;
+            break;
         }
         let line = input.trim();
         if line.is_empty() {

@@ -31,10 +31,15 @@
 //!
 //! ## Known limitations (see also `input.rs`)
 //!
-//! - **Ctrl-C cannot cancel an in-flight turn.** The [`Ui`] trait exposes no
-//!   cancellation channel, so a running turn always completes. Ctrl-C clears
-//!   the current input; while a turn runs, Ctrl-C on an empty input drops the
-//!   queued messages instead. Ctrl-D on an empty line exits between turns.
+//! - **Ctrl-C stops a turn at the next opportunity, not instantly.** Each
+//!   press does one thing: clear the input line if it has text, else drop
+//!   queued messages if any, else stop the running turn ([`Ui::interrupted`]).
+//!   The OpenAI loop notices at the next streamed chunk or between tool
+//!   calls (a tool already running finishes; a request still waiting for its
+//!   first byte isn't cut short). The Claude backend preempts claude's turn
+//!   and **never stops its background agents** (see `src/claude`). Ctrl-D on
+//!   an empty line exits between turns — twice, if claude has background
+//!   work running.
 //! - **Terminal height must be ≥ 3 rows.** The live region occupies up to three
 //!   rows and the redraw moves the cursor up by up to two; on a 1–2 row terminal
 //!   the accounting degrades (no crash, but the strip may be clipped).
@@ -60,6 +65,7 @@ mod input;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -88,6 +94,9 @@ const SPINNER_TICK: Duration = Duration::from_millis(100);
 /// How long one keyboard poll blocks while a turn runs; this is also the pump
 /// loop's sleep, so it bounds output latency.
 const KEY_POLL: Duration = Duration::from_millis(30);
+/// How long the idle prompt waits for a key before checking for output that
+/// arrived between turns (claude reporting on background work).
+const IDLE_POLL: Duration = Duration::from_millis(200);
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Drive a session through the inline terminal interface.
@@ -120,9 +129,17 @@ pub fn run(mut session: Session) -> Result<()> {
                 r.push_line(format!("{PROMPT}{line}"), false);
                 line
             }
-            None => match read_line(&mut r)? {
+            None => match read_line(&mut r, &mut session, turn)? {
                 Some(line) => line,
-                None => break, // Ctrl-D
+                // Ctrl-D: exits, unless that would stop claude's background
+                // work and this is the first attempt.
+                None => {
+                    if session.confirm_quit(&mut TuiUi { r: &mut r }) {
+                        break;
+                    }
+                    r.refresh()?;
+                    continue;
+                }
             },
         };
         r.refresh()?;
@@ -164,9 +181,17 @@ pub fn run(mut session: Session) -> Result<()> {
 
 /// Block at the idle prompt until the user submits a line (`Some`) or asks to
 /// exit with Ctrl-D on an empty input (`None`). The submitted line is echoed
-/// into the scrollback record.
-fn read_line(r: &mut Renderer) -> Result<Option<String>> {
+/// into the scrollback record. Meanwhile, output the session produces on its
+/// own (claude reporting on background work) is rendered above the prompt.
+fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Option<String>> {
     loop {
+        if !event::poll(IDLE_POLL)? {
+            if session.poll_background(&mut TuiUi { r: &mut *r }) {
+                r.status = build_status(session, turn);
+                r.refresh()?;
+            }
+            continue;
+        }
         match event::read()? {
             // A resize just needs a repaint; `refresh` re-reads the width.
             Event::Resize(_, _) => r.refresh()?,
@@ -251,6 +276,8 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
     let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
     let (ans_tx, ans_rx) = mpsc::channel::<agent::Approval>();
     let queue = Arc::clone(&r.queue);
+    let stop = Arc::clone(&r.stop);
+    stop.store(false, Ordering::Relaxed);
 
     r.working = Some(Instant::now());
     r.approval_pending = false;
@@ -262,6 +289,7 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
                 tx: ev_tx.clone(),
                 answers: ans_rx,
                 queue,
+                stop,
             };
             let outcome = session.send(input, &mut ui).map_err(|e| format!("{e:#}"));
             // The receiver only disappears if the pump failed; nothing to do.
@@ -334,13 +362,17 @@ fn pump(
 }
 
 /// A keystroke while a turn is running: edit the line as usual, but Enter
-/// queues it rather than sending, and Ctrl-C on an empty line drops the queue.
+/// queues it rather than sending. Ctrl-C on an empty line drops the queue,
+/// or, with nothing queued, stops the turn.
 fn working_key(r: &mut Renderer, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && k.code == KeyCode::Char('c') && r.editor.is_empty() {
         let dropped = r.clear_queue();
         if dropped > 0 {
             r.push_line(format!("! dropped {dropped} queued message(s)"), true);
+        } else if !r.stop.swap(true, Ordering::Relaxed) {
+            r.commit_pending_if_any();
+            r.push_line("! stopping…".into(), true);
         }
         return;
     }
@@ -413,6 +445,7 @@ struct ChanUi {
     tx: Sender<UiEvent>,
     answers: Receiver<agent::Approval>,
     queue: Queue,
+    stop: Arc<AtomicBool>,
 }
 
 impl ChanUi {
@@ -466,6 +499,9 @@ impl Ui for ChanUi {
     fn queued_delivered(&mut self, text: &str) {
         self.send(UiEvent::Delivered(text.to_string()));
     }
+    fn interrupted(&mut self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
 }
 
 /// Pop queued lines from the front up to (not including) the first slash
@@ -513,6 +549,9 @@ struct Renderer {
     approval_pending: bool,
     /// Lines submitted while working, awaiting delivery.
     queue: Queue,
+    /// Set by Ctrl-C to stop the running turn; read by the worker through
+    /// [`Ui::interrupted`], cleared when a turn starts.
+    stop: Arc<AtomicBool>,
 }
 
 impl Renderer {
@@ -527,6 +566,7 @@ impl Renderer {
             working: None,
             approval_pending: false,
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
