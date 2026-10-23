@@ -50,7 +50,13 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::agent::{Approval, Ui};
+use crate::provider::ToolSpec;
 use crate::settings::Settings;
+
+#[cfg(unix)]
+mod host;
+#[cfg(unix)]
+pub use host::relay;
 
 /// Appended to Claude Code's own system prompt so it knows about the
 /// context block atelier prepends to user turns.
@@ -59,7 +65,9 @@ The user is talking to you through atelier, a terminal frontend. A user \
 message may begin with an <atelier-context> block that atelier gathered \
 automatically just before sending (git status, diff, project layout, build \
 diagnostics). Treat it as the current state of the project; the user did \
-not type it.";
+not type it. atelier's own tools are available as `mcp__atelier__*` (file \
+tools confined to the project, with read-before-edit tracking; a sandboxed \
+`node` scripting tool; and more); use them where they fit.";
 
 /// Delivered (preempting the running turn) when the user presses Ctrl-C.
 const STOP_MESSAGE: &str = "\
@@ -88,9 +96,14 @@ pub struct Launch<'a> {
 pub struct Bridge {
     child: Child,
     stdin: Option<ChildStdin>,
-    /// Output lines, read continuously by a thread; disconnects when the
-    /// child's stdout closes.
-    lines: Receiver<String>,
+    /// Everything the event loop acts on: the child's output lines (read
+    /// continuously by a thread) and calls to atelier's tools (from the MCP
+    /// host).
+    incoming: Receiver<Incoming>,
+    /// Serves atelier's tools to claude; `None` when there are none to offer
+    /// (or no Unix sockets).
+    #[cfg(unix)]
+    _host: Option<host::Host>,
     stderr: Arc<Mutex<String>>,
     /// Claude's session id, from the `init` event (stable across turns).
     session_id: Option<String>,
@@ -122,9 +135,41 @@ struct TurnState {
     done: bool,
 }
 
+/// What the bridge's event loop receives.
+pub enum Incoming {
+    /// One line of the child's stdout.
+    Line(String),
+    /// The child's stdout closed: it exited.
+    Closed,
+    /// claude called one of atelier's tools.
+    #[cfg(unix)]
+    Call(host::ToolRequest),
+}
+
+/// Runs atelier's tools for claude: the session's tool registry and approval
+/// policy, driven with the interface of whichever loop receives the call.
+pub trait ToolHost {
+    /// Skip every approval prompt (claude's permission requests included).
+    fn auto_approve(&self) -> bool;
+    /// Run tool `name` (asking approval if its policy says so), returning
+    /// `(result_text, ok)`.
+    fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (String, bool);
+}
+
+/// How atelier's tools appear in claude: `mcp__atelier__<tool>`.
+#[cfg(unix)]
+const TOOL_PREFIX: &str = "mcp__atelier__";
+
 impl Bridge {
-    /// Spawn the CLI in `root`, wired to the MCP servers in `settings`.
-    pub fn spawn(launch: &Launch, root: &Path, settings: &Settings) -> Result<Self> {
+    /// Spawn the CLI in `root`, wired to the MCP servers in `settings` and
+    /// offering atelier's `tools`.
+    pub fn spawn(
+        launch: &Launch,
+        root: &Path,
+        settings: &Settings,
+        tools: Vec<ToolSpec>,
+    ) -> Result<Self> {
+        let (tx, incoming) = mpsc::channel();
         let mut cmd = Command::new(launch.bin);
         cmd.args([
             "-p",
@@ -145,7 +190,27 @@ impl Bridge {
         if let Some(id) = launch.resume {
             cmd.args(["--resume", id]);
         }
-        if let Some(cfg) = mcp_config(settings) {
+        let mut mcp = mcp_config(settings);
+        // atelier's own tools, unless a configured server already took the
+        // name. claude may run them without asking: atelier applies its own
+        // policy (confined file tools run, `bash` and the like ask).
+        #[cfg(unix)]
+        let host = if tools.is_empty()
+            || mcp
+                .as_ref()
+                .is_some_and(|c| !c["mcpServers"][host::SERVER_NAME].is_null())
+        {
+            None
+        } else {
+            let h = host::Host::start(tools, tx.clone())?;
+            mcp.get_or_insert_with(|| json!({ "mcpServers": {} }))["mcpServers"]
+                [host::SERVER_NAME] = h.mcp_entry()?;
+            cmd.args(["--allowedTools", &format!("mcp__{}", host::SERVER_NAME)]);
+            Some(h)
+        };
+        #[cfg(not(unix))]
+        let _ = tools;
+        if let Some(cfg) = mcp {
             cmd.args(["--mcp-config", &cfg.to_string()]);
         }
         let mut child = cmd
@@ -162,14 +227,14 @@ impl Bridge {
             })?;
         let stdin = child.stdin.take();
         let stdout = BufReader::new(child.stdout.take().context("claude stdout")?);
-        let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
             for line in stdout.lines() {
                 let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
+                if tx.send(Incoming::Line(line)).is_err() {
+                    return;
                 }
             }
+            let _ = tx.send(Incoming::Closed);
         });
         // Drain stderr in the background so the child can't block on a full
         // pipe; keep the tail for error reports.
@@ -195,7 +260,9 @@ impl Bridge {
         Ok(Self {
             child,
             stdin,
-            lines,
+            incoming,
+            #[cfg(unix)]
+            _host: host,
             stderr,
             session_id: launch.resume.map(str::to_owned),
             model: None,
@@ -240,7 +307,7 @@ impl Bridge {
     /// While waiting, `ui.interrupted()` is polled; when the user asks to
     /// stop, the turn is preempted (see the module docs) and this returns
     /// once claude has acknowledged the stop — without an error.
-    pub fn turn(&mut self, content: Value, ui: &mut dyn Ui, auto_approve: bool) -> Result<()> {
+    pub fn turn(&mut self, content: Value, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Result<()> {
         let mut st = TurnState {
             awaiting: new_uuid(),
             started: false,
@@ -250,16 +317,10 @@ impl Bridge {
         };
         self.send_user(content, &st.awaiting)?;
         while !st.done {
-            match self.lines.recv_timeout(POLL) {
-                Ok(line) => {
-                    for ev in parse_line(&line) {
-                        self.handle(ev, ui, auto_approve, Some(&mut st))?;
-                    }
-                }
+            match self.incoming.recv_timeout(POLL) {
+                Ok(inc) => self.receive(inc, ui, host, Some(&mut st))?,
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    bail!("claude exited mid-turn{}", self.stderr_note())
-                }
+                Err(RecvTimeoutError::Disconnected) => unreachable!("the bridge holds no sender"),
             }
             if !st.done && !st.stopping && ui.interrupted() {
                 self.stop(&mut st, ui)?;
@@ -275,20 +336,16 @@ impl Bridge {
     /// Render whatever the child produced while no turn was running — claude
     /// reporting back on background work. Returns whether anything arrived.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub fn pump(&mut self, ui: &mut dyn Ui, auto_approve: bool) -> Result<bool> {
+    pub fn pump(&mut self, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Result<bool> {
         let mut any = false;
         loop {
-            match self.lines.try_recv() {
-                Ok(line) => {
+            match self.incoming.try_recv() {
+                Ok(inc) => {
                     any = true;
-                    for ev in parse_line(&line) {
-                        self.handle(ev, ui, auto_approve, None)?;
-                    }
+                    self.receive(inc, ui, host, None)?;
                 }
                 Err(TryRecvError::Empty) => return Ok(any),
-                Err(TryRecvError::Disconnected) => {
-                    bail!("claude exited{}", self.stderr_note())
-                }
+                Err(TryRecvError::Disconnected) => unreachable!("the bridge holds no sender"),
             }
         }
     }
@@ -296,7 +353,7 @@ impl Bridge {
     /// Render output until no background task is running (and claude has
     /// finished reporting on them). For one-shot runs, which must not end —
     /// and take the child with them — while background work is in flight.
-    pub fn wait_background(&mut self, ui: &mut dyn Ui, auto_approve: bool) -> Result<()> {
+    pub fn wait_background(&mut self, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Result<()> {
         // Done once nothing is running and the stream has been quiet for a
         // moment: the report on a finished task is a turn of its own, and
         // that report can start more work (a subagent resumed by its own
@@ -304,17 +361,36 @@ impl Bridge {
         let quiet = Duration::from_millis(1500);
         loop {
             let wait = if self.background > 0 { POLL } else { quiet };
-            match self.lines.recv_timeout(wait) {
-                Ok(line) => {
-                    for ev in parse_line(&line) {
-                        self.handle(ev, ui, auto_approve, None)?;
-                    }
-                }
+            match self.incoming.recv_timeout(wait) {
+                Ok(inc) => self.receive(inc, ui, host, None)?,
                 Err(RecvTimeoutError::Timeout) if self.background == 0 => return Ok(()),
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    bail!("claude exited{}", self.stderr_note())
+                Err(RecvTimeoutError::Disconnected) => unreachable!("the bridge holds no sender"),
+            }
+        }
+    }
+
+    /// Act on one incoming item; `turn` is the turn being waited on, if any.
+    fn receive(
+        &mut self,
+        inc: Incoming,
+        ui: &mut dyn Ui,
+        host: &mut dyn ToolHost,
+        mut turn: Option<&mut TurnState>,
+    ) -> Result<()> {
+        match inc {
+            Incoming::Line(line) => {
+                for ev in parse_line(&line) {
+                    self.handle(ev, ui, host, turn.as_deref_mut())?;
                 }
+                Ok(())
+            }
+            Incoming::Closed => bail!("claude exited{}", self.stderr_note()),
+            #[cfg(unix)]
+            Incoming::Call(req) => {
+                // The call already shows as claude's tool use; this just runs it.
+                let _ = req.reply.send(host.call(&req.name, req.arguments, ui));
+                Ok(())
             }
         }
     }
@@ -324,7 +400,7 @@ impl Bridge {
         &mut self,
         ev: Event,
         ui: &mut dyn Ui,
-        auto_approve: bool,
+        host: &mut dyn ToolHost,
         turn: Option<&mut TurnState>,
     ) -> Result<()> {
         match ev {
@@ -337,6 +413,11 @@ impl Bridge {
             Event::Text(t) => ui.content(&t),
             Event::Thinking(t) => ui.reasoning(&t),
             Event::ToolUse { id, name, input } => {
+                // atelier's own tools read as themselves, not `mcp__atelier__…`.
+                #[cfg(unix)]
+                let name = name
+                    .strip_prefix(TOOL_PREFIX)
+                    .map_or(name.clone(), str::to_owned);
                 ui.tool_start(&name, &input);
                 self.tool_names.insert(id, name);
             }
@@ -351,7 +432,7 @@ impl Bridge {
             Event::Context(n) => self.context = n,
             Event::Background(n) => self.background = n,
             Event::Permission(req) => {
-                let answer = self.decide(&req, ui, auto_approve);
+                let answer = self.decide(&req, ui, host.auto_approve());
                 self.write(&answer)?;
             }
             Event::Lifecycle { uuid, state } => {
@@ -989,6 +1070,18 @@ mod tests {
         }
     }
 
+    /// Auto-approves, offers no tools.
+    struct NoTools;
+
+    impl ToolHost for NoTools {
+        fn auto_approve(&self) -> bool {
+            true
+        }
+        fn call(&mut self, name: &str, _: Value, _: &mut dyn Ui) -> (String, bool) {
+            panic!("unexpected tool call: {name}")
+        }
+    }
+
     /// The property Ctrl-C exists for: stopping a turn leaves background
     /// agents running. (claude's own `interrupt` would kill them; it drops
     /// the background count to 0 before the interrupted turn's result.)
@@ -1002,7 +1095,7 @@ mod tests {
             model: Some("haiku"),
             resume: None,
         };
-        let mut b = Bridge::spawn(&launch, &dir, &Settings::default()).unwrap();
+        let mut b = Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()).unwrap();
         let mut ui = LiveUi {
             stop_after: Some(300),
             ..LiveUi::default()
@@ -1016,7 +1109,7 @@ mod tests {
                  essay about the history of lighthouses."
             ),
             &mut ui,
-            true,
+            &mut NoTools,
         )
         .unwrap();
         assert!(
@@ -1032,10 +1125,10 @@ mod tests {
         );
 
         // The agent then finishes on its own, and the session keeps working.
-        b.wait_background(&mut ui, true).unwrap();
+        b.wait_background(&mut ui, &mut NoTools).unwrap();
         assert_eq!(b.background(), 0);
         let mut after = LiveUi::default();
-        b.turn(json!("Reply with exactly: ok"), &mut after, true)
+        b.turn(json!("Reply with exactly: ok"), &mut after, &mut NoTools)
             .unwrap();
         assert!(after.text.to_lowercase().contains("ok"), "{:?}", after.text);
         let _ = std::fs::remove_dir_all(&dir);

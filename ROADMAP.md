@@ -337,8 +337,14 @@ servers, and per-turn context.
   agents. Background work is never ended unless explicitly requested (`/new
   force`, repeated quit); claude's own reports on it render while idle.
   Live-tested: `cargo test live_stop -- --ignored`.
-- ⏳ Offer atelier's own tools to claude (atelier as an MCP server), optionally
-  in place of claude's overlapping built-ins.
+- ✅ **atelier's tools for claude**: `atelier mcp-serve <socket>` is the MCP
+  server claude launches — a token-authenticated relay over a private Unix
+  socket back to the atelier process, which answers MCP and runs each call
+  with the session's tools, read tracking and approval policy (claude allows
+  `mcp__atelier` wholesale; atelier decides). Live-tested:
+  `cargo test --test claude_live -- --ignored`.
+- ⏳ Optionally switch off claude's overlapping built-ins in favor of
+  atelier's.
 - ⏳ Inject messages queued mid-turn into the running claude turn.
 
 ---

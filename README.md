@@ -78,7 +78,7 @@ src/
 ├─ session.rs     on-disk session persistence (.atelier/session.json)
 ├─ headless.rs    --print: one-shot non-interactive mode
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls, vision
-├─ claude/        Claude backend: drives the `claude` CLI over stream-json
+├─ claude/        Claude backend: drives the `claude` CLI; serves it atelier's tools (mcp-serve)
 ├─ agent/         agent loop, conversation state, turn orchestration, compaction
 ├─ tools/         built-in tools + registry (read/write/edit/multiedit/bash/…)
 ├─ js/            the `node` tool: mediated JS runtime (fs, console, network)

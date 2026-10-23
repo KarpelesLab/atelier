@@ -22,7 +22,7 @@ use crate::claude::{self, Bridge};
 use crate::config::{Backend, Config};
 use crate::context::{ContextItem, ContextProvider};
 use crate::mcp::{self, HttpServer, StdioServer};
-use crate::provider::{self, Completion, Message, StreamEvent, ToolCall};
+use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
 use crate::tools::{FileState, ToolCtx, ToolRegistry};
 
@@ -517,10 +517,10 @@ impl Session {
     /// Returns whether anything arrived.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn poll_background(&mut self, ui: &mut dyn Ui) -> bool {
-        let Some(bridge) = self.claude.as_mut() else {
+        let (Some(bridge), mut runner) = self.parts() else {
             return false;
         };
-        let result = bridge.pump(ui, self.auto_approve);
+        let result = bridge.pump(ui, &mut runner);
         self.sync_claude();
         match result {
             Ok(any) => any,
@@ -535,10 +535,10 @@ impl Session {
     /// Block until claude's background work is done, rendering its reports.
     /// For one-shot runs, whose exit would otherwise kill that work.
     pub fn wait_background(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        let Some(bridge) = self.claude.as_mut() else {
+        let (Some(bridge), mut runner) = self.parts() else {
             return Ok(());
         };
-        let result = bridge.wait_background(ui, self.auto_approve);
+        let result = bridge.wait_background(ui, &mut runner);
         self.sync_claude();
         result
     }
@@ -894,26 +894,15 @@ impl Session {
                         .push(Message::tool_result(call.id.clone(), msg));
                     continue;
                 }
-                let call_args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                if self.needs_approval(&call.name, &call_args) {
-                    for signal in crate::risk::signals(&call.name, &call.arguments) {
-                        ui.info(&format!("⚠ {signal}"));
-                    }
-                    match ui.ask_approval(&call.name, &call.arguments) {
-                        Approval::Once => {}
-                        Approval::Always => self.grant_always(&call.name),
-                        Approval::Deny => {
-                            let msg =
-                                "error: the user denied permission to run this tool.".to_string();
-                            ui.tool_end(&call.name, &msg, false);
-                            self.history
-                                .push(Message::tool_result(call.id.clone(), msg));
-                            continue;
-                        }
-                    }
+                if !self.runner().approve(&call.name, &call.arguments, ui) {
+                    let msg = DENIED.to_string();
+                    ui.tool_end(&call.name, &msg, false);
+                    self.history
+                        .push(Message::tool_result(call.id.clone(), msg));
+                    continue;
                 }
                 ui.tool_start(&call.name, &call.arguments);
-                let (result, ok) = self.exec_tool(call);
+                let (result, ok) = self.runner().exec_json(&call.name, &call.arguments);
                 ui.tool_end(&call.name, &result, ok);
                 self.history
                     .push(Message::tool_result(call.id.clone(), result));
@@ -1031,7 +1020,12 @@ impl Session {
                 model: model.as_deref(),
                 resume: self.claude_session.as_deref(),
             };
-            self.claude = Some(Bridge::spawn(&launch, &self.root, &self.settings)?);
+            self.claude = Some(Bridge::spawn(
+                &launch,
+                &self.root,
+                &self.settings,
+                self.tools.specs(),
+            )?);
             self.claude_restart = false;
         }
         self.quit_warned = false;
@@ -1043,8 +1037,9 @@ impl Session {
         let images = std::mem::take(&mut self.pending_images);
         let content = claude::user_content(&text, &images);
 
-        let bridge = self.claude.as_mut().expect("spawned above");
-        let result = bridge.turn(content, ui, self.auto_approve);
+        let (bridge, mut runner) = self.parts();
+        let bridge = bridge.expect("spawned above");
+        let result = bridge.turn(content, ui, &mut runner);
         // Only relaunch (next turn, resuming) if the child actually died; a
         // live one may be running background work.
         let dead = !bridge.is_alive();
@@ -1069,50 +1064,25 @@ impl Session {
         queued.len()
     }
 
-    /// Whether a tool call must be approved before running: the tool declares it
-    /// needs approval (unconfined — `bash`, MCP tools), it isn't already
-    /// allowed, and we're not in auto-approve mode. Tools confined to the
-    /// project directory (all file tools) never prompt.
-    fn needs_approval(&self, name: &str, args: &Value) -> bool {
-        if self.auto_approve || self.allow.contains(name) {
-            return false;
-        }
-        self.tools
-            .get(name)
-            .map(|t| t.requires_approval(args))
-            .unwrap_or(false)
+    /// The tool runner, borrowing the session's tool state.
+    fn runner(&mut self) -> ToolRunner<'_> {
+        self.parts().1
     }
 
-    /// Remember a tool as always-allowed for this session and persist it.
-    fn grant_always(&mut self, name: &str) {
-        self.allow.insert(name.to_string());
-        if !self.settings.permissions.allow.iter().any(|n| n == name) {
-            self.settings.permissions.allow.push(name.to_string());
-            let _ = self.settings.save(&self.root);
-        }
-    }
-
-    /// Execute a single tool call, returning `(result_text, ok)`.
-    fn exec_tool(&mut self, call: &ToolCall) -> (String, bool) {
-        let args: Value = if call.arguments.trim().is_empty() {
-            Value::Null
-        } else {
-            match serde_json::from_str(&call.arguments) {
-                Ok(v) => v,
-                Err(e) => return (format!("error: invalid arguments JSON: {e}"), false),
-            }
-        };
-        let Some(tool) = self.tools.get(&call.name) else {
-            return (format!("error: unknown tool '{}'", call.name), false);
-        };
-        let mut ctx = ToolCtx {
-            project_root: &self.root,
-            fstate: &mut self.fstate,
-        };
-        match tool.call(&mut ctx, args) {
-            Ok(s) => (s, true),
-            Err(e) => (format!("error: {e:#}"), false),
-        }
+    /// The Claude bridge and the tool runner at once (they borrow disjoint
+    /// parts of the session), so the bridge can run atelier's tools.
+    fn parts(&mut self) -> (Option<&mut Bridge>, ToolRunner<'_>) {
+        (
+            self.claude.as_mut(),
+            ToolRunner {
+                tools: &self.tools,
+                root: &self.root,
+                fstate: &mut self.fstate,
+                allow: &mut self.allow,
+                settings: &mut self.settings,
+                auto_approve: self.auto_approve,
+            },
+        )
     }
 
     /// If the context has grown past the threshold, summarize the older part of
@@ -1181,6 +1151,98 @@ impl Session {
         let (kept, snapshot) = crate::context::dedup_items(&self.last_ctx, items);
         self.last_ctx = snapshot;
         crate::context::render_budgeted(kept, CONTEXT_TOKEN_BUDGET)
+    }
+}
+
+/// The tool result for a call the user refused.
+const DENIED: &str = "error: the user denied permission to run this tool.";
+
+/// Runs tool calls against the session: approval policy (prompting through
+/// the caller's [`Ui`]), then execution confined to the project root. Used by
+/// atelier's own loop, and — as the [`ToolHost`](claude::ToolHost) — for
+/// the tools atelier offers claude.
+struct ToolRunner<'a> {
+    tools: &'a ToolRegistry,
+    root: &'a std::path::Path,
+    fstate: &'a mut FileState,
+    allow: &'a mut HashSet<String>,
+    settings: &'a mut Settings,
+    auto_approve: bool,
+}
+
+impl ToolRunner<'_> {
+    /// Whether the call may run, asking the user when its tool requires
+    /// approval (unconfined — `bash`, MCP tools) and it isn't already
+    /// allowed. "Always" is remembered and persisted. Tools confined to the
+    /// project directory (all file tools) never prompt.
+    fn approve(&mut self, name: &str, arguments: &str, ui: &mut dyn Ui) -> bool {
+        if self.auto_approve || self.allow.contains(name) {
+            return true;
+        }
+        let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+        let needs = self
+            .tools
+            .get(name)
+            .is_some_and(|t| t.requires_approval(&args));
+        if !needs {
+            return true;
+        }
+        for signal in crate::risk::signals(name, arguments) {
+            ui.info(&format!("⚠ {signal}"));
+        }
+        match ui.ask_approval(name, arguments) {
+            Approval::Once => true,
+            Approval::Always => {
+                self.allow.insert(name.to_string());
+                if !self.settings.permissions.allow.iter().any(|n| n == name) {
+                    self.settings.permissions.allow.push(name.to_string());
+                    let _ = self.settings.save(self.root);
+                }
+                true
+            }
+            Approval::Deny => false,
+        }
+    }
+
+    /// Execute a call whose arguments are a JSON string (as models send).
+    fn exec_json(&mut self, name: &str, arguments: &str) -> (String, bool) {
+        let args = if arguments.trim().is_empty() {
+            Value::Null
+        } else {
+            match serde_json::from_str(arguments) {
+                Ok(v) => v,
+                Err(e) => return (format!("error: invalid arguments JSON: {e}"), false),
+            }
+        };
+        self.exec(name, args)
+    }
+
+    /// Execute a call, returning `(result_text, ok)`.
+    fn exec(&mut self, name: &str, args: Value) -> (String, bool) {
+        let Some(tool) = self.tools.get(name) else {
+            return (format!("error: unknown tool '{name}'"), false);
+        };
+        let mut ctx = ToolCtx {
+            project_root: self.root,
+            fstate: self.fstate,
+        };
+        match tool.call(&mut ctx, args) {
+            Ok(s) => (s, true),
+            Err(e) => (format!("error: {e:#}"), false),
+        }
+    }
+}
+
+impl claude::ToolHost for ToolRunner<'_> {
+    fn auto_approve(&self) -> bool {
+        self.auto_approve
+    }
+
+    fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (String, bool) {
+        if !self.approve(name, &arguments.to_string(), ui) {
+            return (DENIED.to_string(), false);
+        }
+        self.exec(name, arguments)
     }
 }
 

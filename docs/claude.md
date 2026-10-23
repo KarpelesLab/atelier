@@ -43,6 +43,14 @@ atelier only keeps the session id in `.atelier/claude-session`).
 **What atelier adds:**
 
 - **The interface.** Same TUI/REPL/`--print` as the OpenAI backend.
+- **Its own tools.** atelier's built-in tools (project-confined file tools
+  with read-before-edit tracking, `apply_patch`, the sandboxed `node`
+  runtime, `bash`, …) are offered to claude as the `mcp__atelier__*` MCP
+  server, alongside claude's own. They run *in the atelier process*, with its
+  approval policy: confined tools run without asking, `bash` and other
+  unconfined tools ask through atelier's prompt (claude is told to allow the
+  server wholesale, so nothing is asked twice). They show under their atelier
+  names (`⚙ read …`). See [How atelier's tools reach claude](#how-ateliers-tools-reach-claude).
 - **MCP servers.** Everything in `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`)
   is passed via `--mcp-config` instead of being connected by atelier.
   `/mcp add`/`remove` relaunch claude on the next message, resuming the same
@@ -50,6 +58,26 @@ atelier only keeps the session id in `.atelier/claude-session`).
 - **Per-turn context.** atelier's context providers (git status, diff,
   layout, diagnostics) are prepended to each message in an
   `<atelier-context>` block, deduplicated across turns.
+
+## How atelier's tools reach claude
+
+claude can only use extra tools from MCP servers it launches itself, while
+atelier's tools need the live session (project root, read tracking, approval
+prompt, "always allow" list). So the server claude launches is a relay:
+
+```
+claude ──stdio MCP──▶ atelier mcp-serve <socket> ──Unix socket──▶ atelier (your session)
+```
+
+atelier listens on a socket in a private (0700) temporary directory and
+passes the relay a random token through the `--mcp-config` entry's
+environment; connections without it are dropped. The relay only pipes bytes.
+The session answers `initialize`/`tools/list` itself and runs each
+`tools/call` in its event loop — during a turn, or while idle (a background
+subagent using atelier's tools) — prompting through the normal interface.
+
+The server is named `atelier`; if `atelier.toml` already configures an MCP
+server by that name, atelier's tools aren't offered. Unix only.
 
 ## Stopping a turn, and background agents
 
@@ -72,7 +100,8 @@ Ctrl-C). So atelier never sends a plain interrupt:
   only relaunched after an error if it actually died.
 
 `cargo test live_stop -- --ignored` checks the Ctrl-C property against the
-real CLI (it runs a few cheap Haiku turns on your account).
+real CLI, and `cargo test --test claude_live -- --ignored` checks atelier's
+tools through the relay (both run a few cheap Haiku turns on your account).
 
 ## Permissions
 
@@ -84,8 +113,10 @@ without it, requests are denied (nobody is there to answer).
 
 ## Limitations (for now)
 
-- atelier's built-in tools (sandboxed file tools, `node`) are not offered to
-  claude; it uses its own.
+- claude's own overlapping built-ins (`Read`, `Edit`, `Bash`, …) stay
+  enabled next to atelier's; nothing yet switches them off.
+- claude loads MCP tools on demand (`ToolSearch`), so it tends to reach for
+  its built-ins first unless asked.
 - Messages typed mid-turn are sent as the next prompt after the turn ends,
   not injected into the running turn.
 - Ctrl-C while claude is still on a *queued* message (behind a turn it

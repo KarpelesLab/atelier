@@ -29,6 +29,16 @@ use settings::Settings;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
+    // claude launch — a relay back to the atelier process that owns the
+    // session (see `claude::relay`). Nothing else runs in that mode.
+    #[cfg(unix)]
+    if args.first().map(String::as_str) == Some("mcp-serve") {
+        let socket = args
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("usage: atelier mcp-serve <socket>"))?;
+        return claude::relay(socket);
+    }
     // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
     let mut cfg = Config::from_env(args.iter().any(|a| a == "--claude"));
     let claude = matches!(cfg.backend, config::Backend::Claude { .. });
