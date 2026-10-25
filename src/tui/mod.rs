@@ -190,6 +190,10 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Optio
                 r.status = build_status(session, turn);
                 r.refresh()?;
             }
+            if let Some(notice) = crate::update::take_notice() {
+                r.push_line(format!("! {notice}"), true);
+                r.refresh()?;
+            }
             continue;
         }
         match event::read()? {

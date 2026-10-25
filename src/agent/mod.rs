@@ -1483,6 +1483,9 @@ pub fn repl(mut session: Session) -> Result<()> {
 
     let stdin = io::stdin();
     loop {
+        if let Some(notice) = crate::update::take_notice() {
+            eprintln!("{notice}");
+        }
         print!("› ");
         io::stdout().flush().ok();
         let mut input = String::new();

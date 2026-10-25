@@ -21,6 +21,7 @@ mod shlex;
 mod tools;
 #[cfg(feature = "tui")]
 mod tui;
+mod update;
 
 use anyhow::Result;
 
@@ -32,6 +33,14 @@ fn main() -> Result<()> {
     // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
     // claude launch — a relay back to the atelier process that owns the
     // session (see `claude::relay`). Nothing else runs in that mode.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{}", update::version_line());
+        return Ok(());
+    }
+    // `atelier update`: install the latest release now (see `update`).
+    if args.first().map(String::as_str) == Some("update") {
+        return update::run_command();
+    }
     #[cfg(unix)]
     if args.first().map(String::as_str) == Some("mcp-serve") {
         let socket = args
@@ -40,6 +49,8 @@ fn main() -> Result<()> {
         return claude::relay(socket);
     }
     // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
+    // Daily check for a newer release, in the background (official builds).
+    update::spawn_background_check();
     let mut cfg = Config::from_env(args.iter().any(|a| a == "--claude"));
     let claude = matches!(cfg.backend, config::Backend::Claude { .. });
     let root = std::env::current_dir()?;

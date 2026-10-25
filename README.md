@@ -39,6 +39,29 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   posting short 💭 notes into the dialog — it can comment but never act.
 - **One binary, organized by module** — not an internal crate workspace.
 
+## Install
+
+Linux (x86_64 or aarch64) — a static binary from the latest
+[release](https://github.com/KarpelesLab/atelier/releases):
+
+```sh
+arch=$(uname -m)   # x86_64 or aarch64
+curl -fsSLo ~/.local/bin/atelier \
+  "https://github.com/KarpelesLab/atelier/releases/latest/download/atelier-$arch-unknown-linux-musl"
+chmod +x ~/.local/bin/atelier
+```
+
+Release binaries **keep themselves up to date**: at most once a day, at
+startup, atelier checks for a newer release in the background, verifies it
+against the release's `SHA256SUMS`, and swaps it in for the next launch
+(with a one-line notice). `atelier update` does it on demand;
+`ATELIER_NO_UPDATE=1` turns the background check off. Builds from source
+never update themselves.
+
+Publishing a release: bump `version` in `Cargo.toml`, then push a matching
+`vX.Y.Z` tag; `.github/workflows/release.yml` builds and publishes the
+binaries and checksums.
+
 ## Quickstart
 
 ```sh

@@ -352,6 +352,19 @@ servers, and per-turn context.
   `anthropic/alwaysLoad` so claude doesn't defer them.
 - ⏳ Inject messages queued mid-turn into the running claude turn.
 
+
+### M13 — Releases & self-update ✅
+
+- ✅ **Release workflow** (`.github/workflows/release.yml`): a `vX.Y.Z` tag
+  (checked against `Cargo.toml`) builds static musl binaries natively on
+  x86_64 and arm64 runners, smoke-tests them, and publishes them with
+  `SHA256SUMS`.
+- ✅ **Self-update** (`src/update.rs`): official builds (marked by
+  `ATELIER_RELEASE_TARGET` at compile time) check the latest release daily
+  in the background, verify the checksum, test-run the new binary, and
+  rename it over the old one for the next launch; `atelier update` on
+  demand, `ATELIER_NO_UPDATE` to opt out. Builds from source never update.
+- ⏳ First release (`v0.1.0`).
 ---
 
 ## 4. Harness ergonomics — designing for the agent's experience
