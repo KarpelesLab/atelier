@@ -364,7 +364,7 @@ servers, and per-turn context.
   in the background, verify the checksum, test-run the new binary, and
   rename it over the old one for the next launch; `atelier update` on
   demand, `ATELIER_NO_UPDATE` to opt out. Builds from source never update.
-- ⏳ First release (`v0.1.0`).
+- ✅ First release (`v0.1.0`): x86_64 and aarch64 static binaries with `SHA256SUMS`.
 ---
 
 ## 4. Harness ergonomics — designing for the agent's experience
