@@ -107,6 +107,16 @@ subagent using atelier's tools) — prompting through the normal interface.
 The server is named `atelier`; if `atelier.toml` already configures an MCP
 server by that name, atelier's tools aren't offered. Unix only.
 
+## Typing while claude works
+
+A message typed while a turn runs joins that turn: claude takes it at its
+next step, after the running tool calls return (as in its own TUI), and the
+transcript shows it there. atelier holds it until a tool call is running,
+since that is when claude can take it; until then Ctrl-C can still drop it.
+Once claude has it, a Ctrl-C stop delivers it along with the stop message.
+A message typed after the last tool call runs as the next turn. Slash
+commands always wait for the turn to end.
+
 ## Stopping a turn, and background agents
 
 **Background work is never killed unless you explicitly ask.** Background
@@ -127,8 +137,8 @@ Ctrl-C). So atelier never sends a plain interrupt:
   `--print` and piped input wait for them before exiting. The process is
   only relaunched after an error if it actually died.
 
-`cargo test live_stop -- --ignored` checks the Ctrl-C property against the
-real CLI, and `cargo test --test claude_live -- --ignored` checks atelier's
+`cargo test live_ -- --ignored` checks the Ctrl-C property and mid-turn
+messages against the real CLI, and `cargo test --test claude_live -- --ignored` checks atelier's
 tools through the relay and as replacements — reading, images, background
 jobs, approval policy (both run a few cheap Haiku turns on your account).
 
@@ -145,8 +155,6 @@ without it, requests are denied (nobody is there to answer).
 - atelier's tools can't push notifications into claude's turn, so a
   background job is waited on with `bash_output` rather than reporting in by
   itself the way claude's own background shells do.
-- Messages typed mid-turn are sent as the next prompt after the turn ends,
-  not injected into the running turn.
 - Ctrl-C while claude is still on a *queued* message (behind a turn it
   started itself) stops that turn, and the queued message then runs.
 - Subagent activity is shown only as its single top-level tool call.

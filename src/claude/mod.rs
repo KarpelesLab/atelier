@@ -29,6 +29,13 @@
 //! when that message's turn has completed), and output arriving between
 //! turns is rendered by [`Bridge::pump`].
 //!
+//! Messages the user types while a turn runs ([`Ui::take_queued`]) are handed
+//! to claude while a tool is running: claude delivers queued messages at the
+//! turn's next step, after the tool results, the way its own TUI does. Until
+//! then they stay in atelier's queue, where Ctrl-C can still drop them (once
+//! handed over, a stop delivers them along with the stop message). The turn
+//! ends when every message sent during it has completed.
+//!
 //! **Background work is never killed unless the user explicitly asks.** That
 //! rules out claude's own `interrupt` request, which stops background agents
 //! along with the turn. Ctrl-C instead *preempts* the turn: atelier queues a
@@ -38,7 +45,7 @@
 //! is only ever dropped (which ends everything in it) with no background
 //! tasks running, or on an explicit `/new force` / repeated quit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -170,11 +177,19 @@ pub struct Bridge {
 
 /// Progress of the turn [`Bridge::turn`] is waiting on.
 struct TurnState {
-    /// uuid of the user message whose completion ends the turn: the user's
-    /// own, or the stop message once Ctrl-C was pressed.
-    awaiting: String,
-    /// `awaiting` has started running (results seen before that belong to
-    /// some other turn, e.g. one reporting a finished background agent).
+    /// uuids of the user messages whose completion ends the turn: the user's
+    /// own and those handed over mid-turn, or the stop message once Ctrl-C
+    /// was pressed.
+    awaiting: Vec<String>,
+    /// Messages handed over mid-turn and not yet started, by uuid, so the
+    /// transcript can show each one when claude delivers it.
+    injected: HashMap<String, String>,
+    /// Tool calls of this turn still running: queued messages are handed
+    /// over only then (see the module docs).
+    tools: HashSet<String>,
+    /// An awaited message has started running (results seen before that
+    /// belong to some other turn, e.g. one reporting a finished background
+    /// agent).
     started: bool,
     /// Ctrl-C was pressed and the stop message sent.
     stopping: bool,
@@ -371,13 +386,15 @@ impl Bridge {
     /// once claude has acknowledged the stop — without an error.
     pub fn turn(&mut self, content: Value, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Result<()> {
         let mut st = TurnState {
-            awaiting: new_uuid(),
+            awaiting: vec![new_uuid()],
+            injected: HashMap::new(),
+            tools: HashSet::new(),
             started: false,
             stopping: false,
             error: None,
             done: false,
         };
-        self.send_user(content, &st.awaiting)?;
+        self.send_user(content, &st.awaiting[0])?;
         while !st.done {
             match self.incoming.recv_timeout(POLL) {
                 Ok(inc) => self.receive(inc, ui, host, Some(&mut st))?,
@@ -386,6 +403,9 @@ impl Bridge {
             }
             if !st.done && !st.stopping && ui.interrupted() {
                 self.stop(&mut st, ui)?;
+            }
+            if !st.done && !st.stopping && !st.tools.is_empty() {
+                self.inject(&mut st, ui)?;
             }
         }
         ui.turn_end();
@@ -481,6 +501,9 @@ impl Bridge {
                     .strip_prefix(TOOL_PREFIX)
                     .map_or(name.clone(), str::to_owned);
                 ui.tool_start(&name, &input);
+                if let Some(st) = turn {
+                    st.tools.insert(id.clone());
+                }
                 self.tool_names.insert(id, name);
             }
             Event::ToolResult {
@@ -488,6 +511,9 @@ impl Bridge {
                 content,
                 is_error,
             } => {
+                if let Some(st) = turn {
+                    st.tools.remove(&id);
+                }
                 let name = self.tool_names.remove(&id).unwrap_or_default();
                 ui.tool_end(&name, &content, !is_error);
             }
@@ -499,12 +525,21 @@ impl Bridge {
             }
             Event::Lifecycle { uuid, state } => {
                 if let Some(st) = turn
-                    && uuid == st.awaiting
+                    && st.awaiting.contains(&uuid)
                 {
                     match state.as_str() {
                         "queued" => {}
-                        "started" => st.started = true,
-                        _ => st.done = true,
+                        "started" => {
+                            st.started = true;
+                            if let Some(text) = st.injected.remove(&uuid) {
+                                ui.queued_delivered(&text);
+                            }
+                        }
+                        // completed, cancelled, …
+                        _ => {
+                            st.awaiting.retain(|u| *u != uuid);
+                            st.done = st.awaiting.is_empty();
+                        }
                     }
                 }
             }
@@ -544,7 +579,11 @@ impl Bridge {
             "request_id": new_uuid(),
             "request": { "subtype": "interrupt", "send_now": true, "message_uuid": id },
         }))?;
-        st.awaiting = id;
+        // claude delivers the handed-over messages it hasn't started along
+        // with the stop message, so they're still awaited; the rest of the
+        // turn ends as cancelled.
+        st.awaiting.retain(|u| st.injected.contains_key(u));
+        st.awaiting.push(id);
         st.started = false;
         st.stopping = true;
         st.error = None;
@@ -553,6 +592,18 @@ impl Bridge {
                 "{} background task(s) keep running",
                 self.background
             ));
+        }
+        Ok(())
+    }
+
+    /// Hand the user's queued messages to claude, which delivers them at the
+    /// turn's next step.
+    fn inject(&mut self, st: &mut TurnState, ui: &mut dyn Ui) -> Result<()> {
+        for text in ui.take_queued() {
+            let id = new_uuid();
+            self.send_user(Value::from(text.as_str()), &id)?;
+            st.awaiting.push(id.clone());
+            st.injected.insert(id, text);
         }
         Ok(())
     }
@@ -1111,6 +1162,9 @@ mod tests {
         text: String,
         tools: Vec<String>,
         stop_after: Option<usize>,
+        /// Typed "while the turn runs"; handed over on the bridge's ask.
+        queued: Vec<String>,
+        delivered: Vec<String>,
     }
 
     impl Ui for LiveUi {
@@ -1129,6 +1183,12 @@ mod tests {
         fn notice(&mut self, _: &str) {}
         fn interrupted(&mut self) -> bool {
             self.stop_after.is_some_and(|n| self.text.len() > n)
+        }
+        fn take_queued(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.queued)
+        }
+        fn queued_delivered(&mut self, text: &str) {
+            self.delivered.push(text.to_string());
         }
     }
 
@@ -1199,6 +1259,35 @@ mod tests {
         b.turn(json!("Reply with exactly: ok"), &mut after, &mut NoTools)
             .unwrap();
         assert!(after.text.to_lowercase().contains("ok"), "{:?}", after.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A message typed mid-turn reaches the running turn: claude delivers it
+    /// after the tool results, and the turn ends once both are done.
+    #[test]
+    #[ignore = "drives the real claude CLI on your account; run with --ignored"]
+    fn live_queued_message_joins_the_turn() {
+        let dir = std::env::temp_dir().join(format!("atelier-live-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = Launch {
+            bin: "claude",
+            model: Some("haiku"),
+            resume: None,
+            keep_builtins: false,
+        };
+        let mut b = Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()).unwrap();
+        let mut ui = LiveUi {
+            queued: vec!["Also: end your final reply with the word BANANA.".into()],
+            ..LiveUi::default()
+        };
+        b.turn(
+            json!("Run `sleep 5; echo first` with the Bash tool, then reply with its output."),
+            &mut ui,
+            &mut NoTools,
+        )
+        .unwrap();
+        assert_eq!(ui.delivered.len(), 1, "{:?}", ui.delivered);
+        assert!(ui.text.contains("BANANA"), "{:?}", ui.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

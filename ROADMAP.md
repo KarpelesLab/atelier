@@ -350,7 +350,8 @@ servers, and per-turn context.
   `bash` background jobs + `bash_output`/`bash_kill` cover Monitor;
   `notebook_edit`; `web_fetch` converts HTML and pages. Tools are marked
   `anthropic/alwaysLoad` so claude doesn't defer them.
-- ⏳ Inject messages queued mid-turn into the running claude turn.
+- ✅ Messages typed mid-turn join the running claude turn (handed over
+  while a tool runs; claude delivers them after the tool results).
 
 
 ### M13 — Releases & self-update ✅
