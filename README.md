@@ -121,7 +121,7 @@ first conversation, the REPL/TUI fallback).
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` — and how it differs from `atelier review` |
 | [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |
 | [Claude backend](docs/claude.md) | `--claude`: driving your Claude Code CLI from atelier |
-| [Coordinator](docs/coordinator.md) | How running ateliers find and message each other: `/peers`, `/send`, topics, the `peers`/`peer_send` tools |
+| [Coordinator](docs/coordinator.md) | How running ateliers find and message each other: `/peers`, `/send`, topics, asking another agent and getting its answer, the `peer*` tools |
 
 ## Layout
 

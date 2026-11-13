@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::ask::Outcome;
 use super::client::{self, Client, Options};
 use super::{Message, daemon, socket_path};
 
@@ -233,6 +234,253 @@ fn instances_rejoin_a_new_coordinator() {
 
     client::control(&dir.0, "shutdown").unwrap();
     second.join().unwrap();
+}
+
+/// The question `c` was just asked.
+fn next_question(c: &Client) -> (String, Message) {
+    let m = next_message(c);
+    (m.question.clone().expect("a question"), m)
+}
+
+#[test]
+fn a_question_is_answered_later_by_whoever_holds_it() {
+    let dir = Dir::new("ask");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let t = Duration::from_secs(30);
+
+    // The asker blocks; the question sits in the target's inbox, and the
+    // target's reader thread is free meanwhile (it answers a `ping`).
+    let asker = {
+        let a = Arc::clone(&a);
+        std::thread::spawn(move || a.ask("b", "which port does it listen on?", t))
+    };
+    let (id, m) = next_question(&b);
+    assert_eq!(
+        (m.from.as_str(), m.cwd.as_str(), m.body.as_str()),
+        ("a", "/work/a", "which port does it listen on?")
+    );
+    assert_eq!(id, "q1");
+    assert!(b.question_open(&id));
+    assert_eq!(a.call("b", "ping", json!({}), t).unwrap(), "pong");
+    assert!(!asker.is_finished());
+
+    assert_eq!(b.answer_question(&id, "8080").unwrap(), "a");
+    assert_eq!(
+        asker.join().unwrap().unwrap(),
+        Outcome::Answered("8080".into())
+    );
+    // Once only.
+    assert!(!b.question_open(&id));
+    let again = b.answer_question(&id, "8081").unwrap_err().to_string();
+    assert!(again.contains("no open question 'q1'"), "{again}");
+
+    // Nobody by that name: the question could not be asked at all.
+    let nobody = a.ask("z", "hello?", t).unwrap_err().to_string();
+    assert!(nobody.contains("no instance named"), "{nobody}");
+    client::control(&dir.0, "shutdown").unwrap();
+}
+
+#[test]
+fn an_unanswered_question_says_why() {
+    let dir = Dir::new("noanswer");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let unanswered = |r: anyhow::Result<Outcome>| match r {
+        Ok(Outcome::Unanswered(why)) => why,
+        other => panic!("expected no answer, got {other:?}"),
+    };
+
+    // Nobody answers in time: the coordinator gives up at the deadline, and
+    // the target forgets the question.
+    let why = unanswered(a.ask("b", "anyone?", Duration::from_millis(100)));
+    assert!(why.contains("b did not answer within"), "{why}");
+    let (id, _) = next_question(&b);
+    wait_for("the question to expire", || !b.question_open(&id));
+    assert!(b.answer_question(&id, "too late").is_err());
+
+    // The turn it was handed to ends without an answer. A question that is
+    // still in the inbox, or that the session holds for its next prompt,
+    // was not handed to that turn and stays open.
+    let ask = |q: &'static str| {
+        let a = Arc::clone(&a);
+        std::thread::spawn(move || a.ask("b", q, Duration::from_secs(30)))
+    };
+    let (first, second, third) = (ask("one"), ask("two"), ask("three"));
+    let mut got = Vec::new();
+    wait_for("three questions", || {
+        got.extend(b.take_messages());
+        got.len() == 3
+    });
+    let id_of = |body: &str| {
+        let m = got.iter().find(|m| m.body == body).expect("asked");
+        m.question.clone().unwrap()
+    };
+    let (one, two, three) = (id_of("one"), id_of("two"), id_of("three"));
+    let fourth = ask("four");
+    wait_for("the fourth to be admitted", || b.question_open("q5"));
+    let closed = b.close_questions(&[two.as_str()], "b ended its turn without answering");
+    let mut expected = vec![(one.clone(), "a".to_string()), (three, "a".to_string())];
+    expected.sort();
+    assert_eq!(closed, expected);
+    assert_eq!(
+        unanswered(first.join().unwrap()),
+        "b ended its turn without answering"
+    );
+    assert_eq!(
+        unanswered(third.join().unwrap()),
+        "b ended its turn without answering"
+    );
+    assert!(b.question_open(&two));
+    b.answer_question(&two, "2").unwrap();
+    assert_eq!(
+        second.join().unwrap().unwrap(),
+        Outcome::Answered("2".into())
+    );
+    let (four, _) = next_question(&b);
+    b.answer_question(&four, "4").unwrap();
+    assert_eq!(
+        fourth.join().unwrap().unwrap(),
+        Outcome::Answered("4".into())
+    );
+
+    // The target leaves with the question open.
+    let last = ask("five");
+    next_question(&b);
+    b.stop();
+    let why = unanswered(last.join().unwrap());
+    assert!(why.contains("b disconnected before answering"), "{why}");
+    client::control(&dir.0, "shutdown").unwrap();
+}
+
+#[test]
+fn two_instances_asking_each_other_do_not_wait_each_other_out() {
+    let dir = Dir::new("mutual");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let t = Duration::from_secs(30);
+
+    let asker = {
+        let a = Arc::clone(&a);
+        std::thread::spawn(move || a.ask("b", "what do you need?", t))
+    };
+    let (id, _) = next_question(&b);
+    // b's agent, instead of answering, asks a — whose agent is blocked on b.
+    match b.ask("a", "what do *you* need?", t).unwrap() {
+        Outcome::Unanswered(why) => {
+            assert!(
+                why.contains("a is itself waiting for an answer from b"),
+                "{why}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(a.take_messages().is_empty());
+    b.answer_question(&id, "nothing").unwrap();
+    assert_eq!(
+        asker.join().unwrap().unwrap(),
+        Outcome::Answered("nothing".into())
+    );
+    client::control(&dir.0, "shutdown").unwrap();
+}
+
+#[test]
+fn a_deferred_handler_answers_from_another_thread_or_not_at_all() {
+    let dir = Dir::new("deferred");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let t = Duration::from_secs(30);
+
+    let (tx, rx) = std::sync::mpsc::channel::<client::Incoming>();
+    let tx = std::sync::Mutex::new(tx);
+    b.handle_deferred("later", move |call| {
+        tx.lock().unwrap().send(call).unwrap();
+    });
+    let caller = {
+        let a = Arc::clone(&a);
+        std::thread::spawn(move || a.call("b", "later", json!({"n": 20}), t))
+    };
+    let call = rx.recv_timeout(Duration::from_secs(10)).expect("the call");
+    assert_eq!((call.from.as_str(), call.cwd.as_str()), ("a", "/work/a"));
+    assert!(!caller.is_finished());
+    let n = call.params["n"].as_i64().unwrap();
+    call.reply.answer(Ok(json!(n + 1))).unwrap();
+    assert_eq!(caller.join().unwrap().unwrap(), 21);
+
+    // A responder that is dropped fails the call instead of leaving the
+    // caller to its timeout.
+    let caller = {
+        let a = Arc::clone(&a);
+        std::thread::spawn(move || a.call("b", "later", json!({}), t))
+    };
+    drop(rx.recv_timeout(Duration::from_secs(10)).expect("the call"));
+    let err = caller.join().unwrap().unwrap_err().to_string();
+    assert!(err.contains("left unanswered"), "{err}");
+    client::control(&dir.0, "shutdown").unwrap();
+}
+
+#[test]
+fn the_ask_tools_are_gated_like_what_they_do() {
+    use crate::tools::{FileState, ToolCtx, ToolRegistry};
+    let dir = Dir::new("asktools");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let (mut for_a, mut for_b) = (ToolRegistry::new(), ToolRegistry::new());
+    super::tools::register(&mut for_a, &a);
+    super::tools::register(&mut for_b, &b);
+
+    // Asking sets another agent to work: approved by the user, and not for
+    // plan mode. Answering only completes what was already admitted.
+    let (ask, answer) = (
+        for_a.get("peer_ask").unwrap(),
+        for_b.get("peer_answer").unwrap(),
+    );
+    assert!(ask.requires_approval(&json!({})) && ask.mutates(&json!({})));
+    assert!(!answer.requires_approval(&json!({})) && !answer.mutates(&json!({})));
+
+    let root = dir.0.clone();
+    let call = move |tools: &ToolRegistry, name: &str, args: Value| {
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: true,
+        };
+        tools.get(name).unwrap().call(&mut ctx, args)
+    };
+    let asker = {
+        let call = call.clone();
+        std::thread::spawn(move || {
+            call(&for_a, "peer_ask", json!({"to": "b", "question": "ready?"}))
+        })
+    };
+    let (id, _) = next_question(&b);
+    let sent = call(&for_b, "peer_answer", json!({"id": id, "answer": "yes"})).unwrap();
+    assert_eq!(sent, "answer sent to a");
+    assert_eq!(asker.join().unwrap().unwrap(), "yes");
+
+    // No answer is a result the asking model reads, not an error.
+    let mut for_a = ToolRegistry::new();
+    super::tools::register(&mut for_a, &a);
+    let asker = std::thread::spawn(move || {
+        call(
+            &for_a,
+            "peer_ask",
+            json!({"to": "b", "question": "and now?"}),
+        )
+    });
+    next_question(&b);
+    b.close_questions(&[], "b ended its turn without answering");
+    assert_eq!(
+        asker.join().unwrap().unwrap(),
+        "no answer: b ended its turn without answering"
+    );
+    client::control(&dir.0, "shutdown").unwrap();
 }
 
 /// One raw JSON-RPC exchange.

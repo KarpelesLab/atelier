@@ -30,11 +30,14 @@
 //!
 //! Inside atelier these surface as the `peers` and `peer_send` tools
 //! ([`tools`]), the `/peers`, `/send`, `/subscribe` commands, and messages
-//! from other instances delivered into the conversation (`agent`).
+//! from other instances delivered into the conversation (`agent`). One
+//! `call` method, `ask`, carries a question to another instance's *agent*
+//! and its answer back — the `peer_ask` and `peer_answer` tools ([`ask`]).
 //!
 //! Unix only (`cfg(unixlike)`, see `build.rs`): elsewhere [`start`] returns
 //! `None` and atelier runs alone.
 
+pub mod ask;
 #[cfg(unixlike)]
 pub mod client;
 #[cfg(not(unixlike))]
@@ -66,9 +69,14 @@ pub const ENV_DIR: &str = "ATELIER_COORDINATOR_DIR";
 pub const ERR_SUPERSEDED: i64 = -32001;
 /// JSON-RPC error: the caller speaks a protocol this coordinator doesn't.
 pub const ERR_INCOMPATIBLE: i64 = -32002;
+/// JSON-RPC error: the target of a `call` did not answer before the
+/// caller's deadline.
+pub const ERR_TIMEOUT: i64 = -32003;
+/// JSON-RPC error: the target of a `call` disconnected before answering.
+pub const ERR_GONE: i64 = -32004;
 
 /// A message from another instance.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Message {
     /// The sender's name (unique among connected instances).
     pub from: String,
@@ -79,6 +87,9 @@ pub struct Message {
     /// Sent to every instance rather than to this one.
     pub broadcast: bool,
     pub body: String,
+    /// Set when the sender is waiting for this instance's agent to answer
+    /// (see [`ask`]): the id the answer must name.
+    pub question: Option<String>,
 }
 
 impl Message {

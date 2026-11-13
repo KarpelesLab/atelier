@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 use super::Message;
+use super::ask::Outcome;
 
 pub struct Options {
     pub dir: PathBuf,
@@ -44,6 +45,18 @@ impl Client {
         bail!(UNSUPPORTED)
     }
     pub fn topics(&self) -> Vec<String> {
+        Vec::new()
+    }
+    pub fn ask(&self, _: &str, _: &str, _: std::time::Duration) -> Result<Outcome> {
+        bail!(UNSUPPORTED)
+    }
+    pub fn answer_question(&self, _: &str, _: &str) -> Result<String> {
+        bail!(UNSUPPORTED)
+    }
+    pub fn question_open(&self, _: &str) -> bool {
+        false
+    }
+    pub fn close_questions(&self, _: &[&str], _: &str) -> Vec<(String, String)> {
         Vec::new()
     }
     pub fn update(&self, _: &str, _: &str) {}

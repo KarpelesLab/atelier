@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::{ERR_INCOMPATIBLE, ERR_SUPERSEDED, PROTO, socket_path};
+use super::{ERR_GONE, ERR_INCOMPATIBLE, ERR_SUPERSEDED, ERR_TIMEOUT, PROTO, socket_path};
 use crate::update::{VERSION, parse_version};
 
 /// How long the daemon outlives its last instance.
@@ -43,9 +43,11 @@ const TICK: Duration = Duration::from_millis(250);
 const EXE_CHECK: Duration = Duration::from_secs(2);
 /// A peer that doesn't take a line within this is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// `call`: default and longest time the target gets to answer.
+/// `call`: default and longest time the target gets to answer. The longest
+/// is what a question to another instance's agent may wait (see
+/// [`super::ask`]): an answer that takes a model's turn, not a function's.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
-const CALL_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+const CALL_TIMEOUT_MAX: Duration = super::ask::MAX_TIMEOUT;
 
 pub struct Config {
     pub dir: PathBuf,
@@ -145,7 +147,7 @@ impl State {
             for k in gone {
                 if let Some(c) = self.calls.remove(&k) {
                     let msg = format!("{} disconnected before answering", peer.name);
-                    self.send(c.caller, error(&c.caller_id, -32000, &msg));
+                    self.send(c.caller, error(&c.caller_id, ERR_GONE, &msg));
                 }
             }
         }
@@ -308,7 +310,7 @@ impl Daemon {
                 .collect();
             for k in late {
                 if let Some(c) = st.calls.remove(&k) {
-                    st.send(c.caller, error(&c.caller_id, -32000, "call timed out"));
+                    st.send(c.caller, error(&c.caller_id, ERR_TIMEOUT, "call timed out"));
                 }
             }
             let idle_out = st.peers.is_empty()

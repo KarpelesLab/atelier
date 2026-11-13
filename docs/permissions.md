@@ -47,10 +47,10 @@ What each mode does with each class of tool, when no rule matches the call:
 
 | Tool class | Tools | `plan` | `ask-edits` | `auto-edit` | `yolo` |
 |------------|-------|--------|-------------|-------------|--------|
-| Read-only, confined | `read` (in the project), `grep`, `glob`, `ls`, `tree`, `todo`, `skill`, `memory` `read`/`list`, `bash_output`, `bash_kill`, `peers` | run | run | run | run |
+| Read-only, confined | `read` (in the project), `grep`, `glob`, `ls`, `tree`, `todo`, `skill`, `memory` `read`/`list`, `bash_output`, `bash_kill`, `peers`, `peer_answer` | run | run | run | run |
 | Read-only, unconfined | `web_fetch`, `web_search`, `read` outside the project, MCP tools their server marks `readOnlyHint: true`, MCP `read_resource` / `get_prompt` | ask | ask | ask | run |
 | Modifying, confined | `write`, `edit`, `multiedit`, `apply_patch`, `notebook_edit`, `node` (its `fs` can write), `memory` `save`/`delete` | **refused** | **ask** | run | run |
-| Modifying, unconfined | `bash`, `node` with `network: true`, every other MCP tool, `peer_send` | **refused** (but see `bash` below) | ask | ask | run |
+| Modifying, unconfined | `bash`, `node` with `network: true`, every other MCP tool, `peer_send`, `peer_ask` | **refused** (but see `bash` below) | ask | ask | run |
 
 And with [rules](#rules):
 

@@ -8,6 +8,13 @@
 //! to whichever coordinator it finds next. Requests made while
 //! disconnected wait briefly for the link to come back, then fail with an
 //! error saying why it is down.
+//!
+//! Another instance's `call` is answered by the handler registered for its
+//! method. Handlers run on the reader thread, so they must return quickly;
+//! one whose answer takes longer than that — a question for the agent, see
+//! [`super::ask`] — registers with [`Client::handle_deferred`] and keeps the
+//! [`Responder`] it is handed, to answer whenever the answer exists. The
+//! coordinator holds the call open until then, or until its deadline.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -17,13 +24,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{ENV_DIR, ERR_INCOMPATIBLE, Message, PROTO, socket_path};
+use super::ask::{self, Desk, Outcome};
+use super::{ENV_DIR, ERR_GONE, ERR_INCOMPATIBLE, ERR_TIMEOUT, Message, PROTO, socket_path};
 use crate::update::VERSION;
 
 /// How long a request waits for the link before giving up.
@@ -72,13 +80,83 @@ struct Link {
     down: String,
     /// The coordinator's version, while connected.
     coordinator: String,
+    /// Counts the connections established. A forwarded `call` is known by
+    /// a number of the coordinator's that means nothing to the next one.
+    session: u64,
 }
 
-type Waiter = Sender<Result<Value, String>>;
-/// Answers a `call` from another instance: `(method, params)`.
-type Handler = Box<dyn Fn(&Value) -> Result<Value, String> + Send + Sync>;
+/// A request the coordinator (or the instance it forwarded a `call` to)
+/// answered with an error.
+#[derive(Debug)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+type Waiter = Sender<Result<Value, RpcError>>;
+/// Deals with a `call` from another instance.
+type Handler = Box<dyn Fn(Incoming) + Send + Sync>;
+
+/// A `call` from another instance, as its handler gets it.
+pub struct Incoming {
+    /// The calling instance's name, and the directory it works in.
+    pub from: String,
+    pub cwd: String,
+    pub params: Value,
+    /// How to answer; may be kept and used after the handler has returned.
+    pub reply: Responder,
+}
+
+/// The answer to one forwarded `call`, to be given once. Dropped without
+/// one, it tells the caller so rather than leave it waiting for its timeout.
+pub struct Responder {
+    sh: Weak<Shared>,
+    id: Value,
+    /// The connection the call arrived on (see [`Link::session`]).
+    session: u64,
+    answered: bool,
+}
+
+impl Responder {
+    /// Send the answer. Fails when the connection the call arrived on is
+    /// gone — the coordinator has already failed the call for the caller.
+    pub fn answer(mut self, result: Result<Value, String>) -> Result<()> {
+        self.answered = true;
+        self.send(result)
+    }
+
+    fn send(&self, result: Result<Value, String>) -> Result<()> {
+        let Some(sh) = self.sh.upgrade() else {
+            bail!("this instance has left the coordinator");
+        };
+        let mut reply = json!({ "jsonrpc": "2.0", "id": self.id });
+        match result {
+            Ok(v) => reply["result"] = v,
+            Err(e) => reply["error"] = json!({ "code": -32000, "message": e }),
+        }
+        sh.write_on(Some(self.session), &reply)
+    }
+}
+
+impl Drop for Responder {
+    fn drop(&mut self) {
+        if !self.answered {
+            let _ = self.send(Err("the call was left unanswered".into()));
+        }
+    }
+}
 
 struct Shared {
+    /// Itself, for the responders it hands out.
+    me_ref: Weak<Shared>,
     dir: PathBuf,
     exe: Option<PathBuf>,
     /// Stable for the life of the process, across coordinators.
@@ -91,6 +169,11 @@ struct Shared {
     inbox: Mutex<VecDeque<Message>>,
     topics: Mutex<BTreeSet<String>>,
     handlers: Mutex<HashMap<String, Handler>>,
+    /// The questions other instances asked this one (see [`ask`]). Locked
+    /// after `inbox` where both are held.
+    desk: Mutex<Desk>,
+    /// The instances this one is waiting on an answer from.
+    asking: Mutex<Vec<String>>,
     stop: AtomicBool,
 }
 
@@ -104,7 +187,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Client {
     pub fn start(opts: Options) -> Arc<Self> {
-        let sh = Arc::new(Shared {
+        let sh = Arc::new_cyclic(|me_ref| Shared {
+            me_ref: me_ref.clone(),
             dir: opts.dir,
             exe: opts.exe,
             id: crate::claude::new_uuid(),
@@ -124,6 +208,8 @@ impl Client {
             inbox: Mutex::new(VecDeque::new()),
             topics: Mutex::new(BTreeSet::new()),
             handlers: Mutex::new(HashMap::new()),
+            desk: Mutex::new(Desk::default()),
+            asking: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
         });
         let client = Arc::new(Self {
@@ -132,6 +218,12 @@ impl Client {
         client.handle("ping", |_| Ok(json!("pong")));
         let info = Arc::clone(&sh);
         client.handle("info", move |_| Ok(info.describe()));
+        let asked = Arc::downgrade(&sh);
+        client.handle_deferred(ask::METHOD, move |call| {
+            if let Some(sh) = asked.upgrade() {
+                sh.asked(call);
+            }
+        });
         std::thread::spawn(move || sh.run());
         client
     }
@@ -143,6 +235,15 @@ impl Client {
         method: &str,
         f: impl Fn(&Value) -> Result<Value, String> + Send + Sync + 'static,
     ) {
+        self.handle_deferred(method, move |call| {
+            let _ = call.reply.answer(f(&call.params));
+        });
+    }
+
+    /// Like [`handle`](Self::handle), for a method whose answer is not ready
+    /// when the handler returns: `f` keeps the call's [`Responder`] and
+    /// answers through it later, from any thread.
+    pub fn handle_deferred(&self, method: &str, f: impl Fn(Incoming) + Send + Sync + 'static) {
         lock(&self.sh.handlers).insert(method.to_string(), Box::new(f));
     }
 
@@ -209,7 +310,6 @@ impl Client {
     }
 
     /// Ask the instance `to` to run `method` and wait for its answer.
-    #[allow(dead_code)] // the instance-to-instance RPC primitive; no caller in atelier yet
     pub fn call(&self, to: &str, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let p = json!({
             "to": to,
@@ -219,6 +319,57 @@ impl Client {
         });
         // The coordinator enforces the deadline; allow it time to say so.
         self.request("call", p, timeout + Duration::from_secs(2))
+    }
+
+    /// Put `question` to the agent of the instance `to` and wait, up to
+    /// `timeout`, for what it answers (see [`ask`]). `Err` is for a question
+    /// that could not be asked at all.
+    pub fn ask(&self, to: &str, question: &str, timeout: Duration) -> Result<Outcome> {
+        let timeout = timeout.min(ask::MAX_TIMEOUT);
+        let params = json!({ "question": question, "timeout_ms": timeout.as_millis() as u64 });
+        lock(&self.sh.asking).push(to.to_string());
+        let answer = self.call(to, ask::METHOD, params, timeout);
+        {
+            let mut asking = lock(&self.sh.asking);
+            if let Some(i) = asking.iter().position(|n| n == to) {
+                asking.swap_remove(i);
+            }
+        }
+        match answer {
+            Ok(v) => Ok(Outcome::from_value(&v)),
+            Err(e) => match e.downcast_ref::<RpcError>() {
+                Some(rpc) if rpc.code == ERR_TIMEOUT => Ok(Outcome::Unanswered(format!(
+                    "{to} did not answer within {}s: it may be idle, waiting for its user, or \
+                     busy with something long",
+                    timeout.as_secs()
+                ))),
+                Some(rpc) if rpc.code == ERR_GONE => Ok(Outcome::Unanswered(rpc.message.clone())),
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// Answer the question `id` another instance asked this one; returns
+    /// the asker's name.
+    pub fn answer_question(&self, id: &str, text: &str) -> Result<String> {
+        lock(&self.sh.desk).answer(id, text)
+    }
+
+    /// Whether the question `id` still has someone waiting for its answer.
+    pub fn question_open(&self, id: &str) -> bool {
+        lock(&self.sh.desk).is_open(id)
+    }
+
+    /// Close the questions that were handed out (they are no longer in the
+    /// inbox, nor among `held`, the ids the caller still keeps for later)
+    /// and are still unanswered, telling each asker `why`. Returns
+    /// `(id, asker)` of each.
+    pub fn close_questions(&self, held: &[&str], why: &str) -> Vec<(String, String)> {
+        let inbox = lock(&self.sh.inbox);
+        let waiting = |id: &str| {
+            held.contains(&id) || inbox.iter().any(|m| m.question.as_deref() == Some(id))
+        };
+        lock(&self.sh.desk).close(waiting, why)
     }
 
     /// Tell the other instances what this one is doing (`idle`/`working`)
@@ -267,13 +418,18 @@ impl Client {
         }
         match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(anyhow!(e)),
+            Ok(Err(e)) => Err(anyhow::Error::new(e)),
             Err(_) => {
                 lock(&sh.pending).remove(&id);
                 bail!("the coordinator did not answer '{method}' in time")
             }
         }
     }
+}
+
+/// A JSON string, or nothing.
+fn text(v: &Value) -> String {
+    v.as_str().unwrap_or_default().to_string()
 }
 
 /// How a connection attempt ended.
@@ -299,7 +455,16 @@ impl Shared {
     }
 
     fn write(&self, msg: &Value) -> Result<()> {
+        self.write_on(None, msg)
+    }
+
+    /// [`write`](Self::write), but only on the connection numbered
+    /// `session`, if one is given.
+    fn write_on(&self, session: Option<u64>, msg: &Value) -> Result<()> {
         let mut link = lock(&self.link);
+        if session.is_some_and(|s| s != link.session) {
+            bail!("the coordinator connection it arrived on is gone");
+        }
         let Some(out) = link.out.as_mut() else {
             bail!("not connected to the coordinator ({})", link.down);
         };
@@ -347,7 +512,10 @@ impl Shared {
             };
             // Whoever was waiting on the old connection won't get an answer.
             for (_, waiter) in lock(&self.pending).drain() {
-                let _ = waiter.send(Err("the coordinator connection was lost".into()));
+                let _ = waiter.send(Err(RpcError {
+                    code: -32000,
+                    message: "the coordinator connection was lost".into(),
+                }));
             }
             let until = Instant::now() + delay + jitter;
             while Instant::now() < until && !self.stop.load(Ordering::Relaxed) {
@@ -393,6 +561,7 @@ impl Shared {
                 .unwrap_or("?")
                 .to_string();
             link.out = Some(out);
+            link.session += 1;
             link.down.clear();
         }
         self.linked.notify_all();
@@ -406,6 +575,62 @@ impl Shared {
         Ok(Ended::Lost)
     }
 
+    /// Put a message in the inbox, making room if it is full.
+    fn deliver(&self, inbox: &mut VecDeque<Message>, m: Message) {
+        if inbox.len() >= INBOX_MAX
+            && let Some(Message {
+                question: Some(id), ..
+            }) = inbox.pop_front()
+        {
+            // A question nobody will see must not keep its asker waiting.
+            let me = lock(&self.me).name.clone();
+            let why = format!("{me} had too many unread messages; the question was dropped");
+            lock(&self.desk).close(|open| open != id, &why);
+        }
+        inbox.push_back(m);
+    }
+
+    /// Another instance's question (see [`ask`]): written down for the
+    /// agent, to be answered through the kept responder.
+    fn asked(&self, call: Incoming) {
+        let Incoming {
+            from,
+            cwd,
+            params,
+            reply,
+        } = call;
+        let reply: ask::Reply = Box::new(move |outcome| reply.answer(Ok(outcome.to_value())));
+        // This instance's agent is blocked on `from`'s answer, so it will
+        // not get to the question before that call is over: say so now
+        // rather than have both wait out their timeouts.
+        if lock(&self.asking).contains(&from) {
+            let me = lock(&self.me).name.clone();
+            let why = format!(
+                "{me} is itself waiting for an answer from {from}, and cannot answer until it \
+                 has it"
+            );
+            let _ = reply(Outcome::Unanswered(why));
+            return;
+        }
+        let timeout = params["timeout_ms"]
+            .as_u64()
+            .map_or(ask::DEFAULT_TIMEOUT, Duration::from_millis)
+            .min(ask::MAX_TIMEOUT);
+        let mut inbox = lock(&self.inbox);
+        let id = lock(&self.desk).admit(&from, timeout, reply);
+        self.deliver(
+            &mut inbox,
+            Message {
+                from,
+                cwd,
+                topic: None,
+                broadcast: false,
+                body: text(&params["question"]),
+                question: Some(id),
+            },
+        );
+    }
+
     fn incoming(&self, msg: &Value) {
         let params = &msg["params"];
         match (msg["method"].as_str(), msg.get("id")) {
@@ -415,38 +640,49 @@ impl Shared {
                     return;
                 };
                 let answer = match msg.get("error") {
-                    Some(e) => Err(e["message"].as_str().unwrap_or("error").to_string()),
+                    Some(e) => Err(RpcError {
+                        code: e["code"].as_i64().unwrap_or(-32000),
+                        message: e["message"].as_str().unwrap_or("error").to_string(),
+                    }),
                     None => Ok(msg["result"].clone()),
                 };
                 let _ = waiter.send(answer);
             }
             (Some("message"), _) => {
-                let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
                 let mut inbox = lock(&self.inbox);
-                if inbox.len() >= INBOX_MAX {
-                    inbox.pop_front();
-                }
-                inbox.push_back(Message {
-                    from: text(&params["from"]["name"]),
-                    cwd: text(&params["from"]["cwd"]),
-                    topic: params["topic"].as_str().map(String::from),
-                    broadcast: params["broadcast"].as_bool().unwrap_or(false),
-                    body: text(&params["body"]),
-                });
+                self.deliver(
+                    &mut inbox,
+                    Message {
+                        from: text(&params["from"]["name"]),
+                        cwd: text(&params["from"]["cwd"]),
+                        topic: params["topic"].as_str().map(String::from),
+                        broadcast: params["broadcast"].as_bool().unwrap_or(false),
+                        body: text(&params["body"]),
+                        question: None,
+                    },
+                );
             }
             // Another instance's `call`, forwarded for us to answer.
             (Some("call"), Some(id)) => {
                 let method = params["method"].as_str().unwrap_or_default();
-                let result = match lock(&self.handlers).get(method) {
-                    Some(f) => f(&params["params"]),
-                    None => Err(format!("'{method}' is not something this instance answers")),
+                let call = Incoming {
+                    from: text(&params["from"]["name"]),
+                    cwd: text(&params["from"]["cwd"]),
+                    params: params["params"].clone(),
+                    reply: Responder {
+                        sh: self.me_ref.clone(),
+                        id: id.clone(),
+                        session: lock(&self.link).session,
+                        answered: false,
+                    },
                 };
-                let mut reply = json!({ "jsonrpc": "2.0", "id": id });
-                match result {
-                    Ok(v) => reply["result"] = v,
-                    Err(e) => reply["error"] = json!({ "code": -32000, "message": e }),
+                match lock(&self.handlers).get(method) {
+                    Some(f) => f(call),
+                    None => {
+                        let why = format!("'{method}' is not something this instance answers");
+                        let _ = call.reply.answer(Err(why));
+                    }
                 }
-                let _ = self.write(&reply);
             }
             // `shutdown` and anything newer: the closed connection says it all.
             _ => {}

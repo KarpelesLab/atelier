@@ -42,11 +42,47 @@ start working because a message arrived** — it waits for you.
 The agent sees a peer's message marked as coming from another agent, not
 from you, and is told to treat it as information.
 
-The agent has two tools for this (see [tools](tools.md#peers-peer_send)):
+The agent has tools for this (see [tools](tools.md#peers-peer_send)):
 `peers` lists the instances and manages its topic subscriptions, and
 `peer_send` sends a message. `peer_send` asks for your approval like any
 tool that acts outside the project; answer "always" to let the agent talk
 to its peers freely.
+
+## Asking another agent
+
+A message is left and forgotten; a **question** is waited for. With the
+`peer_ask` tool an agent puts a question to another instance and gets that
+instance's agent's answer back as the tool's result:
+
+1. The asking agent calls `peer_ask` (you approve it, like `peer_send`). Its
+   turn waits there — up to 5 minutes unless it asks for another timeout, 30
+   minutes at most.
+2. The question arrives in the other instance like a message (`✉ name asks
+   (q1): …`), and reaches its agent the same way: at its next step if it is
+   working, with your next prompt if it is idle. The agent sees it marked as
+   a question from another agent, with the id to answer under.
+3. That agent answers with `peer_answer` (no approval: it only completes
+   an exchange you already allowed on the asking side), and the asking
+   agent's `peer_ask` returns the answer.
+
+When there is no answer, `peer_ask` still returns — a result that says so
+(`no answer: …`), not a failure:
+
+| What happened | The asker is told |
+|---|---|
+| The turn the question was delivered to ended without a `peer_answer` | `<name> ended its turn without answering` |
+| Nobody answered before the timeout — typically the other instance is idle and nobody prompted it | `<name> did not answer within <n>s …` |
+| The other instance exited | `<name> disconnected before answering` |
+| The other agent is itself waiting on a `peer_ask` to the asker | `<name> is itself waiting for an answer from <asker> …` |
+
+A question that timed out before you prompted the idle instance is still
+passed on to its agent with that prompt, as an ordinary message: nobody is
+waiting any more, but what was asked may still matter.
+
+The asking turn cannot be interrupted while it waits (no tool call can), so
+an agent should give `timeout_secs` when a short wait is all the question is
+worth. An idle instance does not answer by itself: the question waits for
+its user's next prompt, like any message.
 
 From a shell:
 
@@ -59,7 +95,7 @@ atelier coordinator stop     # end it (instances will start another)
 
 | Variable | |
 |---|---|
-| `ATELIER_NO_COORDINATOR` | Any non-empty value other than `0`: this atelier runs alone — it neither joins nor starts a coordinator, and has no `peers`/`peer_send` tools |
+| `ATELIER_NO_COORDINATOR` | Any non-empty value other than `0`: this atelier runs alone — it neither joins nor starts a coordinator, and has none of the `peer*` tools |
 | `ATELIER_COORDINATOR_DIR` | Directory for the coordinator's socket, lock and log. Default: `$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier`. Instances only meet if they use the same directory |
 
 The coordinator is available on Unix systems. Its log is
@@ -92,10 +128,28 @@ the name it gets. After that:
 Deliveries arrive as a `message` notification (`from`, `body`, and `topic`
 or `broadcast`). A `call` arrives at its target as a `call` request, whose
 answer the coordinator passes back to the caller; it fails if the target
-disconnects or takes longer than `timeout_ms` (30 s by default). Instances
-answer `ping` and `info` today — `call` is the extension point for richer
+disconnects (error `-32004`) or takes longer than `timeout_ms` (error
+`-32003`; 30 s by default, 30 minutes at most). Instances answer `ping`,
+`info` and `ask` — `call` is the extension point for richer
 instance-to-instance requests (`Client::handle` in `src/coord/client.rs`).
+
+The answer to a `call` need not be ready when its handler returns. Handlers
+run on the thread that reads the connection and must not hold it up, so one
+registered with `Client::handle_deferred` is given a `Responder` it may keep
+and answer through later, from any thread; the coordinator simply holds the
+call open until the answer or the deadline. A responder is bound to the
+connection the call arrived on (a new coordinator numbers its calls afresh),
+and one dropped without an answer fails the call at once.
+
+`ask` is built on that: `call {to, method: "ask", params: {question,
+timeout_ms}}`. The target's handler files the question under an id (`q1`,
+`q2`, …) with its responder and puts it in the inbox; `peer_answer` looks
+the id up and answers `{answered: true, answer}`. A question closed without
+an answer is answered `{answered: false, reason}`. The target forgets a
+question after the same `timeout_ms`, so an agent is never asked to answer
+one nobody waits for (`src/coord/ask.rs`).
 
 The code is in `src/coord/`: `daemon.rs` (the coordinator), `client.rs`
 (an instance's connection, reconnection and launch of the coordinator),
-`tools.rs` (the agent's tools).
+`ask.rs` (questions awaiting this instance's agent), `tools.rs` (the
+agent's tools).

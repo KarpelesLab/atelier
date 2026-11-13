@@ -32,6 +32,8 @@ the model verbatim as the tool result.
 | `node`      | auto, unless `network: true` (then required); with `tools: true`, each tool the script calls is approved as that tool | fs yes; network no |
 | `peers`     | auto     | n/a (lists your atelier instances) |
 | `peer_send` | **required** | no (reaches other instances) |
+| `peer_ask`  | **required** | no (sets another instance's agent to work) |
+| `peer_answer` | auto (answers a question already admitted) | n/a |
 
 "Confined" tools resolve every path with `ToolCtx::resolve` /
 `tools::confine`: a relative path is joined against the project root, `.`/`..`
@@ -608,3 +610,30 @@ only reads it with its user's next prompt.
 |-----------|--------|----------|---------|
 | `to`      | string | yes      | An instance name, `*` for every other instance, or `#topic` |
 | `message` | string | yes      | The text to deliver |
+
+## `peer_ask`, `peer_answer`
+
+A question to another instance's agent, and its answer — see
+[Asking another agent](coordinator.md#asking-another-agent).
+
+`peer_ask` sends the question and blocks until the other agent answers; the
+answer is the result. With no answer the result is `no answer: <why>` (the
+other agent's turn ended without one, the timeout ran out, the instance
+left), which is not an error. It counts as a modifying tool — the other
+agent may act on what it is asked — so plan mode refuses it.
+
+| Param          | Type    | Required | Meaning |
+|----------------|---------|----------|---------|
+| `to`           | string  | yes      | The instance to ask (a name from `peers`) |
+| `question`     | string  | yes      | What to ask |
+| `timeout_secs` | integer | no       | How long to wait (default 300, at most 1800) |
+
+`peer_answer` answers a question that reached this agent as
+`<peer-question id="…" from="…">`. It must be called in the turn the
+question arrives in: a question still open when that turn ends is closed as
+unanswered.
+
+| Param    | Type   | Required | Meaning |
+|----------|--------|----------|---------|
+| `id`     | string | yes      | The question's id |
+| `answer` | string | yes      | The answer |
