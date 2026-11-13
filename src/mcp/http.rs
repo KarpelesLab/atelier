@@ -48,9 +48,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::ServerOptions;
 use super::jsonrpc::JsonRpc;
-use crate::tools::Tool;
+use super::{Connection, ServerOptions};
 
 /// Configuration for one Streamable-HTTP MCP server.
 pub struct HttpServer {
@@ -64,13 +63,14 @@ pub struct HttpServer {
     pub options: ServerOptions,
 }
 
-/// Connect to an MCP server over Streamable HTTP and return its tools.
+/// Connect to an MCP server over Streamable HTTP and return its tools and
+/// instructions.
 ///
 /// Performs the `initialize` / `notifications/initialized` handshake against
 /// `server.url`, then calls `tools/list` and wraps each advertised tool as a
 /// [`Tool`]. The connection (and any session id the server assigned) is
 /// shared across every returned tool; calls are serialized through it.
-pub fn connect_http(server: &HttpServer) -> Result<Vec<Box<dyn Tool>>> {
+pub fn connect_http(server: &HttpServer) -> Result<Connection> {
     let options = &server.options;
     let mut conn = HttpConn::new(
         server.url.clone(),
@@ -564,7 +564,9 @@ mod tests {
             headers: vec![],
             options: ServerOptions::default(),
         };
-        let tools = connect_http(&server).expect("connect_http should succeed");
+        let tools = connect_http(&server)
+            .expect("connect_http should succeed")
+            .tools;
         assert_eq!(tools.len(), 3);
 
         let echo = tools
@@ -668,7 +670,9 @@ mod tests {
             }
             tools_only(json!([{ "name": "slow" }, { "name": "fast" }]))(method, params)
         });
-        let tools = connect_http(&server(&fake, 5_000, 300)).expect("connects");
+        let tools = connect_http(&server(&fake, 5_000, 300))
+            .expect("connects")
+            .tools;
         let call = |name: &str| {
             let mut fstate = crate::tools::FileState::new();
             let mut ctx = crate::tools::ToolCtx {

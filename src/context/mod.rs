@@ -30,6 +30,7 @@ mod environment;
 mod git;
 mod instructions;
 mod layout;
+mod mcp;
 mod memory;
 mod skills;
 mod todos;
@@ -41,6 +42,7 @@ pub use budget::{estimate_tokens, render_budgeted};
 #[allow(unused_imports)]
 pub use dedup::{Delta, dedup_items};
 pub use instructions::nested_instructions;
+pub use mcp::McpProvider;
 
 use crate::settings::DiagnosticCheck;
 use std::path::Path;

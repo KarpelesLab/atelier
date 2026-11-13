@@ -606,6 +606,8 @@ pub struct Session {
     root: PathBuf,
     tools: ToolRegistry,
     context: Vec<Box<dyn ContextProvider>>,
+    /// The connected MCP servers, as the MCP context provider sees them.
+    mcp_catalog: mcp::Catalog,
     settings: Settings,
     /// How much runs without asking (see [`crate::permissions`]); `yolo` is
     /// `ATELIER_APPROVE=all`.
@@ -671,9 +673,15 @@ impl Session {
         cfg: Config,
         root: PathBuf,
         tools: ToolRegistry,
-        context: Vec<Box<dyn ContextProvider>>,
+        mut context: Vec<Box<dyn ContextProvider>>,
         settings: Settings,
     ) -> Self {
+        // Servers connect later (startup, `/mcp add`); what they have to
+        // tell the model reaches this provider through the catalog.
+        let mcp_catalog = mcp::Catalog::default();
+        context.push(Box::new(crate::context::McpProvider::new(
+            mcp_catalog.clone(),
+        )));
         // env wins; else the project's [defaults]; else the built-in default.
         let mode = Mode::configured(&settings.defaults);
         let compact_threshold = std::env::var("ATELIER_CONTEXT_LIMIT")
@@ -696,6 +704,7 @@ impl Session {
             root,
             tools,
             context,
+            mcp_catalog,
             settings,
             mode,
             usage_ctx: 0,
@@ -1062,11 +1071,8 @@ impl Session {
                 continue;
             }
             match mcp::connect_stdio(&to_stdio(&s)) {
-                Ok(tools) => {
-                    let n = tools.len();
-                    for t in tools {
-                        self.tools.register(t);
-                    }
+                Ok(connection) => {
+                    let n = self.mcp_register(&s.name, connection);
                     status.push(format!("mcp: connected '{}' ({n} tool(s))", s.name));
                 }
                 Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
@@ -1078,17 +1084,25 @@ impl Session {
                 continue;
             }
             match mcp::connect_http(&to_http(&s)) {
-                Ok(tools) => {
-                    let n = tools.len();
-                    for t in tools {
-                        self.tools.register(t);
-                    }
+                Ok(connection) => {
+                    let n = self.mcp_register(&s.name, connection);
                     status.push(format!("mcp: connected '{}' (http, {n} tool(s))", s.name));
                 }
                 Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
             }
         }
         status
+    }
+
+    /// Take in a server that just connected: its tools join the registry,
+    /// the rest goes to the catalog. Returns how many tools it brought.
+    fn mcp_register(&mut self, name: &str, connection: mcp::Connection) -> usize {
+        self.mcp_catalog.insert(name, &connection);
+        let n = connection.tools.len();
+        for t in connection.tools {
+            self.tools.register(t);
+        }
+        n
     }
 
     /// One display line per configured MCP server (stdio and HTTP).
@@ -1131,11 +1145,8 @@ impl Session {
             self.settings.mcp.push(cfg);
             return self.claude_mcp_changed().map(|_| 0);
         }
-        let tools = mcp::connect_stdio(&to_stdio(&cfg))?;
-        let n = tools.len();
-        for t in tools {
-            self.tools.register(t);
-        }
+        let connection = mcp::connect_stdio(&to_stdio(&cfg))?;
+        let n = self.mcp_register(name, connection);
         self.settings.mcp.push(cfg);
         self.settings.save(&self.root)?;
         Ok(n)
@@ -1157,11 +1168,8 @@ impl Session {
             self.settings.mcp_http.push(cfg);
             return self.claude_mcp_changed().map(|_| 0);
         }
-        let tools = mcp::connect_http(&to_http(&cfg))?;
-        let n = tools.len();
-        for t in tools {
-            self.tools.register(t);
-        }
+        let connection = mcp::connect_http(&to_http(&cfg))?;
+        let n = self.mcp_register(name, connection);
         self.settings.mcp_http.push(cfg);
         self.settings.save(&self.root)?;
         Ok(n)
@@ -1180,6 +1188,7 @@ impl Session {
             return self.claude_mcp_changed().map(|_| true);
         }
         self.tools.remove_prefix(&format!("mcp__{name}__"));
+        self.mcp_catalog.remove(name);
         self.settings.save(&self.root)?;
         Ok(true)
     }

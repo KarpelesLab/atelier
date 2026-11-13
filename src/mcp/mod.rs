@@ -40,6 +40,11 @@
 //! transcript. A server that doesn't support prompts (an erroring or empty
 //! `prompts/list`) simply gets no such tool — the connection still succeeds.
 //!
+//! A server's `initialize` answer may also carry `instructions` for whoever
+//! uses its tools. They come back with the tools in the [`Connection`], and
+//! reach the model through the [`Catalog`] the session records connections
+//! in (see `catalog.rs`).
+//!
 //! # Per-server options
 //!
 //! [`ServerOptions`] carries what the user may set on any server, whichever
@@ -55,6 +60,7 @@
 // `main` once registration is wired up.
 #![allow(dead_code)]
 
+mod catalog;
 mod conn;
 mod http;
 mod jsonrpc;
@@ -85,6 +91,17 @@ use tool::McpTool;
 // same as `connect_stdio`/`StdioServer` before this module was consumed.
 #[allow(unused_imports)]
 pub use http::{HttpServer, connect_http};
+
+pub use catalog::Catalog;
+
+/// A connected server: what [`connect_stdio`] and [`connect_http`] return.
+pub struct Connection {
+    /// The server's tools, in the order it listed them, all sharing the
+    /// connection (which lives as long as any of them does).
+    pub tools: Vec<Box<dyn Tool>>,
+    /// The `instructions` of the server's `initialize` answer, as sent.
+    pub instructions: Option<String>,
+}
 
 /// Seconds a handshake request may take unless the server's
 /// `startup_timeout_secs` says otherwise.
@@ -141,7 +158,7 @@ pub struct StdioServer {
     pub options: ServerOptions,
 }
 
-/// Launch an MCP server over stdio and return its tools.
+/// Launch an MCP server over stdio and return its tools and instructions.
 ///
 /// Spawns `server.command server.args...` with piped stdin/stdout, performs
 /// the `initialize` / `notifications/initialized` handshake, then calls
@@ -150,7 +167,7 @@ pub struct StdioServer {
 /// returned tool, and calls are serialized through it; the child is kept
 /// alive for as long as any of the returned tools are, and is killed once
 /// they're all dropped — or right here, if the handshake fails or times out.
-pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
+pub fn connect_stdio(server: &StdioServer) -> Result<Connection> {
     let mut child = Command::new(&server.command)
         .args(&server.args)
         .stdin(Stdio::piped())
@@ -191,6 +208,7 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
 
 /// What a server said it offers, as raw protocol objects.
 pub(crate) struct Discovered {
+    instructions: Option<String>,
     tools: Vec<Value>,
     resources: Vec<Value>,
     prompts: Vec<Value>,
@@ -207,22 +225,24 @@ pub(crate) fn discover(
     server_name: &str,
     protocol_version: &str,
 ) -> Result<Discovered> {
+    let (instructions, tools) = handshake_and_list_tools(conn, server_name, protocol_version)?;
     Ok(Discovered {
-        tools: handshake_and_list_tools(conn, server_name, protocol_version)?,
+        instructions,
+        tools,
         resources: list_resources(conn),
         prompts: list_prompts(conn),
     })
 }
 
-/// Turn what [`discover`] found into the server's [`Tool`]s, all sharing
-/// `conn`: one per advertised tool, then `read_resource` and `get_prompt`
-/// where the server has any — each only if `options` allows it.
+/// Turn what [`discover`] found into a [`Connection`]. Its [`Tool`]s all
+/// share `conn`: one per advertised tool, then `read_resource` and
+/// `get_prompt` where the server has any — each only if `options` allows it.
 pub(crate) fn assemble(
     conn: Arc<Mutex<dyn JsonRpc>>,
     server_name: &str,
     options: &ServerOptions,
     found: Discovered,
-) -> Vec<Box<dyn Tool>> {
+) -> Connection {
     let mut tools = wrap_tools(conn.clone(), server_name, options, found.tools);
     if options.allows("read_resource")
         && let Some(tool) = maybe_resource_tool(conn.clone(), server_name, found.resources)
@@ -234,25 +254,34 @@ pub(crate) fn assemble(
     {
         tools.push(tool);
     }
-    tools
+    Connection {
+        tools,
+        instructions: found.instructions,
+    }
 }
 
 /// Run the `initialize` → `notifications/initialized` → `tools/list`
-/// handshake and return the raw `tools` array the server advertised.
+/// handshake and return the server's `instructions`, if it gave any, and the
+/// raw `tools` array it advertised.
 fn handshake_and_list_tools(
     conn: &mut dyn JsonRpc,
     server_name: &str,
     protocol_version: &str,
-) -> Result<Vec<Value>> {
-    conn.request(
-        "initialize",
-        json!({
-            "protocolVersion": protocol_version,
-            "capabilities": {},
-            "clientInfo": { "name": "atelier", "version": "0.0.0" },
-        }),
-    )
-    .with_context(|| format!("initializing MCP server `{server_name}`"))?;
+) -> Result<(Option<String>, Vec<Value>)> {
+    let initialized = conn
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": { "name": "atelier", "version": "0.0.0" },
+            }),
+        )
+        .with_context(|| format!("initializing MCP server `{server_name}`"))?;
+    let instructions = initialized
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     conn.notify("notifications/initialized", json!({}))
         .with_context(|| format!("completing handshake with MCP server `{server_name}`"))?;
@@ -261,11 +290,12 @@ fn handshake_and_list_tools(
         .request("tools/list", json!({}))
         .with_context(|| format!("listing tools from MCP server `{server_name}`"))?;
 
-    Ok(tools_result
+    let tools = tools_result
         .get("tools")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    Ok((instructions, tools))
 }
 
 /// Wrap each raw advertised-tool object (as returned by `tools/list`) that
@@ -558,7 +588,33 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
     fn connect_fake(options: &ServerOptions) -> Vec<Box<dyn Tool>> {
         let mut rpc = testutil::FakeRpc::new(github);
         let found = discover(&mut rpc, "gh", "2024-11-05").unwrap();
-        assemble(Arc::new(Mutex::new(rpc)), "gh", options, found)
+        assemble(Arc::new(Mutex::new(rpc)), "gh", options, found).tools
+    }
+
+    #[test]
+    fn instructions_come_back_with_the_connection() {
+        let connect = |initialize: Value| {
+            let mut rpc = testutil::FakeRpc::new(move |method, params| match method {
+                "initialize" => Some(initialize.clone()),
+                _ => testutil::tools_only(json!([]))(method, params),
+            });
+            let found = discover(&mut rpc, "s", "2024-11-05").unwrap();
+            assemble(
+                Arc::new(Mutex::new(rpc)),
+                "s",
+                &ServerOptions::default(),
+                found,
+            )
+        };
+        let with = connect(json!({ "capabilities": {}, "instructions": "Call `plan` first." }));
+        assert_eq!(with.instructions.as_deref(), Some("Call `plan` first."));
+        assert!(
+            connect(json!({ "capabilities": {} }))
+                .instructions
+                .is_none()
+        );
+        // Not a string: ignored rather than failing the connection.
+        assert!(connect(json!({ "instructions": 7 })).instructions.is_none());
     }
 
     #[test]
@@ -596,7 +652,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
     #[test]
     fn connects_lists_and_calls_tools() {
         let server = fake_server();
-        let tools = connect_stdio(&server).expect("connect_stdio should succeed");
+        let tools = connect_stdio(&server)
+            .expect("connect_stdio should succeed")
+            .tools;
 
         assert_eq!(tools.len(), 4);
 
@@ -696,7 +754,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             options: ServerOptions::default(),
         };
         let tools = connect_stdio(&server)
-            .expect("connect_stdio should succeed even when resources/list errors");
+            .expect("connect_stdio should succeed even when resources/list errors")
+            .tools;
 
         assert_eq!(tools.len(), 1);
         assert!(

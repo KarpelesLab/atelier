@@ -147,6 +147,23 @@ bytes comes back as its start and its end, with all of it saved to a file the
 agent can `read` or `grep` ([spilled output](tools.md#long-output-goes-to-a-file));
 the same goes for `read_resource`.
 
+## Server instructions
+
+A server's answer to `initialize` may carry `instructions`: how its tools are
+meant to be used. atelier passes them to the model as standing context — in
+the system message of every request, not only on the turn the server
+connected — in an `MCP servers` section, each server's text under its own
+name and introduced as the server's guidance for its tools, not as the user's
+word. Each server's text is capped at 2 KiB (cut at a character boundary,
+with a note saying so); a server that sends none adds nothing. `/mcp remove`
+takes a server's instructions away with its tools.
+
+The path they take: `connect_stdio`/`connect_http` return a `Connection`
+(tools plus instructions); the session records it in an `mcp::Catalog`, a
+shared handle that the `mcp` context provider (`src/context/mcp.rs`) reads on
+every turn. With the Claude backend `claude` connects the servers itself and
+handles their instructions its own way.
+
 ## The Streamable HTTP transport in detail
 
 `src/mcp/http.rs` (`connect_http`, `HttpServer`) POSTs each JSON-RPC message
