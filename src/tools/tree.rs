@@ -20,6 +20,11 @@ impl Tool for TreeTool {
         "tree"
     }
 
+    // Only reads.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn requires_approval(&self, _args: &Value) -> bool {
         false
     }

@@ -36,7 +36,8 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_BASE_URL`        | `http://192.168.0.50:11400/v1`   | `Config::from_env` | OpenAI-compatible endpoint base; every request path is appended to it |
 | `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | `Config::from_env` | Model id sent in every request. Claude backend: passed as `--model` when set (e.g. `opus`, `sonnet`); unset leaves the choice to claude |
 | `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token; sent as `Authorization: Bearer <key>` when set to a non-empty value |
-| `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
+| `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session — the `yolo` [mode](permissions.md#modes) — for headless/CI runs (see [Permissions](permissions.md)) |
+| `ATELIER_MODE`            | *(unset)*                        | `main`, `permissions::Mode::from_env` | The permission [mode](permissions.md#modes) to start in: `plan`, `ask-edits`, `auto-edit` (the default) or `yolo`. Overridden by `--mode`; overrides `ATELIER_APPROVE` and `[defaults] mode`. Any other value is an error |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
 | `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `hooks::Paths::from_env` | `1` runs the project's [hooks](hooks.md) without your stored approval — for headless runs (`--print`), which never ask and otherwise skip unapproved project hooks. Only for checkouts you control |
@@ -139,8 +140,16 @@ variable when set:
 [defaults]
 model = "qwen3-coder:30b"   # overridden by ATELIER_MODEL
 approve = false             # overridden by ATELIER_APPROVE
+mode = "auto-edit"          # overridden by ATELIER_MODE and --mode
 context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
 ```
+
+`mode` is the permission [mode](permissions.md#modes) sessions start in:
+`plan`, `ask-edits`, `auto-edit` (the default when unset) or `yolo`.
+`approve = true` is the older spelling of `mode = "yolo"`; `mode` wins when
+both are set. On the command line, `--mode <name>` (or `--mode=<name>`)
+selects the mode for one run, interactive or `--print`; `/mode <name>`
+switches it during a session.
 
 ## `[review]`
 

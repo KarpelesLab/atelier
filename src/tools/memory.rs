@@ -56,6 +56,15 @@ impl Tool for MemoryTool {
         "memory"
     }
 
+    // Reading and listing change nothing; saving and deleting do. An
+    // action it does not know counts as a change.
+    fn mutates(&self, args: &Value) -> bool {
+        !matches!(
+            args.get("action").and_then(Value::as_str),
+            Some("read" | "list")
+        )
+    }
+
     fn requires_approval(&self, _args: &Value) -> bool {
         // Reads and writes only note files inside the memory directories.
         false

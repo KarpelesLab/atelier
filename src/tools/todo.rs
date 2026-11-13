@@ -74,6 +74,12 @@ impl Tool for TodoTool {
         "todo"
     }
 
+    // The checklist is the agent's own scratch state, not the user's work:
+    // keeping it is part of planning.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn requires_approval(&self, _args: &Value) -> bool {
         // Only reads/writes .atelier/todos.json inside the project root.
         false

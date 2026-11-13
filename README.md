@@ -109,7 +109,7 @@ first conversation, the REPL/TUI fallback).
 | [Skills](docs/skills.md) | `SKILL.md` directories the agent loads on demand: `.atelier/skills/` (also `.claude/skills/`, `.agents/skills/`), the `skill` tool, `/skills` |
 | [Hooks](docs/hooks.md) | Commands run on events (before/after a tool call, on a prompt, at turn end) that can observe or decide: `[[hooks]]`, the stdin/stdout contract, trust, `/hooks`, examples |
 | [Subagents](docs/agents.md) | The `task` tool: `explore` and `general`, your own agents as Markdown files in `.atelier/agents/` (also `.claude/agents/`), the step cap, parallel runs, `/agents` |
-| [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |
+| [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` |

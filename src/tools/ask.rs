@@ -325,6 +325,11 @@ impl Tool for AskTool {
         false
     }
 
+    // Only talks to the user.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: NAME.to_string(),

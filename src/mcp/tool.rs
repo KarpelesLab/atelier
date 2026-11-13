@@ -20,6 +20,9 @@ pub(crate) struct McpTool {
     original_name: String,
     description: String,
     parameters: Value,
+    /// The server marked the tool `readOnlyHint: true` in its annotations:
+    /// it says the tool modifies nothing.
+    read_only: bool,
 }
 
 impl McpTool {
@@ -29,6 +32,7 @@ impl McpTool {
         original_name: String,
         description: String,
         parameters: Value,
+        read_only: bool,
     ) -> Self {
         Self {
             conn,
@@ -36,6 +40,7 @@ impl McpTool {
             original_name,
             description,
             parameters,
+            read_only,
         }
     }
 }
@@ -51,6 +56,13 @@ impl Tool for McpTool {
             description: self.description.clone(),
             parameters: self.parameters.clone(),
         }
+    }
+
+    // The server's word is taken for it: the user chose to connect the
+    // server, and the call still asks before it runs. Without the hint a
+    // tool counts as modifying.
+    fn mutates(&self, _args: &Value) -> bool {
+        !self.read_only
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
@@ -129,6 +141,7 @@ mod tests {
             "dump".into(),
             String::new(),
             json!({}),
+            false,
         );
         let mut fstate = FileState::new();
         let mut ctx = ToolCtx {

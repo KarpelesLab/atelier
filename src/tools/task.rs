@@ -104,6 +104,12 @@ impl Tool for TaskTool {
         false
     }
 
+    // Starting a subagent changes nothing by itself: each of its calls is
+    // judged on its own, by the parent's rules and mode.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn spec(&self) -> ToolSpec {
         // Built per request, so an agent file added mid-session is offered
         // at the next step.

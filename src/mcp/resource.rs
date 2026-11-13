@@ -67,6 +67,11 @@ impl Tool for McpResourceTool {
     // `requires_approval` is intentionally left at the `Tool` trait default
     // (`true`): this makes a server call, same as any other MCP tool.
 
+    // `resources/read` is a read by protocol.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
         let Some(uri) = args.get("uri").and_then(Value::as_str) else {
             bail!("missing required `uri` argument");

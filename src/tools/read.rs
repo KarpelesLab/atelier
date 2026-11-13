@@ -26,6 +26,11 @@ impl Tool for ReadTool {
         "read"
     }
 
+    // Only reads.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn requires_approval(&self, _args: &serde_json::Value) -> bool {
         false
     }

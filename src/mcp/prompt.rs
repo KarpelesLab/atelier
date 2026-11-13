@@ -71,6 +71,11 @@ impl Tool for McpPromptTool {
     // `requires_approval` is intentionally left at the `Tool` trait default
     // (`true`): this makes a server call, same as any other MCP tool.
 
+    // `prompts/get` is a read by protocol.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn call(&self, _ctx: &mut ToolCtx, args: Value) -> Result<String> {
         let Some(name) = args.get("name").and_then(Value::as_str) else {
             bail!("missing required `name` argument");

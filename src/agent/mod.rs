@@ -36,6 +36,7 @@ use crate::context::{ContextItem, ContextProvider};
 use crate::coord;
 use crate::hooks::{self, Hooks};
 use crate::mcp::{self, HttpServer, StdioServer};
+use crate::permissions::Mode;
 use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
@@ -61,6 +62,10 @@ and how to continue from here.";
 /// Token budget for per-turn injected context (git status, diff, layout,
 /// diagnostics), prioritized and truncated to fit.
 const CONTEXT_TOKEN_BUDGET: usize = 2_000;
+
+/// Title of the context item that states the permission mode to the model
+/// (see [`Mode::note`]).
+const MODE_NOTE: &str = "permission mode";
 
 /// Default context-size threshold (last request's total tokens) past which the
 /// conversation is compacted (see [`compact`]). Override with
@@ -190,6 +195,7 @@ const HELP: &[&str] = &[
     "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
     "  /mcp remove <name>                    remove an MCP server",
     "  /permissions                          list the permission rules in force, by source",
+    "  /mode [plan|ask-edits|auto-edit|yolo] show or switch how much runs without asking",
     "  /new [force]                          start a fresh conversation (clear saved session);",
     "                                        force: even if claude has background tasks running",
     "  /compact [instructions]               shrink the conversation now: prune old tool output,",
@@ -294,6 +300,19 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 ui.info(&line);
             }
         }
+        "/mode" => match args.first().map(|name| Mode::parse(name)) {
+            None => {
+                for mode in Mode::ALL {
+                    let mark = if mode == session.mode { "*" } else { " " };
+                    ui.info(&format!("{mark} {:<10} {}", mode.name(), mode.summary()));
+                }
+            }
+            Some(Ok(mode)) => {
+                session.set_mode(mode);
+                ui.info(&format!("mode: {mode} — {}", mode.summary()));
+            }
+            Some(Err(e)) => ui.info(&e),
+        },
         "/model" => match args.first() {
             None => ui.info(&format!("model: {}", session.backend_label())),
             Some(name) => {
@@ -558,9 +577,9 @@ pub struct Session {
     tools: ToolRegistry,
     context: Vec<Box<dyn ContextProvider>>,
     settings: Settings,
-    /// Skip approval prompts entirely (e.g. `ATELIER_APPROVE=all` for headless
-    /// runs).
-    auto_approve: bool,
+    /// How much runs without asking (see [`crate::permissions`]); `yolo` is
+    /// `ATELIER_APPROVE=all`.
+    mode: Mode,
     /// Prompt+completion tokens of the most recent request (the live context
     /// size), and the cumulative completion tokens generated this session.
     usage_ctx: u32,
@@ -626,10 +645,7 @@ impl Session {
         settings: Settings,
     ) -> Self {
         // env wins; else the project's [defaults]; else the built-in default.
-        let auto_approve = match std::env::var("ATELIER_APPROVE") {
-            Ok(v) => matches!(v.as_str(), "all" | "yes" | "1"),
-            Err(_) => settings.defaults.approve.unwrap_or(false),
-        };
+        let mode = Mode::configured(&settings.defaults);
         let compact_threshold = std::env::var("ATELIER_CONTEXT_LIMIT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -651,7 +667,7 @@ impl Session {
             tools,
             context,
             settings,
-            auto_approve,
+            mode,
             usage_ctx: 0,
             usage_out: 0,
             steps: 0,
@@ -721,8 +737,16 @@ impl Session {
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
+    #[allow(dead_code)] // used by the /config screen
     pub fn auto_approve(&self) -> bool {
-        self.auto_approve
+        self.mode == Mode::Yolo
+    }
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+    /// Switch the permission mode for this session (`--mode`, `/mode`).
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
     }
     pub fn context_limit(&self) -> u32 {
         self.compact_threshold
@@ -732,7 +756,13 @@ impl Session {
     }
     #[allow(dead_code)] // used by the /config screen
     pub fn set_auto_approve(&mut self, on: bool) {
-        self.auto_approve = on;
+        // Auto-approve is the `yolo` mode; switching it off leaves any other
+        // mode as it is.
+        if on {
+            self.mode = Mode::Yolo;
+        } else if self.mode == Mode::Yolo {
+            self.mode = Mode::AutoEdit;
+        }
         self.settings.defaults.approve = Some(on);
     }
     #[allow(dead_code)] // used by the /config screen
@@ -1547,7 +1577,7 @@ impl Session {
                 root: &self.root,
                 fstate: &mut self.fstate,
                 settings: &mut self.settings,
-                auto_approve: self.auto_approve,
+                mode: self.mode,
                 hooks: &self.hooks,
                 parent: self.child.as_ref().map(|c| &c.link),
             },
@@ -1560,11 +1590,22 @@ impl Session {
     /// Providers are prioritized and truncated to a token budget so a large diff
     /// or layout can't crowd out the conversation.
     fn gather_context(&mut self) -> Option<String> {
-        let items: Vec<ContextItem> = self
+        let mut items: Vec<ContextItem> = self
             .context
             .iter()
             .filter_map(|p| p.gather(&self.root))
             .collect();
+        // Plan mode is stated up front, so the model plans rather than
+        // finding out one refused call at a time.
+        let was_told = self.last_ctx.contains_key(MODE_NOTE);
+        if let Some(note) = self.mode.note(was_told) {
+            let item = ContextItem::new(MODE_NOTE, note, u8::MAX);
+            items.push(if self.mode == Mode::Plan {
+                item.standing()
+            } else {
+                item
+            });
+        }
         // Drop items unchanged since last turn so we don't re-send identical
         // context every turn; remember the full snapshot for next time.
         // Claude keeps the context in its transcript, standing items (the
@@ -1672,7 +1713,7 @@ struct ToolRunner<'a> {
     root: &'a std::path::Path,
     fstate: &'a mut FileState,
     settings: &'a mut Settings,
-    auto_approve: bool,
+    mode: Mode,
     hooks: &'a Hooks,
     /// In a subagent's session: the parent, which decides its calls.
     parent: Option<&'a subagent::Link>,
@@ -1707,18 +1748,17 @@ impl ToolRunner<'_> {
             };
         }
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-        let needs_approval = self
-            .tools
-            .get(name)
-            .is_some_and(|t| t.requires_approval_in(&args, self.root));
+        let tool = self.tools.get(name);
         let req = crate::permissions::Request {
             tool: name,
             arguments,
-            needs_approval,
+            needs_approval: tool.is_some_and(|t| t.requires_approval_in(&args, self.root)),
+            // A name the registry does not know never runs (`exec` says so).
+            mutates: tool.is_some_and(|t| t.mutates(&args)),
             hook_allowed,
             hooks: Some(self.hooks),
         };
-        crate::permissions::approve(self.settings, self.root, self.auto_approve, req, ui)
+        crate::permissions::approve(self.settings, self.root, self.mode, req, ui)
     }
 
     /// Execute a call whose arguments are a JSON string (as models send).
@@ -1798,7 +1838,7 @@ impl ToolRunner<'_> {
 
 impl claude::ToolHost for ToolRunner<'_> {
     fn auto_approve(&self) -> bool {
-        self.auto_approve
+        self.mode == Mode::Yolo
     }
 
     fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
@@ -2067,7 +2107,7 @@ fn config_summary(session: &Session) -> Vec<String> {
         "settings:".to_string(),
         format!("  backend:        {}", session.backend_label()),
         format!("  model:          {}", session.config().model),
-        format!("  auto-approve:   {}", session.auto_approve()),
+        format!("  mode:           {}", session.mode()),
         format!("  context limit:  {}", session.context_limit()),
         format!("  review mode:    {}", session.review_enabled()),
     ];
@@ -2289,7 +2329,7 @@ mod tests {
             root: &root,
             fstate: &mut fstate,
             settings: &mut settings,
-            auto_approve: true,
+            mode: Mode::Yolo,
             hooks: &hooks,
             parent: None,
         };
@@ -2317,6 +2357,143 @@ mod tests {
         );
         assert!(!write.contains("WEB rules"));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A [`Ui`] that refuses every prompt and keeps what it was told.
+    #[derive(Default)]
+    struct Quiet {
+        infos: Vec<String>,
+        asked: usize,
+    }
+
+    impl Ui for Quiet {
+        fn reasoning(&mut self, _: &str) {}
+        fn content(&mut self, _: &str) {}
+        fn tool_start(&mut self, _: &str, _: &str) {}
+        fn tool_end(&mut self, _: &str, _: &str, _: bool) {}
+        fn info(&mut self, text: &str) {
+            self.infos.push(text.to_string());
+        }
+        fn ask_approval(&mut self, _: &str, _: &str) -> Approval {
+            self.asked += 1;
+            Approval::Deny
+        }
+        fn notice(&mut self, _: &str) {}
+    }
+
+    /// A session on the built-in tools in a scratch directory.
+    fn scratch_session(name: &str) -> (Session, PathBuf) {
+        let root = std::env::temp_dir().join(format!("atl-agent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let session = Session::new(
+            Config::from_env(false),
+            root.clone(),
+            crate::tools::builtin_registry(),
+            Vec::new(),
+            Settings::default(),
+        );
+        (session, root)
+    }
+
+    #[test]
+    fn the_runner_applies_the_session_mode_to_each_tool() {
+        let (mut session, root) = scratch_session("mode");
+        let mut ui = Quiet::default();
+        let write = r#"{"path": "a.txt", "content": "x"}"#;
+        let read = r#"{"path": "a.txt"}"#;
+
+        session.set_mode(Mode::Plan);
+        let err = session
+            .runner()
+            .approve("write", write, &mut ui)
+            .unwrap_err();
+        assert!(err.contains("plan mode: write is not available"), "{err}");
+        assert!(session.runner().approve("read", read, &mut ui).is_ok());
+        assert!(
+            session
+                .runner()
+                .approve(
+                    "bash",
+                    r#"{"command": "atelier-no-such-program x"}"#,
+                    &mut ui
+                )
+                .is_err()
+        );
+        assert_eq!(ui.asked, 0);
+
+        // ask-edits: the write is put to the user, who (here) says no.
+        session.set_mode(Mode::AskEdits);
+        let err = session
+            .runner()
+            .approve("write", write, &mut ui)
+            .unwrap_err();
+        assert_eq!(err, crate::permissions::DENIED);
+        assert_eq!(ui.asked, 1);
+        assert!(session.runner().approve("read", read, &mut ui).is_ok());
+
+        session.set_mode(Mode::AutoEdit);
+        assert!(session.runner().approve("write", write, &mut ui).is_ok());
+        assert_eq!(ui.asked, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mode_command_shows_and_switches() {
+        let (mut session, root) = scratch_session("mode-cmd");
+        session.set_mode(Mode::AutoEdit);
+        let mut ui = Quiet::default();
+        assert!(matches!(
+            dispatch(&mut session, "/mode", &mut ui),
+            Dispatch::Handled
+        ));
+        assert_eq!(ui.infos.len(), 4, "{:?}", ui.infos);
+        assert!(ui.infos[2].starts_with("* auto-edit"), "{:?}", ui.infos);
+        assert!(ui.infos[0].starts_with("  plan"), "{:?}", ui.infos);
+
+        dispatch(&mut session, "/mode plan", &mut ui);
+        assert_eq!(session.mode(), Mode::Plan);
+        // A name that is no mode changes nothing.
+        dispatch(&mut session, "/mode pln", &mut ui);
+        assert_eq!(session.mode(), Mode::Plan);
+        assert!(ui.infos.last().unwrap().contains("unknown mode 'pln'"));
+        // The settings screen's auto-approve switch is the yolo mode, and
+        // switching it off does not take a session out of plan mode.
+        session.set_auto_approve(false);
+        assert_eq!(session.mode(), Mode::Plan);
+        session.set_auto_approve(true);
+        assert!(session.auto_approve() && session.mode() == Mode::Yolo);
+        session.set_auto_approve(false);
+        assert_eq!(session.mode(), Mode::AutoEdit);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_mode_is_stated_in_context_and_so_is_its_end() {
+        let (mut session, root) = scratch_session("mode-ctx");
+        session.set_mode(Mode::AutoEdit);
+        assert_eq!(session.gather_turn_context(), None);
+
+        session.set_mode(Mode::Plan);
+        let first = session.gather_turn_context().expect("plan mode is stated");
+        assert!(first.contains("PLAN MODE"), "{first}");
+        // It stays in the conversation with the turn it came with, so the
+        // next turn only notes that it still holds.
+        let again = session.gather_turn_context().unwrap_or_default();
+        assert!(!again.contains("PLAN MODE"), "{again}");
+
+        session.set_mode(Mode::AskEdits);
+        let over = session
+            .gather_turn_context()
+            .expect("the end of plan mode is stated");
+        assert!(
+            over.contains("Plan mode is off") && over.contains("ask-edits"),
+            "{over}"
+        );
+        // Once: nothing changed since.
+        let after = session.gather_turn_context().unwrap_or_default();
+        assert!(!after.contains("Plan mode is off"), "{after}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

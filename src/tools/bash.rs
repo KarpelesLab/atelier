@@ -312,6 +312,11 @@ impl Tool for BashOutputTool {
         "bash_output"
     }
 
+    // Only reads what a job printed.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn requires_approval(&self, _args: &Value) -> bool {
         // Only reads jobs the user already approved starting.
         false
@@ -423,6 +428,11 @@ pub struct BashKillTool;
 impl Tool for BashKillTool {
     fn name(&self) -> &str {
         "bash_kill"
+    }
+
+    // Stops a job this session started; nothing of the user's changes.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
     }
 
     fn requires_approval(&self, _args: &Value) -> bool {

@@ -16,17 +16,21 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::headless::{InputFormat, Options, OutputFormat};
+use crate::permissions::Mode;
 
 /// What a usage error prints after its message, and `--help` on its own.
 pub const USAGE: &str = "\
-usage: atelier [--claude] [--continue]
+usage: atelier [--claude] [--continue] [--mode MODE]
        atelier --print [options] [--] [prompt...]
        atelier update | coordinator [status|stop]
+       atelier permissions check [--mode MODE] -- <command...>
 
   -c, --continue             resume the saved session for this directory
   -p, --print                run one prompt non-interactively and exit
                              (the prompt is read from stdin when not given)
       --claude               use the Claude Code backend
+      --mode MODE            how much runs without asking: plan (read-only),
+                             ask-edits, auto-edit (default), or yolo
   -V, --version              print the version
   -h, --help                 print this help
 
@@ -49,6 +53,8 @@ pub struct Cli {
     pub resume: bool,
     /// `--help`/`-h`.
     pub help: bool,
+    /// `--mode`: the permission mode to start in.
+    pub mode: Option<Mode>,
     /// `--print`/`-p`: run headlessly with these options, instead of the
     /// interactive interface.
     pub print: Option<Options>,
@@ -60,6 +66,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut claude = false;
     let mut resume = false;
     let mut help = false;
+    let mut mode = None;
     let mut print = false;
     let mut output = None;
     let mut input = None;
@@ -91,6 +98,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match flag {
+            "--mode" => mode = Some(Mode::parse(value()?).map_err(|e| format!("--mode: {e}"))?),
             "--output-format" => output = Some(output_format(value()?)?),
             "--input-format" => input = Some(input_format(value()?)?),
             "--max-turns" => max_turns = Some(positive(flag, value()?)?),
@@ -124,6 +132,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         claude,
         resume,
         help,
+        mode,
         // Without --print, stray words are ignored, as they always were.
         print: print.then(|| Options {
             output: output.unwrap_or(OutputFormat::Text),
@@ -196,6 +205,19 @@ mod tests {
     fn no_arguments_is_interactive() {
         let cli = parse_ok(&[]);
         assert!(!cli.claude && !cli.resume && !cli.help && cli.print.is_none());
+    }
+
+    #[test]
+    fn mode_flag() {
+        assert_eq!(parse_ok(&[]).mode, None);
+        assert_eq!(parse_ok(&["--mode", "plan"]).mode, Some(Mode::Plan));
+        assert_eq!(
+            parse_ok(&["-p", "--mode=ask-edits", "hi"]).mode,
+            Some(Mode::AskEdits)
+        );
+        // A misspelt mode stops the run rather than falling back to another.
+        assert!(parse_err(&["--mode", "pln"]).contains("unknown mode 'pln'"));
+        assert_eq!(parse_err(&["--mode"]), "--mode needs a value");
     }
 
     #[test]

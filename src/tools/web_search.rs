@@ -62,6 +62,11 @@ impl Tool for WebSearchTool {
         "web_search"
     }
 
+    // Reaches out (and so asks), but changes nothing here.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     // Leave the default (`true`): like `web_fetch`, this reaches out over
     // the network, and the query itself leaves the machine.
 

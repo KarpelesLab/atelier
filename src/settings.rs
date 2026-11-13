@@ -131,13 +131,19 @@ pub struct ReviewSettings {
 }
 
 /// Per-project defaults from `[defaults]`. Each is overridden by its env var
-/// (`ATELIER_MODEL`, `ATELIER_APPROVE`, `ATELIER_CONTEXT_LIMIT`) when that's set.
+/// (`ATELIER_MODEL`, `ATELIER_APPROVE`, `ATELIER_MODE`, `ATELIER_CONTEXT_LIMIT`)
+/// when that's set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default)]
     pub model: Option<String>,
+    /// `true` is the `yolo` mode, where `mode` does not say otherwise.
     #[serde(default)]
     pub approve: Option<bool>,
+    /// The permission mode sessions start in (`plan`, `ask-edits`,
+    /// `auto-edit`, `yolo` — see [`crate::permissions::Mode`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::permissions::Mode>,
     #[serde(default)]
     pub context_limit: Option<u32>,
 }

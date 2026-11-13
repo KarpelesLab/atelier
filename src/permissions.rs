@@ -76,6 +76,29 @@
 //! makes sense — an open-ended launcher such as `sh`, `env`, `xargs`, `sudo`
 //! or `python -c`, a command that cannot be followed — the call runs once and
 //! nothing is saved.
+//!
+//! # Modes
+//!
+//! A [`Mode`] sets how much runs unasked where no rule decides, and is judged
+//! here, next to the rules, so there is one decision ([`judge`]) for every
+//! caller:
+//!
+//! - **`plan`** — read-only. A call that can modify something
+//!   ([`Tool::mutates`](crate::tools::Tool::mutates)) is refused, with a
+//!   message telling the model to investigate and present a plan. The one
+//!   way through is `bash` with a command that allow rules *with a pattern*
+//!   cover (`bash(git log *)`): the user has named that command as fine to
+//!   run unread. A whole-tool `bash` rule does not count — it says nothing
+//!   about what is read-only — and neither does a prompt: nobody is asked
+//!   to approve a change in plan mode.
+//! - **`ask-edits`** — the modifying tools that normally run unasked because
+//!   they are confined to the project (`write`, `edit`, …) ask first, unless
+//!   an allow rule covers the call.
+//! - **`auto-edit`** — the default: the tools' own defaults apply.
+//! - **`yolo`** — every prompt is answered yes (`ATELIER_APPROVE=all`).
+//!
+//! Deny rules refuse in every mode, and an ask rule prompts in every mode
+//! but `yolo`.
 
 mod shell;
 
@@ -85,14 +108,127 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use globset::GlobBuilder;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::{Approval, Ui};
-use crate::settings::{Permissions, Settings};
+use crate::settings::{Defaults, Permissions, Settings};
 use crate::tools;
 
 /// The tool result for a call the user refused at the prompt.
 pub const DENIED: &str = "error: the user denied permission to run this tool.";
+
+/// How much the agent may do without asking (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// Read-only: calls that can modify something are refused.
+    Plan,
+    /// Modifying tools ask, even those confined to the project.
+    AskEdits,
+    /// Tools confined to the project run; the rest ask.
+    #[default]
+    AutoEdit,
+    /// Every prompt is answered yes.
+    Yolo,
+}
+
+impl Mode {
+    /// Every mode, from the most careful to the least.
+    pub const ALL: [Mode; 4] = [Mode::Plan, Mode::AskEdits, Mode::AutoEdit, Mode::Yolo];
+
+    /// The name the user selects it by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Plan => "plan",
+            Mode::AskEdits => "ask-edits",
+            Mode::AutoEdit => "auto-edit",
+            Mode::Yolo => "yolo",
+        }
+    }
+
+    /// One line on what the mode does, for `/mode`.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Mode::Plan => "read-only: the agent investigates and proposes; changes are refused",
+            Mode::AskEdits => "asks before every file change, command and network access",
+            Mode::AutoEdit => "file changes inside the project run; commands and the network ask",
+            Mode::Yolo => "nothing asks (deny rules still refuse)",
+        }
+    }
+
+    /// The mode called `name`; the error is the message for the user. A
+    /// misspelt mode is never read as some other one: the caller must stop.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.name() == name.trim())
+            .ok_or_else(|| format!("unknown mode '{name}' (plan, ask-edits, auto-edit, yolo)"))
+    }
+
+    /// `ATELIER_MODE`, if set. `Err` when it names no mode.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        match std::env::var("ATELIER_MODE") {
+            Ok(v) if !v.trim().is_empty() => Self::parse(&v)
+                .map(Some)
+                .map_err(|e| format!("ATELIER_MODE: {e}")),
+            _ => Ok(None),
+        }
+    }
+
+    /// The mode a session starts in when neither `--mode` nor `ATELIER_MODE`
+    /// chose one: `ATELIER_APPROVE=all` is `yolo`, as it always was; else
+    /// `[defaults] mode`; else `[defaults] approve = true` is `yolo`; else
+    /// `auto-edit`. `ATELIER_APPROVE` set to anything else switches off
+    /// `[defaults] approve`, as before.
+    pub fn configured(defaults: &Defaults) -> Self {
+        let approve = std::env::var("ATELIER_APPROVE").ok();
+        Self::resolve(approve.as_deref(), defaults)
+    }
+
+    /// [`configured`](Self::configured), given the value of `ATELIER_APPROVE`.
+    fn resolve(approve: Option<&str>, defaults: &Defaults) -> Self {
+        match approve {
+            Some("all" | "yes" | "1") => Mode::Yolo,
+            Some(_) => defaults.mode.unwrap_or_default(),
+            None => defaults.mode.unwrap_or(if defaults.approve == Some(true) {
+                Mode::Yolo
+            } else {
+                Mode::AutoEdit
+            }),
+        }
+    }
+
+    /// What the model is told about the mode at the start of a turn, if
+    /// anything: in plan mode, so that it plans instead of finding the wall
+    /// by trial; and, once it has been told that, when plan mode is over
+    /// (`was_told`), since the earlier statement may still be in front of it.
+    pub fn note(self, was_told: bool) -> Option<String> {
+        match self {
+            Mode::Plan => Some(
+                "PLAN MODE (read-only) is on. Tools that can change anything — write, edit, \
+                 multiedit, apply_patch, notebook_edit, node, bash (but for commands the user's \
+                 allow rules name), saving or deleting memories, MCP tools not marked \
+                 read-only — are refused. Investigate with the \
+                 read-only tools (read, grep, glob, ls, tree, web_fetch, web_search), then \
+                 present a concrete plan of the changes you would make and stop. The user \
+                 will switch modes to let you carry it out."
+                    .to_string(),
+            ),
+            _ if was_told => Some(format!(
+                "Plan mode is off (the mode is now {self}): the tools it refused are \
+                 available again."
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// Tools whose subject is a path.
 const FILE_TOOLS: &[&str] = &[
@@ -448,6 +584,14 @@ impl Policy {
             });
         }
         Some(policy)
+    }
+
+    /// This policy without the allow rules that cover a whole tool: what is
+    /// allowed under it is allowed by a rule that names it.
+    fn naming_rules(&self) -> Self {
+        let mut policy = self.clone();
+        policy.allow.retain(|e| e.rule.pattern.is_some());
+        policy
     }
 
     /// What the rules say about calling `tool` with `args`.
@@ -838,17 +982,102 @@ pub struct Request<'a> {
     pub hook_allowed: bool,
     /// The hooks whose `permission_request` may answer in the user's place.
     pub hooks: Option<&'a crate::hooks::Hooks>,
+    /// Whether the call can modify something
+    /// ([`Tool::mutates`](crate::tools::Tool::mutates)).
+    pub mutates: bool,
 }
 
-/// Whether `req` may run: applies the rules, and prompts through `ui` when
-/// they (or the tool's default) say to ask. `Err` carries the tool result for
-/// the model — which rule refused, or that the user did. `auto_approve`
-/// (`ATELIER_APPROVE=all`) answers every prompt with yes; deny rules still
-/// hold. "Always" saves a rule to the project's `atelier.toml`.
+/// What happens to a call: the rules and the mode, combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ruling {
+    /// Runs without asking.
+    Run,
+    /// The user is asked.
+    Ask,
+    /// A deny rule refuses it.
+    Denied,
+    /// Plan mode refuses it.
+    Planning,
+}
+
+/// Decide a call under `policy` and `mode`, without side effects: the one
+/// place rules and modes meet. The [`Verdict`] is what the rules alone said.
+pub fn judge(
+    policy: &Policy,
+    mode: Mode,
+    req: &Request,
+    args: &Value,
+    root: &Path,
+) -> (Ruling, Verdict) {
+    let verdict = policy.decide(req.tool, args, root);
+    let ruling = match verdict.decision {
+        Decision::Deny => Ruling::Denied,
+        _ if mode == Mode::Plan && req.mutates && !plan_exempt(policy, req.tool, args, root) => {
+            Ruling::Planning
+        }
+        Decision::Allow => Ruling::Run,
+        Decision::Ask if mode == Mode::Yolo => Ruling::Run,
+        Decision::Ask => Ruling::Ask,
+        Decision::Default => {
+            // `ask-edits`: a modifying tool asks even where confinement
+            // would let it run.
+            let asks = req.needs_approval || (mode == Mode::AskEdits && req.mutates);
+            if asks && mode != Mode::Yolo {
+                Ruling::Ask
+            } else {
+                Ruling::Run
+            }
+        }
+    };
+    (ruling, verdict)
+}
+
+/// The one modifying call plan mode lets through: a `bash` command that allow
+/// rules with a pattern cover in full. Such a rule names the command, and an
+/// allow never covers a part that writes to a file, sets variables or cannot
+/// be followed (see [`Policy::allowed`]); a whole-tool `bash` rule names
+/// nothing, so it does not make the shell read-only — the command is judged
+/// as if only the rules with a pattern were there.
+fn plan_exempt(policy: &Policy, tool: &str, args: &Value, root: &Path) -> bool {
+    tool == "bash" && policy.naming_rules().decide(tool, args, root).decision == Decision::Allow
+}
+
+/// The tool result for a call plan mode refuses: what to do instead.
+fn plan_refusal(tool: &str) -> String {
+    let mut msg = format!(
+        "error: plan mode: {tool} is not available — investigate with the read-only tools, \
+         then present a plan; the user will switch modes to let you carry it out."
+    );
+    if tool == "bash" {
+        msg.push_str(
+            " (In plan mode bash runs only the commands a [permissions] allow rule names, \
+             such as `bash(git log *)`; no such rule covers this one.)",
+        );
+    }
+    msg
+}
+
+/// The tool result for a call a deny rule refuses.
+fn deny_refusal(verdict: &Verdict, root: &Path) -> String {
+    let rule = verdict
+        .by
+        .as_ref()
+        .map(|by| format!(" `{}` ({})", by.rule, by.source.describe(root)))
+        .unwrap_or_default();
+    format!(
+        "error: refused by the permission rule{rule}. The user has ruled this out: do not \
+         retry it in another form — take an approach the rule does not cover, or ask the user."
+    )
+}
+
+/// Whether `req` may run: applies the rules and the `mode`, and prompts
+/// through `ui` when they (or the tool's default) say to ask. `Err` carries
+/// the tool result for the model — which rule refused, that plan mode did, or
+/// that the user did. "Always" saves a rule to the project's `atelier.toml`.
 pub fn approve(
     settings: &mut Settings,
     root: &Path,
-    auto_approve: bool,
+    mode: Mode,
     req: Request,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
@@ -860,7 +1089,7 @@ pub fn approve(
             ui.info(&format!("⚠ {problem}"));
         }
     }
-    approve_with(&policy, settings, root, auto_approve, req, ui)
+    approve_with(&policy, settings, root, mode, req, ui)
 }
 
 /// [`approve`] under a given policy.
@@ -868,28 +1097,19 @@ fn approve_with(
     policy: &Policy,
     settings: &mut Settings,
     root: &Path,
-    auto_approve: bool,
+    mode: Mode,
     req: Request,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
     let args: Value = serde_json::from_str(req.arguments).unwrap_or(Value::Null);
-    let verdict = policy.decide(req.tool, &args, root);
-    match verdict.decision {
-        Decision::Deny => {
-            let rule = verdict
-                .by
-                .map(|by| format!(" `{}` ({})", by.rule, by.source.describe(root)))
-                .unwrap_or_default();
-            return Err(format!(
-                "error: refused by the permission rule{rule}. The user has ruled this out: do \
-                 not retry it in another form — take an approach the rule does not cover, or \
-                 ask the user."
-            ));
-        }
-        Decision::Allow => return Ok(()),
-        Decision::Default if !req.needs_approval => return Ok(()),
-        Decision::Ask | Decision::Default if auto_approve || req.hook_allowed => return Ok(()),
-        Decision::Ask | Decision::Default => {}
+    let (ruling, verdict) = judge(policy, mode, &req, &args, root);
+    match ruling {
+        Ruling::Run => return Ok(()),
+        Ruling::Denied => return Err(deny_refusal(&verdict, root)),
+        Ruling::Planning => return Err(plan_refusal(req.tool)),
+        // A `pre_tool` hook's approval answers the prompt — nothing more.
+        Ruling::Ask if req.hook_allowed => return Ok(()),
+        Ruling::Ask => {}
     }
     if let Some(by) = &verdict.by {
         ui.info(&format!("the rule `{}` asks before this runs", by.rule));
@@ -962,15 +1182,25 @@ fn remember(
     }
 }
 
-const USAGE: &str = "usage: atelier permissions check -- <command…>\n       \
-                     atelier permissions check --tool <name> [--args '<json>']";
+const USAGE: &str = "usage: atelier permissions check [--mode <mode>] -- <command…>\n       \
+                     atelier permissions check [--mode <mode>] --tool <name> [--args '<json>']";
 
-/// `atelier permissions check …`: print what the rules decide for a call, and
-/// which rule decided.
+/// `atelier permissions check …`: print what the rules and the mode decide
+/// for a call, and which rule decided. Without `--mode`, the mode is the one
+/// a session started here would be in.
 pub fn run_command(args: &[String]) -> Result<()> {
     let Some(("check", rest)) = args.split_first().map(|(a, r)| (a.as_str(), r)) else {
         bail!(USAGE);
     };
+    let (chosen, rest) = match rest {
+        [flag, name, more @ ..] if flag == "--mode" => (Some(name.as_str()), more),
+        [flag, more @ ..] if flag.starts_with("--mode=") => (flag.strip_prefix("--mode="), more),
+        _ => (None, rest),
+    };
+    let chosen = chosen
+        .map(Mode::parse)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--mode: {e}"))?;
     let (tool, call_args) = match rest {
         [flag, name, more @ ..] if flag == "--tool" => {
             let json = match more {
@@ -997,32 +1227,39 @@ pub fn run_command(args: &[String]) -> Result<()> {
     let root = std::env::current_dir()?;
     let settings = Settings::load(&root)?;
     let policy = Policy::load(&settings.permissions);
-    // The built-in tools know their default; anything else (an MCP tool)
-    // asks.
-    let needs_approval = tools::builtin_registry()
-        .get(&tool)
-        .is_none_or(|t| t.requires_approval_in(&call_args, &root));
-    for line in explain(&policy, &tool, &call_args, needs_approval, &root) {
+    let mode = match chosen {
+        Some(mode) => mode,
+        None => Mode::from_env()
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_else(|| Mode::configured(&settings.defaults)),
+    };
+    // The built-in tools know their defaults; anything else (an MCP tool)
+    // asks, and counts as able to modify.
+    let registry = tools::builtin_registry();
+    let known = registry.get(&tool);
+    let arguments = call_args.to_string();
+    let req = Request {
+        tool: &tool,
+        arguments: &arguments,
+        needs_approval: known.is_none_or(|t| t.requires_approval_in(&call_args, &root)),
+        mutates: known.is_none_or(|t| t.mutates(&call_args)),
+        hook_allowed: false,
+        hooks: None,
+    };
+    for line in explain(&policy, mode, &req, &call_args, &root) {
         println!("{line}");
     }
     Ok(())
 }
 
 /// The lines `permissions check` prints.
-fn explain(
-    policy: &Policy,
-    tool: &str,
-    args: &Value,
-    needs_approval: bool,
-    root: &Path,
-) -> Vec<String> {
-    let verdict = policy.decide(tool, args, root);
-    let decision = match verdict.decision {
-        Decision::Deny => "deny",
-        Decision::Ask => "ask",
-        Decision::Allow => "allow",
-        Decision::Default if needs_approval => "ask",
-        Decision::Default => "allow",
+fn explain(policy: &Policy, mode: Mode, req: &Request, args: &Value, root: &Path) -> Vec<String> {
+    let tool = req.tool;
+    let (ruling, verdict) = judge(policy, mode, req, args, root);
+    let decision = match ruling {
+        Ruling::Denied | Ruling::Planning => "deny",
+        Ruling::Ask => "ask",
+        Ruling::Run => "allow",
     };
     let mut out = vec![format!("decision: {decision}")];
     out.push(match &verdict.by {
@@ -1030,9 +1267,23 @@ fn explain(
         None if verdict.decision == Decision::Ask => {
             "rule:     none — the command cannot be followed".to_string()
         }
-        None if needs_approval => format!("rule:     none — `{tool}` asks by default"),
+        None if req.needs_approval => format!("rule:     none — `{tool}` asks by default"),
         None => format!("rule:     none — `{tool}` runs without asking by default"),
     });
+    // The mode is only worth a line when it is what decided.
+    let (unmoded, _) = judge(policy, Mode::default(), req, args, root);
+    if ruling != unmoded {
+        out.push(format!(
+            "mode:     {mode} — {}",
+            match mode {
+                Mode::Plan if tool == "bash" =>
+                    "read-only: `bash` runs only what an allow rule with a pattern covers",
+                Mode::Plan => "read-only: this call can modify something",
+                Mode::AskEdits => "a modifying tool asks first",
+                Mode::AutoEdit | Mode::Yolo => "every prompt is answered yes",
+            }
+        ));
+    }
     out.extend(verdict.notes.iter().map(|n| format!("  {n}")));
     out.extend(policy.problems.iter().map(|p| format!("! {p}")));
     out
@@ -1848,11 +2099,19 @@ mod tests {
         fn notice(&mut self, _: &str) {}
     }
 
+    /// Whether a call can modify something, as the session would know it:
+    /// the built-in tool's own answer, and yes for anything else.
+    fn modifies(tool: &str, args: &Value) -> bool {
+        tools::builtin_registry()
+            .get(tool)
+            .is_none_or(|t| t.mutates(args))
+    }
+
     /// Run one call through [`approve_with`] in a scratch project.
     struct Gate {
         dir: PathBuf,
         settings: Settings,
-        auto_approve: bool,
+        mode: Mode,
     }
 
     impl Gate {
@@ -1866,7 +2125,7 @@ mod tests {
                     permissions,
                     ..Settings::default()
                 },
-                auto_approve: false,
+                mode: Mode::AutoEdit,
             }
         }
 
@@ -1889,15 +2148,9 @@ mod tests {
                 needs_approval,
                 hook_allowed: false,
                 hooks: None,
+                mutates: modifies(tool, &args),
             };
-            approve_with(
-                &policy,
-                &mut self.settings,
-                &self.dir,
-                self.auto_approve,
-                req,
-                ui,
-            )
+            approve_with(&policy, &mut self.settings, &self.dir, self.mode, req, ui)
         }
 
         fn bash(&mut self, command: &str, ui: &mut Scripted) -> Result<(), String> {
@@ -1919,7 +2172,7 @@ mod tests {
         assert!(err.contains("`bash(rm *)`"), "{err}");
         assert_eq!(ui.asked, 0);
         // …even with every prompt auto-approved.
-        gate.auto_approve = true;
+        gate.mode = Mode::Yolo;
         assert!(gate.bash("rm x", &mut ui).is_err());
         assert!(gate.bash("ls", &mut ui).is_ok());
         assert_eq!(ui.asked, 0);
@@ -1943,7 +2196,7 @@ mod tests {
         assert_eq!(ui.asked, 1);
         assert!(ui.infos.iter().any(|i| i.contains("read(.env*)")));
         // Auto-approve answers the prompt.
-        gate.auto_approve = true;
+        gate.mode = Mode::Yolo;
         assert!(
             gate.call("read", json!({"path": ".env"}), false, &mut ui)
                 .is_ok()
@@ -2043,8 +2296,16 @@ mod tests {
                 needs_approval: true,
                 hook_allowed: true,
                 hooks: None,
+                mutates: true,
             };
-            approve_with(&policy, &mut gate.settings, &gate.dir, false, req, ui)
+            approve_with(
+                &policy,
+                &mut gate.settings,
+                &gate.dir,
+                Mode::AutoEdit,
+                req,
+                ui,
+            )
         };
         assert!(call("cargo build", &mut ui).is_ok());
         assert!(call("make all", &mut ui).is_ok());
@@ -2070,19 +2331,461 @@ mod tests {
             needs_approval: true,
             hook_allowed: false,
             hooks: None,
+            mutates: true,
         };
         let policy = policy(&["bash(ls *)"], &[], &[]);
-        assert!(approve_with(&policy, &mut gate.settings, &gate.dir, false, req, &mut ui).is_err());
+        let mode = Mode::AutoEdit;
+        assert!(approve_with(&policy, &mut gate.settings, &gate.dir, mode, req, &mut ui).is_err());
+        assert_eq!(ui.asked, 2);
+    }
+
+    // ── modes ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn mode_names_round_trip_and_typos_are_errors() {
+        for mode in Mode::ALL {
+            assert_eq!(Mode::parse(mode.name()), Ok(mode));
+            assert_eq!(mode.to_string(), mode.name());
+        }
+        assert_eq!(Mode::parse(" plan "), Ok(Mode::Plan));
+        assert_eq!(Mode::default(), Mode::AutoEdit);
+        for bad in ["", "pln", "Plan", "default", "auto", "auto_edit"] {
+            let err = Mode::parse(bad).unwrap_err();
+            assert!(err.contains("plan, ask-edits, auto-edit, yolo"), "{err}");
+        }
+    }
+
+    #[test]
+    fn mode_in_settings_is_kebab_case() {
+        let settings: Settings =
+            tomlproc::serde::from_str("[defaults]\nmode = \"ask-edits\"\n").unwrap();
+        assert_eq!(settings.defaults.mode, Some(Mode::AskEdits));
+        assert!(tomlproc::serde::from_str::<Settings>("[defaults]\nmode = \"pln\"\n").is_err());
+        // Unset stays out of the file.
+        let text = tomlproc::serde::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!text.contains("mode"), "{text}");
+    }
+
+    #[test]
+    fn starting_mode_from_approve_and_defaults() {
+        let defaults = |mode, approve| Defaults {
+            mode,
+            approve,
+            ..Defaults::default()
+        };
+        // Nothing set: today's behaviour.
+        assert_eq!(Mode::resolve(None, &defaults(None, None)), Mode::AutoEdit);
+        // ATELIER_APPROVE=all is yolo, over anything in the file.
+        for v in ["all", "yes", "1"] {
+            let d = defaults(Some(Mode::Plan), Some(false));
+            assert_eq!(Mode::resolve(Some(v), &d), Mode::Yolo);
+        }
+        // `[defaults] approve = true` is yolo, unless the env says otherwise…
+        let approve = defaults(None, Some(true));
+        assert_eq!(Mode::resolve(None, &approve), Mode::Yolo);
+        assert_eq!(Mode::resolve(Some("no"), &approve), Mode::AutoEdit);
+        // …or `[defaults] mode` names one.
+        let both = defaults(Some(Mode::Plan), Some(true));
+        assert_eq!(Mode::resolve(None, &both), Mode::Plan);
+        assert_eq!(Mode::resolve(Some("no"), &both), Mode::Plan);
+    }
+
+    #[test]
+    fn the_model_is_told_about_plan_mode_and_when_it_ends() {
+        let plan = Mode::Plan.note(false).unwrap();
+        assert!(plan.contains("PLAN MODE") && plan.contains("present a concrete plan"));
+        assert_eq!(Mode::Plan.note(true), Some(plan));
+        for mode in [Mode::AskEdits, Mode::AutoEdit, Mode::Yolo] {
+            assert_eq!(mode.note(false), None);
+            let over = mode.note(true).unwrap();
+            assert!(over.contains("Plan mode is off") && over.contains(mode.name()));
+        }
+    }
+
+    /// The classes of tool call a mode tells apart, each with a real call of
+    /// that class: `(needs_approval, mutates)` as the built-in tool answers.
+    const CLASSES: [(&str, bool, bool); 4] = [
+        ("read-only, confined", false, false),
+        ("read-only, unconfined", true, false),
+        ("modifying, confined", false, true),
+        ("modifying, unconfined", true, true),
+    ];
+
+    /// [`judge`] for a call of the given class, on a tool no rule names
+    /// unless `policy` has one for `mcp__t__x`.
+    fn rule_on(policy: &Policy, mode: Mode, needs_approval: bool, mutates: bool) -> Ruling {
+        let req = Request {
+            tool: "mcp__t__x",
+            arguments: "{}",
+            needs_approval,
+            mutates,
+            hook_allowed: false,
+            hooks: None,
+        };
+        judge(policy, mode, &req, &json!({}), Path::new(ROOT)).0
+    }
+
+    #[test]
+    fn every_mode_and_tool_class_without_rules() {
+        use Ruling::{Ask, Planning, Run};
+        let none = policy(&[], &[], &[]);
+        // Rows follow CLASSES; columns are plan, ask-edits, auto-edit, yolo.
+        let expected = [
+            [Run, Run, Run, Run],
+            [Ask, Ask, Ask, Run],
+            [Planning, Ask, Run, Run],
+            [Planning, Ask, Ask, Run],
+        ];
+        for ((class, needs, mutates), row) in CLASSES.into_iter().zip(expected) {
+            for (mode, want) in Mode::ALL.into_iter().zip(row) {
+                assert_eq!(
+                    rule_on(&none, mode, needs, mutates),
+                    want,
+                    "{class} in {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_mode_and_tool_class_under_each_kind_of_rule() {
+        use Ruling::{Ask, Denied, Planning, Run};
+        let deny = policy(&[], &[], &["mcp__t__x"]);
+        let ask = policy(&[], &["mcp__t__x"], &[]);
+        let allow = policy(&["mcp__t__x"], &[], &[]);
+        for (class, needs, mutates) in CLASSES {
+            for mode in Mode::ALL {
+                let at = format!("{class} in {mode}");
+                // A deny rule refuses everywhere, yolo included.
+                assert_eq!(rule_on(&deny, mode, needs, mutates), Denied, "{at}");
+                // Plan mode refuses what can modify whatever the rules allow
+                // or ask; otherwise an ask rule prompts (but in yolo) and an
+                // allow rule runs.
+                let planning = mode == Mode::Plan && mutates;
+                let want_ask = match mode {
+                    _ if planning => Planning,
+                    Mode::Yolo => Run,
+                    _ => Ask,
+                };
+                assert_eq!(rule_on(&ask, mode, needs, mutates), want_ask, "{at}");
+                let want_allow = if planning { Planning } else { Run };
+                assert_eq!(rule_on(&allow, mode, needs, mutates), want_allow, "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_tools_fall_in_the_expected_class() {
+        let registry = tools::builtin_registry();
+        let root = Path::new(ROOT);
+        let class = |tool: &str, args: Value| {
+            let t = registry
+                .get(tool)
+                .unwrap_or_else(|| panic!("no tool {tool}"));
+            (t.requires_approval_in(&args, root), t.mutates(&args))
+        };
+        let path = json!({"path": "src/a.rs"});
+        // Read-only and confined: runs in every mode.
+        for (tool, args) in [
+            ("read", path.clone()),
+            ("grep", json!({"pattern": "x"})),
+            ("glob", json!({"pattern": "*"})),
+            ("ls", json!({})),
+            ("tree", json!({})),
+            ("todo", json!({"action": "add", "text": "x"})),
+            ("skill", json!({"name": "x"})),
+            ("memory", json!({"action": "read", "name": "x"})),
+            ("memory", json!({"action": "list"})),
+            ("bash_output", json!({"id": "1"})),
+            ("bash_kill", json!({"id": "1"})),
+            ("ask", json!({"question": "x"})),
+        ] {
+            assert_eq!(class(tool, args.clone()), (false, false), "{tool} {args}");
+        }
+        // Read-only but leaving the project or the machine: asks, plan too.
+        for (tool, args) in [
+            ("read", json!({"path": "/etc/hosts"})),
+            ("web_fetch", json!({"url": "https://example.com"})),
+            ("web_search", json!({"query": "x"})),
+        ] {
+            assert_eq!(class(tool, args.clone()), (true, false), "{tool} {args}");
+        }
+        // Modifying, confined: refused in plan, asks in ask-edits.
+        for (tool, args) in [
+            ("write", path.clone()),
+            ("edit", path.clone()),
+            ("multiedit", path.clone()),
+            ("apply_patch", json!({"patch": ""})),
+            ("notebook_edit", path.clone()),
+            ("node", json!({"code": "1"})),
+            ("memory", json!({"action": "save", "name": "x"})),
+            ("memory", json!({"action": "delete", "name": "x"})),
+            ("memory", json!({"action": "frobnicate"})),
+            ("memory", json!({})),
+        ] {
+            assert_eq!(class(tool, args.clone()), (false, true), "{tool} {args}");
+        }
+        // Modifying, unconfined.
+        for (tool, args) in [
+            ("bash", json!({"command": "ls"})),
+            ("node", json!({"code": "1", "network": true})),
+        ] {
+            assert_eq!(class(tool, args.clone()), (true, true), "{tool} {args}");
+        }
+        // Every built-in is in one of the lists above: a new tool must be
+        // classified here, not left to the default.
+        let listed = [
+            "read",
+            "grep",
+            "glob",
+            "ls",
+            "tree",
+            "todo",
+            "skill",
+            "memory",
+            "bash_output",
+            "bash_kill",
+            "ask",
+            "web_fetch",
+            "web_search",
+            "write",
+            "edit",
+            "multiedit",
+            "apply_patch",
+            "notebook_edit",
+            "node",
+            "bash",
+        ];
+        for spec in registry.specs() {
+            assert!(
+                listed.contains(&spec.name.as_str()),
+                "unclassified: {}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_refuses_edits_with_a_message_the_model_can_act_on() {
+        let mut gate = Gate::new("plan", perms(&["write", "bash"], &[], &[]));
+        gate.mode = Mode::Plan;
+        let mut ui = Scripted::new(|| Approval::Once);
+        for (tool, args) in [
+            ("write", json!({"path": "a.txt", "content": "x"})),
+            ("edit", json!({"path": "a.txt"})),
+            ("multiedit", json!({"path": "a.txt"})),
+            (
+                "apply_patch",
+                json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            ),
+            ("notebook_edit", json!({"path": "a.ipynb"})),
+            ("node", json!({"code": "fs.writeFileSync('a', 'b')"})),
+            ("memory", json!({"action": "save", "name": "x"})),
+            ("mcp__srv__create", json!({})),
+        ] {
+            let err = gate.call(tool, args, false, &mut ui).unwrap_err();
+            assert!(
+                err.starts_with(&format!("error: plan mode: {tool} is not available")),
+                "{err}"
+            );
+            assert!(err.contains("present a plan"), "{err}");
+            assert!(err.contains("switch modes"), "{err}");
+        }
+        // Nobody is asked to approve a change in plan mode.
+        assert_eq!(ui.asked, 0);
+        // Reading goes on as usual.
+        for (tool, args) in [
+            ("read", json!({"path": "a.txt"})),
+            ("grep", json!({"pattern": "x"})),
+            ("memory", json!({"action": "list"})),
+            ("todo", json!({"action": "list"})),
+        ] {
+            assert!(gate.call(tool, args, false, &mut ui).is_ok(), "{tool}");
+        }
+        assert_eq!(ui.asked, 0);
+        // What asks, still asks.
+        let fetch = json!({"url": "https://example.com"});
+        assert!(gate.call("web_fetch", fetch, true, &mut ui).is_ok());
+        assert_eq!(ui.asked, 1);
+    }
+
+    #[test]
+    fn plan_mode_runs_bash_only_under_a_pattern_allow_rule() {
+        let mut ui = Scripted::new(|| Approval::Once);
+        // No rule, and a whole-tool rule (which names no command): refused.
+        for allow in [&[][..], &["bash"], &["bash(*)"], &["bash", "bash(ls *)"]] {
+            let mut gate = Gate::new("plan-bash", perms(allow, &[], &[]));
+            gate.mode = Mode::Plan;
+            let err = gate.bash("git log", &mut ui).unwrap_err();
+            assert!(
+                err.contains("plan mode: bash is not available"),
+                "{allow:?}: {err}"
+            );
+            assert!(err.contains("allow rule"), "{err}");
+        }
+        // A whole-tool rule next to the pattern rules changes nothing.
+        let rules = perms(
+            &["bash", "bash(git log *)", "bash(cat *)"],
+            &["bash(git log --all *)"],
+            &["bash(cat /etc/shadow)"],
+        );
+        let mut gate = Gate::new("plan-bash-rules", rules);
+        gate.mode = Mode::Plan;
+        assert!(gate.bash("git log --oneline", &mut ui).is_ok());
+        assert!(gate.bash("git log | cat", &mut ui).is_ok());
+        for cmd in [
+            // Not covered, or only in part.
+            "git commit -m x",
+            "git log; rm -rf x",
+            "git log && git push",
+            "git log $(touch x)",
+            // Covered, but writing: an allow rule never covers these.
+            "git log > out.txt",
+            "cat a >> b",
+            "GIT_DIR=/x git log",
+            // Not followed.
+            "git log <<EOF\nEOF",
+            "(git log)",
+            // An ask rule: there is nobody to ask about a change here.
+            "git log --all",
+        ] {
+            let err = gate.bash(cmd, &mut ui).unwrap_err();
+            assert!(err.contains("plan mode: bash"), "{cmd:?}: {err}");
+        }
+        // A deny rule still answers as a deny rule.
+        let err = gate.bash("cat /etc/shadow", &mut ui).unwrap_err();
+        assert!(err.contains("refused by the permission rule"), "{err}");
+        assert_eq!(ui.asked, 0);
+    }
+
+    #[test]
+    fn ask_edits_asks_before_confined_edits_unless_a_rule_allows() {
+        let mut gate = Gate::new("ask-edits", perms(&["edit(docs/**)"], &[], &[]));
+        gate.mode = Mode::AskEdits;
+        let mut ui = Scripted::new(|| Approval::Deny);
+        let write = json!({"path": "a.txt", "content": "x"});
+        assert_eq!(
+            gate.call("write", write.clone(), false, &mut ui)
+                .unwrap_err(),
+            DENIED
+        );
+        assert_eq!(
+            gate.call("node", json!({"code": "1"}), false, &mut ui)
+                .unwrap_err(),
+            DENIED
+        );
+        assert_eq!(ui.asked, 2);
+        // Reads and rule-allowed edits do not ask.
+        assert!(
+            gate.call("read", json!({"path": "a.txt"}), false, &mut ui)
+                .is_ok()
+        );
+        assert!(
+            gate.call("edit", json!({"path": "docs/x.md"}), false, &mut ui)
+                .is_ok()
+        );
+        assert_eq!(ui.asked, 2);
+        assert_eq!(
+            gate.call("edit", json!({"path": "src/x.rs"}), false, &mut ui)
+                .unwrap_err(),
+            DENIED
+        );
+        // The same calls run unasked in auto-edit.
+        gate.mode = Mode::AutoEdit;
+        assert!(gate.call("write", write, false, &mut ui).is_ok());
+        assert_eq!(ui.asked, 3);
+    }
+
+    #[test]
+    fn always_in_ask_edits_saves_a_rule_for_that_file() {
+        let mut gate = Gate::new("ask-edits-always", Permissions::default());
+        gate.mode = Mode::AskEdits;
+        let mut ui = Scripted::new(|| Approval::Always);
+        let write = json!({"path": "a.txt", "content": "x"});
+        assert!(gate.call("write", write.clone(), false, &mut ui).is_ok());
+        let saved = &gate.settings.permissions.allow;
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert!(saved[0].starts_with("write(") && saved[0].ends_with("a.txt)"));
+        assert!(gate.call("write", write, false, &mut ui).is_ok());
+        assert_eq!(ui.asked, 1);
+        let other = json!({"path": "b.txt", "content": "x"});
+        assert!(gate.call("write", other, false, &mut ui).is_ok());
         assert_eq!(ui.asked, 2);
     }
 
     // ── explanations ────────────────────────────────────────────────────
 
     #[test]
+    fn check_explains_what_the_mode_decided() {
+        let p = policy(&["bash(git log *)"], &[], &[]);
+        let root = Path::new(ROOT);
+        let run = |mode: Mode, tool: &str, args: Value, needs: bool| {
+            let arguments = args.to_string();
+            let req = Request {
+                tool,
+                arguments: &arguments,
+                needs_approval: needs,
+                mutates: modifies(tool, &args),
+                hook_allowed: false,
+                hooks: None,
+            };
+            explain(&p, mode, &req, &args, root)
+        };
+        let write = json!({"path": "a.txt"});
+
+        let out = run(Mode::Plan, "write", write.clone(), false);
+        assert_eq!(out[0], "decision: deny");
+        assert!(
+            out.iter().any(|l| l.starts_with("mode:     plan")),
+            "{out:?}"
+        );
+        let out = run(Mode::Plan, "bash", json!({"command": "make"}), true);
+        assert_eq!(out[0], "decision: deny");
+        assert!(out.iter().any(|l| l.contains("allow rule with a pattern")));
+        let out = run(Mode::Plan, "bash", json!({"command": "git log -3"}), true);
+        assert_eq!(out[0], "decision: allow");
+        assert!(!out.iter().any(|l| l.starts_with("mode:")), "{out:?}");
+
+        let out = run(Mode::AskEdits, "write", write.clone(), false);
+        assert_eq!(out[0], "decision: ask");
+        assert!(out.iter().any(|l| l.starts_with("mode:     ask-edits")));
+
+        let out = run(Mode::Yolo, "bash", json!({"command": "make"}), true);
+        assert_eq!(out[0], "decision: allow");
+        assert!(out.iter().any(|l| l.starts_with("mode:     yolo")));
+
+        // Where the mode changes nothing, it is not mentioned.
+        for mode in Mode::ALL {
+            let out = run(mode, "read", json!({"path": "a.txt"}), false);
+            assert_eq!(out[0], "decision: allow", "{mode}");
+            assert!(!out.iter().any(|l| l.starts_with("mode:")), "{mode}");
+        }
+        let out = run(Mode::AutoEdit, "write", write, false);
+        assert_eq!(
+            out,
+            [
+                "decision: allow",
+                "rule:     none — `write` runs without asking by default"
+            ]
+        );
+    }
+
+    #[test]
     fn check_explains_the_decision() {
         let p = policy(&["bash(git diff *)"], &["read(.env*)"], &["bash(rm *)"]);
         let root = Path::new(ROOT);
-        let run = |tool: &str, args: Value, needs: bool| explain(&p, tool, &args, needs, root);
+        let run = |tool: &str, args: Value, needs: bool| {
+            let arguments = args.to_string();
+            let req = Request {
+                tool,
+                arguments: &arguments,
+                needs_approval: needs,
+                mutates: modifies(tool, &args),
+                hook_allowed: false,
+                hooks: None,
+            };
+            explain(&p, Mode::AutoEdit, &req, &args, root)
+        };
 
         let out = run("bash", json!({"command": "git diff --stat"}), true);
         assert_eq!(out[0], "decision: allow");

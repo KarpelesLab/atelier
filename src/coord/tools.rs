@@ -53,6 +53,12 @@ impl Tool for Peers {
         "peers"
     }
 
+    // Lists instances and sets which topics this one hears; nothing of the
+    // user's changes.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "peers".into(),

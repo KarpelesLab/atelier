@@ -194,6 +194,7 @@ pub(crate) fn wrap_tools(
             .cloned()
             .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
         let namespaced_name = format!("mcp__{server_name}__{original_name}");
+        let read_only = t["annotations"]["readOnlyHint"].as_bool() == Some(true);
 
         tools.push(Box::new(McpTool::new(
             conn.clone(),
@@ -201,6 +202,7 @@ pub(crate) fn wrap_tools(
             original_name.to_string(),
             description,
             parameters,
+            read_only,
         )));
     }
     tools
@@ -524,6 +526,48 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             tools.iter().all(|t| t.name() != "mcp__fake__get_prompt"),
             "no get_prompt tool should be added when prompts/list fails"
         );
+    }
+
+    /// A connection nothing is sent on.
+    struct Unused;
+
+    impl JsonRpc for Unused {
+        fn request(&mut self, method: &str, _: Value) -> Result<Value> {
+            panic!("unexpected request: {method}")
+        }
+        fn notify(&mut self, method: &str, _: Value) -> Result<()> {
+            panic!("unexpected notification: {method}")
+        }
+    }
+
+    #[test]
+    fn only_a_true_read_only_hint_makes_a_tool_non_mutating() {
+        let advertised = vec![
+            json!({"name": "search", "annotations": {"readOnlyHint": true}}),
+            json!({"name": "create", "annotations": {"readOnlyHint": false}}),
+            json!({"name": "titled", "annotations": {"title": "x"}}),
+            json!({"name": "truthy", "annotations": {"readOnlyHint": "true"}}),
+            json!({"name": "plain"}),
+        ];
+        let tools = wrap_tools(Arc::new(Mutex::new(Unused)), "srv", advertised);
+        let mutates: Vec<(String, bool)> = tools
+            .iter()
+            .map(|t| (t.name().to_string(), t.mutates(&json!({}))))
+            .collect();
+        let expected = [
+            ("mcp__srv__search", false),
+            ("mcp__srv__create", true),
+            ("mcp__srv__titled", true),
+            ("mcp__srv__truthy", true),
+            ("mcp__srv__plain", true),
+        ];
+        assert_eq!(mutates.len(), expected.len());
+        for ((name, got), (want_name, want)) in mutates.iter().zip(expected) {
+            assert_eq!((name.as_str(), *got), (want_name, want));
+        }
+        // The hint is about modifying, not about asking: the call leaves the
+        // machine either way.
+        assert!(tools.iter().all(|t| t.requires_approval(&json!({}))));
     }
 
     #[test]

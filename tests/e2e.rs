@@ -233,6 +233,7 @@ fn atelier(base_url: &str, cwd: &Path) -> Command {
         .env_remove("ATELIER_BACKEND")
         .env_remove("ATELIER_CONTEXT_LIMIT")
         .env_remove("ATELIER_REVIEW")
+        .env_remove("ATELIER_MODE")
         .current_dir(cwd);
     cmd
 }
@@ -251,6 +252,26 @@ fn run_atelier(base_url: &str, cwd: &Path, args: &[&str], stdin: Option<&str>) -
     run_atelier_env(base_url, cwd, args, stdin, &[])
 }
 
+/// [`run_atelier`] with changes to its environment: each variable is set to
+/// the value given, or removed for `None`.
+fn run_atelier_setenv(
+    base_url: &str,
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    env: &[(&str, Option<&str>)],
+) -> Output {
+    let mut cmd = atelier(base_url, cwd);
+    cmd.args(args);
+    for (name, value) in env {
+        match value {
+            Some(v) => cmd.env(name, v),
+            None => cmd.env_remove(name),
+        };
+    }
+    finish(cmd, stdin)
+}
+
 /// [`run_atelier`] with extra environment variables for the child.
 fn run_atelier_env(
     base_url: &str,
@@ -259,9 +280,14 @@ fn run_atelier_env(
     stdin: Option<&str>,
     env: &[(&str, &str)],
 ) -> Output {
-    let mut child = atelier(base_url, cwd)
-        .args(args)
-        .envs(env.iter().copied())
+    let mut cmd = atelier(base_url, cwd);
+    cmd.args(args).envs(env.iter().copied());
+    finish(cmd, stdin)
+}
+
+/// Run `cmd` to its end, feeding it `stdin`, and return its captured output.
+fn finish(mut cmd: Command, stdin: Option<&str>) -> Output {
+    let mut child = cmd
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -2324,4 +2350,191 @@ fn a_subagents_call_asks_the_user_and_names_the_agent() {
     assert!(stdout.contains("2 agent(s):"), "{stdout}");
     assert!(stdout.contains("  explore — Read-only search"));
     assert!(stdout.contains("built-in · tools: read, grep, glob, ls, tree, web_fetch, web_search"));
+}
+
+/// A responder for a `write` of `out.txt`, then a `read` of `seed.txt`, then
+/// the answer `"done"` — one tool that modifies and one that does not.
+fn write_read_done() -> Responder {
+    Arc::new(|n| match n {
+        0 => sse_response(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write","arguments":"{\"path\":\"out.txt\",\"content\":\"written by tool\"}"}}]}}]}"#,
+        ]),
+        1 => sse_response(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"read","arguments":"{\"path\":\"seed.txt\"}"}}]}}]}"#,
+        ]),
+        _ => sse_response(&[r#"{"choices":[{"index":0,"delta":{"content":"done"}}]}"#]),
+    })
+}
+
+/// Plan mode end to end, however it is selected: the `write` is refused with
+/// the message that tells the model what to do instead and no file appears,
+/// the `read` after it works, and the model was told the mode up front.
+#[test]
+fn plan_mode_refuses_write_and_allows_read() {
+    type Select = (
+        &'static [&'static str],
+        &'static [(&'static str, Option<&'static str>)],
+        Option<&'static str>,
+    );
+    let selections: [Select; 3] = [
+        // The flag wins over ATELIER_APPROVE=all, which the harness sets.
+        (&["--mode", "plan"], &[], None),
+        (&[], &[("ATELIER_MODE", Some("plan"))], None),
+        (
+            &[],
+            &[("ATELIER_APPROVE", None)],
+            Some("[defaults]\nmode = \"plan\"\n"),
+        ),
+    ];
+    for (i, (flags, env, toml)) in selections.into_iter().enumerate() {
+        let mock = Mock::start(write_read_done());
+        let dir = unique_dir(&format!("plan-{i}"));
+        std::fs::write(dir.join("seed.txt"), "seed contents").unwrap();
+        if let Some(toml) = toml {
+            std::fs::write(dir.join("atelier.toml"), toml).unwrap();
+        }
+        let mut args = vec!["--print"];
+        args.extend(flags);
+        args.push("change things");
+
+        let out = run_atelier_setenv(&mock.base_url(), &dir, &args, None, env);
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "case {i}: {stderr}");
+        assert!(!dir.join("out.txt").exists(), "case {i}: the write ran");
+        assert_eq!(mock.requests(), 3, "case {i}: {stderr}");
+        assert!(
+            mock.body(0).contains("PLAN MODE"),
+            "case {i}: the mode was not stated to the model"
+        );
+        let after_write = mock.body(1);
+        assert!(
+            after_write.contains("plan mode: write is not available")
+                && after_write.contains("present a plan"),
+            "case {i}: {after_write}"
+        );
+        assert!(
+            mock.body(2).contains("seed contents"),
+            "case {i}: the read did not run"
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+    }
+}
+
+/// `ask-edits` with nobody to ask (`--print`): the `write` is denied and no
+/// file appears; the `read` still runs.
+#[test]
+fn ask_edits_headless_denies_write() {
+    let mock = Mock::start(write_read_done());
+    let dir = unique_dir("ask-edits");
+    std::fs::write(dir.join("seed.txt"), "seed contents").unwrap();
+
+    let args = ["--print", "--mode=ask-edits", "write the file"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!dir.join("out.txt").exists(), "the write ran");
+    assert!(
+        mock.body(1).contains("the user denied permission"),
+        "{}",
+        mock.body(1)
+    );
+    assert!(!mock.body(0).contains("PLAN MODE"));
+    assert!(mock.body(2).contains("seed contents"));
+}
+
+/// With no mode chosen and no `ATELIER_APPROVE`, nothing changed: a `write`
+/// inside the project runs without anyone being asked.
+#[test]
+fn default_mode_still_writes_without_asking() {
+    for env in [
+        &[("ATELIER_APPROVE", None)][..],
+        &[("ATELIER_MODE", Some("auto-edit"))],
+    ] {
+        let mock = Mock::start(write_read_done());
+        let dir = unique_dir("auto-edit");
+        std::fs::write(dir.join("seed.txt"), "seed contents").unwrap();
+
+        let out = run_atelier_setenv(&mock.base_url(), &dir, &["--print", "go"], None, env);
+
+        assert!(out.status.success());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "written by tool"
+        );
+        assert!(!mock.body(0).contains("PLAN MODE"));
+    }
+}
+
+/// A mode that does not exist stops the run (exit 2) before any request: a
+/// misspelt `plan` must not become a mode that edits.
+#[test]
+fn unknown_mode_is_a_usage_error() {
+    let mock = Mock::start(write_then_done());
+    let dir = unique_dir("bad-mode");
+    let by_flag = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["--print", "--mode", "pln", "go"],
+        None,
+    );
+    let by_env = run_atelier_setenv(
+        &mock.base_url(),
+        &dir,
+        &["--print", "go"],
+        None,
+        &[("ATELIER_MODE", Some("pln"))],
+    );
+    for out in [by_flag, by_env] {
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("unknown mode 'pln'"), "{stderr}");
+    }
+    assert_eq!(mock.requests(), 0);
+    assert!(!dir.join("out.txt").exists());
+}
+
+/// `atelier permissions check --mode`: the mode's part in a decision.
+#[test]
+fn permissions_check_takes_a_mode() {
+    let dir = unique_dir("check-mode");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        "[permissions]\nallow = [\"bash(git log *)\"]\n",
+    )
+    .unwrap();
+    let check = |args: &[&str]| {
+        let mut full = vec!["permissions", "check"];
+        full.extend(args);
+        let out = run_atelier_setenv(
+            "http://127.0.0.1:9",
+            &dir,
+            &full,
+            None,
+            &[("ATELIER_APPROVE", None)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let write = ["--tool", "write", "--args", r#"{"path": "a.txt"}"#];
+
+    let out = check(&[&["--mode", "plan"][..], &write].concat());
+    assert!(out.starts_with("decision: deny"), "{out}");
+    assert!(out.contains("mode:     plan"), "{out}");
+    let out = check(&[&["--mode=ask-edits"][..], &write].concat());
+    assert!(out.starts_with("decision: ask"), "{out}");
+    let out = check(&write);
+    assert!(out.starts_with("decision: allow"), "{out}");
+
+    let out = check(&["--mode", "plan", "--", "git", "log", "-3"]);
+    assert!(out.starts_with("decision: allow"), "{out}");
+    let out = check(&["--mode", "plan", "--", "git", "push"]);
+    assert!(out.starts_with("decision: deny"), "{out}");
+    let out = check(&["--mode", "yolo", "--", "git", "push"]);
+    assert!(out.starts_with("decision: allow"), "{out}");
 }

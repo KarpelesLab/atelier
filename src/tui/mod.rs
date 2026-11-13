@@ -86,6 +86,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::agent::{self, Session, Ui};
+use crate::permissions::Mode;
 use crate::tools::ask::{Answer, Question};
 
 use input::LineEditor;
@@ -169,6 +170,8 @@ pub fn run(mut session: Session) -> Result<()> {
         match outcome {
             agent::Dispatch::Quit => break,
             agent::Dispatch::Handled => {
+                // `/mode` and `/model` change what the strip shows.
+                r.status = build_status(&session, turn);
                 r.refresh()?;
             }
             agent::Dispatch::Config => {
@@ -908,7 +911,8 @@ impl Ui for TuiUi<'_> {
     }
 }
 
-/// Build the status strip: `model · cwd · branch · turn N`.
+/// Build the status strip: `model · cwd · branch · turn N`, then the
+/// permission mode when it is not the default one.
 fn build_status(session: &Session, turn: u32) -> String {
     let model = &session.config().model;
     let cwd = std::env::current_dir()
@@ -921,6 +925,10 @@ fn build_status(session: &Session, turn: u32) -> String {
         s.push_str(&branch);
     }
     s.push_str(&format!(" · turn {turn}"));
+    let mode = session.mode();
+    if mode != Mode::default() {
+        s.push_str(&format!(" · {mode}"));
+    }
     if let Some(u) = session.usage_summary() {
         s.push_str(" · ");
         s.push_str(&u);

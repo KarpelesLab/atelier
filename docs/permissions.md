@@ -4,7 +4,9 @@ atelier's approval model is keyed on **confinement**, not on whether an
 action mutates something: a tool that provably cannot leave the project
 directory runs without asking; a tool that can run arbitrary, unbounded code
 always asks (or is pre-authorized). [Rules](#rules) refine that per call:
-allow this command, ask before reading that file, never do the other.
+allow this command, ask before reading that file, never do the other. A
+[mode](#modes) moves the whole line: `plan` refuses changes, `ask-edits`
+asks before them, `yolo` asks about nothing.
 
 ## Confined vs. unconfined
 
@@ -29,6 +31,88 @@ allow this command, ask before reading that file, never do the other.
     (`NodeTool::requires_approval` returns `true` exactly when `network` is
     set).
 
+## Modes
+
+A **mode** sets how much runs without asking where no rule decides. There
+are four, from the most careful to the least:
+
+| Mode | What it is for |
+|------|----------------|
+| `plan` | Read-only. The agent investigates and proposes; anything that can change something is refused, with a message telling the model to present a plan. Switch modes to let it carry the plan out. |
+| `ask-edits` | Every file change asks first, like commands do. |
+| `auto-edit` | **The default.** File changes inside the project run; commands and the network ask. |
+| `yolo` | Nothing asks. What `ATELIER_APPROVE=all` has always done. |
+
+What each mode does with each class of tool, when no rule matches the call:
+
+| Tool class | Tools | `plan` | `ask-edits` | `auto-edit` | `yolo` |
+|------------|-------|--------|-------------|-------------|--------|
+| Read-only, confined | `read` (in the project), `grep`, `glob`, `ls`, `tree`, `todo`, `skill`, `memory` `read`/`list`, `bash_output`, `bash_kill`, `peers` | run | run | run | run |
+| Read-only, unconfined | `web_fetch`, `web_search`, `read` outside the project, MCP tools their server marks `readOnlyHint: true`, MCP `read_resource` / `get_prompt` | ask | ask | ask | run |
+| Modifying, confined | `write`, `edit`, `multiedit`, `apply_patch`, `notebook_edit`, `node` (its `fs` can write), `memory` `save`/`delete` | **refused** | **ask** | run | run |
+| Modifying, unconfined | `bash`, `node` with `network: true`, every other MCP tool, `peer_send` | **refused** (but see `bash` below) | ask | ask | run |
+
+And with [rules](#rules):
+
+- A **deny** rule refuses in every mode, `yolo` included.
+- An **ask** rule prompts in every mode but `yolo` — except that in `plan`
+  mode a modifying call is refused rather than asked about: nobody is asked
+  to approve a change there.
+- An **allow** rule runs the call without asking in `ask-edits`,
+  `auto-edit` and `yolo`. That is how `ask-edits` is tuned:
+  `allow = ["edit(docs/**)", "write(docs/**)"]` lets the documentation be
+  edited freely while every other change asks. Answering "always" to an
+  `ask-edits` prompt saves a rule for that one file.
+- In **`plan`** mode an allow rule does not make a modifying tool available,
+  with one exception: **`bash` runs a command that allow rules *with a
+  pattern* cover in full** — `allow = ["bash(git log *)", "bash(rg *)"]`
+  keeps those usable while planning. A whole-tool rule (`allow = ["bash"]`)
+  does not count: it names no command, so it says nothing about what is
+  safe to run in a read-only mode. Every other `bash` call is refused, and
+  the refusal says so. Since an allow rule never covers a command that
+  redirects output to a file, sets variables or cannot be followed (see
+  [`bash` patterns](#bash-patterns)), those are refused too — but atelier
+  does not know what a program does: `bash(cargo *)` lets `cargo build`
+  write `target/` in plan mode. Allow, for planning, the commands you
+  consider read-only.
+
+A refused call in plan mode returns, as the tool result:
+
+```text
+error: plan mode: write is not available — investigate with the read-only tools, then present a plan; the user will switch modes to let you carry it out.
+```
+
+The model is also told up front: while plan mode is on, a standing line in
+its context says which tools are refused and what is expected of it (and one
+line says so when plan mode ends).
+
+Whether a tool can modify something is the tool's own answer
+(`Tool::mutates`, default `true`), separate from confinement: `write` is
+confined yet modifies; `web_fetch` leaves the machine yet modifies nothing.
+An MCP tool counts as modifying unless its server's `tools/list` entry
+carries `annotations.readOnlyHint: true` — the server's word is taken for
+it, and the call still asks.
+
+### Selecting a mode
+
+In order of precedence:
+
+1. `/mode <name>` during a session (`/mode` alone prints the current mode
+   and the list). Not saved.
+2. `--mode <name>` on the command line.
+3. `ATELIER_MODE=<name>`.
+4. `ATELIER_APPROVE=all` (or `yes`, `1`) — `yolo`.
+5. `[defaults] mode = "<name>"` in the project's `atelier.toml`.
+6. `[defaults] approve = true` — `yolo` (what the `/config` screen's
+   auto-approve switch sets).
+7. Otherwise `auto-edit`.
+
+A name that is no mode is an error, not a fallback: `--mode pln` and
+`ATELIER_MODE=pln` stop atelier before it runs anything.
+
+The status strip shows the mode when it is not `auto-edit`
+(`… · turn 3 · plan`).
+
 ## Rules
 
 On top of those defaults, `[permissions]` in `atelier.toml` holds three lists
@@ -46,7 +130,7 @@ deny  = ["read(~/.ssh/**)", "bash(rm -rf *)", "write(.github/**)"]
 which rule, and not to retry it in another form; else any matching `ask`
 prompts, even for a call that would otherwise run unasked (`read` of a
 project file); else a matching `allow` runs it; else the default above
-applies. A bare tool name (`allow = ["bash"]`) covers the whole tool, as it
+applies, as the [mode](#modes) has it. A bare tool name (`allow = ["bash"]`) covers the whole tool, as it
 always has.
 
 **User-global rules** live in `$XDG_CONFIG_HOME/atelier/atelier.toml` (else
@@ -178,20 +262,39 @@ command; quote it as a single argument when it holds shell syntax.
 `--tool <name> [--args '<json>']` checks any other tool (MCP servers are not
 connected for this, so an unmatched MCP tool reports the default: ask).
 
+`--mode <name>` judges the call under that mode (without it: the mode a
+session started in this directory would be in), and a `mode:` line says so
+when the mode is what decided:
+
+```console
+$ atelier permissions check --mode plan --tool write --args '{"path": "src/a.rs"}'
+decision: deny
+rule:     none — `write` runs without asking by default
+mode:     plan — read-only: this call can modify something
+
+$ atelier permissions check --mode plan -- git log -3
+decision: allow
+rule:     bash(git log *) (project, /work/proj/atelier.toml)
+  `git log -3` is allowed by `bash(git log *)`
+```
+
 `/permissions` in a session lists the rules in force, by source.
 
 ## Headless mode: `ATELIER_APPROVE` and `--print`
 
 Set `ATELIER_APPROVE=all` (also accepts `yes` or `1`) to answer every
 approval prompt with yes for the session — for CI or scripted/unattended
-runs. That covers `ask` rules and the defaults; **`deny` rules still refuse**.
+runs. This is the `yolo` [mode](#modes). It covers `ask` rules and the
+defaults; **`deny` rules still refuse**.
 
 `--print`/`-p` (see [Quickstart](quickstart.md)) runs one prompt to
 completion with no human able to answer a prompt, so its `Ui::ask_approval`
 always answers **Deny** rather than blocking on stdin — the model is told the
 tool was denied and can try to proceed without it. Allow rules are how a
 `--print` run gets exactly the unconfined calls it needs;
-`ATELIER_APPROVE=all` gives it all of them.
+`ATELIER_APPROVE=all` gives it all of them. `--print --mode plan` is a
+read-only run: it can investigate and report, and change nothing. In
+`--print --mode ask-edits` every edit no rule allows is denied.
 
 ## Subagents
 
@@ -243,5 +346,7 @@ signals at once (each category is reported at most once per call).
 - `grep`, `glob`, `ls` and `tree` are matched on their JSON arguments, not as
   paths.
 - MCP tools have no risk-signal analysis.
-- Modes (`plan`, …), a sandbox for `bash`, an approving reviewer and
-  project trust are the rest of roadmap M17.
+- In `plan` mode, `bash` commands covered by a pattern allow rule run
+  unexamined: atelier does not check that they only read.
+- A sandbox for `bash`, an approving reviewer and project trust are the
+  rest of roadmap M17.

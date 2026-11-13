@@ -39,6 +39,11 @@ impl Tool for SkillTool {
         "skill"
     }
 
+    // Only reads.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     fn requires_approval(&self, _args: &Value) -> bool {
         // Reads skill directories only; see the module docs.
         false

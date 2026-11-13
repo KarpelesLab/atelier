@@ -21,6 +21,11 @@ impl Tool for WebFetchTool {
         "web_fetch"
     }
 
+    // Reaches out (and so asks), but changes nothing here.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
     // Leave the default (`true`): this reaches out over the network and is
     // not confined to the project directory, so it needs approval like `bash`.
 

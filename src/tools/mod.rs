@@ -172,6 +172,18 @@ pub trait Tool: Send + Sync {
     fn requires_approval_in(&self, args: &Value, _root: &Path) -> bool {
         self.requires_approval(args)
     }
+    /// Whether this call can modify something — files, processes, anything
+    /// beyond the conversation. Plan mode refuses the calls that can, and
+    /// `ask-edits` asks before them (see [`crate::permissions`]).
+    ///
+    /// Defaults to `true` — the safe default for unknown and MCP tools; the
+    /// tools that only read override it. This is a separate question from
+    /// [`requires_approval`](Tool::requires_approval), which is about
+    /// confinement: `write` is confined yet modifies, `web_fetch` leaves the
+    /// machine yet modifies nothing.
+    fn mutates(&self, _args: &Value) -> bool {
+        true
+    }
     /// Execute with parsed JSON `args`. The returned string is fed back to the
     /// model as the tool result; return `Err` for a failure the model should
     /// see (it is rendered as an error result, not a crash).

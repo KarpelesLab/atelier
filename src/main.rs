@@ -102,6 +102,18 @@ fn run() -> Result<u8> {
         println!("{}", cli::USAGE);
         return Ok(0);
     }
+    // `--mode`, else `ATELIER_MODE`. A value that names no mode stops the
+    // run: `plan` misspelt must not quietly become a mode that edits.
+    let mode = match cli
+        .mode
+        .map_or_else(permissions::Mode::from_env, |m| Ok(Some(m)))
+    {
+        Ok(mode) => mode,
+        Err(msg) => {
+            eprintln!("atelier: {msg}");
+            return Ok(headless::EXIT_USAGE);
+        }
+    };
     // Daily check for a newer release, in the background (official builds).
     update::spawn_background_check();
     // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
@@ -140,6 +152,9 @@ fn run() -> Result<u8> {
     }
     let context = context::default_providers(settings.diagnostics.clone());
     let mut session = agent::Session::new(cfg, root, tools, context, settings);
+    if let Some(mode) = mode {
+        session.set_mode(mode);
+    }
     if let Some(c) = coordinator {
         session.attach_coordinator(c);
     }

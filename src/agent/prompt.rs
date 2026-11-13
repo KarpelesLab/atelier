@@ -36,7 +36,7 @@
 //! prompt, and atelier only prefixes a context block to the user's message
 //! (`Session::gather_context`).
 
-use super::{CONTEXT_TOKEN_BUDGET, SYSTEM_PROMPT, Session};
+use super::{CONTEXT_TOKEN_BUDGET, MODE_NOTE, SYSTEM_PROMPT, Session};
 use crate::context::{self, ContextItem};
 
 /// The session's one system message: `prompt`, then the standing context
@@ -92,12 +92,20 @@ impl Session {
     /// context block to attach to the turn's user message, if anything
     /// changed since the last one.
     pub(super) fn gather_turn_context(&mut self) -> Option<String> {
-        let (standing, volatile): (Vec<_>, Vec<_>) = self
+        let (standing, mut volatile): (Vec<_>, Vec<_>) = self
             .context
             .iter()
             .filter_map(|p| p.gather(&self.root))
             .partition(|item| item.standing);
         self.standing = standing;
+        // Plan mode is stated up front, so the model plans rather than
+        // finding out one refused call at a time. It rides with the turn
+        // (not the system message): the mode can change mid-session, and
+        // the prompt cache should survive that.
+        let was_told = self.last_ctx.contains_key(MODE_NOTE);
+        if let Some(note) = self.mode.note(was_told) {
+            volatile.push(ContextItem::new(MODE_NOTE, note, u8::MAX));
+        }
         let mut delta = context::dedup_items(&self.last_ctx, volatile);
         self.last_ctx = std::mem::take(&mut delta.snapshot);
         turn_block(delta)
