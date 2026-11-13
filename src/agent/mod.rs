@@ -545,9 +545,18 @@ fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option
     let root = session.root.clone();
     let global = crate::commands::global_dir();
     let command = crate::commands::find(&root, global.as_deref(), name.strip_prefix('/')?)?;
+    // These lines run on the host (`commands::run_shell`), never in the
+    // sandbox. With the sandbox on, a plain `bash` call is one the sandbox
+    // would run and so needs no approval: ask about the call this is — one
+    // that runs on the host.
+    let sandboxed = crate::sandbox::state(&root) != crate::sandbox::State::Off;
     let mut approve = |shell: &str| {
         let mut runner = session.runner();
-        let arguments = serde_json::json!({ "command": shell }).to_string();
+        let mut arguments = serde_json::json!({ "command": shell });
+        if sandboxed {
+            arguments["sandbox"] = false.into();
+        }
+        let arguments = arguments.to_string();
         // `approve` passes tools it doesn't know; never run a shell on that.
         runner.tools.get("bash").is_some() && runner.approve("bash", &arguments, ui).is_ok()
     };
@@ -3067,6 +3076,43 @@ mod tests {
         assert!(session.auto_approve() && session.mode() == Mode::Yolo);
         session.set_auto_approve(false);
         assert_eq!(session.mode(), Mode::AutoEdit);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A command file's `` !`command` `` runs on the host. With the sandbox
+    /// on, `bash` calls the sandbox would run need no approval — which
+    /// must not carry over to a line that never goes near the sandbox.
+    #[test]
+    fn a_command_files_shell_line_is_asked_about_though_the_sandbox_is_on() {
+        use crate::sandbox;
+        let (mut session, root) = scratch_session("cmd-sandbox");
+        session.set_mode(Mode::AutoEdit);
+        let commands = root.join(".atelier/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("sbx-probe.md"),
+            "Look: !`touch ran-on-host`\n",
+        )
+        .unwrap();
+        let _reset = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
+            rootfs: PathBuf::from("/nonexistent/rootfs"),
+            memory_mb: 64,
+            interp: false,
+            helper: Some(PathBuf::from("/nonexistent/atelier")),
+            notes: Vec::new(),
+        }));
+        // What the sandbox would run is not asked about…
+        let mut ui = Quiet::default();
+        let plain = r#"{"command": "touch x"}"#;
+        assert!(session.runner().approve("bash", plain, &mut ui).is_ok());
+        assert_eq!(ui.asked, 0);
+        // …the command file's line is, and (refused here) does not run.
+        assert!(matches!(
+            dispatch(&mut session, "/sbx-probe", &mut ui),
+            Dispatch::Handled
+        ));
+        assert_eq!(ui.asked, 1, "{:?}", ui.infos);
+        assert!(!root.join("ran-on-host").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

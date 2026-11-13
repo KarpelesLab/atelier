@@ -77,6 +77,8 @@ whether it is on, which root, which CPU backend, what is read-only — and
 - **Background jobs run on the host**, and so ask as before; the result says
   so. Each command gets a fresh guest, so a server started in one could not
   be reached from the next.
+- **A [command file's](commands.md) `` !`command` `` lines run on the host**
+  too, and ask like a `"sandbox": false` call (the prompt shows it as one).
 - **A failure that looks like the sandbox's doing says so**, e.g.
 
   ```
