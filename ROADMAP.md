@@ -357,15 +357,19 @@ servers, and per-turn context.
 ### M13 — Releases & self-update ✅
 
 - ✅ **Release workflow** (`.github/workflows/release.yml`): a `vX.Y.Z` tag
-  (checked against `Cargo.toml`) builds static musl binaries natively on
-  x86_64 and arm64 runners, smoke-tests them, and publishes them with
-  `SHA256SUMS`.
+  (checked against `Cargo.toml`) builds static binaries natively on x86_64
+  (with [fullrust](https://github.com/KarpelesLab/fullrust): libc-free) and
+  arm64 (musl, until fullrust targets it) runners, smoke-tests them, and
+  publishes them gzip-compressed (`atelier-<target>.gz`) with `SHA256SUMS`.
 - ✅ **Self-update** (`src/update.rs`): official builds (marked by
   `ATELIER_RELEASE_TARGET` at compile time) check the latest release daily
-  in the background, verify the checksum, test-run the new binary, and
+  in the background, verify the checksum, decompress (pure-Rust `compcol`),
+  test-run the new binary, and
   rename it over the old one for the next launch; `atelier update` on
   demand, `ATELIER_NO_UPDATE` to opt out. Builds from source never update.
-- ✅ First release (`v0.1.0`): x86_64 and aarch64 static binaries with `SHA256SUMS`.
+- ✅ First release (`v0.1.0`): x86_64 and aarch64 static binaries with `SHA256SUMS`
+  (musl, uncompressed — the asset names changed after it, so it doesn't
+  update itself to later releases).
 
 ### M14 — Coordinator: instances connected ✅ (v1)
 

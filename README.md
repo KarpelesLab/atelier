@@ -45,15 +45,22 @@ Linux (x86_64 or aarch64) — a static binary from the latest
 [release](https://github.com/KarpelesLab/atelier/releases):
 
 ```sh
-arch=$(uname -m)   # x86_64 or aarch64
-curl -fsSLo ~/.local/bin/atelier \
-  "https://github.com/KarpelesLab/atelier/releases/latest/download/atelier-$arch-unknown-linux-musl"
+case $(uname -m) in
+  x86_64)  target=x86_64-unknown-linux-fullrust ;;
+  aarch64) target=aarch64-unknown-linux-musl ;;
+esac
+curl -fsSL "https://github.com/KarpelesLab/atelier/releases/latest/download/atelier-$target.gz" \
+  | gunzip > ~/.local/bin/atelier
 chmod +x ~/.local/bin/atelier
 ```
 
+The x86_64 binary is built with [fullrust](https://github.com/KarpelesLab/fullrust):
+it contains no libc and needs nothing but a Linux kernel. The arm64 one is
+static against musl.
+
 Release binaries **keep themselves up to date**: at most once a day, at
-startup, atelier checks for a newer release in the background, verifies it
-against the release's `SHA256SUMS`, and swaps it in for the next launch
+startup, atelier checks for a newer release in the background, verifies the
+download against the release's `SHA256SUMS`, and swaps it in for the next launch
 (with a one-line notice). `atelier update` does it on demand;
 `ATELIER_NO_UPDATE=1` turns the background check off. Builds from source
 never update themselves.

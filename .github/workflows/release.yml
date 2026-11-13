@@ -2,6 +2,11 @@ name: Release
 
 # Push a tag `vX.Y.Z` (matching Cargo.toml's version) to publish a release.
 # Installed official builds pick it up within a day (see src/update.rs).
+#
+# Assets are static binaries, gzip-compressed: `atelier-<target>.gz`.
+# - x86_64 is built with fullrust (https://github.com/KarpelesLab/fullrust):
+#   no libc at all, the binary only needs a Linux kernel.
+# - arm64 is built against musl, as fullrust is x86-64 only for now.
 
 on:
   push:
@@ -14,15 +19,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  check:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Tag matches Cargo.toml version
@@ -32,28 +30,62 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
+
+  build-x86_64:
+    needs: check
+    runs-on: ubuntu-latest
+    # The fullrust toolchain image: in it, a plain `cargo build` targets
+    # x86_64-unknown-linux-fullrust.
+    container: ghcr.io/karpeleslab/fullrust:1.99
+    env:
+      TARGET: x86_64-unknown-linux-fullrust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          # Marks the build as official: it then updates itself from releases.
+          ATELIER_RELEASE_TARGET: ${{ env.TARGET }}
+        # Not `--locked`: the image substitutes its libc-free getrandom,
+        # which changes that one entry of the lock file.
+        run: cargo build --release
+      - name: Smoke test
+        run: ./target/$TARGET/release/atelier --version | grep -F "($TARGET)"
+      - name: Stage
+        run: gzip -9 -c target/$TARGET/release/atelier > atelier-$TARGET.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atelier-${{ env.TARGET }}
+          path: atelier-${{ env.TARGET }}.gz
+          if-no-files-found: error
+
+  build-aarch64:
+    needs: check
+    runs-on: ubuntu-24.04-arm
+    env:
+      TARGET: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ env.TARGET }}
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
         env:
-          # Marks the build as official: it then updates itself from releases.
-          ATELIER_RELEASE_TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
+          ATELIER_RELEASE_TARGET: ${{ env.TARGET }}
+        run: cargo build --release --locked --target $TARGET
       - name: Smoke test
-        run: ./target/${{ matrix.target }}/release/atelier --version
+        run: ./target/$TARGET/release/atelier --version | grep -F "($TARGET)"
       - name: Stage
-        run: cp target/${{ matrix.target }}/release/atelier atelier-${{ matrix.target }}
+        run: gzip -9 -c target/$TARGET/release/atelier > atelier-$TARGET.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: atelier-${{ matrix.target }}
-          path: atelier-${{ matrix.target }}
+          name: atelier-${{ env.TARGET }}
+          path: atelier-${{ env.TARGET }}.gz
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [build-x86_64, build-aarch64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -61,9 +93,11 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
+        # Of the files as published (compressed): the updater verifies a
+        # download before decompressing it.
         run: |
           cd dist
-          sha256sum atelier-* > SHA256SUMS
+          sha256sum atelier-*.gz > SHA256SUMS
           cat SHA256SUMS
       - name: Publish
         env:

@@ -3,9 +3,10 @@
 //! Official builds — made by the release workflow, which sets
 //! `ATELIER_RELEASE_TARGET` at compile time to the asset they come from —
 //! check the repository's latest release at most once a day, in the
-//! background, at startup. A newer release's binary for this target is
-//! downloaded, checked against the release's `SHA256SUMS`, test-run
-//! (`--version`), and swapped in for the running executable with an atomic
+//! background, at startup. A newer release's binary for this target
+//! (`atelier-<target>.gz`) is downloaded, checked against the release's
+//! `SHA256SUMS`, decompressed, test-run (`--version`), and swapped in for
+//! the running executable with an atomic
 //! rename; it takes effect on the next launch, and the interface says so
 //! ([`take_notice`]). `atelier update` does the same on demand.
 //!
@@ -25,8 +26,8 @@ const REPO: &str = "KarpelesLab/atelier";
 /// GitHub's API, unless `ATELIER_UPDATE_API` points elsewhere (a mirror, or
 /// a test server).
 const DEFAULT_API: &str = "https://api.github.com";
-/// This build's release target (e.g. `x86_64-unknown-linux-musl`), set by
-/// the release workflow; `None` for builds from source.
+/// This build's release target (e.g. `x86_64-unknown-linux-fullrust`), set
+/// by the release workflow; `None` for builds from source.
 const TARGET: Option<&str> = option_env!("ATELIER_RELEASE_TARGET");
 /// The version this binary is.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,6 +35,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Checksums file published with each release.
 const SUMS_ASSET: &str = "SHA256SUMS";
+/// The most a release binary may decompress to; a download claiming more
+/// is refused rather than unpacked.
+const MAX_BINARY: u64 = 512 * 1024 * 1024;
 
 /// A message for the user from the background check, picked up by the
 /// interface.
@@ -154,7 +158,7 @@ fn check_and_install(target: &str) -> Result<Outcome> {
         return Ok(Outcome::UpToDate { latest: tag });
     }
 
-    let asset_name = format!("atelier-{target}");
+    let asset_name = asset_name(target);
     let url_of = |name: &str| {
         release["assets"]
             .as_array()
@@ -168,11 +172,14 @@ fn check_and_install(target: &str) -> Result<Outcome> {
     let sums = String::from_utf8(get(&url_of(SUMS_ASSET)?)?).context("reading checksums")?;
     let expected = checksum_for(&sums, &asset_name)
         .with_context(|| format!("{SUMS_ASSET} of {tag} doesn't list {asset_name}"))?;
-    let binary = get(&url_of(&asset_name)?).context("downloading the new binary")?;
-    let actual = hex(&purecrypto::hash::sha256(&binary));
+    // The checksum covers the download as published, so nothing unverified
+    // reaches the decompressor.
+    let download = get(&url_of(&asset_name)?).context("downloading the new binary")?;
+    let actual = hex(&purecrypto::hash::sha256(&download));
     if actual != expected {
         bail!("checksum mismatch for {asset_name} of {tag}; not installing it");
     }
+    let binary = gunzip(&download).with_context(|| format!("decompressing {asset_name}"))?;
 
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
@@ -186,6 +193,17 @@ fn check_and_install(target: &str) -> Result<Outcome> {
         }),
         false => Ok(Outcome::NotWritable { version, path: exe }),
     }
+}
+
+/// The release asset holding the binary for `target`: gzip-compressed.
+fn asset_name(target: &str) -> String {
+    format!("atelier-{target}.gz")
+}
+
+/// Decompress a gzip file (its CRC is checked).
+fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
+    compcol::vec::decompress_to_vec_capped::<compcol::gzip::Gzip>(data, MAX_BINARY)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Put `binary` in place of `exe`: write it next to it, check it runs, then
@@ -318,18 +336,55 @@ mod tests {
 
     #[test]
     fn checksums() {
-        let sums = "AB12  atelier-x86_64-unknown-linux-musl\n\
-                    cd34 *atelier-aarch64-unknown-linux-musl\n";
+        let sums = "AB12  atelier-x86_64-unknown-linux-fullrust.gz\n\
+                    cd34 *atelier-aarch64-unknown-linux-musl.gz\n";
         assert_eq!(
-            checksum_for(sums, "atelier-x86_64-unknown-linux-musl").as_deref(),
+            checksum_for(sums, &asset_name("x86_64-unknown-linux-fullrust")).as_deref(),
             Some("ab12")
         );
         assert_eq!(
-            checksum_for(sums, "atelier-aarch64-unknown-linux-musl").as_deref(),
+            checksum_for(sums, &asset_name("aarch64-unknown-linux-musl")).as_deref(),
             Some("cd34")
+        );
+        // The binary's own name isn't an asset any more.
+        assert_eq!(
+            checksum_for(sums, "atelier-aarch64-unknown-linux-musl"),
+            None
         );
         assert_eq!(checksum_for(sums, "atelier-other"), None);
         assert_eq!(hex(&purecrypto::hash::sha256(b"abc"))[..8], *"ba7816bf");
+    }
+
+    /// What `gzip -9` makes of a file is read back whole; damage and
+    /// oversized claims are refused.
+    #[test]
+    fn gunzip_reads_what_gzip_writes() {
+        let dir = std::env::temp_dir().join(format!("atelier-gunzip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("atelier-test");
+        let content: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i / 7).to_le_bytes())
+            .collect();
+        std::fs::write(&plain, &content).unwrap();
+        let ran = std::process::Command::new("gzip")
+            .args(["-9", "-k"])
+            .arg(&plain)
+            .status();
+        if !ran.is_ok_and(|s| s.success()) {
+            eprintln!("skipping: no gzip here");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut gz = std::fs::read(dir.join("atelier-test.gz")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gz.len() < content.len());
+        assert_eq!(gunzip(&gz).unwrap(), content);
+
+        assert!(gunzip(&gz[..gz.len() / 2]).is_err()); // cut short
+        assert!(gunzip(b"not gzip at all").is_err());
+        let mid = gz.len() / 2;
+        gz[mid] ^= 0xff; // damaged
+        assert!(gunzip(&gz).is_err());
     }
 
     #[test]
