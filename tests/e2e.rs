@@ -3546,7 +3546,11 @@ fn a_background_job_that_ends_between_turns_leads_the_next_prompt() {
             (
                 "call_read",
                 "bash",
-                serde_json::json!({"command": "echo read-to-the-end", "background": true}),
+                // It must still be running when the model's `bash_output`
+                // (the next step) starts waiting on it: a job that ended
+                // before anyone looked would rightly be announced, which is
+                // not the case this test is about.
+                serde_json::json!({"command": "sleep 2; echo read-to-the-end", "background": true}),
             ),
             (
                 "call_held",
