@@ -147,6 +147,29 @@ bytes comes back as its start and its end, with all of it saved to a file the
 agent can `read` or `grep` ([spilled output](tools.md#long-output-goes-to-a-file));
 the same goes for `read_resource`.
 
+## Tool annotations
+
+A server may annotate a tool in `tools/list`. atelier keeps the title and the
+`readOnlyHint` / `destructiveHint` hints (`mcp::Annotations`, reachable from
+the tool through `McpTool::annotations()` and by tool name through
+`mcp::Catalog`), and `/tools` shows them after the tool's name:
+
+```
+mcp__tracker__list_issues [read-only] List issues
+mcp__tracker__close_issue [destructive]
+mcp__tracker__comment
+```
+
+`[read-only]` is shown for `readOnlyHint: true`; `[destructive]` for
+`destructiveHint: true` on a tool not also said to be read-only. A tool whose
+server says nothing gets no marker — the protocol's defaults (not read-only,
+possibly destructive) describe every unannotated tool and would mark them
+all.
+
+These are the server's claims about itself. They inform the listing; they do
+not change approval — an MCP tool asks before running whatever its server
+says, unless a [permission rule](permissions.md) allows it.
+
 ## Server instructions
 
 A server's answer to `initialize` may carry `instructions`: how its tools are

@@ -10,9 +10,10 @@
 //! turn. It is a cheap handle — clones share one list — kept in connection
 //! order, which at startup is the order of the configuration file.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::Connection;
+use super::{Annotations, Connection};
 
 /// Most bytes of one server's `instructions` kept for the model. They are
 /// sent with every request, and a server's author decides their length: one
@@ -27,6 +28,8 @@ struct Entry {
     server: String,
     /// The server's `instructions`, already capped.
     instructions: Option<String>,
+    /// What the server said about its tools, by registered name.
+    annotations: HashMap<String, Annotations>,
 }
 
 impl Catalog {
@@ -41,6 +44,7 @@ impl Catalog {
         self.entries().push(Entry {
             server: server.to_string(),
             instructions,
+            annotations: connection.annotations.clone(),
         });
     }
 
@@ -55,6 +59,20 @@ impl Catalog {
             .iter()
             .filter_map(|e| Some((e.server.clone(), e.instructions.clone()?)))
             .collect()
+    }
+
+    /// What its server said about the tool registered as `tool`, for a
+    /// listing: `[read-only]` or `[destructive]`, then its title — whichever
+    /// of them there is. `None` for a tool with neither (or not from MCP).
+    pub fn describe(&self, tool: &str) -> Option<String> {
+        let entries = self.entries();
+        let annotations = entries.iter().find_map(|e| e.annotations.get(tool))?;
+        let parts: Vec<&str> = annotations
+            .marker()
+            .into_iter()
+            .chain(annotations.title.as_deref())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     fn entries(&self) -> MutexGuard<'_, Vec<Entry>> {
@@ -86,7 +104,51 @@ mod tests {
         Connection {
             tools: Vec::new(),
             instructions: instructions.map(str::to_string),
+            annotations: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn a_tool_is_described_by_its_marker_and_title() {
+        let annotated = |title: Option<&str>, read_only, destructive| Annotations {
+            title: title.map(str::to_string),
+            read_only,
+            destructive,
+        };
+        let mut connection = connection(None);
+        connection.annotations = HashMap::from([
+            (
+                "mcp__s__list".to_string(),
+                annotated(Some("List things"), Some(true), None),
+            ),
+            (
+                "mcp__s__wipe".to_string(),
+                annotated(None, None, Some(true)),
+            ),
+            (
+                "mcp__s__named".to_string(),
+                annotated(Some("Just a title"), None, None),
+            ),
+            (
+                "mcp__s__plain".to_string(),
+                annotated(None, Some(false), Some(false)),
+            ),
+        ]);
+        let catalog = Catalog::default();
+        catalog.insert("s", &connection);
+
+        let describe = |tool: &str| catalog.describe(tool);
+        assert_eq!(
+            describe("mcp__s__list").as_deref(),
+            Some("[read-only] List things")
+        );
+        assert_eq!(describe("mcp__s__wipe").as_deref(), Some("[destructive]"));
+        assert_eq!(describe("mcp__s__named").as_deref(), Some("Just a title"));
+        assert_eq!(describe("mcp__s__plain"), None);
+        assert_eq!(describe("bash"), None);
+
+        catalog.remove("s");
+        assert_eq!(describe("mcp__s__list"), None);
     }
 
     #[test]

@@ -1,4 +1,11 @@
 //! [`Tool`] wrapper around one tool advertised by an MCP server.
+//!
+//! Besides its name, description and schema, a server may *annotate* a tool
+//! (`annotations` in `tools/list`): a human-readable title, and hints about
+//! what calling it does. [`Annotations`] keeps the ones atelier has a use
+//! for. They are the server's own claims about itself — good for telling
+//! the user what a tool is, not a reason to trust it: nothing here lets a
+//! tool skip approval because its server says it only reads.
 
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +14,45 @@ use serde_json::{Value, json};
 
 use crate::mcp::jsonrpc::JsonRpc;
 use crate::tools::{Tool, ToolCtx, ToolSpec, spill};
+
+/// What a server says about one of its tools beyond the schema. A hint the
+/// server left out is `None`, which is not the same as it saying `false`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Annotations {
+    /// A display name for people.
+    pub title: Option<String>,
+    /// `readOnlyHint`: the tool does not modify its environment.
+    pub read_only: Option<bool>,
+    /// `destructiveHint`: the tool may delete or overwrite, rather than
+    /// only add. Meaningless on a read-only tool.
+    pub destructive: Option<bool>,
+}
+
+impl Annotations {
+    /// Read them off a raw `tools/list` entry. The title is taken from
+    /// `annotations.title`, or from the tool's own `title` where the server
+    /// follows the later revision of the protocol that moved it there.
+    pub(crate) fn of(tool: &Value) -> Self {
+        let annotations = &tool["annotations"];
+        let title = annotations["title"].as_str().or(tool["title"].as_str());
+        Self {
+            title: title.map(str::to_string),
+            read_only: annotations["readOnlyHint"].as_bool(),
+            destructive: annotations["destructiveHint"].as_bool(),
+        }
+    }
+
+    /// `[read-only]` or `[destructive]` for a listing, when the server
+    /// said so. A tool said to be both is read-only: the destructive hint
+    /// only qualifies tools that write.
+    pub fn marker(&self) -> Option<&'static str> {
+        match (self.read_only, self.destructive) {
+            (Some(true), _) => Some("[read-only]"),
+            (_, Some(true)) => Some("[destructive]"),
+            _ => None,
+        }
+    }
+}
 
 /// A single MCP-advertised tool, callable through the shared connection to
 /// its server. `conn` is transport-agnostic (stdio or HTTP) — see
@@ -20,9 +66,7 @@ pub(crate) struct McpTool {
     original_name: String,
     description: String,
     parameters: Value,
-    /// The server marked the tool `readOnlyHint: true` in its annotations:
-    /// it says the tool modifies nothing.
-    read_only: bool,
+    annotations: Annotations,
 }
 
 impl McpTool {
@@ -32,7 +76,7 @@ impl McpTool {
         original_name: String,
         description: String,
         parameters: Value,
-        read_only: bool,
+        annotations: Annotations,
     ) -> Self {
         Self {
             conn,
@@ -40,8 +84,13 @@ impl McpTool {
             original_name,
             description,
             parameters,
-            read_only,
+            annotations,
         }
+    }
+
+    /// What the server said about this tool (see [`Annotations`]).
+    pub(crate) fn annotations(&self) -> &Annotations {
+        &self.annotations
     }
 }
 
@@ -62,7 +111,7 @@ impl Tool for McpTool {
     // server, and the call still asks before it runs. Without the hint a
     // tool counts as modifying.
     fn mutates(&self, _args: &Value) -> bool {
-        !self.read_only
+        self.annotations.read_only != Some(true)
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
@@ -141,7 +190,7 @@ mod tests {
             "dump".into(),
             String::new(),
             json!({}),
-            false,
+            Annotations::default(),
         );
         let mut fstate = FileState::new();
         let mut ctx = ToolCtx {

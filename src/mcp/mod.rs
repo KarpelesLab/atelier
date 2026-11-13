@@ -43,7 +43,9 @@
 //! A server's `initialize` answer may also carry `instructions` for whoever
 //! uses its tools. They come back with the tools in the [`Connection`], and
 //! reach the model through the [`Catalog`] the session records connections
-//! in (see `catalog.rs`).
+//! in (see `catalog.rs`). So do the *annotations* a server puts on its tools
+//! (a title, read-only and destructive hints; see `tool.rs`), which the
+//! `/tools` listing shows.
 //!
 //! # Per-server options
 //!
@@ -70,6 +72,7 @@ mod resource;
 pub(crate) mod testutil;
 mod tool;
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -93,6 +96,7 @@ use tool::McpTool;
 pub use http::{HttpServer, connect_http};
 
 pub use catalog::Catalog;
+pub use tool::Annotations;
 
 /// A connected server: what [`connect_stdio`] and [`connect_http`] return.
 pub struct Connection {
@@ -101,6 +105,10 @@ pub struct Connection {
     pub tools: Vec<Box<dyn Tool>>,
     /// The `instructions` of the server's `initialize` answer, as sent.
     pub instructions: Option<String>,
+    /// What the server said about each of `tools`, by the tool's registered
+    /// (`mcp__<server>__<tool>`) name. The tools atelier adds itself
+    /// (`read_resource`, `get_prompt`) have none.
+    pub annotations: HashMap<String, Annotations>,
 }
 
 /// Seconds a handshake request may take unless the server's
@@ -243,7 +251,12 @@ pub(crate) fn assemble(
     options: &ServerOptions,
     found: Discovered,
 ) -> Connection {
-    let mut tools = wrap_tools(conn.clone(), server_name, options, found.tools);
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut annotations = HashMap::new();
+    for tool in wrap_tools(conn.clone(), server_name, options, found.tools) {
+        annotations.insert(tool.name().to_string(), tool.annotations().clone());
+        tools.push(Box::new(tool));
+    }
     if options.allows("read_resource")
         && let Some(tool) = maybe_resource_tool(conn.clone(), server_name, found.resources)
     {
@@ -257,6 +270,7 @@ pub(crate) fn assemble(
     Connection {
         tools,
         instructions: found.instructions,
+        annotations,
     }
 }
 
@@ -305,8 +319,8 @@ fn wrap_tools(
     server_name: &str,
     options: &ServerOptions,
     advertised: Vec<Value>,
-) -> Vec<Box<dyn Tool>> {
-    let mut tools: Vec<Box<dyn Tool>> = Vec::with_capacity(advertised.len());
+) -> Vec<McpTool> {
+    let mut tools = Vec::with_capacity(advertised.len());
     for t in advertised {
         let Some(original_name) = t.get("name").and_then(Value::as_str) else {
             continue;
@@ -324,16 +338,15 @@ fn wrap_tools(
             .cloned()
             .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
         let namespaced_name = format!("mcp__{server_name}__{original_name}");
-        let read_only = t["annotations"]["readOnlyHint"].as_bool() == Some(true);
 
-        tools.push(Box::new(McpTool::new(
+        tools.push(McpTool::new(
             conn.clone(),
             namespaced_name,
             original_name.to_string(),
             description,
             parameters,
-            read_only,
-        )));
+            Annotations::of(&t),
+        ));
     }
     tools
 }
@@ -589,6 +602,35 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
         let mut rpc = testutil::FakeRpc::new(github);
         let found = discover(&mut rpc, "gh", "2024-11-05").unwrap();
         assemble(Arc::new(Mutex::new(rpc)), "gh", options, found).tools
+    }
+
+    #[test]
+    fn annotations_are_kept_per_tool() {
+        let mut rpc = testutil::FakeRpc::new(testutil::tools_only(json!([
+            { "name": "list", "annotations": { "title": "List things", "readOnlyHint": true } },
+            { "name": "wipe", "annotations": { "destructiveHint": true, "readOnlyHint": false } },
+            { "name": "odd", "annotations": { "readOnlyHint": true, "destructiveHint": true } },
+            { "name": "new_style", "title": "Top-level title" },
+            { "name": "plain" },
+            { "name": "hidden", "annotations": { "readOnlyHint": true } },
+        ])));
+        let found = discover(&mut rpc, "s", "2024-11-05").unwrap();
+        let options = filters(&[], &["hidden"]);
+        let connection = assemble(Arc::new(Mutex::new(rpc)), "s", &options, found);
+        let of = |name: &str| &connection.annotations[&format!("mcp__s__{name}")];
+
+        assert_eq!(of("list").title.as_deref(), Some("List things"));
+        assert_eq!(of("list").marker(), Some("[read-only]"));
+        assert_eq!(of("wipe").marker(), Some("[destructive]"));
+        assert_eq!(of("wipe").read_only, Some(false));
+        // Read-only wins: "destructive" only qualifies a tool that writes.
+        assert_eq!(of("odd").marker(), Some("[read-only]"));
+        assert_eq!(of("new_style").title.as_deref(), Some("Top-level title"));
+        // Unsaid is not "false", and earns no marker.
+        assert_eq!(of("plain"), &Annotations::default());
+        assert_eq!(of("plain").marker(), None);
+        // Only the tools that were kept.
+        assert_eq!(connection.annotations.len(), 5);
     }
 
     #[test]

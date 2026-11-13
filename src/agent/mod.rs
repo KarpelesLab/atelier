@@ -374,10 +374,10 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                     "Claude backend: claude uses its own tools plus the configured MCP servers.",
                 );
             }
-            let names = session.tool_names();
-            ui.info(&format!("{} tools available:", names.len()));
-            for n in names {
-                ui.info(&format!("  {n}"));
+            let lines = session.tool_listing();
+            ui.info(&format!("{} tools available:", lines.len()));
+            for l in lines {
+                ui.info(&format!("  {l}"));
             }
         }
         "/review" => match args.first().copied() {
@@ -990,11 +990,22 @@ impl Session {
         Ok(model)
     }
 
-    /// Names of all registered tools, sorted (for `/tools`).
+    /// Names of all registered tools, sorted.
     pub fn tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.tools.specs().into_iter().map(|s| s.name).collect();
         names.sort();
         names
+    }
+
+    /// [`tool_names`](Self::tool_names) as `/tools` shows them: each name,
+    /// then what an MCP server said about that tool (`[read-only]`,
+    /// `[destructive]`, a title).
+    pub fn tool_listing(&self) -> Vec<String> {
+        let line = |name: String| match self.mcp_catalog.describe(&name) {
+            Some(said) => format!("{name} {said}"),
+            None => name,
+        };
+        self.tool_names().into_iter().map(line).collect()
     }
 
     /// Load a previously-saved conversation for this project (for `--continue`).

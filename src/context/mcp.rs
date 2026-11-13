@@ -62,6 +62,7 @@ mod tests {
         Connection {
             tools: Vec::new(),
             instructions: instructions.map(str::to_string),
+            annotations: Default::default(),
         }
     }
 

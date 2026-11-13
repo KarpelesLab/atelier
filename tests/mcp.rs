@@ -256,13 +256,19 @@ fn text(bytes: &[u8]) -> String {
 }
 
 /// A server's `instructions` stand in the system message of every request
-/// under its name, and its tool filters decide which tools are advertised.
+/// under its name, its tool filters decide which tools are advertised, and
+/// `/tools` shows what it said about them.
 #[test]
 fn server_instructions_and_tool_filters_reach_the_model() {
     let tracker = mcp_server(
         json!({ "capabilities": {}, "instructions": "Search before creating an issue." }),
         json!([
-            { "name": "list_issues", "description": "List issues" },
+            {
+                "name": "list_issues",
+                "description": "List issues",
+                "annotations": { "title": "List issues", "readOnlyHint": true },
+            },
+            { "name": "close_issue", "annotations": { "destructiveHint": true } },
             { "name": "delete_issue", "description": "Delete an issue" },
         ]),
     );
@@ -276,12 +282,22 @@ fn server_instructions_and_tool_filters_reach_the_model() {
         ),
     );
 
-    let out = run_repl(&model, &dir, "hello\nagain\n");
+    let out = run_repl(&model, &dir, "hello\nagain\n/tools\n");
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("mcp: connected 'tracker' (http, 1 tool(s))"),
+        stderr.contains("mcp: connected 'tracker' (http, 2 tool(s))"),
         "{stderr}"
     );
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("  mcp__tracker__list_issues [read-only] List issues\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  mcp__tracker__close_issue [destructive]\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  bash\n"), "{stdout}");
     assert!(stderr.contains("mcp: 'off' (http) is disabled"), "{stderr}");
 
     let bodies = model.bodies();
