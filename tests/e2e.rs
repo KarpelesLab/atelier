@@ -1795,3 +1795,67 @@ fn passing_the_threshold_summarizes_older_turns_after_the_turn() {
     assert!(!bodies[3].contains("first prompt"));
     assert!(bodies[3].contains("second prompt") && bodies[3].contains("third prompt"));
 }
+
+/// Case 10 — `/context` accounts for the window: before any turn only the
+/// fixed parts, afterwards also the standing instructions, the turn's
+/// context block by item, the conversation by role, and the endpoint's own
+/// count for the last request.
+#[test]
+fn context_command_shows_where_the_window_goes() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => tool_call_response("call_1", "read", r#"{"path":"notes.txt"}"#),
+        _ => answer_with_usage("read it", 4_321),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("context");
+    std::fs::write(dir.join("AGENTS.md"), "STANDING-RULE-2b7d").unwrap();
+    std::fs::write(dir.join("notes.txt"), "some notes\n").unwrap();
+
+    let mut repl = Repl::start(&mock.base_url(), &dir, &[]);
+    repl.line("/context");
+    repl.line("read the notes");
+    wait_requests(&mock, 2);
+    repl.line("/context");
+    let (stdout, stderr) = repl.finish();
+
+    let reports: Vec<&str> = stdout.split("context window — ").skip(1).collect();
+    assert_eq!(reports.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+    let (before, after) = (reports[0], reports[1]);
+
+    assert!(
+        before.contains("share of the compaction threshold (8,000)"),
+        "{before}"
+    );
+    assert!(before.contains("  system prompt "), "{before}");
+    assert!(before.contains("  tool list ("), "{before}");
+    assert!(before.contains("  history: user (0)"), "{before}");
+    assert!(
+        before.contains("last request: no usage reported"),
+        "{before}"
+    );
+    assert!(
+        before.contains("(project context is gathered when you send a message)"),
+        "{before}"
+    );
+    assert!(!before.contains("standing: "), "{before}");
+
+    for line in [
+        "  standing: project instructions ",
+        "  turn context (1 block(s)) ",
+        "    environment ",
+        "  history: user (1) ",
+        "  history: assistant (2) ",
+        "  history: tool results (1) ",
+        "  total ",
+        "last request: 4,321 tokens as counted by the endpoint",
+    ] {
+        assert!(after.contains(line), "{line:?} missing from:\n{after}");
+    }
+    assert!(!after.contains("gathered when you send"), "{after}");
+    // Every row carries an estimate and its share of the threshold.
+    let total = after
+        .lines()
+        .find(|l| l.starts_with("  total "))
+        .expect("a total row");
+    assert!(total.trim_end().ends_with('%'), "{total}");
+}

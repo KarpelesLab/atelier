@@ -38,8 +38,11 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   networked scripts) asks for approval.
 - **Sessions persist and compact themselves.** Conversations are saved to
   `.atelier/session.json` and resumable with `--continue`; once a
-  conversation grows past a token threshold, older turns are summarized
-  automatically instead of being sent in full on every request.
+  conversation grows past a token threshold, old tool output is pruned and,
+  if needed, older turns become a structured hand-off summary (`/compact` on
+  demand, `/context` to see where the window goes). Requests are laid out so
+  each is a prefix of the next, which keeps the inference server's prompt
+  cache warm from turn to turn.
 - **A parallel reviewer, opt-in.** Turn on the "subconscious" (`/review on`)
   and a second, read-only model pass watches the exchange and edits,
   posting short 💭 notes into the dialog — it can comment but never act.

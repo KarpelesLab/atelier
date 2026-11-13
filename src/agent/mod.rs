@@ -15,6 +15,7 @@
 
 mod compact;
 mod prompt;
+mod window;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -172,6 +173,7 @@ const HELP: &[&str] = &[
     "                                        force: even if claude has background tasks running",
     "  /compact [instructions]               shrink the conversation now: prune old tool output,",
     "                                        summarize older turns (instructions guide the summary)",
+    "  /context                              show where the context window goes, in tokens",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
@@ -357,6 +359,11 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             }
         }
         "/hooks" => session.hooks_command(&args, ui),
+        "/context" => {
+            for l in session.context_report() {
+                ui.info(&l);
+            }
+        }
         "/peers" | "/subscribe" | "/unsubscribe" => dispatch_peers(session, cmd, &args, ui),
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),

@@ -45,7 +45,7 @@ The entry point ...
 
 Type `/help` to see the available slash commands (`/models`, `/model`,
 `/login`, `/logout`, `/tools`, `/mcp`, `/review`, `/config`, `/new`,
-`/compact`, `/image`, `/memory`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the
+`/compact`, `/context`, `/image`, `/memory`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the
 agent itself can do, [permissions](permissions.md) for how tool approval
 works, [review mode](review.md) for the parallel "subconscious" reviewer
 behind `/review`, and [Sign in with ChatGPT](chatgpt.md) for `/login`/`/logout`.

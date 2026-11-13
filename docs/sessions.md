@@ -195,6 +195,47 @@ request](#the-shape-of-a-request)). The model always sees the summary, never
 the raw messages it was built from. The context blocks of the summarized
 turns went with them, so the next turn's block carries every item again.
 
+## Where the window goes: `/context`
+
+`/context` prints what the next request is made of, one part per line, with
+an estimated token count and its share of the compaction threshold:
+
+```text
+context window — estimated tokens, and their share of the compaction threshold (8,000)
+  system prompt                               80    1.0%
+  standing: project instructions             412    5.2%
+  standing: memory                            96    1.2%
+  summary of earlier turns                   211    2.6%
+  tool list (17 tool(s))                   4,281   53.5%
+  turn context (3 block(s))                  640    8.0%
+    git status (×3)                          118    1.5%
+    project layout                           402    5.0%
+    environment                                9    0.1%
+  history: user (4)                           61    0.8%
+  history: assistant (9)                     350    4.4%
+  history: tool results (6)                1,204   15.1%
+  total                                    7,259   90.7%
+last request: 7,804 tokens as counted by the endpoint (prompt + completion)
+```
+
+- **standing** rows are the items of the system message besides the prompt;
+  **summary** appears after a compaction.
+- **turn context** is what the `<context>` blocks attached to your messages
+  cost together, then by item (`×3`: three blocks carry it — it changed
+  twice).
+- **history** is the conversation by role; tool calls count with the
+  assistant, their output under tool results — usually the first thing worth
+  pruning (`/compact`).
+- The counts are estimates of about four characters per token; the last line
+  is the endpoint's own count for the last request, when it reports usage (it
+  is cleared by a compaction until the next request). If the two differ a
+  lot, trust the endpoint — it is what triggers compaction.
+
+A large tool list is a fixed cost on every request; removing an MCP server
+you don't use (`/mcp remove`) is how to shrink it. Before the first message
+of a session the standing and turn context rows are missing: project context
+is gathered when you send one.
+
 ## See also
 
 - [Configuration](configuration.md) — the full environment-variable reference
