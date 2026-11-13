@@ -41,7 +41,7 @@ mod todos;
 pub use budget::{estimate_tokens, render_budgeted};
 #[allow(unused_imports)]
 pub use dedup::{Delta, dedup_items};
-pub use instructions::{nested_instructions, review_section};
+pub use instructions::{instruction_files, nested_instructions, review_section};
 pub use mcp::McpProvider;
 
 use crate::settings::DiagnosticCheck;

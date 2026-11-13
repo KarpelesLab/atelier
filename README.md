@@ -101,7 +101,7 @@ first conversation, the REPL/TUI fallback).
 |-----|--------|
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
 | [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, exit codes; `atelier review` (a read-only review of a change, for you or CI) |
-| [Troubleshooting](docs/troubleshooting.md) | `atelier debug prompt`: the exact first request a prompt would make, without sending it |
+| [Troubleshooting](docs/troubleshooting.md) | `atelier doctor`: a checklist of the setup (config files, endpoint, model, instruction files, hooks, MCP, …); `atelier debug prompt`: the exact first request a prompt would make, without sending it |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |

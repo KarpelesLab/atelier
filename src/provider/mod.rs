@@ -912,8 +912,14 @@ pub fn model_listing(cfg: &Config) -> Vec<String> {
 /// connect timeout is `ATELIER_HTTP_TIMEOUT_MS` (milliseconds), else the
 /// provider's own, else [`DEFAULT_LIST_MODELS_TIMEOUT_MS`].
 pub fn list_models(provider: &Provider) -> Result<Vec<String>> {
-    let url = provider.endpoint("models");
     let timeout = connect_timeout(provider, DEFAULT_LIST_MODELS_TIMEOUT_MS);
+    list_models_within(provider, timeout)
+}
+
+/// [`list_models`] with the connect timeout given by the caller, for
+/// `atelier doctor`, which is not prepared to wait as long.
+pub fn list_models_within(provider: &Provider, timeout: Duration) -> Result<Vec<String>> {
+    let url = provider.endpoint("models");
     let key = provider.key()?;
     let mut attempt: u32 = 0;
     let resp = loop {

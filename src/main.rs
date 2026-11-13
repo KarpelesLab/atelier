@@ -13,6 +13,7 @@ mod commands;
 mod config;
 mod context;
 mod coord;
+mod doctor;
 mod headless;
 mod hooks;
 mod js;
@@ -78,6 +79,11 @@ fn run() -> Result<u8> {
     // call, and which rule decided (see `permissions`).
     if args.first().map(String::as_str) == Some("permissions") {
         return permissions::run_command(&args[1..]).map(|()| 0);
+    }
+    // `atelier doctor`: check the setup a session here would run with,
+    // without starting one (see `doctor`).
+    if args.first().map(String::as_str) == Some("doctor") {
+        return Ok(doctor::run_command(&args[1..]));
     }
     // `atelier stats …`: totals of the usage log (see `usage`).
     if args.first().map(String::as_str) == Some("stats") {

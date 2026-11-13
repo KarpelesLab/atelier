@@ -76,6 +76,9 @@ mod config;
 mod input;
 mod term;
 
+/// The terminal window's size, for `atelier doctor`.
+pub use term::size as window_size;
+
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

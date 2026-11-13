@@ -323,6 +323,12 @@ pub fn nested_instructions(root: &Path, dirs: &[PathBuf]) -> Option<String> {
     nested(&Loader::from_env(), root, dirs)
 }
 
+/// The instruction files a session at `root` loads up front, least specific
+/// first — what [`InstructionsProvider`] renders. For `atelier doctor`.
+pub fn instruction_files(root: &Path) -> Vec<PathBuf> {
+    Loader::from_env().applicable(root)
+}
+
 /// The titles (compared ignoring case) of the section an instruction file
 /// gives a reviewer.
 const REVIEW_TITLES: &[&str] = &["review", "code review"];

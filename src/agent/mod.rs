@@ -2240,7 +2240,7 @@ fn image_mime(path: &str) -> &'static str {
     }
 }
 
-fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
+pub(crate) fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
     StdioServer {
         name: cfg.name.clone(),
         command: cfg.command.clone(),
@@ -2254,7 +2254,7 @@ fn needs_login(e: &anyhow::Error) -> bool {
     e.downcast_ref::<mcp::oauth::LoginRequired>().is_some()
 }
 
-fn to_http(cfg: &HttpServerConfig, tokens: &mcp::oauth::TokenStore) -> HttpServer {
+pub(crate) fn to_http(cfg: &HttpServerConfig, tokens: &mcp::oauth::TokenStore) -> HttpServer {
     let headers = cfg
         .headers
         .iter()

@@ -285,6 +285,22 @@ impl Hooks {
         Ok(())
     }
 
+    /// How many usable hooks are the user's and how many the project's.
+    pub fn counts(&self) -> (usize, usize) {
+        let project = self.project_count();
+        (self.hooks.len() - project, project)
+    }
+
+    /// Whether the project's hooks may run.
+    pub fn trust_state(&self) -> Trust {
+        self.trust
+    }
+
+    /// The configuration entries that were left out, each with why.
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+
     fn project_runs(&self) -> bool {
         matches!(self.trust, Trust::Trusted | Trust::Env)
     }

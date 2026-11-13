@@ -191,6 +191,8 @@ so you don't need to manage this by hand (`/compact` does it on demand). Add `.a
 
 ## Next steps
 
+- [Troubleshooting](troubleshooting.md) — something not working? `atelier doctor` checks
+  the setup, `atelier debug prompt` shows what the model is sent
 - [Configuration](configuration.md) — env vars + `atelier.toml`
 - [Sessions](sessions.md) — persistence, `--continue`, compaction
 - [Tools](tools.md) — the built-in tool set

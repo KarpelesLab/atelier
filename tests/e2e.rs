@@ -3666,3 +3666,92 @@ fn debug_prompt_prints_the_request_print_then_sends() {
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert_eq!(mock.requests(), 1);
 }
+
+/// The check called `name` in `atelier doctor --json` output.
+fn doctor_check<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    let checks = report["checks"].as_array().expect("checks");
+    checks
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no check named {name}: {report}"))
+}
+
+/// Doctor 1 — `atelier doctor --offline --json` describes the setup without
+/// touching the network: where the model's name comes from, the instruction
+/// file that would load, an agent file that was skipped (a warning), MCP
+/// servers left unstarted. An `atelier.toml` that does not parse is a
+/// failure that names the offending key, and makes the exit status 1.
+#[test]
+fn doctor_reports_the_setup_and_fails_on_a_broken_config() {
+    let mock = Mock::start(always("unused"));
+    let dir = unique_dir("doctor");
+    std::fs::write(dir.join("AGENTS.md"), "Be brief.\n").unwrap();
+    std::fs::create_dir_all(dir.join(".atelier/agents")).unwrap();
+    std::fs::write(dir.join(".atelier/agents/broken.md"), "no front matter\n").unwrap();
+    std::fs::write(
+        dir.join("atelier.toml"),
+        "[defaults]\nmodel = \"from-the-file\"\n\n[[mcp]]\nname = \"docs\"\ncommand = \"docs-server\"\n",
+    )
+    .unwrap();
+
+    let args = ["doctor", "--offline", "--json"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let report = &json_lines(&out)[0];
+    assert_eq!(report["ok"], true);
+    for check in report["checks"].as_array().unwrap() {
+        assert_ne!(check["status"], "fail", "{check}");
+    }
+    assert_eq!(doctor_check(report, "project config")["status"], "ok");
+    // The environment wins over the file, and the report says so.
+    let model = doctor_check(report, "model")["detail"].as_str().unwrap();
+    assert_eq!(model, "mock (ATELIER_MODEL)");
+    let endpoint = doctor_check(report, "endpoint")["detail"].as_str().unwrap();
+    assert!(endpoint.contains("--offline"), "{endpoint}");
+    let instructions = doctor_check(report, "instructions")["detail"]
+        .as_str()
+        .unwrap();
+    assert!(
+        instructions.contains("AGENTS.md (10 bytes)"),
+        "{instructions}"
+    );
+    let agents = doctor_check(report, "agents");
+    assert_eq!(agents["status"], "warn");
+    assert!(agents["detail"].as_str().unwrap().contains("broken.md"));
+    let mcp = doctor_check(report, "mcp 'docs'")["detail"]
+        .as_str()
+        .unwrap();
+    assert!(mcp.contains("not started"), "{mcp}");
+    assert_eq!(mock.requests(), 0);
+
+    // Online, the endpoint is asked for its models — and for nothing else.
+    // (The mock answers every request with a chat stream, which is not a
+    // model list: a failure, reported as a line.)
+    let out = run_atelier(&mock.base_url(), &dir, &["doctor"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(mock.requests(), 1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\nFAIL  endpoint: GET http://127.0.0.1"),
+        "{stdout}"
+    );
+
+    std::fs::write(
+        dir.join("atelier.toml"),
+        "[defaults]\nmodel = \"m\"\ncontext_limit = \"plenty\"\n",
+    )
+    .unwrap();
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let report = &json_lines(&out)[0];
+    assert_eq!(report["ok"], false);
+    let config = doctor_check(report, "project config");
+    assert_eq!(config["status"], "fail");
+    let detail = config["detail"].as_str().unwrap();
+    assert!(detail.contains("at `defaults.context_limit`"), "{detail}");
+    // Never a stack trace, whatever is broken.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+
+    let out = run_atelier(&mock.base_url(), &dir, &["doctor", "--fix"], None);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}

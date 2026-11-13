@@ -174,6 +174,33 @@ pub fn start(root: &Path, model: &str) -> Option<Arc<Client>> {
     }))
 }
 
+/// The coordinator's state in a sentence, for `atelier doctor`. Like
+/// `atelier coordinator status`, it asks a running one and never starts it.
+pub fn describe() -> String {
+    if cfg!(not(unixlike)) {
+        return "not supported on this platform".to_string();
+    }
+    if disabled() {
+        return format!("off ({ENV_DISABLE} is set)");
+    }
+    let Some(dir) = runtime_dir() else {
+        return format!("off: no runtime directory (set {ENV_DIR} or HOME)");
+    };
+    #[cfg(unixlike)]
+    if let Ok(s) = client::control(&dir, "status") {
+        return format!(
+            "running: version {}, pid {}, {}",
+            s["version"].as_str().unwrap_or("?"),
+            s["pid"],
+            socket_path(&dir).display()
+        );
+    }
+    format!(
+        "not running; the first interactive or --print run starts it ({})",
+        dir.display()
+    )
+}
+
 /// `atelier coordinator [status|stop]`. With no argument, be the
 /// coordinator (what instances launch); `status` and `stop` talk to a
 /// running one and never start it.

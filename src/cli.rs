@@ -8,7 +8,7 @@
 //! doesn't know is an error rather than part of the prompt: a script that
 //! misspells `--max-turns` should find out, not run unbounded.
 //!
-//! Subcommands that are programs of their own (`update`, `coordinator`,
+//! Subcommands that are programs of their own (`update`, `coordinator`, `doctor`,
 //! `mcp-serve`) are picked off in `main` before this runs. Those that are
 //! runs on a session (`review`, `debug prompt`) are recognized by [`subcommand`]; their
 //! arguments are their own, parsed by the module that implements them.
@@ -26,6 +26,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier --print [options] [--] [prompt...]
        atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
        atelier debug prompt [prompt...]
+       atelier doctor [--json] [--offline] [--mcp]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
@@ -49,7 +50,8 @@ with --print:
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
              4 answer failed --output-schema
 
-`atelier review --help` and `atelier debug --help` describe those commands.";
+`atelier review --help`, `atelier debug --help` and `atelier doctor --help`
+describe those commands.";
 
 /// The parsed command line.
 #[derive(Debug)]
