@@ -3261,3 +3261,166 @@ command = """echo ran >> hook.log; printf '{"arguments": {"action": "save", "nam
         "ran\n"
     );
 }
+
+/// What opens a finished background job's notice in a request. (The `bash`
+/// tool's description mentions the tag too, without attributes.)
+const JOB_NOTICE: &str = "<background-job id=";
+
+/// Background jobs that notify 1 — within a turn. The model starts a job
+/// and goes on with other work (here: short foreground commands, one step
+/// after the other, for as long as the job has not reported — the mock
+/// keeps it busy rather than the test guessing how long a job takes). When
+/// the job ends, its notice arrives between two steps as a user message:
+/// the marked block, the output, and the line saying it is the harness
+/// speaking. It arrives once, however many steps follow, and the user is
+/// shown one line.
+#[test]
+fn a_background_job_that_ends_mid_turn_is_announced_to_the_model_once() {
+    let bash = |id: &str, command: &str| {
+        json_tool_call(id, "bash", serde_json::json!({"command": command}))
+    };
+    let mock = Mock::start_by_body(Arc::new(move |n, body| {
+        let told = body.contains(JOB_NOTICE);
+        match n {
+            0 => json_tool_call(
+                "call_start",
+                "bash",
+                serde_json::json!({"command": "echo job-says-hi", "background": true}),
+            ),
+            _ if told && body.contains("after-the-notice") => text_response("done"),
+            _ if told => bash("call_after", "echo after-the-notice"),
+            // Far more steps than a job that prints one line can need.
+            _ if n < 200 => bash(&format!("call_wait_{n}"), "sleep 0.05"),
+            _ => text_response("the job never reported"),
+        }
+    }));
+    let dir = unique_dir("job-notice");
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "run it"],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let events = json_lines(&out);
+    assert_eq!(events.last().unwrap()["result"], "done", "{events:?}");
+
+    // Once in the whole conversation, as the last request holds it.
+    let last = mock.body(mock.requests() - 1);
+    assert_eq!(last.matches(JOB_NOTICE).count(), 1, "{last}");
+    let users = messages_of(&request(&last), "user");
+    let notice = users
+        .iter()
+        .find(|m| m.contains(JOB_NOTICE))
+        .expect("the notice is a user message");
+    assert!(
+        notice.starts_with(r#"<background-job id="job-1" exit="0" runtime=""#),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("command: echo job-says-hi\noutput:\njob-says-hi\n</background-job>\n"),
+        "{notice}"
+    );
+    assert!(notice.contains("not a message from your user"), "{notice}");
+    assert!(
+        notice.contains(r#"bash_output with id "job-1""#),
+        "{notice}"
+    );
+
+    // The user: one line, and no echo of the block as something they typed.
+    let lines: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .filter_map(|e| e["text"].as_str())
+        .filter(|t| t.contains("job 1 finished"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{events:?}");
+    assert!(
+        lines[0].starts_with("⚙ job 1 finished (exit 0, "),
+        "{lines:?}"
+    );
+    assert!(lines[0].ends_with("): echo job-says-hi"), "{lines:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches("<background-job").count(), 0, "{stdout}");
+}
+
+/// Background jobs that notify 2 — between turns. A job that ends while the
+/// session is idle does not wake the model: nothing is requested until the
+/// user's next prompt, and that prompt carries the notice in front of it.
+/// (The job is held until the first turn is over, then released and waited
+/// for by the second prompt's own `` !`command` ``.) A job the model has
+/// read to its end with `bash_output` announces nothing.
+#[cfg(unix)]
+#[test]
+fn a_background_job_that_ends_between_turns_leads_the_next_prompt() {
+    let mock = Mock::start(Arc::new(|n| match n {
+        0 => tool_calls_response(&[
+            (
+                "call_read",
+                "bash",
+                serde_json::json!({"command": "echo read-to-the-end", "background": true}),
+            ),
+            (
+                "call_held",
+                "bash",
+                serde_json::json!({
+                    "command": "echo $$ > bg.pid; while [ ! -e go ]; do sleep 0.02; done; echo job-says-hi; exit 4",
+                    "background": true,
+                }),
+            ),
+        ]),
+        1 => json_tool_call(
+            "call_output",
+            "bash_output",
+            serde_json::json!({"id": "job-1", "wait_ms": 10000}),
+        ),
+        2 => text_response("started"),
+        _ => text_response("seen"),
+    }));
+    let dir = unique_dir("job-notice-idle");
+    let commands = dir.join(".atelier/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("wait.md"), "What happened? !`sh wait.sh`\n").unwrap();
+    // Release the job, and return once atelier has seen it exit (it is no
+    // longer there to signal) and a moment has passed for its output.
+    std::fs::write(
+        dir.join("wait.sh"),
+        "while [ ! -s bg.pid ]; do sleep 0.02; done\n\
+         touch go\n\
+         while kill -0 \"$(cat bg.pid)\" 2>/dev/null; do sleep 0.02; done\n\
+         sleep 0.3\n\
+         echo waited\n",
+    )
+    .unwrap();
+
+    let out = run_atelier(&mock.base_url(), &dir, &[], Some("start them\n/wait\n"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(mock.requests(), 4, "stdout: {stdout}\nstderr: {stderr}");
+
+    // The first turn never heard of either job's end.
+    assert_eq!(mock.body(2).matches(JOB_NOTICE).count(), 0);
+    // The second prompt: the held job's notice, then what the user sent.
+    let last = mock.body(3);
+    assert_eq!(last.matches(JOB_NOTICE).count(), 1, "{last}");
+    let users = messages_of(&request(&last), "user");
+    // (After the turn's project context, which opens the message.)
+    let prompt = users.last().unwrap();
+    assert!(
+        prompt.contains(r#"<background-job id="job-2" exit="4" runtime=""#),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("output:\njob-says-hi\n</background-job>"),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("What happened? waited"), "{prompt}");
+
+    assert_eq!(
+        stdout.matches("job 2 finished (exit 4, ").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("job 1 finished"), "{stdout}");
+}

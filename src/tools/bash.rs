@@ -5,6 +5,21 @@
 //! Background jobs belong to the atelier process (a registry shared by every
 //! call), run in their own process group so stopping one stops what it
 //! spawned, and are killed when atelier exits ([`kill_all`]).
+//!
+//! # A finished job says so
+//!
+//! The model does not have to poll a job to learn that it ended: each job
+//! that exits leaves a [`Notice`] — which job, how it ended, how long it
+//! ran, the end of its output — that the agent loop collects with
+//! [`notices`] and puts in front of the model as a marked block (see
+//! `agent::jobs`). Who has been told is kept with the job ([`Told`]), so the
+//! user is shown one line and the model gets one block, whichever of them
+//! comes first. No notice is left by a job the model stopped (`bash_kill`)
+//! or whose exit it has already seen through `bash_output`.
+//!
+//! A job's exit is noticed by a thread that watches it ([`watch`]), which
+//! is what makes the reported runtime the job's own rather than the time
+//! until somebody looked.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -28,6 +43,18 @@ const MAX_OUTPUT_BYTES: usize = 20_000;
 /// How often the watchdog polls the child for exit while waiting for the
 /// timeout to elapse.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How often a background job is looked at to see whether it has ended.
+const WATCH_INTERVAL: Duration = Duration::from_millis(100);
+/// How many lines from the end of a job's output its notice carries, and
+/// the most of each line, and of the command, in characters.
+const NOTICE_LINES: usize = 10;
+const NOTICE_LINE_CHARS: usize = 200;
+const NOTICE_COMMAND_CHARS: usize = 80;
+/// How long after a job's exit its notice waits for the last of its output
+/// (see [`Job::settled`]).
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+/// What opens a job's notice as the model sees it.
+pub const NOTICE_OPEN: &str = "<background-job ";
 
 pub struct BashTool;
 
@@ -43,9 +70,11 @@ impl Tool for BashTool {
                 combined stdout/stderr and the exit status. Very long output comes back as its start and its end, with all of it saved \
                 to a file you can read or grep; \
                 the command is killed if it exceeds the timeout. With `background: true` it \
-                starts as a job instead and returns its id at once: read its output, or wait \
-                for it to finish or print something, with `bash_output`; stop it with \
-                `bash_kill`. Use that for servers, watchers, and long builds."
+                starts as a job instead and returns its id at once. You are told when the \
+                job ends (a <background-job> block), so do not poll it: go on with other \
+                work. Read its output, or wait for it to print something, with \
+                `bash_output`; stop it with `bash_kill`. Use that for servers, watchers, \
+                and long builds."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -184,6 +213,109 @@ struct Job {
     /// How much of `output` the model has already been shown.
     seen: usize,
     started: Instant,
+    /// When it was found to have exited (by [`watch`], or by whoever asked
+    /// first).
+    ended: Option<Instant>,
+    /// Who knows that it ended.
+    told: Told,
+}
+
+/// Who has been told that a job ended.
+#[derive(Clone, Copy, PartialEq)]
+enum Told {
+    Nobody,
+    /// The user was shown the line; the model has yet to get the block.
+    User,
+    /// The model knows: it got the block, or saw the exit status in a
+    /// `bash_output` result. Nothing more to say.
+    Model,
+}
+
+/// Whom a set of notices is collected for (see [`notices`]).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Audience {
+    /// The user alone, for now: the session is idle, and a finished job
+    /// does not start a turn. The model gets these later.
+    User,
+    /// The model (and the user, where a notice is new to them).
+    Model,
+}
+
+/// A background job that ended, for the user ([`line`](Self::line)) and for
+/// the model ([`block`](Self::block)).
+pub struct Notice {
+    /// `job-3`.
+    id: String,
+    /// The command's first line, clipped.
+    command: String,
+    /// The exit code, or how else it ended (`signal: 15 (SIGTERM)`).
+    exit: String,
+    runtime: Duration,
+    /// The last lines of its output, and how many lines there were.
+    tail: Vec<String>,
+    lines: usize,
+    /// The user has already been shown [`line`](Self::line).
+    pub announced: bool,
+}
+
+impl Notice {
+    /// One line for the transcript: `⚙ job 3 finished (exit 0, 42s): cargo test`.
+    pub fn line(&self) -> String {
+        let exit = match self.exit.parse::<i32>() {
+            Ok(code) => format!("exit {code}"),
+            Err(_) => self.exit.clone(),
+        };
+        format!(
+            "⚙ {} finished ({exit}, {}): {}",
+            self.id.replace('-', " "),
+            runtime(self.runtime),
+            self.command
+        )
+    }
+
+    /// What the model is given: the facts in a marked block, then a line
+    /// saying whose message this is — it arrives where the user's own
+    /// messages do, and must not be taken for one.
+    pub fn block(&self) -> String {
+        let Notice { id, exit, .. } = self;
+        let output = match (self.lines, self.tail.len()) {
+            (0, _) => "(no output)".to_string(),
+            (all, shown) if all > shown => {
+                format!(
+                    "last {shown} of {all} lines of output:\n{}",
+                    self.tail.join("\n")
+                )
+            }
+            _ => format!("output:\n{}", self.tail.join("\n")),
+        };
+        format!(
+            "{NOTICE_OPEN}id=\"{id}\" exit=\"{exit}\" runtime=\"{}\">\n\
+             command: {}\n{output}\n</background-job>\n\
+             (The block above is a notification from atelier, the harness — not a message \
+             from your user: a background job you started with bash has ended. bash_output \
+             with id \"{id}\" returns the output you have not read yet.)",
+            runtime(self.runtime),
+            self.command
+        )
+    }
+}
+
+/// A duration as `42s` or `3m07s`.
+fn runtime(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 60 => format!("{s}s"),
+        s => format!("{}m{:02}s", s / 60, s % 60),
+    }
+}
+
+/// `text` cut to `max` characters, with a mark when something was cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        let cut: String = text.chars().take(max).collect();
+        format!("{cut}…")
+    } else {
+        text.to_string()
+    }
 }
 
 impl Job {
@@ -198,7 +330,58 @@ impl Job {
     }
 
     fn finished(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+        let finished = !matches!(self.child.try_wait(), Ok(None));
+        if finished && self.ended.is_none() {
+            self.ended = Some(Instant::now());
+        }
+        finished
+    }
+
+    /// Whether the job has ended and its output is all here. The exit can
+    /// be seen before the last output is read off the pipes, and a notice
+    /// taken then would show a tail that is not the end; the reader threads
+    /// drop their handle on `output` when the pipes close. Something the
+    /// job left running may hold them open for good, though, so past
+    /// [`DRAIN_GRACE`] the notice goes out with what there is.
+    fn settled(&mut self) -> bool {
+        self.finished()
+            && (Arc::strong_count(&self.output) == 1
+                || self.ended.is_some_and(|at| at.elapsed() >= DRAIN_GRACE))
+    }
+
+    /// The notice of a job that has ended.
+    fn notice(&mut self, id: &str) -> Notice {
+        let exit = match self.child.try_wait() {
+            Ok(Some(status)) => match status.code() {
+                Some(code) => code.to_string(),
+                // Ended by a signal: the status says which.
+                None => status.to_string(),
+            },
+            _ => "unknown".to_string(),
+        };
+        let output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        let text = String::from_utf8_lossy(&output);
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = lines[lines.len().saturating_sub(NOTICE_LINES)..]
+            .iter()
+            .map(|l| clip(l, NOTICE_LINE_CHARS))
+            .collect();
+        let whole = self.command.trim();
+        let first = whole.lines().next().unwrap_or("");
+        let mut command = clip(first, NOTICE_COMMAND_CHARS);
+        // A command of several lines is cut after the first, visibly.
+        if first.len() < whole.len() && !command.ends_with('…') {
+            command.push('…');
+        }
+        Notice {
+            id: id.to_string(),
+            command,
+            exit,
+            runtime: self.ended.unwrap_or_else(Instant::now) - self.started,
+            tail,
+            lines: lines.len(),
+            announced: self.told == Told::User,
+        }
     }
 }
 
@@ -207,6 +390,51 @@ impl Job {
 struct Jobs {
     next: u32,
     jobs: BTreeMap<String, Job>,
+}
+
+impl Jobs {
+    /// The notices `audience` has not had yet, among the jobs `keep`
+    /// accepts — marked as had.
+    fn notices(&mut self, audience: Audience, keep: impl Fn(&str) -> bool) -> Vec<Notice> {
+        let mut notices = Vec::new();
+        for (id, job) in self.jobs.iter_mut() {
+            let due = match audience {
+                Audience::User => job.told == Told::Nobody,
+                Audience::Model => job.told != Told::Model,
+            };
+            if due && keep(id) && job.settled() {
+                notices.push(job.notice(id));
+                job.told = match audience {
+                    Audience::User => Told::User,
+                    Audience::Model => Told::Model,
+                };
+            }
+        }
+        notices
+    }
+}
+
+/// The background jobs that ended and that `audience` has not been told
+/// about. Each is returned once per audience: asking for the
+/// user's leaves them due for the model, with
+/// [`announced`](Notice::announced) set; asking for the model's settles
+/// them.
+pub fn notices(audience: Audience) -> Vec<Notice> {
+    jobs().notices(audience, |_| true)
+}
+
+/// Note when the job `id` ends: look at it now and then until it has
+/// exited — or is gone from the registry, stopped by `bash_kill`.
+fn watch(id: String) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(WATCH_INTERVAL);
+            // `finished` is what records the time.
+            if jobs().jobs.get_mut(&id).is_none_or(Job::finished) {
+                return;
+            }
+        }
+    });
 }
 
 fn jobs() -> MutexGuard<'static, Jobs> {
@@ -268,11 +496,15 @@ fn start_job(command: &str, root: &std::path::Path) -> Result<String> {
             output,
             seen: 0,
             started: Instant::now(),
+            ended: None,
+            told: Told::Nobody,
         },
     );
+    drop(jobs);
+    watch(id.clone());
     Ok(format!(
-        "started background job {id} (pid {pid}). Read its output or wait on it with \
-         bash_output; stop it with bash_kill."
+        "started background job {id} (pid {pid}). You will be told when it ends; read its \
+         output or wait on it with bash_output; stop it with bash_kill."
     ))
 }
 
@@ -404,6 +636,11 @@ impl Tool for BashOutputTool {
                 }
                 if job.finished() || matched || Instant::now() >= deadline {
                     job.seen += fresh.len();
+                    // This result carries the exit status: the model needs
+                    // no notice of what it is reading here.
+                    if job.finished() {
+                        job.told = Told::Model;
+                    }
                     let mut out = format!(
                         "[{id}: {} after {}s]\n",
                         job.status(),
@@ -638,6 +875,169 @@ mod tests {
         assert!(out.contains("exit status: 3"), "{out}");
         assert!(!out.contains("exit status: exit status"), "{out}");
         assert!(out.contains("done"), "{out}");
+    }
+
+    /// Start `command` as a job and return its id.
+    fn start(ctx: &mut ToolCtx, command: &str) -> String {
+        let started = BashTool
+            .call(ctx, json!({"command": command, "background": true}))
+            .unwrap();
+        let id = started.split_whitespace().find(|w| w.starts_with("job-"));
+        id.unwrap().to_string()
+    }
+
+    /// The notices due to `audience` for the job `id` alone, once it has
+    /// ended. (Tests share the job registry: each asks about its own job.)
+    fn notices_of(id: &str, audience: Audience) -> Vec<Notice> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut jobs = jobs();
+            if jobs.jobs.get_mut(id).is_none_or(Job::settled) {
+                return jobs.notices(audience, |job| job == id);
+            }
+            drop(jobs);
+            assert!(Instant::now() < deadline, "{id} never ended");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn a_finished_job_leaves_one_notice_for_the_user_and_one_for_the_model() {
+        let root = tempdir("bash-notice");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        let id = start(&mut ctx, "seq 1 12; echo oops; exit 3");
+
+        // While it runs there is nothing to say (asked before it can have
+        // ended would be a race; a job that never ends is not).
+        let running = start(&mut ctx, "sleep 30");
+        assert!(
+            jobs()
+                .notices(Audience::Model, |job| job == running)
+                .is_empty()
+        );
+
+        // Idle: the user is shown the line, once; the model's is still due.
+        let shown = notices_of(&id, Audience::User);
+        assert_eq!(shown.len(), 1);
+        assert!(!shown[0].announced);
+        let n = id.trim_start_matches("job-");
+        let line = shown[0].line();
+        assert!(
+            line.starts_with(&format!("⚙ job {n} finished (exit 3, ")),
+            "{line}"
+        );
+        assert!(line.ends_with("s): seq 1 12; echo oops; exit 3"), "{line}");
+        assert!(notices_of(&id, Audience::User).is_empty());
+
+        // The model gets the block, once, marked as already shown.
+        let told = notices_of(&id, Audience::Model);
+        assert_eq!(told.len(), 1);
+        assert!(told[0].announced);
+        let block = told[0].block();
+        assert!(
+            block.starts_with(&format!(
+                "<background-job id=\"{id}\" exit=\"3\" runtime=\""
+            )),
+            "{block}"
+        );
+        // The command, the end of the output, and where the rest is.
+        assert!(
+            block.contains(
+                "s\">\ncommand: seq 1 12; echo oops; exit 3\n\
+                 last 10 of 13 lines of output:\n4\n5\n"
+            ),
+            "{block}"
+        );
+        assert!(block.contains("\n12\noops\n</background-job>\n"), "{block}");
+        assert!(block.contains("not a message from your user"), "{block}");
+        assert!(block.contains(&format!("bash_output with id \"{id}\"")));
+        assert!(notices_of(&id, Audience::Model).is_empty());
+        assert!(notices_of(&id, Audience::User).is_empty());
+        // The notice is not the output: that is still there to read.
+        let out = BashOutputTool.call(&mut ctx, json!({"id": id})).unwrap();
+        assert!(out.contains("\n1\n2\n3\n"), "{out}");
+
+        // A job the model stops has nothing to announce.
+        BashKillTool.call(&mut ctx, json!({"id": running})).unwrap();
+        assert!(notices_of(&running, Audience::Model).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_job_whose_exit_the_model_read_leaves_no_notice() {
+        let root = tempdir("bash-notice-read");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        // Read after it ended: the result said how it went.
+        let id = start(&mut ctx, "echo all there is");
+        let out = BashOutputTool
+            .call(&mut ctx, json!({"id": id, "wait_ms": 20000}))
+            .unwrap();
+        assert!(out.contains("exit status: 0"), "{out}");
+        assert!(notices_of(&id, Audience::User).is_empty());
+        assert!(notices_of(&id, Audience::Model).is_empty());
+
+        // Read while it ran, never after: its end is still news — to the
+        // model directly, when the user was not shown it first.
+        let id = start(
+            &mut ctx,
+            "echo early; while [ ! -e go ]; do sleep 0.05; done; echo late",
+        );
+        let out = BashOutputTool
+            .call(
+                &mut ctx,
+                json!({"id": id, "wait_ms": 20000, "until": "early"}),
+            )
+            .unwrap();
+        assert!(out.contains("running"), "{out}");
+        std::fs::write(root.join("go"), "").unwrap();
+        let told = notices_of(&id, Audience::Model);
+        assert_eq!(told.len(), 1);
+        assert!(!told[0].announced);
+        assert!(
+            told[0]
+                .block()
+                .contains("output:\nearly\nlate\n</background-job>")
+        );
+        assert!(notices_of(&id, Audience::User).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn notices_are_short_whatever_the_job_was() {
+        assert_eq!(runtime(Duration::from_millis(900)), "0s");
+        assert_eq!(runtime(Duration::from_secs(42)), "42s");
+        assert_eq!(runtime(Duration::from_secs(187)), "3m07s");
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(clip("abcd", 3), "abc…");
+
+        let notice = Notice {
+            id: "job-7".into(),
+            command: "true".into(),
+            exit: "signal: 15 (SIGTERM)".into(),
+            runtime: Duration::from_secs(61),
+            tail: Vec::new(),
+            lines: 0,
+            announced: false,
+        };
+        assert_eq!(
+            notice.line(),
+            "⚙ job 7 finished (signal: 15 (SIGTERM), 1m01s): true"
+        );
+        assert!(
+            notice
+                .block()
+                .contains("runtime=\"1m01s\">\ncommand: true\n(no output)\n</background-job>")
+        );
     }
 
     /// The file a result with omitted output names, read back.

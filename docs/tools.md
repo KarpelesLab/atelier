@@ -214,6 +214,33 @@ a **background job** instead and the call returns its id (`job-N`) at once —
 for servers, watchers, and long builds. Jobs run in their own process group
 and are stopped when atelier exits.
 
+**A job that ends says so**; the agent does not have to poll it.
+
+- The model gets a notice at its next step — between two steps of the
+  running turn, the way a message you type mid-turn is delivered — as a
+  marked block, followed by a line saying that it comes from the harness and
+  not from you:
+
+  ```
+  <background-job id="job-3" exit="0" runtime="42s">
+  command: cargo test
+  last 10 of 214 lines of output:
+  …
+  </background-job>
+  ```
+
+  It carries the exit code (or the signal), the runtime, the command (its
+  first line, clipped) and the last 10 lines of output; `bash_output` with
+  the job's id returns everything not read yet.
+- You see one line: `⚙ job 3 finished (exit 0, 42s): cargo test`.
+- If the session is idle when the job ends, the line appears at the prompt
+  and the notice goes to the model **with your next prompt**. A finished job
+  never starts a turn by itself.
+- No notice for a job the model stopped with `bash_kill`, nor for one whose
+  exit it already saw in a `bash_output` result.
+- A job started by a [subagent](agents.md) is announced to the main
+  conversation: the subagent may be gone by the time it ends.
+
 ## `bash_output`
 
 Read a background job's output since the last call, and its status — or
@@ -227,8 +254,9 @@ wait on it.
 
 Returns `[job-N: running|exit status: … after Ns]` then the new output (its
 start and its end if over 20,000 bytes, [the rest in a
-file](#long-output-goes-to-a-file)). This is how to wait for a build to finish or a
-server to print "listening".
+file](#long-output-goes-to-a-file)). This is how to wait for a server to print
+"listening", or to block on a build when there is nothing else to do. Just
+learning that a job has ended needs no call: [it says so](#bash).
 
 ## `bash_kill`
 

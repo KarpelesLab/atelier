@@ -21,6 +21,7 @@
 
 mod batch;
 mod compact;
+mod jobs;
 mod prompt;
 mod window;
 
@@ -785,9 +786,12 @@ impl Session {
 
     /// Show the messages other instances sent since the last look; they
     /// are kept for the model's next turn. Returns whether any arrived.
+    /// Background jobs that ended are shown on the same occasion (see
+    /// `jobs`).
     pub fn poll_peers(&mut self, ui: &mut dyn Ui) -> bool {
+        let ended = jobs::announce(ui);
         let Some(coord) = &self.coord else {
-            return false;
+            return ended;
         };
         let fresh = coord.take_messages();
         for m in &fresh {
@@ -795,7 +799,7 @@ impl Session {
         }
         let any = !fresh.is_empty();
         self.peer_pending.extend(fresh);
-        any
+        any || ended
     }
 
     /// Activate the ChatGPT (Responses API) backend with the given tokens.
@@ -1359,6 +1363,10 @@ impl Session {
             return self.run_turn(user_input, ui);
         }
         let user_input = &self.hook_prompt(user_input, ui)?;
+        // Background jobs that ended: the ones since the last turn lead the
+        // prompt, the ones that end during this turn join what is queued.
+        let user_input = &jobs::lead(user_input, ui);
+        let ui = &mut jobs::JobsUi { inner: ui };
         let Some(coord) = self.coord.clone() else {
             return self.run_turn(user_input, ui);
         };

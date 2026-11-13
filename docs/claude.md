@@ -175,9 +175,12 @@ request, so atelier's rules and modes do not see them — this matters with
 
 ## Limitations (for now)
 
-- atelier's tools can't push notifications into claude's turn, so a
-  background job is waited on with `bash_output` rather than reporting in by
-  itself the way claude's own background shells do.
+- atelier's tools can't push notifications into claude's turn. The notice of
+  a finished `bash` background job ([tools](tools.md#bash)) is therefore
+  handed to claude the way a message you type mid-turn is — while a tool is
+  running, for delivery at the turn's next step — or else with your next
+  prompt. Unlike claude's own background shells, a job that ends while
+  claude is idle does not make it start a turn.
 - Ctrl-C while claude is still on a *queued* message (behind a turn it
   started itself) stops that turn, and the queued message then runs.
 - Subagent activity is shown only as its single top-level tool call.
