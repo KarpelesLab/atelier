@@ -9,7 +9,7 @@
 //! misspells `--max-turns` should find out, not run unbounded.
 //!
 //! Subcommands that are programs of their own (`update`, `coordinator`, `doctor`,
-//! `trust`, `mcp-serve`) are picked off in `main` before this runs. Those that are
+//! `trust`, `mcp`, `mcp-serve`) are picked off in `main` before this runs. Those that are
 //! runs on a session (`review`, `debug prompt`) are recognized by [`subcommand`]; their
 //! arguments are their own, parsed by the module that implements them.
 //! `serve` is one more exception: it runs a session, so it takes the
@@ -35,6 +35,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
        atelier trust [status|accept|revoke] [path]
+       atelier mcp [--mode MODE] [--allow-all] [--tools a,b] [--no-tools x,y]
 
   -c, --continue             resume the saved session for this directory
   -p, --print                run one prompt non-interactively and exit
@@ -60,8 +61,8 @@ serve: the session as JSON-RPC 2.0 on stdin/stdout, for a program to drive
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
              4 answer failed --output-schema, 6 --goal not met in its bounds
 
-`atelier review --help`, `atelier debug --help` and `atelier doctor --help`
-describe those commands.";
+`atelier review --help`, `atelier debug --help`, `atelier doctor --help` and
+`atelier mcp --help` describe those commands.";
 
 /// The parsed command line.
 #[derive(Debug)]

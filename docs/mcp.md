@@ -12,6 +12,10 @@ of the file's choosing. In an untrusted project the startup notice lists the
 servers and `/trust` starts them. Servers you add yourself with `/mcp add`
 are connected at once either way.
 
+The other direction — atelier's own tools, offered to another program's
+agent over MCP — is [`atelier mcp`](#atelier-as-an-mcp-server), at the end
+of this page.
+
 ## Configuring a stdio server
 
 ### `/mcp add`
@@ -435,3 +439,125 @@ The tool filters (`enabled_tools` / `disabled_tools`) decide what the *model*
 is offered; they do not remove these commands. A [command
 file](commands.md) with the same name (`mcp/kb/review.md`) wins. With the
 Claude backend the servers are claude's, and there are no such commands.
+
+## atelier as an MCP server
+
+`atelier mcp` turns this around: it is an MCP **server** over stdio that any
+MCP client — another coding harness, an editor, a desktop assistant — can
+launch in a project directory to give its agent atelier's tools there. The
+client's configuration is the usual one for a stdio server:
+
+```json
+{
+  "mcpServers": {
+    "atelier": { "command": "atelier", "args": ["mcp"] }
+  }
+}
+```
+
+The server works in the directory it is started in; a client that has a
+setting for the working directory (`cwd`) should point it at the project.
+
+```
+atelier mcp [--mode MODE] [--allow-all] [--tools a,b,…] [--no-tools x,y,…]
+```
+
+It speaks newline-delimited JSON-RPC 2.0 (one message per line), answers
+`initialize` with the protocol version the client asked for, and serves
+`ping`, `tools/list` and `tools/call`. Nothing but protocol is written to
+stdout; warnings go to stderr.
+
+### The tools
+
+`read`, `write`, `edit`, `multiedit`, `apply_patch`, `notebook_edit`, `grep`,
+`glob`, `ls`, `tree`, `bash` (with `bash_output` and `bash_kill`),
+`web_fetch`, `web_search`, `node`, `todo`, `memory` and `skill` — the same
+tools, with the same schemas, a session has ([Built-in tools](tools.md)):
+
+- **Confined to the project root**, like in a session: a path outside it is
+  not written, and reading one needs an approval (below).
+- **Read tracking lasts as long as the server process**: an `edit` of a file
+  that changed since the server last read or wrote it is refused until it is
+  read again. Start one server per project and keep it running.
+- **Images** a tool returns (`read` on a picture) are MCP `image` content.
+- Each tool carries **annotations**: `readOnlyHint` from whether the tool
+  can change anything, and `destructiveHint: true` on `bash` and `write`.
+
+Not served: `ask` (there is no user interface to put a question on), `task`
+(subagents need a model — the client brings its own), the coordinator's
+`peers`/`peer_send`, and the tools of MCP servers configured in
+`atelier.toml` (the server does not connect them; give them to the client
+directly). `--tools read,grep,glob` serves only the tools named;
+`--no-tools bash,node` serves all but those. A name that is not a tool is a
+usage error.
+
+No model is involved and no conversation is kept: no system prompt, no
+session file, no coordinator, and the `session_start`/`session_end`
+[hooks](hooks.md) do not run. `pre_tool` and `post_tool` hooks do, for every
+call, when the project is trusted.
+
+### Permissions without a prompt
+
+Every call goes through the same decision as in a session — the
+[permission rules](permissions.md) of the project and the user, and a mode:
+
+| | |
+|---|---|
+| `--mode MODE` | `plan`, `ask-edits`, `auto-edit` or `yolo`. Default **`auto-edit`**: edits inside the project run, `bash`, the web tools and reads outside the project need approval |
+| `ATELIER_MODE` | the same, from the environment (the flag wins) |
+| `--allow-all` | the same as `--mode yolo` |
+
+The project's `[defaults] mode` and `ATELIER_APPROVE` are **not** consulted:
+a server another program drives does not become `yolo` because a setting
+meant for a terminal session says so.
+
+What differs from a session is the prompt. There is no terminal, so a call
+that would *ask*:
+
+- is **refused**, with a result that says so and gives the rule that would
+  allow it —
+
+  ```
+  error: bash needs approval, and `atelier mcp` has nobody to ask (this MCP
+  client does not support elicitation). The call was not run. To allow it,
+  the person running this server can add a rule to atelier.toml:
+
+  [permissions]
+  allow = ["bash(cargo test *)"]
+  ```
+
+  The rule is the narrow one "always" would have saved at a prompt. The
+  client's agent can relay it; a person decides.
+
+- or, if the client declared the MCP **elicitation** capability in
+  `initialize`, is **put to the client's user**: the server sends
+  `elicitation/create` with a three-way choice (`yes` / `always` / `no`) and
+  waits for the answer on the same connection. `always` saves the narrow
+  rule to `atelier.toml`, as at the prompt; a declined or cancelled form, or
+  a client that goes away, is a no. While the question is open the server
+  answers `ping`, and other requests wait until the call is done.
+
+Deny rules refuse in every mode, `--allow-all` included, and the refusal
+names the rule. Plan mode refuses the tools that change things.
+
+`--allow-all` is **dangerous**: it hands the client's agent a shell and the
+network with no check but your deny rules. Use it only where that agent is
+already trusted with as much (a container, a throwaway checkout).
+
+[Project trust](trust.md) applies as for a headless run: an untrusted
+project's `allow` rules and hooks do not count — a cloned repository must
+not approve its own commands — unless you have run `atelier trust accept`
+there or start the server with `ATELIER_TRUST_PROJECT=1`. Rules in your own
+`~/.config/atelier/atelier.toml` always count, which makes it the place for
+what you want every project's server to allow. `atelier permissions check`
+shows what the rules decide for a command.
+
+### Limits
+
+- One call at a time, in arrival order; there is no cancellation (a tool
+  runs to its own timeout).
+- A `node` script with `tools: true` works, each of its tool calls decided
+  as above; one that would ask is asked through elicitation, or refused.
+- `atelier mcp-serve <socket>` is something else: the internal relay the
+  [Claude backend](claude.md) uses to reach a running session. It is not
+  meant to be started by hand.

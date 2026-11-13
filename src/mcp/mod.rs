@@ -94,6 +94,7 @@ mod jsonrpc;
 pub mod oauth;
 mod prompt;
 mod resource;
+pub mod server;
 #[cfg(test)]
 pub(crate) mod testutil;
 mod tool;

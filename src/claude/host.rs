@@ -27,15 +27,14 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::Incoming;
+use crate::mcp::server;
 use crate::provider::ToolSpec;
 use crate::tools::ToolOutput;
 
 /// The MCP server name; claude exposes the tools as `mcp__atelier__<tool>`.
-pub const SERVER_NAME: &str = "atelier";
+pub use server::SERVER_NAME;
 /// Environment variable carrying the relay's token.
 const TOKEN_ENV: &str = "ATELIER_MCP_TOKEN";
-/// Advertised when the client doesn't name an MCP protocol version.
-const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// A `tools/call` waiting for the session to run it.
 pub struct ToolRequest {
@@ -138,55 +137,28 @@ fn serve(
 }
 
 /// Answer one MCP JSON-RPC message; `None` for notifications. Tool calls go
-/// through `call(name, arguments) -> (output, ok)`.
+/// through `call(name, arguments) -> (output, ok)`. The protocol itself is
+/// [`server::answer`], shared with `atelier mcp`; what is the relay's own is
+/// the listing.
 fn handle(
     msg: &Value,
     specs: &[ToolSpec],
     call: impl FnOnce(&str, Value) -> (ToolOutput, bool),
 ) -> Option<Value> {
-    let id = msg.get("id")?.clone();
-    let params = &msg["params"];
-    let result = match msg["method"].as_str().unwrap_or_default() {
-        "initialize" => json!({
-            "protocolVersion": params["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION),
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
-        }),
-        "ping" => json!({}),
-        // `alwaysLoad`: claude otherwise defers MCP tools behind a search
-        // step, and these replace its everyday built-ins.
-        "tools/list" => json!({
-            "tools": specs.iter().map(|s| json!({
+    // `alwaysLoad`: claude otherwise defers MCP tools behind a search
+    // step, and these replace its everyday built-ins.
+    let listing = || {
+        let entry = |s: &ToolSpec| {
+            json!({
                 "name": s.name,
                 "description": s.description,
                 "inputSchema": s.parameters,
                 "_meta": { "anthropic/alwaysLoad": true },
-            })).collect::<Vec<_>>(),
-        }),
-        "tools/call" => {
-            let Some(name) = params["name"].as_str() else {
-                return Some(error(id, -32602, "tools/call: missing tool name"));
-            };
-            let arguments = match &params["arguments"] {
-                Value::Null => json!({}),
-                a => a.clone(),
-            };
-            let (out, ok) = call(name, arguments);
-            let mut content = vec![json!({ "type": "text", "text": out.text })];
-            content.extend(
-                out.images
-                    .iter()
-                    .map(|i| json!({ "type": "image", "data": i.data, "mimeType": i.mime })),
-            );
-            json!({ "content": content, "isError": !ok })
-        }
-        other => return Some(error(id, -32601, &format!("method not found: {other}"))),
+            })
+        };
+        specs.iter().map(entry).collect()
     };
-    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-}
-
-fn error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+    server::answer(msg, listing, call)
 }
 
 /// `atelier mcp-serve <socket>`: what claude launches. Connects to the

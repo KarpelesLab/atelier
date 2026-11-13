@@ -117,7 +117,7 @@ first conversation, the REPL/TUI fallback).
 | [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
 | [Sandboxed `bash`](docs/sandbox.md) | Experimental (`--features sandbox`): commands in a nixvm guest that sees only the project — setup, what works there, measurements, what is missing |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network, calling other tools from a script (code mode) |
-| [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
+| [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing, deferred tools and code mode; [`atelier mcp`](docs/mcp.md#atelier-as-an-mcp-server): atelier's own tools as an MCP server for another agent |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` — and how it differs from `atelier review` |
 | [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |
 | [Claude backend](docs/claude.md) | `--claude`: driving your Claude Code CLI from atelier |
@@ -141,7 +141,7 @@ src/
 ├─ agent/         agent loop, conversation state, turn orchestration, compaction
 ├─ tools/         built-in tools + registry (read/write/edit/multiedit/bash/…)
 ├─ js/            the `node` tool: mediated JS runtime (fs, console, network)
-├─ mcp/           MCP client (stdio + HTTP transports)
+├─ mcp/           MCP client (stdio + HTTP transports); `atelier mcp`, the server
 ├─ context/       per-turn context helpers
 ├─ risk.rs        risk-signal detection for bash approval prompts
 ├─ sandbox.rs     bash commands in a nixvm guest                [feature = "sandbox", off]

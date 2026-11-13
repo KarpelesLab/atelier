@@ -119,6 +119,11 @@ fn run() -> Result<u8> {
             .ok_or_else(|| anyhow::anyhow!("usage: atelier mcp-serve <socket>"))?;
         return claude::relay(socket).map(|()| 0);
     }
+    // `atelier mcp …`: atelier's tools as an MCP server on stdio, for another
+    // program's agent (see `mcp::server`). No model, no interface.
+    if args.first().map(String::as_str) == Some("mcp") {
+        return mcp::server::run_command(&args[1..]);
+    }
     // `atelier review …` and `atelier debug prompt …`: runs of their own, on
     // the session set up below like any other. Their arguments are their
     // own (see `cli::subcommand`).

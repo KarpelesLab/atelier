@@ -49,6 +49,7 @@ use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 use crate::trust::{self, Trust};
 
+mod direct;
 mod script;
 mod standalone;
 mod subagent;
