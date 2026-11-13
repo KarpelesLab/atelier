@@ -153,7 +153,8 @@ content. The path is relative to the file doing the importing, absolute, or
 starts with `~/`. Imports may nest five levels deep. One that can't be
 followed — missing, a cycle, not text, or over 32 KiB — leaves a one-line
 `[import @… skipped: …]` note in its place. Lines inside a fenced code block
-are never imports.
+are never imports. A project's instruction files can only import files of
+their own repository; your user-global file can import from anywhere.
 
 **Size.** The loaded files share a budget of 32 KiB. Past it the text is cut,
 and a closing note names the file that was cut and any that were left out —

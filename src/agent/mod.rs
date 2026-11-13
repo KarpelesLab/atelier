@@ -1241,6 +1241,9 @@ impl Session {
             Ok(summary) => {
                 self.summary = Some(summary);
                 self.history.drain(0..split);
+                // Nested instruction files arrived in tool results that may
+                // just have been summarized away: deliver them again.
+                self.fstate.forget_dirs();
                 // Avoid re-compacting immediately; the next real turn recomputes.
                 self.usage_ctx = 0;
                 ui.info(&format!(

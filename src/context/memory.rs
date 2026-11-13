@@ -78,7 +78,9 @@ impl ContextProvider for MemoryProvider {
         }
         // Just under the project instructions (250), above everything that
         // describes the repository's current state.
-        Some(ContextItem::new("memory", body, 240))
+        // Standing: the index is what tells the model a memory exists, so it
+        // must be in every request, not only when it last changed.
+        Some(ContextItem::new("memory", body, 240).standing())
     }
 }
 

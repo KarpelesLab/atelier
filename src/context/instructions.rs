@@ -195,6 +195,15 @@ impl Loader {
         if stack.contains(&key) {
             return Err("import cycle".to_string());
         }
+        // A repository's instruction files are loaded without asking, so
+        // they may only pull in files of that repository: otherwise a cloned
+        // project could put any text file of the user's (credentials, keys)
+        // into the prompt. The user's own global file may import anything.
+        let top = &stack[0];
+        let own = self.global.as_deref().map(canonical).as_ref() == Some(top);
+        if !own && !key.starts_with(import_area(top)) {
+            return Err("outside the project".to_string());
+        }
         let text = read_text(&path, Some(BUDGET_BYTES as u64))?;
         stack.push(key);
         let content = self.expand(&path, &text, stack);
@@ -225,6 +234,15 @@ fn pick(dir: &Path) -> Option<PathBuf> {
         .iter()
         .map(|name| dir.join(name))
         .find(|path| path.is_file())
+}
+
+/// The directory tree a project instruction file may import from: its
+/// repository (nearest ancestor with `.git`), else its own directory.
+fn import_area(file: &Path) -> &Path {
+    let dir = file.parent().unwrap_or(Path::new(""));
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(dir)
 }
 
 /// The path an import line names, if `line` (already trimmed) is one.
@@ -461,6 +479,37 @@ mod tests {
             b.ends_with("before\nstyle line\nmore line\nhome prefs\nafter"),
             "{b}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_files_import_only_from_their_repository() {
+        let dir = temp_dir("importarea");
+        let repo = dir.join("repo");
+        write(&repo.join(".git/HEAD"), "");
+        write(&dir.join("secret.txt"), "TOP-SECRET\n");
+        write(&repo.join("shared.md"), "shared\n");
+        write(
+            &repo.join("sub/AGENTS.md"),
+            &format!(
+                "@../shared.md\n@../../secret.txt\n@~/secret.txt\n@{}\n",
+                dir.join("secret.txt").display()
+            ),
+        );
+        // The user's own global file is not restricted.
+        write(&dir.join("cfg/AGENTS.md"), "@../secret.txt\n");
+
+        let provider = InstructionsProvider {
+            loader: Loader {
+                global: Some(dir.join("cfg/AGENTS.md")),
+                home: Some(dir.clone()),
+            },
+        };
+        let b = body(&provider, &repo.join("sub"));
+        assert_eq!(b.matches("TOP-SECRET").count(), 1, "{b}");
+        assert_eq!(b.matches("skipped: outside the project").count(), 3, "{b}");
+        assert!(b.contains("shared"), "{b}");
 
         let _ = fs::remove_dir_all(&dir);
     }
