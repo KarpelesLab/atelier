@@ -3616,3 +3616,53 @@ fn review_targets_a_base_branch_or_a_commit_and_retries_bad_json() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not inside a git work tree"));
     assert_eq!(mock.requests(), 3);
 }
+
+/// Debug 1 — `atelier debug prompt` prints the request a prompt would make
+/// and sends nothing. What it prints is what `--print` then sends for the
+/// same prompt in the same project: the same messages (system message with
+/// the instruction file, the context block, the prompt), the same tools,
+/// the same model. The API key is not in it, and nothing is left behind.
+#[test]
+fn debug_prompt_prints_the_request_print_then_sends() {
+    let mock = Mock::start(always("done"));
+    let dir = unique_dir("debug-prompt");
+    std::fs::write(dir.join("AGENTS.md"), "Prefer early returns.\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "a file in the layout\n").unwrap();
+    let env = [("ATELIER_API_KEY", "sk-very-secret")];
+
+    let args = ["debug", "prompt", "what", "is", "here?"];
+    let out = run_atelier_env(&mock.base_url(), &dir, &args, None, &env);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(mock.requests(), 0, "debug prompt must not send anything");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("sk-very-secret"));
+    let printed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert!(!dir.join(".atelier").exists());
+
+    let args = ["--print", "what is here?"];
+    let out = run_atelier_env(&mock.base_url(), &dir, &args, None, &env);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let sent = request(&mock.body(0));
+
+    assert_eq!(printed["messages"], sent["messages"]);
+    assert_eq!(printed["tools"], sent["tools"]);
+    assert_eq!(printed["model"], sent["model"]);
+    // And it is the real thing, not two empty lists agreeing.
+    assert!(messages_of(&printed, "system")[0].contains("Prefer early returns."));
+    let user = &messages_of(&printed, "user")[0];
+    assert!(
+        user.contains("<context>") && user.ends_with("what is here?"),
+        "{user}"
+    );
+    assert!(tool_names(&printed).contains(&"bash".to_string()));
+
+    // The prompt can come from stdin, as with --print.
+    let args = ["debug", "prompt"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, Some("what is here?\n"));
+    let again: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(again["messages"], printed["messages"]);
+
+    let out = run_atelier(&mock.base_url(), &dir, &["debug", "tools"], None);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(mock.requests(), 1);
+}

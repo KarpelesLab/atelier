@@ -29,14 +29,13 @@
 //! look". A CI job that wants to fail on findings says from which severity
 //! with `--fail-on` (status [`EXIT_FINDINGS`]).
 
-use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{EXIT_ERROR, HeadlessUi, OutputFormat, run_prompt, truncate};
+use super::{EXIT_ERROR, HeadlessUi, run_prompt, truncate};
 use crate::agent::Session;
 use crate::{agents, context};
 
@@ -284,14 +283,7 @@ fn review(session: &mut Session, opts: &Options) -> Result<u8> {
 
     // Progress (the reviewer's reading, its answer as written) on stderr;
     // stdout is for the findings.
-    let mut ui = HeadlessUi {
-        format: OutputFormat::Text,
-        structured: true,
-        answer: String::new(),
-        asks: false,
-        questions: 0,
-        backlog: VecDeque::new(),
-    };
+    let mut ui = HeadlessUi::on_stderr();
     let prompt = prompt(&change, &shown, opts.instructions.as_deref());
     let outcome = run_prompt(session, &mut ui, &prompt, Some(&schema()));
     let Some(answer) = &outcome.structured else {

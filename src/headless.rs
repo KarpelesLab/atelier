@@ -39,6 +39,7 @@
 //!
 //! `atelier review` ([`review`]) is a headless run with its prompt, tools
 //! and answer shape decided for the caller; it is built on the pieces here.
+//! `atelier debug prompt` ([`debug_prompt`]) stops short of running at all.
 
 pub mod review;
 
@@ -164,6 +165,29 @@ pub fn run(mut session: Session, opts: Options) -> u8 {
                     EXIT_ERROR
                 }
             }
+        }
+    }
+}
+
+/// `atelier debug prompt`: print the first request `prompt` (stdin when
+/// `None`) would make, as JSON, and send nothing. See
+/// [`Session::first_request`].
+pub fn debug_prompt(mut session: Session, prompt: Option<String>) -> u8 {
+    let prompt = match prompt.map_or_else(read_stdin_prompt, Ok) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: reading the prompt: {e}");
+            return EXIT_ERROR;
+        }
+    };
+    match session.first_request(&prompt, &mut HeadlessUi::on_stderr()) {
+        Ok(body) => {
+            println!("{body:#}");
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            EXIT_ERROR
         }
     }
 }
@@ -548,6 +572,19 @@ struct HeadlessUi {
 }
 
 impl HeadlessUi {
+    /// A `Ui` that keeps stdout for its caller: everything it is told goes
+    /// to stderr, and nobody can be asked anything.
+    fn on_stderr() -> Self {
+        HeadlessUi {
+            format: OutputFormat::Text,
+            structured: true,
+            answer: String::new(),
+            asks: false,
+            questions: 0,
+            backlog: VecDeque::new(),
+        }
+    }
+
     fn streaming(&self) -> bool {
         self.format == OutputFormat::StreamJson
     }

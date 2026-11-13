@@ -10,7 +10,7 @@
 //!
 //! Subcommands that are programs of their own (`update`, `coordinator`,
 //! `mcp-serve`) are picked off in `main` before this runs. Those that are
-//! runs on a session (`review`) are recognized by [`subcommand`]; their
+//! runs on a session (`review`, `debug prompt`) are recognized by [`subcommand`]; their
 //! arguments are their own, parsed by the module that implements them.
 
 use std::path::Path;
@@ -25,6 +25,7 @@ pub const USAGE: &str = "\
 usage: atelier [--claude] [--continue] [--mode MODE]
        atelier --print [options] [--] [prompt...]
        atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
+       atelier debug prompt [prompt...]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
@@ -48,7 +49,7 @@ with --print:
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
              4 answer failed --output-schema
 
-`atelier review --help` describes that command.";
+`atelier review --help` and `atelier debug --help` describe those commands.";
 
 /// The parsed command line.
 #[derive(Debug)]
@@ -155,7 +156,18 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 pub enum Sub {
     /// `atelier review …` (see [`review`]).
     Review(review::Options),
+    /// `atelier debug prompt [prompt…]`: print the first request the prompt
+    /// (stdin when `None`) would make.
+    DebugPrompt(Option<String>),
 }
+
+/// `atelier debug --help`, and what follows a usage error there.
+const DEBUG_USAGE: &str = "\
+usage: atelier debug prompt [--] [prompt...]
+
+Print, as JSON, the first request the prompt would make (the system message,
+the messages, the tools) without sending it. The prompt is read from stdin
+when not given.";
 
 /// Why a subcommand's arguments end the program before anything runs.
 #[derive(Debug)]
@@ -183,6 +195,27 @@ pub fn subcommand(args: &[String]) -> Result<Option<Sub>, Early> {
             Ok(opts) => Ok(Some(Sub::Review(opts))),
             Err(msg) => Err(Early::Usage(format!("review: {msg}\n\n{}", review::USAGE))),
         },
+        "debug" if wants_help() => Err(Early::Help(DEBUG_USAGE)),
+        "debug" => {
+            let usage = |msg: String| Early::Usage(format!("debug: {msg}\n\n{DEBUG_USAGE}"));
+            let words = match rest.split_first() {
+                Some((what, words)) if what == "prompt" => words,
+                Some((what, _)) => return Err(usage(format!("unknown subcommand '{what}'"))),
+                None => return Err(usage("what to print is missing".to_string())),
+            };
+            // No options of its own: a leading `--` lets the prompt start
+            // with a dash, as with `--print`.
+            let words = match words.split_first() {
+                Some((dashes, words)) if dashes == "--" => words,
+                Some((option, _)) if option.starts_with('-') && option != "-" => {
+                    return Err(usage(format!("unknown option {option}")));
+                }
+                _ => words,
+            };
+            Ok(Some(Sub::DebugPrompt(
+                (!words.is_empty()).then(|| words.join(" ")),
+            )))
+        }
         _ => Ok(None),
     }
 }
@@ -325,6 +358,28 @@ mod tests {
             panic!("expected a usage error");
         };
         assert!(msg.starts_with("review: unknown option --frob\n\nusage: atelier review"));
+
+        let prompt = |args: &[&str]| match sub(args) {
+            Ok(Some(Sub::DebugPrompt(prompt))) => prompt,
+            other => panic!("expected a debug prompt, got {other:?}"),
+        };
+        assert_eq!(prompt(&["debug", "prompt"]), None);
+        assert_eq!(
+            prompt(&["debug", "prompt", "fix", "it"]).as_deref(),
+            Some("fix it")
+        );
+        assert_eq!(
+            prompt(&["debug", "prompt", "--", "--help", "me"]).as_deref(),
+            Some("--help me")
+        );
+        assert!(matches!(sub(&["debug", "--help"]), Err(Early::Help(_))));
+        for bad in [
+            &["debug"][..],
+            &["debug", "tools"],
+            &["debug", "prompt", "-x"],
+        ] {
+            assert!(matches!(sub(bad), Err(Early::Usage(_))), "{bad:?}");
+        }
     }
 
     #[test]

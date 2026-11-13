@@ -35,9 +35,22 @@
 //! The Claude backend doesn't come through here: claude assembles its own
 //! prompt, and atelier only prefixes a context block to the user's message
 //! (`Session::gather_context`).
+//!
+//! # Seeing it
+//!
+//! `atelier debug prompt` prints the first request a prompt would make
+//! ([`Session::first_request`]). It is not a second description of the
+//! layout that could drift from the first: the loop's own two steps —
+//! [`Session::push_user`], then [`Session::next_request`] — are run, and
+//! what they produce is rendered by the function that builds the body the
+//! provider sends. Only the sending is left out.
 
-use super::{CONTEXT_TOKEN_BUDGET, MODE_NOTE, SYSTEM_PROMPT, Session};
+use anyhow::{Result, bail};
+use serde_json::Value;
+
+use super::{CONTEXT_TOKEN_BUDGET, MODE_NOTE, SYSTEM_PROMPT, Session, Ui};
 use crate::context::{self, ContextItem};
+use crate::provider::{self, Message, ToolSpec};
 
 /// The session's one system message: `prompt`, then the standing context
 /// (whole — its providers budget it themselves), then the summary of
@@ -109,6 +122,67 @@ impl Session {
         let mut delta = context::dedup_items(&self.last_ctx, volatile);
         self.last_ctx = std::mem::take(&mut delta.snapshot);
         turn_block(delta)
+    }
+
+    /// Open a turn: append the user's message to the conversation, with any
+    /// staged images and the context gathered for it. What changed in the
+    /// project since the last turn rides with this message, and stays
+    /// there (see the module docs).
+    pub(super) fn push_user(&mut self, user_input: &str) {
+        let context = self.gather_turn_context();
+        let images = std::mem::take(&mut self.pending_images);
+        let user = if images.is_empty() {
+            Message::user(user_input)
+        } else {
+            Message::user_with_images(user_input, images)
+        };
+        self.history.push(user.with_context(context));
+    }
+
+    /// The model's next request: a single leading system message (some
+    /// servers reject a second), constant for the session, then the
+    /// conversation history — so each request is a prefix of the next and
+    /// the server's prompt cache carries over — and the tools on offer:
+    /// none for a subagent that is `wrapping_up` at its step cap.
+    pub(super) fn next_request(&self, wrapping_up: bool) -> (Vec<Message>, Vec<ToolSpec>) {
+        let mut messages = Vec::with_capacity(self.history.len() + 1);
+        messages.push(Message::system(self.system_message()));
+        messages.extend(self.history.iter().cloned());
+        let specs = if wrapping_up {
+            Vec::new()
+        } else {
+            self.tools.specs()
+        };
+        (messages, specs)
+    }
+
+    /// The body of the first request `prompt` would make, as the active
+    /// backend would send it — without sending it (`atelier debug prompt`).
+    ///
+    /// What shapes a prompt on its way in is applied as `send` applies it:
+    /// the `user_prompt` hooks run (and may block it, or add context, as
+    /// may `session_start`'s). Nothing is persisted, and the result holds
+    /// no credential: a key or token travels in a header, never in a body.
+    pub fn first_request(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<Value> {
+        if self.is_claude() {
+            bail!(
+                "with the Claude backend, claude assembles the request itself: there is \
+                 nothing of atelier's to print"
+            );
+        }
+        let prompt = self.hook_prompt(prompt, ui)?;
+        self.push_user(&prompt);
+        let (messages, specs) = self.next_request(false);
+        Ok(match &self.chatgpt {
+            Some(cg) => {
+                let (model, options) = self.cfg.model_and_options(&cg.model);
+                provider::responses::build_body(model, &options, &messages, &specs)
+            }
+            None => {
+                let target = self.cfg.target(crate::config::Role::Main);
+                provider::chat_body(&target, &messages, &specs)
+            }
+        })
     }
 
     /// The system message for the next request (see [`system_message`]).

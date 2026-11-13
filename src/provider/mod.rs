@@ -582,10 +582,12 @@ fn chat_stream(
     Ok(out)
 }
 
-/// The chat-completions request body. The variant's options go in first and
-/// the fields atelier owns are written over them, so no option can replace
-/// the model, the messages or the stream settings.
-fn chat_body(target: &Target, messages: &[Message], tools: &[ToolSpec]) -> Value {
+/// The chat-completions request body: what [`stream_chat`] sends, and what
+/// `atelier debug prompt` prints. Pure — and without the API key, which is
+/// a header. The variant's options go in first and the fields atelier owns
+/// are written over them, so no option can replace the model, the messages
+/// or the stream settings.
+pub fn chat_body(target: &Target, messages: &[Message], tools: &[ToolSpec]) -> Value {
     let mut body = Value::Object(target.options.clone());
     body["model"] = json!(target.model);
     body["messages"] = messages.iter().map(Message::to_wire).collect();

@@ -1437,16 +1437,7 @@ impl Session {
         if self.is_claude() {
             return self.send_claude(user_input, ui);
         }
-        // What changed in the project since the last turn rides with this
-        // turn's user message, and stays there: see `prompt`.
-        let context = self.gather_turn_context();
-        let images = std::mem::take(&mut self.pending_images);
-        let user = if images.is_empty() {
-            Message::user(user_input)
-        } else {
-            Message::user_with_images(user_input, images)
-        };
-        self.history.push(user.with_context(context));
+        self.push_user(user_input);
         // A request refused as too long is compacted and retried — once a
         // turn, so a conversation that can't be made to fit fails the turn
         // rather than looping.
@@ -1480,19 +1471,7 @@ impl Session {
             // Surface any finished background reviews (non-blocking).
             self.drain_reviews(ui);
 
-            // Assemble the request: a single leading system message (some
-            // servers reject a second), constant for the session, then the
-            // conversation history — so each request is a prefix of the
-            // next and the server's prompt cache carries over (see `prompt`).
-            let mut messages = Vec::with_capacity(self.history.len() + 1);
-            messages.push(Message::system(self.system_message()));
-            messages.extend(self.history.iter().cloned());
-
-            let specs = if wrapping_up {
-                Vec::new()
-            } else {
-                self.tools.specs()
-            };
+            let (messages, specs) = self.next_request(wrapping_up);
             // Stream into the UI, stopping early if the user asks (Ctrl-C).
             let mut on_event = |ev: StreamEvent| {
                 match ev {

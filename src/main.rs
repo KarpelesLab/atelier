@@ -93,8 +93,9 @@ fn run() -> Result<u8> {
             .ok_or_else(|| anyhow::anyhow!("usage: atelier mcp-serve <socket>"))?;
         return claude::relay(socket).map(|()| 0);
     }
-    // `atelier review …`: a run of its own, on the session set up below
-    // like any other. Its arguments are its own (see `cli::subcommand`).
+    // `atelier review …` and `atelier debug prompt …`: runs of their own, on
+    // the session set up below like any other. Their arguments are their
+    // own (see `cli::subcommand`).
     let sub = match cli::subcommand(&args) {
         Ok(sub) => sub,
         Err(cli::Early::Help(text)) => {
@@ -196,6 +197,9 @@ fn run() -> Result<u8> {
     match sub {
         Some(cli::Sub::Review(opts)) => {
             return Ok(finish(headless::review::run(session, opts)));
+        }
+        Some(cli::Sub::DebugPrompt(prompt)) => {
+            return Ok(finish(headless::debug_prompt(session, prompt)));
         }
         None => {}
     }

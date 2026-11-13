@@ -189,7 +189,7 @@ fn responses_stream(
 /// are translated — `reasoning_effort` to `reasoning.effort`, `max_tokens`
 /// to `max_output_tokens` — and the rest go in as they are, under the
 /// fields built here.
-fn build_body(
+pub(crate) fn build_body(
     model: &str,
     options: &Map<String, Value>,
     messages: &[Message],
