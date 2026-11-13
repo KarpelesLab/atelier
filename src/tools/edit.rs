@@ -72,7 +72,7 @@ impl Tool for EditTool {
         }
 
         let current =
-            std::fs::read_to_string(&resolved).with_context(|| format!("reading {path:?}"))?;
+            super::files::read_to_string(&resolved).with_context(|| format!("reading {path:?}"))?;
 
         if ctx.fstate.is_stale(&resolved, &current) {
             bail!("{path:?} has changed on disk since it was last read; re-read it before editing");
@@ -99,7 +99,7 @@ impl Tool for EditTool {
             current.replacen(old_string, new_string, 1)
         };
 
-        std::fs::write(&resolved, &updated).with_context(|| format!("writing {path:?}"))?;
+        super::files::write(&resolved, &updated).with_context(|| format!("writing {path:?}"))?;
         ctx.fstate.record(&resolved, &updated);
 
         let n = if replace_all { count } else { 1 };

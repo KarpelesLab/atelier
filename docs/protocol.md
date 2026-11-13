@@ -398,23 +398,22 @@ last.
 and `id` is a request to answer; with `method` only, a notification; with
 `result` or `error`, the response to the request of that `id`.
 
-**ACP (Agent Client Protocol).** An ACP agent for editors is an adapter in
-front of `atelier serve`, not a second implementation: both are JSON-RPC
-over stdio with the same shape of conversation. ACP's `initialize` maps to
-`initialize`; `session/new` to spawning one `atelier serve` process in the
-session's working directory (one session per process, so the adapter keeps a
-process per ACP session, and `--continue` covers `session/load`);
-`session/prompt` to `turn/start`, with the prompt's response sent when
-`turn/ended` arrives (`completed` → `end_turn`, `interrupted` → `cancelled`,
-`max_turns` → `max_turn_requests`); the `session/update` notifications are
-the `event/*` stream (`event/text` → an agent message chunk,
-`event/reasoning` → a thought chunk, `event/tool_start`/`event/tool_end` → a
-tool call and its update); `session/request_permission` is
-`approval/request`, its `allow_once` / `allow_always` / `reject_once`
-options being `once` / `always` / `deny`; `session/cancel` is
-`turn/interrupt`; and ACP's session modes are `command/run "/mode …"`. What
-ACP has no place for (`turn/steer`, `question/request`, `event/idle`) the
-adapter can queue, present as a permission-style prompt, or drop.
+**ACP (Agent Client Protocol).** Editors that speak ACP (Zed, the JetBrains
+IDEs, Neovim plugins) do not need an adapter in front of this protocol:
+[`atelier acp`](acp.md) is an ACP agent itself, a second front end over the
+same session and the same wire (JSON-RPC lines, a reader thread and a
+session thread). The two line up closely — `session/prompt` is `turn/start`
+with the response held until `turn/ended` (`completed` → `end_turn`,
+`interrupted` → `cancelled`, `max_turns` → `max_turn_requests`), the
+`session/update` notifications are the `event/*` stream in ACP's vocabulary,
+`session/request_permission` is `approval/request` (`allow_once` /
+`allow_always` / `reject_once` being `once` / `always` / `deny`),
+`session/cancel` is `turn/interrupt`, and ACP's session modes are the
+permission modes. Where they differ, `serve` is the smaller and the more
+atelier's own: it has mid-turn steering (`turn/steer`), free-form questions
+(`question/request`) and `event/idle`, and no notion of an editor's files.
+Write a front end for atelier against `serve`; point an existing ACP client
+at `acp`.
 
 **Another transport.** Nothing in the protocol depends on stdio beyond
 "lines in, lines out": the messages carry no transport state, and all of it

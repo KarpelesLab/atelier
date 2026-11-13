@@ -136,6 +136,21 @@ impl Catalog {
         Some((entry.server.clone(), prompt.clone()))
     }
 
+    /// Every prompt as the command that runs it (`mcp:<server>:<prompt>`,
+    /// no slash), in the servers' order — for an interface that lists the
+    /// commands itself rather than printing `/help`.
+    pub fn prompt_commands(&self) -> Vec<(String, Prompt)> {
+        let state = self.state();
+        let mut out = Vec::new();
+        for entry in &state.entries {
+            for prompt in &entry.prompts {
+                let command = format!("mcp:{}:{}", entry.server, prompt.name);
+                out.push((command, prompt.clone()));
+            }
+        }
+        out
+    }
+
     /// The lines `/help` adds for the prompts, or nothing when there are
     /// none. `shadowed` says whether a command (given without its slash) is
     /// already something else — a command file wins, so such a prompt is

@@ -52,7 +52,7 @@ impl Tool for WriteTool {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent directories for {path:?}"))?;
         }
-        std::fs::write(&resolved, content).with_context(|| format!("writing to {path:?}"))?;
+        super::files::write(&resolved, content).with_context(|| format!("writing to {path:?}"))?;
 
         ctx.fstate.record(&resolved, content);
 

@@ -4,6 +4,7 @@
 //! plain stdin REPL ([`agent::repl`]) drives it until the inline TUI (M2,
 //! `src/tui`) takes over.
 
+mod acp;
 mod agent;
 mod agents;
 mod auth;
@@ -25,6 +26,7 @@ mod permissions;
 mod provider;
 mod review;
 mod risk;
+mod rpc;
 mod sandbox;
 mod schema;
 mod serve;
@@ -167,8 +169,60 @@ fn run() -> Result<u8> {
     };
     // Daily check for a newer release, in the background (official builds).
     update::spawn_background_check();
+    // `atelier acp`: the Agent Client Protocol on stdin/stdout, for an editor
+    // to drive (see `acp`). The session is opened when the editor asks for
+    // one, in the directory it names — so not here.
+    if let Some(opts) = cli.acp {
+        let claude = cli.claude;
+        let open = move || open_session(claude, mode);
+        return Ok(finish(acp::run(open, opts)));
+    }
+    let mut session = open_session(cli.claude, mode)?;
+    if cli.resume {
+        eprintln!("{}", session.resume());
+    }
+    // Say which of the project's settings are waiting to be trusted (a
+    // headless run can't ask, so it skips them), then run the
+    // `session_start` hooks.
+    for line in session.start_hooks(cli.print.is_none() && sub.is_none()) {
+        eprintln!("{line}");
+    }
+
+    match sub {
+        Some(cli::Sub::Review(opts)) => {
+            return Ok(finish(headless::review::run(session, opts)));
+        }
+        Some(cli::Sub::DebugPrompt(prompt)) => {
+            return Ok(finish(headless::debug_prompt(session, prompt)));
+        }
+        None => {}
+    }
+
+    // Handled before the interactive TUI/REPL branch below, and unconditional
+    // on the `tui` feature, so `--print` works in both build configs.
+    if let Some(opts) = cli.print {
+        return Ok(finish(headless::run(session, opts)));
+    }
+    // `atelier serve`: the session over JSON-RPC on stdin/stdout, for a
+    // program to drive (see `serve`). Its stdout is the protocol's alone.
+    if let Some(opts) = cli.serve {
+        return Ok(finish(serve::run(session, opts)));
+    }
+
+    #[cfg(tui)]
+    let result = tui::run(session);
+    #[cfg(not(tui))]
+    let result = agent::repl(session);
+    finish(result).map(|()| 0)
+}
+
+/// Set up a session in the current directory, as every way of running one
+/// starts: the configuration from the environment and the `atelier.toml`
+/// files, the tools, the link to the other instances. `claude` is
+/// `--claude`; `mode` is the permission mode asked for, if one was.
+fn open_session(claude: bool, mode: Option<permissions::Mode>) -> Result<agent::Session> {
     // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
-    let mut cfg = Config::from_env(cli.claude);
+    let mut cfg = Config::from_env(claude);
     let claude = matches!(cfg.backend, config::Backend::Claude { .. });
     let root = std::env::current_dir()?;
     let settings = Settings::load(&root).unwrap_or_else(|e| {
@@ -224,42 +278,7 @@ fn run() -> Result<u8> {
     if !claude && let Some(tokens) = auth::load() {
         session.use_chatgpt(tokens, None);
     }
-    if cli.resume {
-        eprintln!("{}", session.resume());
-    }
-    // Say which of the project's settings are waiting to be trusted (a
-    // headless run can't ask, so it skips them), then run the
-    // `session_start` hooks.
-    for line in session.start_hooks(cli.print.is_none() && sub.is_none()) {
-        eprintln!("{line}");
-    }
-
-    match sub {
-        Some(cli::Sub::Review(opts)) => {
-            return Ok(finish(headless::review::run(session, opts)));
-        }
-        Some(cli::Sub::DebugPrompt(prompt)) => {
-            return Ok(finish(headless::debug_prompt(session, prompt)));
-        }
-        None => {}
-    }
-
-    // Handled before the interactive TUI/REPL branch below, and unconditional
-    // on the `tui` feature, so `--print` works in both build configs.
-    if let Some(opts) = cli.print {
-        return Ok(finish(headless::run(session, opts)));
-    }
-    // `atelier serve`: the session over JSON-RPC on stdin/stdout, for a
-    // program to drive (see `serve`). Its stdout is the protocol's alone.
-    if let Some(opts) = cli.serve {
-        return Ok(finish(serve::run(session, opts)));
-    }
-
-    #[cfg(tui)]
-    let result = tui::run(session);
-    #[cfg(not(tui))]
-    let result = agent::repl(session);
-    finish(result).map(|()| 0)
+    Ok(session)
 }
 
 /// On the way out: stop the `bash` tool's background jobs, which would

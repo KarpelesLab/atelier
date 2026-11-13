@@ -203,9 +203,11 @@ atelier -p --output-schema schema.json "review the last commit" | jq -r .risk
 
 The validator is built in and covers the common subset: `type` (a name or a
 list), `properties`, `required`, `additionalProperties` (`false` or a
-schema), `items`, `enum`, `const`, nested to any depth. Other keywords
-(`pattern`, `minimum`, `$ref`, `oneOf`, …) are ignored — the model still
-sees them in the prompt, but they are not enforced.
+schema), `items`, `enum`, `const`, nested to any depth, plus `allOf`,
+`anyOf`, `oneOf`, `not` and `$ref` to a place in the same schema
+(`#/$defs/Name`). Other keywords (`pattern`, `minimum`, `format`, …) are
+ignored — the model still sees them in the prompt, but they are not
+enforced.
 
 The retry is a second prompt in the conversation: it gets its own
 `--max-turns` budget, and its requests count in `num_steps`.

@@ -34,6 +34,7 @@ pub mod apply_patch;
 pub mod ask;
 pub mod bash;
 mod edit;
+pub mod files;
 mod glob;
 mod grep;
 mod ls;

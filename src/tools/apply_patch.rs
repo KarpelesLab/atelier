@@ -154,6 +154,26 @@ pub fn target_paths(args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The call `args` as before-and-after text, one entry per hunk: the path
+/// it applies to, the lines it replaces (`None` where the file is created)
+/// and the lines it leaves. For an interface that shows a change as a diff
+/// (see [`crate::acp`]); empty when the patch does not parse.
+pub fn changes(args: &Value) -> Vec<(String, Option<String>, String)> {
+    let patch = args.get("patch").and_then(Value::as_str).unwrap_or("");
+    let mut out = Vec::new();
+    for file in parse_patch(patch).unwrap_or_default() {
+        let created = file.old_path.is_none();
+        let Some(path) = file.new_path.or(file.old_path) else {
+            continue;
+        };
+        for hunk in &file.hunks {
+            let before = (!created).then(|| hunk.old_block().join("\n"));
+            out.push((path.clone(), before, hunk.new_block().join("\n")));
+        }
+    }
+    out
+}
+
 /// Parse a whole unified diff into its per-file sections.
 fn parse_patch(patch: &str) -> Result<Vec<FilePatch>> {
     let lines: Vec<&str> = patch.lines().collect();

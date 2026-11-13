@@ -104,6 +104,7 @@ first conversation, the REPL/TUI fallback).
 | [Troubleshooting](docs/troubleshooting.md) | `atelier doctor`: a checklist of the setup (config files, endpoint, model, instruction files, hooks, MCP, …); `atelier debug prompt`: the exact first request a prompt would make, without sending it |
 | [GitHub Action](docs/github-action.md) | `uses: KarpelesLab/atelier@v0`: review pull requests with inline comments, run a prompt on a schedule, answer `@atelier` in issue and pull request comments — inputs, example workflows, the safety model |
 | [Embedding protocol](docs/protocol.md) | `atelier serve`: the session as JSON-RPC 2.0 over stdio, for editors and other front ends — start, steer and interrupt turns, answer approvals and questions, run commands; events, error codes, how ACP maps onto it |
+| [Editors (ACP)](docs/acp.md) | `atelier acp`: atelier as an [Agent Client Protocol](https://agentclientprotocol.com) agent for Zed and other ACP editors — setup, tool calls and diffs, permission requests, modes, slash commands, files through the editor; what is and isn't supported |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`, `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
@@ -135,6 +136,8 @@ src/
 ├─ session.rs     on-disk session persistence (.atelier/session.json)
 ├─ headless.rs    --print: non-interactive runs, JSON output, exit codes
 ├─ serve.rs       serve: the embedding protocol (JSON-RPC 2.0 over stdio)
+├─ acp.rs, acp/   acp: the Agent Client Protocol agent, for editors
+├─ rpc.rs         JSON-RPC lines over stdio, under serve and acp
 ├─ events.rs      the event payloads --print's stream-json and serve share
 ├─ schema.rs      the JSON Schema subset behind --output-schema
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls, vision

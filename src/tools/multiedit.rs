@@ -147,7 +147,7 @@ impl Tool for MultiEditTool {
         }
 
         let original =
-            std::fs::read_to_string(&resolved).with_context(|| format!("reading {path:?}"))?;
+            super::files::read_to_string(&resolved).with_context(|| format!("reading {path:?}"))?;
 
         if ctx.fstate.is_stale(&resolved, &original) {
             bail!("{path:?} has changed on disk since it was last read; re-read it before editing");
@@ -165,7 +165,7 @@ impl Tool for MultiEditTool {
             }
         }
 
-        std::fs::write(&resolved, &current).with_context(|| format!("writing {path:?}"))?;
+        super::files::write(&resolved, &current).with_context(|| format!("writing {path:?}"))?;
         ctx.fstate.record(&resolved, &current);
 
         Ok(format!("applied {} edit(s) to {path}", ops.len()))

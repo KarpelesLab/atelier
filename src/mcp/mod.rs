@@ -194,6 +194,8 @@ pub struct StdioServer {
     pub command: String,
     /// Arguments to the command.
     pub args: Vec<String>,
+    /// Variables to add to the server's environment (it inherits atelier's).
+    pub env: Vec<(String, String)>,
     /// Tool filters and timeouts.
     pub options: ServerOptions,
 }
@@ -259,6 +261,7 @@ fn in_order<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
 pub fn connect_stdio(server: &StdioServer) -> Result<Connection> {
     let mut child = Command::new(&server.command)
         .args(&server.args)
+        .envs(server.env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -632,6 +635,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             name: "fake".into(),
             command: "sh".into(),
             args: vec!["-c".into(), FAKE_SERVER_SCRIPT.into()],
+            env: Vec::new(),
             options: ServerOptions::default(),
         }
     }
@@ -730,6 +734,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
                 name: "broken".into(),
                 command: "definitely-not-a-real-binary-atelier-mcp-test".into(),
                 args: Vec::new(),
+                env: Vec::new(),
                 options: ServerOptions::default(),
             }),
             http("fast", fast.url("/mcp")),
@@ -941,6 +946,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             name: "fake".into(),
             command: "sh".into(),
             args: vec!["-c".into(), FAKE_SERVER_NO_RESOURCES_SCRIPT.into()],
+            env: Vec::new(),
             options: ServerOptions::default(),
         };
         let tools = connect_stdio(&server)
@@ -1011,6 +1017,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             name: "nope".into(),
             command: "definitely-not-a-real-binary-atelier-mcp-test".into(),
             args: vec![],
+            env: Vec::new(),
             options: ServerOptions::default(),
         };
         match connect_stdio(&server) {

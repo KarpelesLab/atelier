@@ -141,7 +141,8 @@ fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
 }
 
 fn read_text(resolved: &Path, path: &str) -> Result<String> {
-    std::fs::read_to_string(resolved).map_err(|e| anyhow::anyhow!("failed to read {path:?}: {e}"))
+    super::files::read_to_string(resolved)
+        .map_err(|e| anyhow::anyhow!("failed to read {path:?}: {e}"))
 }
 
 /// `cat -n` style numbering of the lines in `[offset, offset + limit)`.

@@ -54,19 +54,19 @@
 //! same limit Ctrl-C has), a watchdog ends the process if it has not let go
 //! after [`GRACE`].
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::agent::{self, Approval, Dispatch, Session, StepLimit, Ui};
 use crate::events;
 use crate::permissions::{Decision, Policy};
+use crate::rpc::{self, Failure, Id, Reply, Scope as Asked, Why, Wire, lock};
 use crate::settings::Permissions;
 use crate::tools::ask::{Answer, Question};
 
@@ -80,16 +80,10 @@ const IDLE_POLL: Duration = Duration::from_millis(200);
 /// has forced a shutdown, before the process ends regardless.
 const GRACE: Duration = Duration::from_secs(5);
 
-/// JSON-RPC error codes. The first five are the standard's; the rest are
-/// this protocol's own, in the range the standard leaves to applications.
-/// They are part of the contract (`docs/protocol.md`): never renumber.
+/// This protocol's own JSON-RPC error codes, in the range the standard
+/// leaves to applications (the standard's are in [`rpc::code`]). They are
+/// part of the contract (`docs/protocol.md`): never renumber.
 mod code {
-    /// A line that is not JSON.
-    pub const PARSE_ERROR: i64 = -32700;
-    /// JSON, but not a request, a notification or an answer.
-    pub const INVALID_REQUEST: i64 = -32600;
-    pub const METHOD_NOT_FOUND: i64 = -32601;
-    pub const INVALID_PARAMS: i64 = -32602;
     /// A turn or a command is running, and this needs the session idle.
     pub const TURN_RUNNING: i64 = -32001;
     /// A request other than `initialize` came first.
@@ -112,10 +106,6 @@ pub struct Options {
     pub approval_timeout: Option<Duration>,
 }
 
-/// A request's `id`, to answer it with; `None` for a notification, which
-/// is carried out but gets no answer.
-type Id = Option<Value>;
-
 /// Serve `session` to the program on the other end of stdin/stdout until it
 /// asks to stop or goes away, and return the exit status: 0, since how each
 /// turn went was reported to the client as it happened.
@@ -132,9 +122,7 @@ pub fn run(session: Session, opts: Options) -> u8 {
         }),
         started: Condvar::new(),
         stop: AtomicBool::new(false),
-        closed: AtomicBool::new(false),
-        pending: Mutex::new(HashMap::new()),
-        next_request: AtomicU64::new(1),
+        wire: Wire::new("serve"),
     });
     let (jobs_tx, jobs_rx) = mpsc::channel();
     let reader = Arc::clone(&shared);
@@ -205,66 +193,17 @@ struct State {
     queue: VecDeque<String>,
 }
 
-/// The answer to a request atelier made of the client.
-enum Reply {
-    /// The client's `result`.
-    Result(Value),
-    /// The client answered with an error: it cannot ask anyone.
-    Error,
-    /// No answer will come.
-    Cancelled(Why),
-}
-
-/// Why a request to the client was given up on.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Why {
-    /// `--approval-timeout` ran out.
-    Timeout,
-    /// The turn was interrupted, or the client is gone.
-    Interrupted,
-}
-
-impl Why {
-    fn name(self) -> &'static str {
-        match self {
-            Why::Timeout => "timeout",
-            Why::Interrupted => "interrupted",
-        }
-    }
-}
-
-/// A request that cannot be carried out: the JSON-RPC error to answer with.
-struct Failure {
-    code: i64,
-    message: String,
-    data: Option<Value>,
-}
-
-impl Failure {
-    fn new(code: i64, message: impl Into<String>) -> Self {
-        Failure {
-            code,
-            message: message.into(),
-            data: None,
-        }
-    }
-
-    fn params(message: impl Into<String>) -> Self {
-        Failure::new(code::INVALID_PARAMS, message)
-    }
-
-    /// The session is not idle.
-    fn busy(running: Running) -> Self {
-        match running {
-            Running::Turn(turn) => Failure {
-                code: code::TURN_RUNNING,
-                message: format!(
-                    "turn {turn} is running: steer it with turn/steer, or stop it with turn/interrupt"
-                ),
-                data: Some(json!({ "turn": turn })),
-            },
-            Running::Command => Failure::new(code::TURN_RUNNING, "a command is running"),
-        }
+/// The session is not idle: the refusal for what needs it to be.
+fn busy(running: Running) -> Failure {
+    match running {
+        Running::Turn(turn) => Failure {
+            code: code::TURN_RUNNING,
+            message: format!(
+                "turn {turn} is running: steer it with turn/steer, or stop it with turn/interrupt"
+            ),
+            data: Some(json!({ "turn": turn })),
+        },
+        Running::Command => Failure::new(code::TURN_RUNNING, "a command is running"),
     }
 }
 
@@ -281,12 +220,6 @@ struct Accepted {
     watchdog: bool,
 }
 
-/// Lock a mutex, tolerating poison: the data is plain values, and a thread
-/// that panicked holding it must not take the other one down in turn.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
-}
-
 /// State shared by the two threads.
 struct Shared {
     /// The project root, for the session's description and for matching
@@ -299,149 +232,34 @@ struct Shared {
     /// Set by `turn/interrupt`, read by the running turn through
     /// [`Ui::interrupted`], cleared when a turn is accepted.
     stop: AtomicBool,
-    /// The client is gone: nothing more can be asked of it.
-    closed: AtomicBool,
-    /// Requests made of the client that it has not answered, by id.
-    pending: Mutex<HashMap<u64, Sender<Reply>>>,
-    next_request: AtomicU64,
+    /// stdout, and the requests made of the client that it has not answered.
+    wire: Wire,
 }
 
 impl Shared {
-    /// Write one message as a line on stdout, flushed so the client sees it
-    /// now. Built first and written in one call under the lock, so messages
-    /// from the two threads never interleave. A closed stdout isn't worth a
-    /// panic: the client went away, and stdin's end says so soon enough.
-    fn write(&self, message: &Value) {
-        let line = format!("{message}\n");
-        let mut out = io::stdout().lock();
-        let _ = out.write_all(line.as_bytes());
-        let _ = out.flush();
-    }
-
-    fn notify(&self, method: &str, params: Value) {
-        self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }));
-    }
-
-    fn respond(&self, id: &Id, result: Value) {
-        if let Some(id) = id {
-            self.write(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-        }
-    }
-
-    fn fail(&self, id: &Id, failure: Failure) {
-        let Some(id) = id else {
-            // A notification gets no answer, not even a refusal.
-            eprintln!("atelier serve: {}", failure.message);
-            return;
-        };
-        let mut error = json!({ "code": failure.code, "message": failure.message });
-        if let Some(data) = failure.data {
-            error["data"] = data;
-        }
-        self.write(&json!({ "jsonrpc": "2.0", "id": id, "error": error }));
-    }
-
-    /// Give up on every request the client has not answered.
-    fn cancel_pending(&self, why: Why) {
-        for (_, waiter) in lock(&self.pending).drain() {
-            let _ = waiter.send(Reply::Cancelled(why));
-        }
-    }
-
     /// The reader thread: every line of stdin, until it ends.
     fn read_requests(&self, jobs: &Sender<Job>) {
-        let mut stdin = io::stdin().lock();
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match stdin.read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            // Bytes that aren't UTF-8 are a malformed line, not the end of
-            // the stream: they fail to parse and are answered as such.
-            let text = String::from_utf8_lossy(&line);
-            let text = text.trim();
-            if !text.is_empty() {
-                self.incoming(text, jobs);
-            }
-        }
+        self.wire
+            .read(|method, id, params| match self.accept(method, id, params) {
+                Ok(accepted) => {
+                    if let Some(reply) = accepted.reply {
+                        self.wire.respond(id, reply);
+                    }
+                    if let Some(job) = accepted.job {
+                        let _ = jobs.send(job);
+                    }
+                    if accepted.watchdog {
+                        rpc::watchdog(GRACE);
+                    }
+                }
+                Err(failure) => self.wire.fail(id, failure),
+            });
         // The client is gone: a shutdown it can no longer be asked to
         // confirm. Whatever is running is stopped, as far as it can be.
-        self.closed.store(true, Ordering::Relaxed);
+        self.wire.close();
         self.stop.store(true, Ordering::Relaxed);
-        self.cancel_pending(Why::Interrupted);
         let _ = jobs.send(Job::Eof);
-        watchdog();
-    }
-
-    /// One line from the client: a request, a notification, or the answer
-    /// to a request of ours.
-    fn incoming(&self, line: &str, jobs: &Sender<Job>) {
-        let null = Some(Value::Null);
-        let message: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                let why = format!("parse error: {e}");
-                return self.fail(&null, Failure::new(code::PARSE_ERROR, why));
-            }
-        };
-        let invalid = |id: &Id, why: &str| {
-            self.fail(id, Failure::new(code::INVALID_REQUEST, why));
-        };
-        let Some(object) = message.as_object() else {
-            return invalid(
-                &null,
-                "a message must be a JSON object (batches are not supported)",
-            );
-        };
-        let id = object.get("id").cloned();
-        match object.get("method") {
-            Some(Value::String(method)) => {
-                let params = object.get("params").unwrap_or(&Value::Null);
-                match self.accept(method, &id, params) {
-                    Ok(accepted) => {
-                        if let Some(reply) = accepted.reply {
-                            self.respond(&id, reply);
-                        }
-                        if let Some(job) = accepted.job {
-                            let _ = jobs.send(job);
-                        }
-                        if accepted.watchdog {
-                            watchdog();
-                        }
-                    }
-                    Err(failure) => self.fail(&id, failure),
-                }
-            }
-            Some(_) => invalid(&id.or(null), "\"method\" must be a string"),
-            None if object.contains_key("result") || object.contains_key("error") => {
-                self.answered(object);
-            }
-            None => invalid(
-                &id.or(null),
-                "neither a request (\"method\") nor an answer (\"result\" or \"error\")",
-            ),
-        }
-    }
-
-    /// The client's answer to a request of ours: hand it to whoever waits.
-    /// An answer nobody waits for (the request timed out or was cancelled
-    /// meanwhile) is dropped; JSON-RPC has no way to refuse an answer.
-    fn answered(&self, object: &Map<String, Value>) {
-        let waiter = object
-            .get("id")
-            .and_then(Value::as_u64)
-            .and_then(|id| lock(&self.pending).remove(&id));
-        let Some(waiter) = waiter else {
-            eprintln!("atelier serve: dropped an answer to a request that is not pending");
-            return;
-        };
-        let reply = match object.get("result") {
-            Some(result) => Reply::Result(result.clone()),
-            None => Reply::Error,
-        };
-        let _ = waiter.send(reply);
+        rpc::watchdog(GRACE);
     }
 
     /// Decide what to do about the request `method`, without doing anything
@@ -501,7 +319,7 @@ impl Shared {
                     ),
                 };
                 if let Some(running) = state.running {
-                    return Err(Failure::busy(running));
+                    return Err(busy(running));
                 }
                 state.turns += 1;
                 let turn = state.turns;
@@ -542,7 +360,7 @@ impl Shared {
                 self.stop.store(true, Ordering::Relaxed);
                 // A turn waiting on an answer is stopped there: the answer
                 // is "deny".
-                self.cancel_pending(Why::Interrupted);
+                self.wire.cancel_turn();
                 Ok(Accepted {
                     reply: Some(json!({ "turn": turn })),
                     ..Accepted::default()
@@ -551,7 +369,7 @@ impl Shared {
             "command/run" => {
                 let line = string_param(params, "line")?;
                 if let Some(running) = state.running {
-                    return Err(Failure::busy(running));
+                    return Err(busy(running));
                 }
                 state.running = Some(Running::Command);
                 Ok(Accepted {
@@ -583,10 +401,10 @@ impl Shared {
                 };
                 if let Some(running) = state.running {
                     if !force {
-                        return Err(Failure::busy(running));
+                        return Err(busy(running));
                     }
                     self.stop.store(true, Ordering::Relaxed);
-                    self.cancel_pending(Why::Interrupted);
+                    self.wire.cancel_turn();
                 }
                 Ok(Accepted {
                     job: Some(Job::Shutdown {
@@ -598,7 +416,7 @@ impl Shared {
                 })
             }
             _ => Err(Failure::new(
-                code::METHOD_NOT_FOUND,
+                rpc::code::METHOD_NOT_FOUND,
                 format!("unknown method '{method}'"),
             )),
         }
@@ -613,18 +431,6 @@ fn string_param(params: &Value, name: &str) -> Result<String, Failure> {
             "\"{name}\" must be a non-empty string"
         ))),
     }
-}
-
-/// End the process after [`GRACE`], whatever the session thread is doing:
-/// for when nobody is left to wait for it. Returning from [`run`] before
-/// then ends the process the normal way, and this with it.
-fn watchdog() {
-    std::thread::spawn(|| {
-        std::thread::sleep(GRACE);
-        // What `main` does on the way out, which this exit skips.
-        crate::tools::bash::kill_all();
-        std::process::exit(0);
-    });
 }
 
 /// The session thread's side: the session and what it serves it to.
@@ -731,7 +537,7 @@ impl Server {
             // Answered before the reader thread is let go (it needs this
             // lock), so the handshake's result precedes the answer to
             // anything sent behind it.
-            self.shared.respond(id, result);
+            self.shared.wire.respond(id, result);
         }
         self.ready = true;
         self.shared.started.notify_all();
@@ -809,7 +615,7 @@ impl Server {
         if !undelivered.is_empty() {
             ended["undelivered"] = Value::from(undelivered);
         }
-        self.shared.notify("turn/ended", ended);
+        self.shared.wire.notify("turn/ended", ended);
     }
 
     /// `command/run`: a slash command, with its output as `event/info`. What
@@ -836,7 +642,7 @@ impl Server {
             Dispatch::Config => json!({ "handled": false, "kind": "config" }),
         };
         self.release();
-        self.shared.respond(id, result);
+        self.shared.wire.respond(id, result);
     }
 
     /// `shutdown`: whether to leave. Exiting ends claude and the background
@@ -853,10 +659,10 @@ impl Server {
                 ),
                 data: Some(json!({ "background": background })),
             };
-            self.shared.fail(id, failure);
+            self.shared.wire.fail(id, failure);
             return false;
         }
-        self.shared.respond(id, json!({}));
+        self.shared.wire.respond(id, json!({}));
         true
     }
 }
@@ -900,12 +706,12 @@ impl<'a> ServeUi<'a> {
         match self.scope {
             Scope::Turn(turn) => {
                 params["turn"] = Value::from(turn);
-                self.shared.notify(&format!("event/{kind}"), params);
+                self.shared.wire.notify(&format!("event/{kind}"), params);
             }
-            Scope::Command => self.shared.notify(&format!("event/{kind}"), params),
+            Scope::Command => self.shared.wire.notify(&format!("event/{kind}"), params),
             Scope::Idle => {
                 params["kind"] = Value::from(kind);
-                self.shared.notify("event/idle", params);
+                self.shared.wire.notify("event/idle", params);
             }
         }
     }
@@ -919,41 +725,35 @@ impl<'a> ServeUi<'a> {
         if let Scope::Turn(turn) = self.scope {
             params["turn"] = Value::from(turn);
         }
-        let id = shared.next_request.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel();
-        lock(&shared.pending).insert(id, tx);
-        // Checked once the request is registered: an interrupt either finds
-        // it there and cancels it, or came first and is seen here.
-        if shared.closed.load(Ordering::Relaxed) || self.interrupted() {
-            lock(&shared.pending).remove(&id);
-            return Reply::Cancelled(Why::Interrupted);
-        }
-        shared.write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-        let reply = match shared.approval_timeout {
-            Some(limit) => rx
-                .recv_timeout(limit)
-                .unwrap_or(Reply::Cancelled(Why::Timeout)),
-            None => rx.recv().unwrap_or(Reply::Cancelled(Why::Interrupted)),
-        };
-        lock(&shared.pending).remove(&id);
-        if let Reply::Cancelled(why) = &reply {
-            shared.notify(
+        let timeout = shared.approval_timeout;
+        let (id, reply) = shared
+            .wire
+            .call(method, params, Asked::Turn, timeout, || self.interrupted());
+        if let (Some(id), Reply::Cancelled(why)) = (id, &reply) {
+            shared.wire.notify(
                 "request/cancelled",
                 json!({ "id": id, "reason": why.name() }),
             );
         }
         reply
     }
+}
 
-    /// The `ask` rule that makes this call prompt, if it is a rule that
-    /// does (rather than the tool's own default, or the mode).
-    fn asking_rule(&self, tool: &str, arguments: &str) -> Option<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-        let verdict = Policy::load(&self.permissions).decide(tool, &args, &self.shared.cwd);
-        match verdict.decision {
-            Decision::Ask => verdict.by.map(|by| by.rule),
-            _ => None,
-        }
+/// The `ask` rule that makes this call prompt, if it is a rule that does
+/// (rather than the tool's own default, or the mode). An interface tells
+/// the user which, and knows not to offer "always": an allow rule saved
+/// from the prompt would lose to the rule that asks.
+pub(crate) fn asking_rule(
+    permissions: &Permissions,
+    cwd: &Path,
+    tool: &str,
+    arguments: &str,
+) -> Option<String> {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let verdict = Policy::load(permissions).decide(tool, &args, cwd);
+    match verdict.decision {
+        Decision::Ask => verdict.by.map(|by| by.rule),
+        _ => None,
     }
 }
 
@@ -998,7 +798,7 @@ impl Ui for ServeUi<'_> {
             "arguments": events::arguments(arguments),
             "risk": crate::risk::signals(tool, arguments),
         });
-        if let Some(rule) = self.asking_rule(tool, arguments) {
+        if let Some(rule) = asking_rule(&self.permissions, &self.shared.cwd, tool, arguments) {
             params["rule"] = Value::from(rule);
         }
         match self.request("approval/request", params) {
@@ -1014,7 +814,7 @@ impl Ui for ServeUi<'_> {
                     Approval::Deny
                 }
             },
-            Reply::Error | Reply::Cancelled(_) => Approval::Deny,
+            Reply::Error(_) | Reply::Cancelled(_) => Approval::Deny,
         }
     }
 
@@ -1033,7 +833,7 @@ impl Ui for ServeUi<'_> {
                 }
             },
             Reply::Cancelled(Why::Interrupted) => Some(Answer::Declined),
-            Reply::Error | Reply::Cancelled(Why::Timeout) => None,
+            Reply::Error(_) | Reply::Cancelled(Why::Timeout) => None,
         }
     }
 

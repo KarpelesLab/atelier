@@ -9,9 +9,13 @@
 //!
 //! Supported keywords: `type` (a name or a list of names), `properties`,
 //! `required`, `additionalProperties` (`false` or a schema), `items`, `enum`
-//! and `const`, nested to any depth, plus the boolean schemas `true`/`false`.
-//! Every other keyword (`pattern`, `minimum`, `$ref`, `oneOf`, …) is ignored:
-//! a value is never rejected on account of a rule this validator doesn't
+//! and `const`, nested to any depth, plus the boolean schemas `true`/`false`;
+//! and what a schema with named, shared parts is built of — `$ref` to a
+//! place in the same document (`#/$defs/Name`), `allOf`, `anyOf`, `oneOf`
+//! and `not`. Those are what the Agent Client Protocol's published schema
+//! needs, which the tests of `atelier acp` hold every message to.
+//! Every other keyword (`pattern`, `minimum`, `format`, …) is ignored: a
+//! value is never rejected on account of a rule this validator doesn't
 //! know, so an unsupported schema is checked loosely rather than refused.
 
 use serde_json::Value;
@@ -20,10 +24,12 @@ use serde_json::Value;
 /// is (`$` is the root, `$.items[2].name` a path into it) and what was
 /// expected — worded for the model that has to fix it.
 pub fn validate(schema: &Value, value: &Value) -> Result<(), String> {
-    check(schema, value, "$")
+    check(schema, schema, value, "$")
 }
 
-fn check(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+/// `root` is the whole document, which a `$ref` points into; `schema` is
+/// the part of it `value` is held to.
+fn check(root: &Value, schema: &Value, value: &Value, path: &str) -> Result<(), String> {
     let schema = match schema {
         Value::Bool(true) => return Ok(()),
         Value::Bool(false) => return Err(format!("{path}: no value is allowed here")),
@@ -31,6 +37,49 @@ fn check(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
         // Not a schema at all; nothing to hold the value to.
         _ => return Ok(()),
     };
+
+    // A reference stands for the schema it names; the keywords next to it
+    // apply as well. One that points nowhere (or outside the document) is a
+    // rule this validator can't know: it doesn't reject.
+    if let Some(target) = schema.get("$ref").and_then(Value::as_str)
+        && let Some(target) = target.strip_prefix('#').and_then(|p| root.pointer(p))
+    {
+        check(root, target, value, path)?;
+    }
+    let list = |keyword: &str| schema.get(keyword).and_then(Value::as_array);
+    for sub in list("allOf").into_iter().flatten() {
+        check(root, sub, value, path)?;
+    }
+    for (keyword, exactly_one) in [("anyOf", false), ("oneOf", true)] {
+        let Some(alternatives) = list(keyword) else {
+            continue;
+        };
+        let results: Vec<Result<(), String>> = alternatives
+            .iter()
+            .map(|sub| check(root, sub, value, path))
+            .collect();
+        let matched = results.iter().filter(|r| r.is_ok()).count();
+        if matched == 0 {
+            // Each alternative's own complaint, so the one that was meant
+            // can be told from the rest.
+            let why: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+            return Err(format!(
+                "{path}: matches none of the {} alternatives of {keyword} ({})",
+                why.len(),
+                why.join("; ")
+            ));
+        }
+        if exactly_one && matched > 1 {
+            return Err(format!(
+                "{path}: matches {matched} alternatives of oneOf, must match exactly one"
+            ));
+        }
+    }
+    if let Some(sub) = schema.get("not")
+        && check(root, sub, value, path).is_ok()
+    {
+        return Err(format!("{path}: matches a schema it must not (not)"));
+    }
 
     if let Some(t) = schema.get("type") {
         let wanted: Vec<&str> = match t {
@@ -72,13 +121,13 @@ fn check(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
         for (name, v) in obj {
             let at = format!("{path}.{name}");
             match props.and_then(|p| p.get(name)) {
-                Some(sub) => check(sub, v, &at)?,
+                Some(sub) => check(root, sub, v, &at)?,
                 // Not a declared property: `additionalProperties` decides.
                 None => match schema.get("additionalProperties") {
                     Some(Value::Bool(false)) => {
                         return Err(format!("{path}: unexpected property \"{name}\""));
                     }
-                    Some(extra) => check(extra, v, &at)?,
+                    Some(extra) => check(root, extra, v, &at)?,
                     None => {}
                 },
             }
@@ -87,7 +136,7 @@ fn check(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
 
     if let (Value::Array(items), Some(sub)) = (value, schema.get("items")) {
         for (i, v) in items.iter().enumerate() {
-            check(sub, v, &format!("{path}[{i}]"))?;
+            check(root, sub, v, &format!("{path}[{i}]"))?;
         }
     }
 
@@ -243,6 +292,63 @@ mod tests {
             validate(&json!({"const": "v1"}), &json!("v2")).unwrap_err(),
             "$: must be \"v1\""
         );
+    }
+
+    #[test]
+    fn references_and_combinators() {
+        let s = json!({
+            "$defs": {
+                "Text": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"]
+                },
+                "Block": {
+                    "oneOf": [
+                        {
+                            "properties": {"type": {"const": "text"}},
+                            "required": ["type"],
+                            "allOf": [{"$ref": "#/$defs/Text"}]
+                        },
+                        {"properties": {"type": {"const": "rule"}}, "required": ["type"]}
+                    ]
+                },
+                "Id": {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+            },
+            "type": "object",
+            "properties": {
+                "id": {"$ref": "#/$defs/Id"},
+                "block": {"$ref": "#/$defs/Block"},
+                "free": {"not": {"type": "null"}}
+            }
+        });
+        assert!(
+            validate(
+                &s,
+                &json!({"id": 1, "block": {"type": "text", "text": "x"}})
+            )
+            .is_ok()
+        );
+        assert!(validate(&s, &json!({"id": "a", "block": {"type": "rule"}})).is_ok());
+        let wrong_id = validate(&s, &json!({"id": 1.5})).unwrap_err();
+        assert!(wrong_id.starts_with("$.id: matches none of the 2 alternatives of anyOf"));
+        // The alternative that was meant says what is missing.
+        let no_text = validate(&s, &json!({"block": {"type": "text"}})).unwrap_err();
+        assert!(no_text.contains("$.block: missing required property \"text\""));
+        assert_eq!(
+            validate(&s, &json!({"free": null})).unwrap_err(),
+            "$.free: matches a schema it must not (not)"
+        );
+        // `oneOf` is exactly one.
+        let both = json!({"oneOf": [{"type": "integer"}, {"type": "number"}]});
+        assert!(validate(&both, &json!(1.5)).is_ok());
+        assert!(
+            validate(&both, &json!(1))
+                .unwrap_err()
+                .contains("exactly one")
+        );
+        // A reference to nowhere is not a reason to reject.
+        assert!(validate(&json!({"$ref": "#/$defs/Missing"}), &json!(1)).is_ok());
     }
 
     #[test]

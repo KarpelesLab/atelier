@@ -21,6 +21,7 @@
 
 mod batch;
 mod compact;
+mod embed;
 mod goal;
 mod idle;
 mod init;
@@ -2652,6 +2653,7 @@ pub(crate) fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
         name: cfg.name.clone(),
         command: cfg.command.clone(),
         args: cfg.args.clone(),
+        env: Vec::new(),
         options: to_options(&cfg.options),
     }
 }

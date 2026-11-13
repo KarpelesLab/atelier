@@ -13,7 +13,7 @@
 //! runs on a session (`review`, `debug prompt`) are recognized by [`subcommand`]; their
 //! arguments are their own, parsed by the module that implements them.
 //! `serve` is one more exception: it runs a session, so it takes the
-//! session's flags and is parsed here.
+//! session's flags and is parsed here. So is `acp`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -31,6 +31,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier debug prompt [prompt...]
        atelier doctor [--json] [--offline] [--mcp]
        atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS]
+       atelier acp [--claude] [--mode MODE] [--max-turns N]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
@@ -58,6 +59,9 @@ serve: the session as JSON-RPC 2.0 on stdin/stdout, for a program to drive
       --approval-timeout N   seconds an approval or a question waits for the
                              client's answer before it counts as a refusal
 
+acp: the Agent Client Protocol on stdin/stdout, for an editor to launch
+      --max-turns N          stop a prompt after N model requests
+
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
              4 answer failed --output-schema, 6 --goal not met in its bounds
 
@@ -81,6 +85,9 @@ pub struct Cli {
     /// `serve` as the first argument: speak the embedding protocol on
     /// stdin/stdout (see `serve`) instead of the interactive interface.
     pub serve: Option<crate::serve::Options>,
+    /// `acp` as the first argument: speak the Agent Client Protocol on
+    /// stdin/stdout (see `acp`) instead of the interactive interface.
+    pub acp: Option<crate::acp::Options>,
 }
 
 /// Parse the arguments after the program name. The error is the message for
@@ -102,7 +109,9 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     // `serve` is a mode of the session like `--print`, so it shares the
     // session's flags; as a subcommand it comes first.
     let serve = args.first().map(String::as_str) == Some("serve");
-    let mut it = args[usize::from(serve)..].iter().map(String::as_str);
+    // So is `acp`, the same session under another protocol.
+    let acp = args.first().map(String::as_str) == Some("acp");
+    let mut it = args[usize::from(serve || acp)..].iter().map(String::as_str);
     while let Some(arg) = it.next() {
         if arg == "--" {
             // Everything after is the prompt, dashes and all.
@@ -145,7 +154,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let headless_only = [
         ("--output-format", output.is_some()),
         ("--input-format", input.is_some()),
-        ("--max-turns", max_turns.is_some()),
+        // A bound on a prompt, which an editor's session has too.
+        ("--max-turns", max_turns.is_some() && !acp),
         ("--output-schema", schema.is_some()),
         ("--goal", goal.is_some()),
     ];
@@ -160,6 +170,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     }
     if serve && let Some(word) = words.first() {
         return Err(format!("serve takes no argument '{word}'"));
+    }
+    if acp && print {
+        return Err("acp and --print are two ways to run; pick one".to_string());
+    }
+    // The editor starts sessions, each in a directory it names; there is no
+    // "this directory's saved session" to resume before it has.
+    if acp && resume {
+        return Err(
+            "--continue does not apply with acp: the editor starts the session".to_string(),
+        );
+    }
+    if acp && let Some(word) = words.first() {
+        return Err(format!("acp takes no argument '{word}'"));
     }
     let input = input.unwrap_or(InputFormat::Text);
     if print && input == InputFormat::StreamJson && !words.is_empty() {
@@ -185,6 +208,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         serve: serve.then(|| crate::serve::Options {
             approval_timeout: approval_timeout.map(|secs| Duration::from_secs(secs.into())),
         }),
+        acp: acp.then_some(crate::acp::Options { max_turns }),
     })
 }
 
@@ -339,6 +363,26 @@ mod tests {
         // A misspelt mode stops the run rather than falling back to another.
         assert!(parse_err(&["--mode", "pln"]).contains("unknown mode 'pln'"));
         assert_eq!(parse_err(&["--mode"]), "--mode needs a value");
+    }
+
+    #[test]
+    fn acp_is_a_subcommand_with_its_own_few_flags() {
+        assert_eq!(parse_ok(&[]).acp, None);
+        let cli = parse_ok(&["acp", "--mode", "plan", "--claude", "--max-turns", "5"]);
+        assert!(cli.claude && cli.print.is_none() && cli.serve.is_none());
+        assert_eq!(cli.mode, Some(Mode::Plan));
+        assert_eq!(cli.acp.unwrap().max_turns, Some(5));
+        assert_eq!(parse_ok(&["acp"]).acp.unwrap().max_turns, None);
+        // Only as the first argument, and not with what belongs to the
+        // other ways of running.
+        assert_eq!(parse_ok(&["--claude", "acp"]).acp, None);
+        assert!(parse_err(&["acp", "--continue"]).contains("--continue does not apply"));
+        assert!(parse_err(&["acp", "-p", "hi"]).contains("pick one"));
+        assert_eq!(parse_err(&["acp", "now"]), "acp takes no argument 'now'");
+        assert!(parse_err(&["acp", "--approval-timeout", "3"]).contains("only applies with serve"));
+        assert!(
+            parse_err(&["acp", "--output-format", "json"]).contains("only applies with --print")
+        );
     }
 
     #[test]
