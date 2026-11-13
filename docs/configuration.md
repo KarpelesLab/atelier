@@ -74,7 +74,7 @@ stderr.
 the tables that run commands or grant access — `[[mcp]]`, `[[mcp_http]]`,
 `[[diagnostics]]` (and auto-detected checkers), `[[provider]]`,
 `[permissions] allow`, a `yolo` default, `[[hooks]]`, `[search] key_env` and
-`url` —
+`url`, `[sandbox] enabled` —
 take effect only once you have accepted them for the project with `/trust`
 (or `atelier trust accept`; `ATELIER_TRUST_PROJECT=1` for one run). See
 [Project trust](trust.md). Your user-global file is never gated.
@@ -664,7 +664,7 @@ memory_mb = 4096
 
 | Field       | Type    | Meaning |
 |-------------|---------|---------|
-| `enabled`   | bool    | Route foreground `bash` commands through the sandbox. The project's file wins over the user-global one; `ATELIER_SANDBOX` wins over both |
+| `enabled`   | bool    | Route foreground `bash` commands through the sandbox. The project's file wins over the user-global one — once the project is [trusted](trust.md), not before; `ATELIER_SANDBOX` wins over both |
 | `root`      | string  | The guest's root filesystem. **User-global file only** — in a project's `atelier.toml` it is ignored, since it decides what of the host the guest can read. Default `$XDG_DATA_HOME/atelier/sandbox/rootfs`; `ATELIER_SANDBOX_ROOT` wins |
 | `memory_mb` | integer | Guest RAM ceiling in MiB (default 4096) |
 | `network`   | array   | Reserved for an allowlist of hosts. Not implemented: the guest has no network, and `atelier sandbox status` says a list here is ignored |

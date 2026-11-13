@@ -57,7 +57,10 @@ and [what nixvm needs next](#what-nixvm-needs-next) for where this is going.
    ```
 
    or `ATELIER_SANDBOX=1` (`0` turns it off whatever the files say).
-   `ATELIER_SANDBOX_INTERP=1` forces nixvm's software CPU.
+   `ATELIER_SANDBOX_INTERP=1` forces nixvm's software CPU. In a project's
+   `atelier.toml` the switch is a [gated setting](trust.md): it counts —
+   on or off — once you have accepted it with `/trust`, so a repository
+   cannot switch your sandbox off, or stop `bash` from asking, by itself.
 
 `atelier sandbox status` says what will happen in the current directory —
 whether it is on, which root, which CPU backend, what is read-only — and

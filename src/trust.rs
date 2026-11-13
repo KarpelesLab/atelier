@@ -18,7 +18,9 @@
 //! - `[[hooks]]`: commands run on lifecycle events;
 //! - `[search] key_env` and `url`: an environment variable sent to a search
 //!   endpoint, and the endpoint itself — which is also sent the key the
-//!   user's own environment holds (`ATELIER_SEARCH_KEY`), and the queries.
+//!   user's own environment holds (`ATELIER_SEARCH_KEY`), and the queries;
+//! - `[sandbox] enabled`: on, sandboxed `bash` commands stop asking; off, a
+//!   sandbox the user switched on in their own file is switched off.
 //!
 //! Everything else in the file applies as before, and so do `deny` and `ask`
 //! rules and the stricter modes: they only restrict. The user-global file is
@@ -198,6 +200,7 @@ enum Kind {
     Yolo,
     Hook,
     Search,
+    Sandbox,
 }
 
 impl Kind {
@@ -213,6 +216,7 @@ impl Kind {
             Kind::Yolo => "yolo",
             Kind::Hook => "hooks",
             Kind::Search => "search",
+            Kind::Sandbox => "sandbox",
         }
     }
 
@@ -227,6 +231,7 @@ impl Kind {
             Kind::Yolo => return "the yolo mode default".to_string(),
             Kind::Hook => ("hook", "hooks"),
             Kind::Search => return "the search endpoint and key".to_string(),
+            Kind::Sandbox => return "the sandbox switch".to_string(),
         };
         format!("{n} {}", if n == 1 { one } else { many })
     }
@@ -428,6 +433,21 @@ fn items(root: &Path, settings: &Settings) -> Vec<Item> {
             line,
         );
     }
+    // Either way it is a say over the `bash` tool: on, the commands the
+    // sandbox can run stop asking; off, a sandbox the user turned on for
+    // themselves is taken away and commands run on the host.
+    if let Some(on) = settings.sandbox.enabled {
+        let line = match on {
+            true => {
+                "[sandbox] turns the bash sandbox on: commands it runs there are not asked about"
+            }
+            false => {
+                "[sandbox] turns the bash sandbox off here, even if you have it on: commands \
+                 run on the host"
+            }
+        };
+        add(Kind::Sandbox, json!(on), line.to_string());
+    }
     out
 }
 
@@ -568,6 +588,9 @@ impl Trust {
         // The endpoint too: the user's own `ATELIER_SEARCH_KEY` would be
         // sent to it. The provider's name stays, with its real endpoint.
         s.search.url = None;
+        // Whether `bash` is sandboxed is then the user's to say (their own
+        // file, `ATELIER_SANDBOX`).
+        s.sandbox.enabled = None;
         // Without its providers, a model addressed on one of them would be
         // sent to the default endpoint under a name it doesn't know; such
         // choices fall back like unset ones, so the session still talks.
@@ -1097,6 +1120,40 @@ key_env = "GITHUB_TOKEN"
         let search = trust.effective(&settings(endpoint)).search;
         assert_eq!(search.url, None);
         assert_eq!(search.provider.as_deref(), Some("brave"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `[sandbox] enabled` decides whether `bash` asks (on) and whether the
+    /// user's own sandbox holds (off): gated both ways, the rest is not.
+    #[test]
+    fn the_sandbox_switch_is_gated_in_both_directions() {
+        let root = dir("sandbox");
+        for (on, word) in [(true, "sandbox on"), (false, "sandbox off")] {
+            let s = settings(&format!("[sandbox]\nenabled = {on}\nmemory_mb = 512\n"));
+            let list = items(&root, &s);
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].kind, Kind::Sandbox);
+            assert!(list[0].line.contains(word), "{}", list[0].line);
+
+            let untrusted = Trust::load(&root, &s, Store::default());
+            assert_eq!(untrusted.state(), State::Untrusted);
+            let sandbox = untrusted.effective(&s).sandbox;
+            assert_eq!(sandbox.enabled, None);
+            assert_eq!(sandbox.memory_mb, Some(512));
+
+            let accepted = Store {
+                accept_all: true,
+                ..Store::default()
+            };
+            let trusted = Trust::load(&root, &s, accepted);
+            assert_eq!(trusted.effective(&s).sandbox.enabled, Some(on));
+        }
+        assert_ne!(
+            hash(&root, "[sandbox]\nenabled = true\n"),
+            hash(&root, "[sandbox]\nenabled = false\n")
+        );
+        // A table that does not touch the switch needs no decision.
+        assert!(hash(&root, "[sandbox]\nmemory_mb = 512\n").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

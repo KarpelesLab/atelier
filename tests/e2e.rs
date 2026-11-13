@@ -4209,6 +4209,8 @@ fn sandboxed_bash_runs_unasked_while_rules_and_the_host_still_ask() {
         &[
             ("ATELIER_APPROVE", "no"),
             ("ATELIER_SANDBOX_ROOT", rootfs.to_str().unwrap()),
+            // The project's `[sandbox] enabled` counts once it is trusted.
+            ("ATELIER_TRUST_PROJECT", "1"),
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{out:?}");
@@ -4249,6 +4251,53 @@ fn sandboxed_bash_runs_unasked_while_rules_and_the_host_still_ask() {
         description.contains("Commands run in a sandbox"),
         "{description}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sandbox × project trust — `[sandbox] enabled` in a project's file is a
+/// say over the `bash` tool (on: sandboxed commands stop asking; off: the
+/// user's own sandbox is taken away), so it waits for trust like the other
+/// gated settings. Seen through `atelier sandbox status`, in any build: an
+/// untrusted project's switch leaves the sandbox off and says why; trusted,
+/// it is acted on (here it can't run — no root filesystem — which is the
+/// point: it was asked for).
+#[test]
+fn a_projects_sandbox_switch_waits_for_trust() {
+    let dir = unique_dir("sandbox-trust");
+    std::fs::write(dir.join("atelier.toml"), "[sandbox]\nenabled = true\n").unwrap();
+    let status = |env: &[(&str, &str)]| {
+        let mut cmd = atelier("http://127.0.0.1:9/v1", &dir);
+        cmd.args(["sandbox", "status"])
+            .env_remove("ATELIER_SANDBOX")
+            .env_remove("ATELIER_SANDBOX_ROOT")
+            .envs(env.iter().copied());
+        let out = finish(cmd, None);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let untrusted = status(&[]);
+    assert!(untrusted.contains("sandbox: off"), "{untrusted}");
+    assert!(
+        untrusted.contains("`[sandbox] enabled` is not in effect"),
+        "{untrusted}"
+    );
+
+    let trusted = status(&[("ATELIER_TRUST_PROJECT", "1")]);
+    assert!(!trusted.contains("sandbox: off"), "{trusted}");
+    assert!(!trusted.contains("not in effect"), "{trusted}");
+    assert!(trusted.contains("unavailable"), "{trusted}");
+
+    // The trust notice names it.
+    let out = Command::new(env!("CARGO_BIN_EXE_atelier"))
+        .args(["trust", "status"])
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.with_extension("state"))
+        .env("HOME", dir.with_extension("home"))
+        .env_remove("ATELIER_TRUST_PROJECT")
+        .output()
+        .expect("run atelier trust status");
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(listed.contains("turns the bash sandbox on"), "{listed}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

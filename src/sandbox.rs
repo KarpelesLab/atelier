@@ -106,16 +106,28 @@ pub fn state(project_root: &Path) -> State {
     }
     #[cfg(not(test))]
     {
-        let project = Settings::load(project_root)
-            .map(|s| s.sandbox)
-            .unwrap_or_default();
         resolve(
             &|key| std::env::var(key).ok(),
-            &project,
+            &project_settings(project_root, crate::trust::Store::from_env()),
             &user_settings(),
             default_rootfs(),
         )
     }
+}
+
+/// `[sandbox]` of the project's `atelier.toml`, as it may be acted on: its
+/// `enabled` counts only in a project the user has trusted (see
+/// [`crate::trust`]). Switching the sandbox on stops `bash` from asking;
+/// switching it off undoes a sandbox the user turned on for themselves —
+/// neither is for a file that came with the repository to decide.
+///
+/// The file is judged as it is on disk now, not as the session loaded it:
+/// an edit made since (the agent's file tools can write `atelier.toml`)
+/// changes the hash, and is not in effect until it has been accepted.
+fn project_settings(project_root: &Path, store: crate::trust::Store) -> SandboxSettings {
+    let settings = Settings::load(project_root).unwrap_or_default();
+    let trust = crate::trust::Trust::load(project_root, &settings, store);
+    trust.effective(&settings).sandbox
 }
 
 /// `[sandbox]` of the user-global `atelier.toml`.
@@ -692,6 +704,15 @@ pub fn run_command(args: &[String]) -> Result<u8> {
 /// What `atelier sandbox status` prints.
 fn status_lines(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
+    let written = Settings::load(root).map(|s| s.sandbox.enabled);
+    let store = crate::trust::Store::from_env();
+    if matches!(written, Ok(Some(_))) && project_settings(root, store).enabled.is_none() {
+        out.push(
+            "note: this project's `[sandbox] enabled` is not in effect — the project is not \
+             trusted (/trust, or `atelier trust accept`)"
+                .to_string(),
+        );
+    }
     match state(root) {
         State::Off => out.push(
             "sandbox: off (`[sandbox] enabled = true` in atelier.toml, or ATELIER_SANDBOX=1)"
@@ -1346,6 +1367,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve(&env(&[]), &off, &on(), None), State::Off);
+    }
+
+    /// The project's switch is read through project trust, from the file
+    /// as it is on disk: untrusted it says nothing (the user's file and
+    /// the environment decide), accepted it counts, and an edit made after
+    /// that — the agent's file tools can write `atelier.toml` — is not in
+    /// effect until it has been accepted in its turn.
+    #[test]
+    fn the_projects_switch_counts_only_as_it_was_trusted() {
+        use crate::trust::{Store, Trust, testing::dir};
+        let root = dir("sbx-project");
+        let state = dir("sbx-state");
+        let store = Store {
+            file: Some(state.join("trust.json")),
+            ..Store::default()
+        };
+        let file = root.join(crate::settings::FILE_NAME);
+        std::fs::write(&file, "[sandbox]\nenabled = false\nmemory_mb = 512\n").unwrap();
+        let read = project_settings(&root, store.clone());
+        assert_eq!(read.enabled, None);
+        assert_eq!(read.memory_mb, Some(512));
+        // With the user's sandbox on, the untrusted file does not turn it
+        // off (in a build without the sandbox: asked for, not `Off`).
+        assert_ne!(resolve(&env(&[]), &read, &on(), None), State::Off);
+
+        let settings = Settings::load(&root).unwrap();
+        let trust = Trust::load(&root, &settings, store.clone());
+        trust.accept(&settings).unwrap();
+        assert_eq!(project_settings(&root, store.clone()).enabled, Some(false));
+
+        std::fs::write(&file, "[sandbox]\nenabled = true\n").unwrap();
+        assert_eq!(project_settings(&root, store).enabled, None);
+        for dir in [root, state] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[cfg(not(sandbox))]
