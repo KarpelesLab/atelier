@@ -699,6 +699,10 @@ impl Session {
             child.set_model(model);
         }
         child.review_enabled = false;
+        // The parent's mode as it is now (`/mode`, `--mode`), not the
+        // configured default: the parent judges the child's calls by it, and
+        // a child in plan mode should be told so rather than find out.
+        child.mode = self.mode;
         child.max_steps = Some(agent.max_steps);
         child.child = Some(Child {
             system: format!("{}\n\n{SUBAGENT_NOTE}", agent.prompt),

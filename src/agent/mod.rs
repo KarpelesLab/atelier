@@ -1709,7 +1709,12 @@ impl Session {
             if completion.tool_calls.is_empty() {
                 ui.turn_end();
                 self.collect_reviews(ui);
-                self.maybe_compact(ui);
+                // A subagent's or a standalone run's conversation ends
+                // with this turn: summarizing it would be a model request
+                // for something about to be dropped.
+                if self.child.is_none() && self.standalone.is_none() {
+                    self.maybe_compact(ui);
+                }
                 self.persist();
                 return Ok(());
             }
