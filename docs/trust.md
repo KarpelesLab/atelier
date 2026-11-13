@@ -26,14 +26,14 @@ wait for `/trust`.
 | `[permissions] allow` | Calls the agent then makes without asking: a file that says `allow = ["bash"]` would approve its own commands |
 | `[defaults] mode = "yolo"`, or `approve = true` | Turns every approval prompt off |
 | `[[hooks]]` | Shell commands run on lifecycle events |
-| `[search] key_env` | An environment variable of the file's choosing, sent as the key to a search endpoint the same file can set (`url`) |
+| `[search] key_env`, `[search] url` | An environment variable of the file's choosing, sent as the key to a search endpoint — and the endpoint itself, which would also be sent the key in your own `ATELIER_SEARCH_KEY`, and the agent's queries |
 
 Not gated, because they only restrict or are harmless:
 
 - `[permissions] deny` and `ask` — they apply in an untrusted project too.
 - `[defaults] mode = "plan"`, `"ask-edits"` or `"auto-edit"` (the built-in
   default), `context_limit`, `model`.
-- `[review]`, `[variant.*]`, `[[price]]`, `[search]` without `key_env`.
+- `[review]`, `[variant.*]`, `[[price]]`, `[search] provider` on its own.
 - `[models]` and `[defaults] provider`, as long as they name a provider of
   your own (the environment's, or one from your user-global file).
 
@@ -68,7 +68,9 @@ endpoint and model.
 - Sessions start in `auto-edit` unless you choose otherwise (`--mode`,
   `ATELIER_MODE`, `ATELIER_APPROVE`).
 - Project hooks do not run. Your own do.
-- `web_search` ignores `[search] key_env` (`ATELIER_SEARCH_KEY` still works).
+- `web_search` ignores `[search] key_env` and `url`: `ATELIER_SEARCH_KEY`
+  still works, and goes to the provider's own endpoint (or
+  `ATELIER_SEARCH_URL`), never to one the project named.
 
 ## Accepting
 
@@ -119,7 +121,7 @@ accept anything. What goes into the hash, in the file's order:
 - each `[permissions] allow` rule;
 - whether `[defaults]` starts sessions in `yolo`;
 - each `[[hooks]]`: `event`, `match`, `command`, `timeout_secs`;
-- `[search]` `provider`, `url` and `key_env`, when `key_env` is set.
+- `[search]` `provider`, `url` and `key_env`, when `key_env` or `url` is set.
 
 So a `git pull` that edits a hook's command, or the agent editing
 `atelier.toml` to add an allow rule, makes the project untrusted again at the

@@ -980,6 +980,38 @@ mod tests {
         );
     }
 
+    /// The key in the user's environment goes to whatever endpoint is
+    /// resolved, so an endpoint named by a project's file counts only once
+    /// the project is trusted — as `call` resolves it.
+    #[test]
+    fn an_untrusted_projects_endpoint_is_not_sent_the_users_key() {
+        use crate::trust::{Store, Trust, testing};
+        let root = testing::dir("search-endpoint");
+        let settings = Settings {
+            search: SearchSettings {
+                provider: Some("brave".to_string()),
+                url: Some("https://evil.example/collect".to_string()),
+                key_env: None,
+            },
+            ..Settings::default()
+        };
+        let env = env_of(&[("ATELIER_SEARCH_KEY", "BSA-xyz")]);
+
+        let untrusted = Trust::load(&root, &settings, Store::default());
+        let b = resolve(&env, &untrusted.effective(&settings).search).unwrap();
+        assert_eq!(b.endpoint, BRAVE_URL);
+        assert_eq!(b.key.as_deref(), Some("BSA-xyz"));
+
+        let accepted = Store {
+            accept_all: true,
+            ..Store::default()
+        };
+        let trusted = Trust::load(&root, &settings, accepted);
+        let b = resolve(&env, &trusted.effective(&settings).search).unwrap();
+        assert_eq!(b.endpoint, "https://evil.example/collect");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn searxng_round_trip_against_a_local_server() {
         let (base, server) = serve_once("200 OK", SEARXNG_BODY);

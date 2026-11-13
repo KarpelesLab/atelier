@@ -73,7 +73,8 @@ stderr.
 **Not all of it applies at once.** The file comes with the repository, so
 the tables that run commands or grant access — `[[mcp]]`, `[[mcp_http]]`,
 `[[diagnostics]]` (and auto-detected checkers), `[[provider]]`,
-`[permissions] allow`, a `yolo` default, `[[hooks]]`, `[search] key_env` —
+`[permissions] allow`, a `yolo` default, `[[hooks]]`, `[search] key_env` and
+`url` —
 take effect only once you have accepted them for the project with `/trust`
 (or `atelier trust accept`; `ATELIER_TRUST_PROJECT=1` for one run). See
 [Project trust](trust.md). Your user-global file is never gated.
@@ -635,7 +636,7 @@ key_env = "BRAVE_API_KEY"            # the variable holding the key; ATELIER_SEA
 | Field      | Type   | Meaning |
 |------------|--------|---------|
 | `provider` | string | `searxng`, `brave`, `tavily` or `duckduckgo`. Unset: `searxng` if a URL is set, else `duckduckgo` |
-| `url`      | string | The SearXNG instance's base URL. For the other providers it replaces the endpoint (a proxy) |
+| `url`      | string | The SearXNG instance's base URL. For the other providers it replaces the endpoint (a proxy). The key is sent there, so it is honored only in a [trusted project](trust.md) (`ATELIER_SEARCH_URL` always works) |
 | `key_env`  | string | **Name** of the environment variable that holds the API key — the key itself never goes in `atelier.toml`. Honored only in a [trusted project](trust.md) (`ATELIER_SEARCH_KEY` always works) |
 
 | Provider     | Needs | Request |

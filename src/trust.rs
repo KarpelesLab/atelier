@@ -16,7 +16,9 @@
 //! - `[permissions] allow`: calls the agent makes without asking;
 //! - `[defaults] mode = "yolo"` (or `approve = true`): no asking at all;
 //! - `[[hooks]]`: commands run on lifecycle events;
-//! - `[search] key_env`: an environment variable sent to a search endpoint.
+//! - `[search] key_env` and `url`: an environment variable sent to a search
+//!   endpoint, and the endpoint itself — which is also sent the key the
+//!   user's own environment holds (`ATELIER_SEARCH_KEY`), and the queries.
 //!
 //! Everything else in the file applies as before, and so do `deny` and `ask`
 //! rules and the stricter modes: they only restrict. The user-global file is
@@ -224,7 +226,7 @@ impl Kind {
             Kind::Allow => ("allow rule", "allow rules"),
             Kind::Yolo => return "the yolo mode default".to_string(),
             Kind::Hook => ("hook", "hooks"),
-            Kind::Search => return "the search key".to_string(),
+            Kind::Search => return "the search endpoint and key".to_string(),
         };
         format!("{n} {}", if n == 1 { one } else { many })
     }
@@ -403,14 +405,27 @@ fn items(root: &Path, settings: &Settings) -> Vec<Item> {
             format!("hook on {on}: {}", h.command),
         );
     }
-    if let Some(var) = &settings.search.key_env {
-        let to = (settings.search.url.as_deref())
-            .or(settings.search.provider.as_deref())
+    // A key goes to the endpoint whether the file names the variable
+    // (`key_env`) or the user's environment holds one (`ATELIER_SEARCH_KEY`),
+    // so an endpoint of the file's choosing is gated with or without
+    // `key_env`. (Hashed as it was when only `key_env` was: a project
+    // trusted with one is not asked again.)
+    let search = &settings.search;
+    if search.key_env.is_some() || search.url.is_some() {
+        let to = (search.url.as_deref())
+            .or(search.provider.as_deref())
             .unwrap_or("the search provider");
+        let line = match &search.key_env {
+            Some(var) => format!("web search: sends ${var} as the key to {to}"),
+            None => format!(
+                "web search: sends the queries, and the key in $ATELIER_SEARCH_KEY if you \
+                 have one set, to {to}"
+            ),
+        };
         add(
             Kind::Search,
-            json!([settings.search.provider, settings.search.url, var]),
-            format!("web search: sends ${var} as the key to {to}"),
+            json!([search.provider, search.url, search.key_env]),
+            line,
         );
     }
     out
@@ -550,6 +565,9 @@ impl Trust {
             s.defaults.approve = None;
         }
         s.search.key_env = None;
+        // The endpoint too: the user's own `ATELIER_SEARCH_KEY` would be
+        // sent to it. The provider's name stays, with its real endpoint.
+        s.search.url = None;
         // Without its providers, a model addressed on one of them would be
         // sent to the default endpoint under a name it doesn't know; such
         // choices fall back like unset ones, so the session still talks.
@@ -1061,8 +1079,24 @@ key_env = "GITHUB_TOKEN"
         assert!(hash(&root, "[defaults]\napprove = true\n").is_some());
         assert!(hash(&root, "[defaults]\napprove = true\nmode = \"plan\"\n").is_none());
         assert!(hash(&root, "[defaults]\nmode = \"auto-edit\"\n").is_none());
-        // A search provider without a key variable sends nothing.
-        assert!(hash(&root, "[search]\nurl = \"https://x.example\"\n").is_none());
+        // A search provider named without an endpoint or a key variable
+        // sends nothing anywhere new; an endpoint alone is gated, since the
+        // key in the user's own environment would be sent to it.
+        assert!(hash(&root, "[search]\nprovider = \"brave\"\n").is_none());
+        let endpoint = "[search]\nprovider = \"brave\"\nurl = \"https://x.example\"\n";
+        let list = items(&root, &settings(endpoint));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, Kind::Search);
+        assert!(
+            list[0].line.contains("$ATELIER_SEARCH_KEY") && list[0].line.contains("x.example"),
+            "{}",
+            list[0].line
+        );
+        let trust = Trust::load(&root, &settings(endpoint), Store::default());
+        assert_eq!(trust.state(), State::Untrusted);
+        let search = trust.effective(&settings(endpoint)).search;
+        assert_eq!(search.url, None);
+        assert_eq!(search.provider.as_deref(), Some("brave"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
