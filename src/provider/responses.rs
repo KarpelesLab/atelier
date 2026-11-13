@@ -86,7 +86,7 @@ pub fn stream_responses(
     let reader = super::send_reader_retrying(&url, &body_bytes, Some(access_token))?;
     let status = reader.status();
     if !(200..300).contains(&status) {
-        bail!("provider returned HTTP {status}");
+        return Err(super::HttpError::read(status, reader).into());
     }
 
     let mut accum = ResponsesAccum::default();

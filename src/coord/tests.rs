@@ -90,6 +90,8 @@ fn instances_see_and_message_each_other() {
         client(&dir.0, "o ther"),
     );
     wait_for("three instances", || names(&a).len() == 3);
+    // Listed is not yet "has read its own name": wait for each to be linked.
+    wait_for("b and c linked", || b.list().is_ok() && c.list().is_ok());
 
     // Names are made unique and typeable; each instance knows its own.
     let mut all = names(&a);
@@ -202,7 +204,11 @@ fn instances_rejoin_a_new_coordinator() {
     let first = spawn_daemon(&dir.0, Duration::from_secs(60));
     let (a, b) = (client(&dir.0, "same"), client(&dir.0, "same"));
     wait_for("both", || names(&a).len() == 2);
+    // The coordinator lists an instance a moment before the instance itself
+    // has read which name it was given.
+    wait_for("b to know its name", || b.list().is_ok());
     let (a_name, b_name) = (a.name(), b.name());
+    assert_ne!(a_name, b_name);
     b.subscribe("news", true).unwrap();
 
     // The coordinator goes away: requests fail, saying why.
@@ -218,6 +224,7 @@ fn instances_rejoin_a_new_coordinator() {
         a.list()
             .is_ok_and(|l| l["instances"].as_array().unwrap().len() == 2)
     });
+    wait_for("b linked again", || b.list().is_ok());
     assert_eq!((a.name(), b.name()), (a_name, b_name.clone()));
     assert_eq!(a.send("#news", "back").unwrap(), 1);
     assert_eq!(next_message(&b).body, "back");

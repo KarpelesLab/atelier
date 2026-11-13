@@ -1540,3 +1540,258 @@ fn each_request_is_a_prefix_of_the_next() {
     );
     assert_eq!(user_turn("third prompt"), "third prompt");
 }
+
+/// An HTTP error response with a JSON body, as an endpoint refusing a request
+/// sends it.
+fn error_response(status: u16, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} Error\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// A streamed plain answer followed by a usage chunk reporting `total` tokens.
+fn answer_with_usage(text: &str, total: u32) -> Vec<u8> {
+    let answer = serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    let usage = serde_json::json!({"choices": [], "usage": {
+        "prompt_tokens": total, "completion_tokens": 0, "total_tokens": total,
+    }});
+    sse_response(&[&answer.to_string(), &usage.to_string()])
+}
+
+/// Case 7 — a request the endpoint refuses as too long is compacted and
+/// retried instead of failing the turn. The model reads a large file; the
+/// follow-up request is answered with a context-length error; atelier prunes
+/// the file's content down to a stub (the turn in progress can't be
+/// summarized, and nothing came before it) and sends the request again.
+#[test]
+fn a_request_rejected_as_too_long_is_compacted_and_retried() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => tool_call_response("call_1", "read", r#"{"path":"big.txt"}"#),
+        1 => error_response(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 4096 tokens.","code":"context_length_exceeded"}}"#,
+        ),
+        _ => answer_response("done"),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("overflow");
+    // Larger than the recent tail kept verbatim (a share of the default
+    // threshold), yet small enough that the tool result `--print` echoes on
+    // stderr fits the pipe `run_print` only reads at exit.
+    let big: String = (1..=400)
+        .map(|i| format!("line {i} of the big file, padded out a little\n"))
+        .collect();
+    std::fs::write(dir.join("big.txt"), big).unwrap();
+
+    let out = run_print(&mock.base_url(), &dir, "read the big file");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "tool call, refused, retried.\n stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("done"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("maximum context length is 4096 tokens")
+            && stderr.contains("compacting and retrying"),
+        "the refusal is shown: {stderr}"
+    );
+    assert!(
+        stderr.contains("compacted: pruned 1 old tool result(s) — ~"),
+        "{stderr}"
+    );
+
+    assert!(bodies[1].contains("line 200 of the big file"));
+    assert!(
+        !bodies[2].contains("line 200 of the big file"),
+        "the file's content is gone from the retried request"
+    );
+    let (refused, retried) = (messages(&bodies[1]), messages(&bodies[2]));
+    assert_eq!(refused.len(), retried.len(), "no message was dropped");
+    let result = retried.last().unwrap();
+    assert_eq!(result["role"], "tool");
+    assert_eq!(
+        result["tool_call_id"], "call_1",
+        "the call keeps its result"
+    );
+    let stub = result["content"].as_str().unwrap();
+    assert!(
+        stub.starts_with("[output of read big.txt — ") && stub.ends_with(" lines, pruned]"),
+        "{stub}"
+    );
+}
+
+/// Any other refusal still fails the turn, with what the server said.
+#[test]
+fn another_http_error_fails_the_turn_with_the_servers_message() {
+    let responder: Responder =
+        Arc::new(|_| error_response(400, r#"{"error":{"message":"unknown model 'mock'"}}"#));
+    let mock = Mock::start(responder);
+    let dir = unique_dir("http-error");
+
+    let out = run_print(&mock.base_url(), &dir, "hi");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert_eq!(mock.bodies.lock().unwrap().len(), 1, "not retried");
+    assert!(
+        stderr.contains("provider returned HTTP 400: unknown model 'mock'"),
+        "{stderr}"
+    );
+}
+
+/// Case 8 — `/compact [instructions]`. The older turn is replaced by a
+/// structured hand-off summary: the summary request asks for the fixed
+/// sections and carries the user's instructions; afterwards the summary
+/// closes the system message, the summarized turn is gone from the request,
+/// the kept turn is intact, and the next turn gets its context afresh. The
+/// summary is saved, so `--continue` picks it up.
+#[test]
+fn compact_command_replaces_older_turns_with_a_hand_off_summary() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => answer_response("the port is 8123"),
+        1 => answer_response("noted"),
+        2 => answer_response("## Goal\nHANDOFF-NOTES-77"),
+        _ => answer_response("fine"),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("compact");
+
+    let mut repl = Repl::start(&mock.base_url(), &dir, &[]);
+    repl.line("which port does it use?");
+    wait_requests(&mock, 1);
+    repl.line("second question");
+    wait_requests(&mock, 2);
+    repl.line("/compact keep the port number");
+    wait_requests(&mock, 3);
+    repl.line("third question");
+    let bodies = wait_requests(&mock, 4);
+    let (stdout, stderr) = repl.finish();
+
+    // The summary request: no tools, the hand-off sections, the transcript
+    // of the older turn only, the user's instructions.
+    let request: serde_json::Value = serde_json::from_str(&bodies[2]).unwrap();
+    assert!(request.get("tools").is_none(), "no tools to summarize with");
+    let summary_request = messages(&bodies[2]);
+    assert_eq!(summary_request.len(), 2);
+    let asked = summary_request[0]["content"].as_str().unwrap();
+    for section in [
+        "## Goal",
+        "## Decisions",
+        "## Current state",
+        "## Files touched",
+        "## Tried and failed",
+        "## Next steps",
+        "## From the user",
+    ] {
+        assert!(asked.contains(section), "{section} in: {asked}");
+    }
+    let transcript = summary_request[1]["content"].as_str().unwrap();
+    assert!(
+        transcript.contains("user: which port does it use?")
+            && transcript.contains("assistant: the port is 8123"),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("second question"),
+        "the last turn stays verbatim: {transcript}"
+    );
+    assert!(transcript.ends_with("keep the port number"), "{transcript}");
+
+    assert!(
+        stdout.contains("compacted: summarized 2 earlier message(s) — ~")
+            && stdout.contains("tokens (estimated)"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // The next request: summary at the end of the system message, the
+    // summarized turn gone, the kept one intact, context sent again.
+    let system = system_message(&bodies[3]);
+    assert!(
+        system.ends_with("Summary of earlier conversation:\n## Goal\nHANDOFF-NOTES-77"),
+        "{system}"
+    );
+    assert!(system.starts_with(&system_message(&bodies[1])));
+    let after = messages(&bodies[3]);
+    let texts: Vec<&str> = after.iter().filter_map(|m| m["content"].as_str()).collect();
+    assert_eq!(after.len(), 4, "system, kept turn, new prompt: {texts:?}");
+    assert!(!bodies[3].contains("which port does it use?"));
+    assert!(texts[1].ends_with("second question"));
+    assert_eq!(texts[2], "noted");
+    assert!(
+        texts[3].starts_with("<context>\n") && texts[3].contains("## environment"),
+        "context is sent afresh after a summary: {}",
+        texts[3]
+    );
+
+    // Saved with the session, and back with `--continue`.
+    let saved = std::fs::read_to_string(dir.join(".atelier/session.json")).unwrap();
+    assert!(saved.contains("HANDOFF-NOTES-77"), "{saved}");
+    let out = atelier(&mock.base_url(), &dir)
+        .args(["--continue", "--print", "and again"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run atelier --continue");
+    assert!(out.status.success());
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 5);
+    assert!(system_message(&bodies[4]).contains("HANDOFF-NOTES-77"));
+    assert!(bodies[4].contains("third question"));
+}
+
+/// Case 9 — automatic compaction. Once the endpoint reports a request past
+/// the threshold, the turns before the last one are summarized after the
+/// turn — but not while there is only one turn, which can't be split.
+#[test]
+fn passing_the_threshold_summarizes_older_turns_after_the_turn() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => answer_with_usage("one", 9_000),
+        1 => answer_with_usage("two", 9_000),
+        2 => answer_response("AUTO-NOTES-31"),
+        _ => answer_response("three"),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("auto-compact");
+
+    let mut repl = Repl::start(&mock.base_url(), &dir, &[("ATELIER_CONTEXT_LIMIT", "50")]);
+    repl.line("first prompt");
+    wait_requests(&mock, 1);
+    repl.line("second prompt");
+    // The second turn's answer is followed by the summary request.
+    wait_requests(&mock, 3);
+    repl.line("third prompt");
+    let bodies = wait_requests(&mock, 4);
+    let (stdout, stderr) = repl.finish();
+    assert_eq!(bodies.len(), 4, "stdout: {stdout}\nstderr: {stderr}");
+
+    // After one turn there was nothing to summarize: request 1 is turn two.
+    assert!(bodies[1].contains("first prompt") && bodies[1].contains("second prompt"));
+    let transcript = messages(&bodies[2])[1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        transcript.contains("user: first prompt") && !transcript.contains("second prompt"),
+        "{transcript}"
+    );
+    assert!(
+        stdout.contains("compacted: summarized 2 earlier message(s)"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(system_message(&bodies[3]).ends_with("AUTO-NOTES-31"));
+    assert!(!bodies[3].contains("first prompt"));
+    assert!(bodies[3].contains("second prompt") && bodies[3].contains("third prompt"));
+}

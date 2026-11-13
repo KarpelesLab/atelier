@@ -10,8 +10,10 @@
 //! stdout one). Nothing here may depend on `tui`.
 //!
 //! How a request is laid out so a server's prompt cache survives from one
-//! to the next is in [`prompt`].
+//! to the next is in [`prompt`]; how a conversation that outgrew the context
+//! window is made to fit again is in [`compact`].
 
+mod compact;
 mod prompt;
 
 use std::collections::HashMap;
@@ -45,15 +47,10 @@ answer.";
 /// diagnostics), prioritized and truncated to fit.
 const CONTEXT_TOKEN_BUDGET: usize = 2_000;
 
-/// Default context-size threshold (last request's total tokens) past which older
-/// history is compacted into a summary. Override with `ATELIER_CONTEXT_LIMIT`.
+/// Default context-size threshold (last request's total tokens) past which the
+/// conversation is compacted (see [`compact`]). Override with
+/// `ATELIER_CONTEXT_LIMIT`.
 const DEFAULT_CONTEXT_LIMIT: u32 = 8_000;
-
-/// When compacting, keep at least this many of the most recent messages intact.
-const COMPACT_KEEP_RECENT: usize = 6;
-
-/// Don't bother compacting until the history has at least this many messages.
-const COMPACT_MIN_MESSAGES: usize = 10;
 
 /// OpenAI API base for the Sign-in-with-ChatGPT (Responses API) backend.
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
@@ -173,6 +170,8 @@ const HELP: &[&str] = &[
     "  /permissions                          list the permission rules in force, by source",
     "  /new [force]                          start a fresh conversation (clear saved session);",
     "                                        force: even if claude has background tasks running",
+    "  /compact [instructions]               shrink the conversation now: prune old tool output,",
+    "                                        summarize older turns (instructions guide the summary)",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
@@ -205,6 +204,14 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             .split_once(char::is_whitespace)
             .unwrap_or(("", ""));
         dispatch_peers(session, "/send", &[to, body.trim()], ui);
+        return Dispatch::Handled;
+    }
+    // So are `/compact`'s instructions for the summary.
+    if let Some(rest) = trimmed.strip_prefix("/compact")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let instructions = Some(rest.trim()).filter(|s| !s.is_empty());
+        session.compact_now(instructions, ui);
         return Dispatch::Handled;
     }
     // File-defined commands take their arguments as typed (prose, where an
@@ -1104,6 +1111,10 @@ impl Session {
             Message::user_with_images(user_input, images)
         };
         self.history.push(user.with_context(context));
+        // A request refused as too long is compacted and retried — once a
+        // turn, so a conversation that can't be made to fit fails the turn
+        // rather than looping.
+        let mut overflow_retried = false;
 
         loop {
             // The step budget is checked here, where the history is
@@ -1145,20 +1156,16 @@ impl Session {
                     ControlFlow::Continue(())
                 }
             };
-            // Route to the ChatGPT (Responses API) backend when signed in,
-            // otherwise the configured chat/completions endpoint.
-            let completion: Completion = if let Some(cg) = self.chatgpt.as_mut() {
-                let token = auth::access_token(&mut cg.tokens)?;
-                provider::responses::stream_responses(
-                    OPENAI_BASE,
-                    &token,
-                    &cg.model,
-                    &messages,
-                    &specs,
-                    &mut on_event,
-                )?
-            } else {
-                provider::stream_chat(&self.cfg, &messages, &specs, &mut on_event)?
+            let completion = match self.request(&messages, &specs, &mut on_event) {
+                Err(e) if !overflow_retried && provider::is_context_overflow(&e) => {
+                    overflow_retried = true;
+                    ui.notice(&format!("{e:#} — compacting and retrying"));
+                    if !self.compact(compact::Trigger::Overflow, None, ui) {
+                        return Err(e);
+                    }
+                    continue;
+                }
+                result => result?,
             };
 
             if let Some(u) = &completion.usage {
@@ -1243,10 +1250,8 @@ impl Session {
                     .push(Message::tool_result(call.id.clone(), out.text));
             }
             if !images.is_empty() {
-                self.history.push(Message::user_with_images(
-                    "[images returned by the tool calls above]",
-                    images,
-                ));
+                self.history
+                    .push(Message::user_with_images(compact::TOOL_IMAGES_NOTE, images));
             }
             if stopped || ui.interrupted() {
                 return self.end_turn(ui);
@@ -1254,6 +1259,30 @@ impl Session {
             // Kick off a parallel review of this tool batch; its note is
             // surfaced by a later `drain_reviews`/`collect_reviews`.
             self.spawn_review();
+        }
+    }
+
+    /// One model request through the active backend: the ChatGPT (Responses
+    /// API) one when signed in, otherwise the configured chat/completions
+    /// endpoint.
+    fn request(
+        &mut self,
+        messages: &[Message],
+        specs: &[provider::ToolSpec],
+        on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
+    ) -> Result<Completion> {
+        if let Some(cg) = self.chatgpt.as_mut() {
+            let token = auth::access_token(&mut cg.tokens)?;
+            provider::responses::stream_responses(
+                OPENAI_BASE,
+                &token,
+                &cg.model,
+                messages,
+                specs,
+                on_event,
+            )
+        } else {
+            provider::stream_chat(&self.cfg, messages, specs, on_event)
         }
     }
 
@@ -1435,71 +1464,6 @@ impl Session {
                 hooks: &self.hooks,
             },
         )
-    }
-
-    /// If the context has grown past the threshold, summarize the older part of
-    /// the history into the rolling summary and drop it from `history`.
-    fn maybe_compact(&mut self, ui: &mut dyn Ui) {
-        if self.usage_ctx <= self.compact_threshold || self.history.len() < COMPACT_MIN_MESSAGES {
-            return;
-        }
-        let Some(split) = self.compact_split_point() else {
-            return;
-        };
-        // Hooks: `pre_compact` and `post_compact` watch (see docs/hooks.md).
-        let fields = serde_json::json!({ "messages": split });
-        self.hooks
-            .observe(hooks::Event::PreCompact, fields.clone(), &mut |m| {
-                ui.notice(m)
-            });
-        let excerpt = render_excerpt(self.summary.as_deref(), &self.history[..split]);
-        match self.summarize(&excerpt) {
-            Ok(summary) => {
-                self.hooks
-                    .observe(hooks::Event::PostCompact, fields, &mut |m| ui.notice(m));
-                self.summary = Some(summary);
-                self.history.drain(0..split);
-                // Nested instruction files arrived in tool results that may
-                // just have been summarized away: deliver them again.
-                self.fstate.forget_dirs();
-                // So did the context blocks of the summarized turns: the
-                // next turn sends every item afresh.
-                self.last_ctx.clear();
-                // Avoid re-compacting immediately; the next real turn recomputes.
-                self.usage_ctx = 0;
-                ui.info(&format!(
-                    "compacted {split} earlier message(s) into a summary"
-                ));
-            }
-            Err(e) => ui.notice(&format!("compaction failed: {e:#}")),
-        }
-    }
-
-    /// Choose where to split history for compaction: summarize everything before
-    /// the returned index, keep the rest. The kept suffix must start at a `user`
-    /// message so the request stays well-formed (no orphan tool result). Returns
-    /// `None` if there's nothing sensible to compact.
-    fn compact_split_point(&self) -> Option<usize> {
-        split_point(&self.history, COMPACT_KEEP_RECENT)
-    }
-
-    /// Summarize a rendered conversation excerpt via the provider (no tools).
-    fn summarize(&self, excerpt: &str) -> Result<String> {
-        let messages = vec![
-            Message::system(
-                "You compress a conversation transcript into a concise summary. Preserve concrete \
-                 facts, decisions, file paths touched, and any open tasks, as short bullet points. \
-                 No preamble or commentary.",
-            ),
-            Message::user(format!("Summarize this conversation excerpt:\n\n{excerpt}")),
-        ];
-        let completion =
-            provider::stream_chat(&self.cfg, &messages, &[], |_| ControlFlow::Continue(()))?;
-        let s = completion.content.trim().to_string();
-        if s.is_empty() {
-            anyhow::bail!("model returned an empty summary");
-        }
-        Ok(s)
     }
 
     /// Gather per-turn context into a single injected block, or `None`, for
@@ -1838,43 +1802,6 @@ impl Ui for PeerUi<'_> {
     }
 }
 
-/// Pick a compaction split index: summarize `history[..i]`, keep `history[i..]`,
-/// where `i` is the first `user` message at or after `len - keep` (so the kept
-/// suffix starts cleanly and no tool result is orphaned). `None` if there's
-/// nothing sensible to compact.
-fn split_point(history: &[Message], keep: usize) -> Option<usize> {
-    let n = history.len();
-    let target = n.saturating_sub(keep);
-    if target == 0 {
-        return None;
-    }
-    let mut i = target;
-    while i < n && history[i].role != "user" {
-        i += 1;
-    }
-    if i == 0 || i >= n { None } else { Some(i) }
-}
-
-/// Render history messages (and any prior summary) into a plain-text excerpt for
-/// summarization.
-fn render_excerpt(prev_summary: Option<&str>, msgs: &[Message]) -> String {
-    let mut s = String::new();
-    if let Some(p) = prev_summary {
-        s.push_str("Earlier summary:\n");
-        s.push_str(p);
-        s.push_str("\n\n");
-    }
-    for m in msgs {
-        if !m.content.is_empty() {
-            s.push_str(&format!("{}: {}\n", m.role, m.content));
-        }
-        for c in &m.tool_calls {
-            s.push_str(&format!("assistant called {}({})\n", c.name, c.arguments));
-        }
-    }
-    s
-}
-
 /// Merge several queued user messages into the content of a single user
 /// message, one per paragraph.
 fn merge_queued(queued: &[String]) -> String {
@@ -2116,63 +2043,6 @@ pub fn repl(mut session: Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_point_finds_user_boundary() {
-        // 12 messages, alternating user/assistant. keep=6 -> target index 6,
-        // which is a user message (even indices are users here).
-        let mut h = Vec::new();
-        for i in 0..12 {
-            h.push(if i % 2 == 0 {
-                Message::user(format!("u{i}"))
-            } else {
-                Message::assistant(format!("a{i}"))
-            });
-        }
-        let i = split_point(&h, 6).expect("should find a split");
-        assert_eq!(h[i].role, "user");
-        assert!((6..12).contains(&i));
-    }
-
-    #[test]
-    fn split_point_advances_past_non_user() {
-        // target lands on an assistant/tool run; must advance to the next user.
-        let h = vec![
-            Message::user("u0"),
-            Message::assistant("a1"),
-            Message::assistant("a2"), // target (keep=2 -> target 1) region is non-user
-            Message::user("u3"),
-        ];
-        let i = split_point(&h, 2).expect("split");
-        assert_eq!(h[i].role, "user");
-        assert_eq!(i, 3);
-    }
-
-    #[test]
-    fn split_point_none_when_short() {
-        let h = vec![Message::user("u0"), Message::assistant("a1")];
-        assert!(split_point(&h, 6).is_none());
-    }
-
-    #[test]
-    fn split_point_none_when_no_user_in_tail() {
-        let h = vec![
-            Message::user("u0"),
-            Message::assistant("a1"),
-            Message::assistant("a2"),
-        ];
-        // keep=1 -> target 2 (assistant), no user after -> None.
-        assert!(split_point(&h, 1).is_none());
-    }
-
-    #[test]
-    fn render_excerpt_includes_summary_and_roles() {
-        let h = vec![Message::user("hi"), Message::assistant("hello")];
-        let s = render_excerpt(Some("prior summary"), &h);
-        assert!(s.contains("Earlier summary:\nprior summary"));
-        assert!(s.contains("user: hi"));
-        assert!(s.contains("assistant: hello"));
-    }
 
     #[test]
     fn merge_queued_joins_paragraphs() {

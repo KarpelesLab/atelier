@@ -44,8 +44,8 @@ The entry point ...
 ```
 
 Type `/help` to see the available slash commands (`/models`, `/model`,
-`/login`, `/logout`, `/tools`, `/mcp`, `/review`, `/config`, `/new`, `/image`,
-`/memory`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the
+`/login`, `/logout`, `/tools`, `/mcp`, `/review`, `/config`, `/new`,
+`/compact`, `/image`, `/memory`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the
 agent itself can do, [permissions](permissions.md) for how tool approval
 works, [review mode](review.md) for the parallel "subconscious" reviewer
 behind `/review`, and [Sign in with ChatGPT](chatgpt.md) for `/login`/`/logout`.
@@ -184,9 +184,9 @@ The conversation is saved to `.atelier/session.json` under the project root
 after each turn. Resume it in a later run with `--continue`/`-c` (you'll see
 `resumed session (N message(s))`); start fresh at any time with `/new`, which
 clears the in-memory history and deletes the saved file. Long conversations
-are compacted automatically — older turns are summarized and dropped once
-the context grows past a threshold — so you don't need to manage this by
-hand. Add `.atelier/` to your project's `.gitignore`. See
+are compacted automatically — once the context grows past a threshold, old
+tool output is pruned and, if that isn't enough, older turns are summarized —
+so you don't need to manage this by hand (`/compact` does it on demand). Add `.atelier/` to your project's `.gitignore`. See
 [Sessions](sessions.md) for the full picture.
 
 ## Next steps

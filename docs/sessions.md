@@ -103,39 +103,91 @@ As a conversation grows, the request sent to the model on every turn (system
 message + full history) grows with it. atelier compacts automatically instead
 of asking you to manage this by hand.
 
-**When it runs:** after a turn finishes (`Session::maybe_compact`, called
-right before persisting), if **both**:
+**When it runs** (`agent::compact`):
 
-- the *previous* request's total token usage (`usage_ctx`, from the
-  provider's reported `usage.total_tokens`) exceeds the compaction
-  threshold, **and**
-- the history holds at least 10 messages (`COMPACT_MIN_MESSAGES`) — so a
-  short conversation is never touched.
+- **after a turn**, when the last request's total token usage (the
+  provider's reported `usage.total_tokens`) exceeded the threshold;
+- **when you ask**: `/compact [instructions]`;
+- **when the endpoint refuses a request as too long** (HTTP 413, or a 400
+  whose body speaks of the context length): the conversation is compacted and
+  the request sent again, once per turn, instead of the turn failing. This is
+  what happens when the threshold is set above the model's real window, or
+  the endpoint reports no usage.
 
-**Threshold:** 8,000 tokens by default, overridable with
-`ATELIER_CONTEXT_LIMIT` (a positive integer; anything else falls back to the
-default). Read once at `Session::new` — set it before launching, not
-mid-session.
+**Threshold:** 8,000 tokens by default; set it with `ATELIER_CONTEXT_LIMIT`
+(a positive integer; anything else falls back to the default),
+`[defaults] context_limit` in `atelier.toml`, or `/config`. Set it somewhat
+below your model's context window.
 
-**What gets summarized:** everything before a split point is compacted; the
-split point keeps at least the 6 most recent messages
-(`COMPACT_KEEP_RECENT`), then advances forward to the next `user`-role
-message so the kept suffix never starts mid-tool-call (an orphaned tool
-result would make the next request malformed). If no such split point exists
-(e.g. the tail has no user message), compaction is skipped for that turn.
+**The recent tail stays verbatim.** The most recent part of the conversation
+is never touched: about 40% of the threshold, measured in estimated tokens
+rather than in messages (a message may be one line or a whole file) — less
+when the system message and tool list are large, so that a compaction leaves
+room for a few turns before the next. Half of that when the endpoint refused
+the request.
 
-**How it summarizes:** the dropped messages (plus any prior summary) are
-rendered to a plain-text excerpt and sent to the model in a dedicated,
-tools-free request with a system prompt asking for a concise, bullet-point
-summary — concrete facts, decisions, file paths touched, open tasks. The
-result replaces `summary`; the summarized messages are drained from
-`history`. On success, the UI prints `compacted N earlier message(s) into a
-summary`; if the summarization call fails, the turn's output isn't affected
-but a `compaction failed: …` notice is shown and history is left untouched
-(compaction is retried on a later turn once usage crosses the threshold
-again — `usage_ctx` is reset to 0 immediately after a successful compaction
-so the *next* turn's real usage decides whether to compact again, not the
-now-stale pre-compaction number).
+**Stage 1 — prune tool output.** Most of a coding session's bulk is file
+contents and command output the model has already acted on. In everything
+older than the tail, the body of each tool result is replaced with one line
+saying what it was:
+
+```text
+[output of read src/agent/mod.rs — 412 lines, pruned]
+[output of bash cargo test — 96 lines, pruned]
+```
+
+The calls, their arguments, and the pairing of each call with its result
+stay, so the model still knows what it did and can run a call again. Images
+that tools returned there are dropped too. If this brings the conversation
+back under the threshold, compaction stops here — nothing was summarized.
+
+**Stage 2 — a hand-off summary.** Otherwise (and always for `/compact` and a
+refused request), everything before the tail is summarized and dropped. The
+boundary only ever falls on one of your messages, so a tool result is never
+cut from its call; if the tail holds none of your messages — one long turn —
+the boundary is the start of that turn, and the turn in progress is never
+summarized. The summary is written by the model in a dedicated, tools-free
+request that asks for fixed sections:
+
+- **Goal** — what you want, with the constraints you set
+- **Decisions** — each one, and why
+- **Current state** — done, half done, broken
+- **Files touched** — and what was done to each
+- **Tried and failed** — so it isn't tried again
+- **Next steps**
+- **From the user** — what you said that must not be forgotten, verbatim
+  where short
+
+The transcript it is given includes the previous summary, which it carries
+forward; long tool results are clipped in it. `/compact`'s instructions are
+added to the request (`/compact keep the list of failing tests`). `/compact`
+summarizes all but the last turn even when the conversation is small.
+
+**What you see:** one line with the estimated size before and after —
+
+```text
+compacted: pruned 7 old tool result(s), summarized 31 earlier message(s) — ~9,412 → ~3,180 tokens (estimated)
+```
+
+If the summary request fails, a `compaction: summary failed: …` notice is
+shown, the pruning stands, the messages stay, and it is tried again the next
+time the threshold is passed. After a compaction the next request's real
+usage decides whether another is needed. Token counts are estimates (about
+four characters per token), calibrated against the endpoint's reported usage
+when deciding whether pruning was enough.
+
+**What is not lost:** the agent's [memory](memory.md) and its todo list live
+outside the conversation; instruction files stay in the system message; a
+subdirectory's `AGENTS.md` is delivered again the next time the agent works
+there.
+
+**The cache:** either stage rewrites the conversation, so the inference
+server evaluates the prompt again from the first changed message — once.
+That is why pruning is done in one batch when the threshold is passed rather
+than a little every turn.
+
+The [Claude backend](claude.md) compacts its own conversation; `/compact`
+does nothing there.
 
 **How it's used afterward:** the summary closes the system message, under
 `Summary of earlier conversation:` (see [the shape of a

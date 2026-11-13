@@ -17,7 +17,7 @@ pub mod responses;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -271,6 +271,103 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// How much of an error response's body is read: enough for any server's
+/// error object, bounded in case it sends a page instead.
+const ERROR_BODY_LIMIT: u64 = 8 * 1024;
+
+/// How much of the server's explanation is shown in the error message.
+const ERROR_DETAIL_CHARS: usize = 300;
+
+/// What servers say when a request doesn't fit the model's context window
+/// (matched in lowercase): OpenAI and vLLM "maximum context length" /
+/// `context_length_exceeded`, llama.cpp "exceeds the available context
+/// size", Anthropic-style "prompt is too long", and the like.
+const OVERFLOW_MARKERS: &[&str] = &[
+    "context length",
+    "context_length",
+    "context size",
+    "context window",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "prompt too long",
+    "input is too long",
+    "request too large",
+];
+
+/// A completion request the endpoint answered with a non-2xx status, with
+/// the start of what it said. A typed error (rather than a formatted
+/// message) so the agent loop can tell a request that was too long for the
+/// model — which it can fix by compacting — from any other failure: see
+/// [`is_context_overflow`].
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    /// The response body, up to [`ERROR_BODY_LIMIT`] bytes.
+    pub body: String,
+}
+
+impl HttpError {
+    /// Takes the status and reads the beginning of the error body.
+    pub(crate) fn read(status: u16, body: impl Read) -> Self {
+        let mut bytes = Vec::new();
+        // Best effort: a body that can't be read leaves the status alone.
+        let _ = body.take(ERROR_BODY_LIMIT).read_to_end(&mut bytes);
+        Self {
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        }
+    }
+
+    /// The server's own explanation: the `error.message` (OpenAI shape),
+    /// `error` or `message` string of a JSON body, else the body's text.
+    fn detail(&self) -> String {
+        let json: Option<Value> = serde_json::from_str(&self.body).ok();
+        let message = json.as_ref().and_then(|v| {
+            [&v["error"]["message"], &v["error"], &v["message"]]
+                .into_iter()
+                .find_map(Value::as_str)
+        });
+        let text = message.unwrap_or(&self.body);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.chars().count() > ERROR_DETAIL_CHARS {
+            let cut: String = text.chars().take(ERROR_DETAIL_CHARS).collect();
+            format!("{cut}…")
+        } else {
+            text
+        }
+    }
+
+    /// Whether the request was refused for not fitting the model's context
+    /// window: a 413, or a 400 whose body says so.
+    pub fn is_context_overflow(&self) -> bool {
+        let body = self.body.to_lowercase();
+        self.status == 413
+            || (self.status == 400 && OVERFLOW_MARKERS.iter().any(|m| body.contains(m)))
+    }
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider returned HTTP {}", self.status)?;
+        let detail = self.detail();
+        if detail.is_empty() {
+            Ok(())
+        } else {
+            write!(f, ": {detail}")
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Whether `err` is the endpoint refusing a request as too long for the
+/// model's context window (see [`HttpError::is_context_overflow`]).
+pub fn is_context_overflow(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HttpError>()
+        .is_some_and(HttpError::is_context_overflow)
+}
+
 /// An incremental piece of a streamed response.
 #[derive(Debug, Clone)]
 pub enum StreamEvent<'a> {
@@ -313,7 +410,7 @@ pub fn stream_chat(
     let reader = send_reader_retrying(&url, &body_bytes, cfg.api_key.as_deref())?;
     let status = reader.status();
     if !(200..300).contains(&status) {
-        bail!("provider returned HTTP {status}");
+        return Err(HttpError::read(status, reader).into());
     }
 
     let mut out = Completion::default();
@@ -889,6 +986,56 @@ mod tests {
         let stored = serde_json::to_value(&msg).unwrap();
         assert_eq!(stored["context"], "## git status\nM a.rs");
         assert_eq!(stored["content"], "fix it");
+    }
+
+    #[test]
+    fn http_error_shows_what_the_server_said() {
+        let openai = HttpError::read(
+            400,
+            &br#"{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}"#[..],
+        );
+        assert_eq!(
+            openai.to_string(),
+            "provider returned HTTP 400: This model's maximum context length is 8192 tokens."
+        );
+        let flat = HttpError::read(500, &br#"{"error":"model not loaded"}"#[..]);
+        assert_eq!(
+            flat.to_string(),
+            "provider returned HTTP 500: model not loaded"
+        );
+        let text = HttpError::read(502, &b"Bad\n  Gateway"[..]);
+        assert_eq!(text.to_string(), "provider returned HTTP 502: Bad Gateway");
+        let empty = HttpError::read(404, &b""[..]);
+        assert_eq!(empty.to_string(), "provider returned HTTP 404");
+        let long = HttpError::read(500, "x".repeat(5_000).as_bytes());
+        assert!(long.to_string().chars().count() < 400);
+    }
+
+    #[test]
+    fn context_overflow_is_recognized_by_status_and_wording() {
+        let overflow = |status: u16, body: &str| {
+            let err: anyhow::Error = HttpError::read(status, body.as_bytes()).into();
+            is_context_overflow(&err)
+        };
+        assert!(overflow(
+            400,
+            r#"{"error":{"code":"context_length_exceeded","message":"too big"}}"#
+        ));
+        assert!(overflow(
+            400,
+            r#"{"error":{"message":"the request exceeds the available context size, try increasing it"}}"#
+        ));
+        assert!(overflow(
+            400,
+            "This model's Maximum Context Length is 4096 tokens"
+        ));
+        assert!(overflow(413, ""));
+        // Any other bad request, or the wording under another status, isn't.
+        assert!(!overflow(400, r#"{"error":{"message":"unknown model"}}"#));
+        assert!(!overflow(500, "context length exceeded"));
+        assert!(!is_context_overflow(&anyhow::anyhow!(
+            "context length exceeded"
+        )));
     }
 
     #[test]
