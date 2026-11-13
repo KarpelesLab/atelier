@@ -205,7 +205,7 @@ fn install(exe: &Path, binary: &[u8]) -> Result<bool> {
         Err(e) => return Err(e).with_context(|| format!("writing {}", tmp.display())),
     }
     let result = (|| {
-        #[cfg(unix)]
+        #[cfg(unixlike)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;

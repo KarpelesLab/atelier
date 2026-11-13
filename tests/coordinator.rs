@@ -2,7 +2,7 @@
 //! killed they launch another and rejoin it. (Routing between instances is
 //! covered by the unit tests in `src/coord`.)
 
-#![cfg(unix)]
+#![cfg(unixlike)]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

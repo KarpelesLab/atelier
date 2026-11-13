@@ -32,16 +32,17 @@
 //! ([`tools`]), the `/peers`, `/send`, `/subscribe` commands, and messages
 //! from other instances delivered into the conversation (`agent`).
 //!
-//! Unix only: elsewhere [`start`] returns `None` and atelier runs alone.
+//! Unix only (`cfg(unixlike)`, see `build.rs`): elsewhere [`start`] returns
+//! `None` and atelier runs alone.
 
-#[cfg(unix)]
+#[cfg(unixlike)]
 pub mod client;
-#[cfg(not(unix))]
+#[cfg(not(unixlike))]
 #[path = "stub.rs"]
 pub mod client;
-#[cfg(unix)]
+#[cfg(unixlike)]
 pub mod daemon;
-#[cfg(all(test, unix))]
+#[cfg(all(test, unixlike))]
 mod tests;
 pub mod tools;
 
@@ -115,7 +116,7 @@ pub fn socket_path(dir: &Path) -> PathBuf {
 /// is longer (a deep home directory), Linux lets us name the socket through
 /// an open handle on its directory instead; the handle is returned and must
 /// outlive the bind/connect call.
-#[cfg(unix)]
+#[cfg(unixlike)]
 fn reachable_socket(dir: &Path) -> Result<(PathBuf, Option<std::fs::File>)> {
     use std::os::fd::AsRawFd;
     const MAX: usize = 100;
@@ -123,9 +124,11 @@ fn reachable_socket(dir: &Path) -> Result<(PathBuf, Option<std::fs::File>)> {
     if socket.as_os_str().len() <= MAX {
         return Ok((socket, None));
     }
-    if cfg!(target_os = "linux")
-        && let Ok(handle) = std::fs::File::open(dir)
-    {
+    // (fullrust is Linux under another `target_os`; rustc knows the name
+    // only in that toolchain.)
+    #[allow(unexpected_cfgs)]
+    let procfs = cfg!(any(target_os = "linux", target_os = "fullrust"));
+    if procfs && let Ok(handle) = std::fs::File::open(dir) {
         let short = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
             .join(socket.file_name().expect("has a file name"));
         return Ok((short, Some(handle)));
@@ -137,7 +140,7 @@ fn reachable_socket(dir: &Path) -> Result<(PathBuf, Option<std::fs::File>)> {
 }
 
 /// Connect to the coordinator serving `dir`.
-#[cfg(unix)]
+#[cfg(unixlike)]
 fn connect(dir: &Path) -> Result<std::os::unix::net::UnixStream> {
     let (path, _handle) = reachable_socket(dir)?;
     Ok(std::os::unix::net::UnixStream::connect(path)?)
@@ -153,7 +156,7 @@ fn disabled() -> bool {
 /// being retried for as long as the process lives. `None` when disabled or
 /// unsupported here.
 pub fn start(root: &Path, model: &str) -> Option<Arc<Client>> {
-    if disabled() || cfg!(not(unix)) {
+    if disabled() || cfg!(not(unixlike)) {
         return None;
     }
     let dir = runtime_dir()?;
@@ -176,7 +179,7 @@ pub fn start(root: &Path, model: &str) -> Option<Arc<Client>> {
 /// coordinator (what instances launch); `status` and `stop` talk to a
 /// running one and never start it.
 pub fn run_command(args: &[String]) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     {
         let dir = runtime_dir()
             .ok_or_else(|| anyhow::anyhow!("no runtime directory (set {ENV_DIR} or HOME)"))?;
@@ -213,7 +216,7 @@ pub fn run_command(args: &[String]) -> Result<()> {
             ),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(unixlike))]
     {
         let _ = args;
         anyhow::bail!("the coordinator is not supported on this platform")

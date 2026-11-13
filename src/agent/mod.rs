@@ -1787,7 +1787,7 @@ mod tests {
     /// Messages from other instances that arrive during a turn join what
     /// the user queued, marked as a peer's; only the user's own lines are
     /// echoed again on delivery.
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     #[test]
     fn peer_messages_join_the_queue_mid_turn() {
         use crate::coord::{client, daemon};

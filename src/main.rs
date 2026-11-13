@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("coordinator") {
         return coord::run_command(&args[1..]);
     }
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     if args.first().map(String::as_str) == Some("mcp-serve") {
         let socket = args
             .get(1)

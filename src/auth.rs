@@ -84,7 +84,7 @@ pub fn save(tokens: &Tokens) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(tokens).context("serializing credentials")?;
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))

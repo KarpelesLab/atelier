@@ -60,9 +60,9 @@ use crate::agent::{Approval, Ui};
 use crate::provider::ToolSpec;
 use crate::settings::Settings;
 
-#[cfg(unix)]
+#[cfg(unixlike)]
 mod host;
-#[cfg(unix)]
+#[cfg(unixlike)]
 pub use host::relay;
 
 /// Appended to Claude Code's own system prompt so it knows about the
@@ -157,7 +157,7 @@ pub struct Bridge {
     incoming: Receiver<Incoming>,
     /// Serves atelier's tools to claude; `None` when there are none to offer
     /// (or no Unix sockets).
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     _host: Option<host::Host>,
     stderr: Arc<Mutex<String>>,
     /// Claude's session id, from the `init` event (stable across turns).
@@ -205,7 +205,7 @@ pub enum Incoming {
     /// The child's stdout closed: it exited.
     Closed,
     /// claude called one of atelier's tools.
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     Call(host::ToolRequest),
 }
 
@@ -225,7 +225,7 @@ pub trait ToolHost {
 }
 
 /// How atelier's tools appear in claude: `mcp__atelier__<tool>`.
-#[cfg(unix)]
+#[cfg(unixlike)]
 const TOOL_PREFIX: &str = "mcp__atelier__";
 
 impl Bridge {
@@ -260,7 +260,7 @@ impl Bridge {
         // atelier's own tools, unless a configured server already took the
         // name. claude may run them without asking: atelier applies its own
         // policy (confined file tools run, `bash` and the like ask).
-        #[cfg(unix)]
+        #[cfg(unixlike)]
         let host = if tools.is_empty()
             || mcp
                 .as_ref()
@@ -274,7 +274,7 @@ impl Bridge {
             cmd.args(["--allowedTools", &format!("mcp__{}", host::SERVER_NAME)]);
             Some(h)
         };
-        #[cfg(not(unix))]
+        #[cfg(not(unixlike))]
         let (host, _) = (None::<()>, tools);
         // Only take claude's tools away when atelier's are there instead.
         let replacing = host.is_some() && !launch.keep_builtins;
@@ -338,7 +338,7 @@ impl Bridge {
             child,
             stdin,
             incoming,
-            #[cfg(unix)]
+            #[cfg(unixlike)]
             _host: host,
             stderr,
             session_id: launch.resume.map(str::to_owned),
@@ -468,7 +468,7 @@ impl Bridge {
                 Ok(())
             }
             Incoming::Closed => bail!("claude exited{}", self.stderr_note()),
-            #[cfg(unix)]
+            #[cfg(unixlike)]
             Incoming::Call(req) => {
                 // The call already shows as claude's tool use; this just runs it.
                 let _ = req.reply.send(host.call(&req.name, req.arguments, ui));
@@ -496,7 +496,7 @@ impl Bridge {
             Event::Thinking(t) => ui.reasoning(&t),
             Event::ToolUse { id, name, input } => {
                 // atelier's own tools read as themselves, not `mcp__atelier__…`.
-                #[cfg(unix)]
+                #[cfg(unixlike)]
                 let name = name
                     .strip_prefix(TOOL_PREFIX)
                     .map_or(name.clone(), str::to_owned);

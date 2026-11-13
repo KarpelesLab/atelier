@@ -244,7 +244,7 @@ fn start_job(command: &str, root: &std::path::Path) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Its own process group, so bash_kill reaches whatever it spawns.
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().context("spawning background command")?;
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -297,7 +297,7 @@ fn start_job(command: &str, root: &std::path::Path) -> Result<String> {
 
 /// Stop a job's whole process group (TERM, then KILL if it lingers).
 fn stop(job: &mut Job) {
-    #[cfg(unix)]
+    #[cfg(unixlike)]
     {
         let pgid = format!("-{}", job.child.id());
         let _ = Command::new("kill").args(["-TERM", "--", &pgid]).status();
