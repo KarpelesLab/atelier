@@ -24,8 +24,9 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
 - **Project-scoped.** Launched inside a project directory; tools, context, and
   permissions are anchored there.
 - **The agent is fed, not just prompted.** Per-turn context providers inject
-  the current repo state (git status, diff, layout, `cargo check`
-  diagnostics) so the model reasons about now, not a stale snapshot.
+  the current repo state (git status, diff, layout, and what the project's
+  own lint/typecheck commands say after each edit) so the model reasons
+  about now, not a stale snapshot.
 - **Your rules, where you already keep them.** `AGENTS.md` (or `CLAUDE.md`,
   `.cursorrules`) is read from your user config and every directory from the
   repository root down, with `@path` imports; a subdirectory's file applies

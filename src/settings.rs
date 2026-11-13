@@ -2,8 +2,8 @@
 //!
 //! Distinct from [`Config`](crate::config::Config), which is ephemeral
 //! connection info from the environment. `Settings` is durable state the user
-//! manages — today, the list of MCP servers — read at startup and written back
-//! when changed interactively (e.g. `/mcp add`).
+//! manages — MCP servers, permissions, defaults, diagnostics checkers — read
+//! at startup and written back when changed interactively (e.g. `/mcp add`).
 //!
 //! Example `atelier.toml`:
 //! ```toml
@@ -38,6 +38,34 @@ pub struct Settings {
     /// The parallel "subconscious" reviewer.
     #[serde(default)]
     pub review: ReviewSettings,
+    /// Lint/typecheck commands whose output is fed back as per-turn
+    /// diagnostics. Empty means "auto-detect from the project's files".
+    #[serde(default)]
+    pub diagnostics: Vec<DiagnosticCheck>,
+}
+
+/// One `[[diagnostics]]` checker: a read-only lint or typecheck command run
+/// from the project root, whose output lines become the diagnostics the
+/// model sees (see `context::diagnostics`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticCheck {
+    /// Label the diagnostics are reported under.
+    pub name: String,
+    /// The command line, split like a shell would (quotes honored) and run
+    /// directly — no shell, so no pipes or redirections.
+    pub command: String,
+    /// Globs, relative to the project root: the checker re-runs only when a
+    /// matching file changed since its last run. Empty means every turn.
+    #[serde(default)]
+    pub when: Vec<String>,
+    /// Seconds before the command is killed.
+    #[serde(default = "default_diagnostic_timeout")]
+    pub timeout_secs: u64,
+}
+
+/// A minute: what `cargo check` was always given.
+fn default_diagnostic_timeout() -> u64 {
+    60
 }
 
 /// The background reviewer ("subconscious"): a parallel, read-only pass that
@@ -114,5 +142,42 @@ impl Settings {
         let path = Self::path(root);
         let text = tomlproc::serde::to_string_pretty(self).context("serializing settings")?;
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_checkers_parse_with_defaults() {
+        let settings: Settings = tomlproc::serde::from_str(
+            r#"
+[[diagnostics]]
+name = "tsc"
+command = "npx tsc --noEmit --pretty false"
+when = ["**/*.ts", "**/*.tsx"]
+timeout_secs = 90
+
+[[diagnostics]]
+name = "lint"
+command = "make lint"
+"#,
+        )
+        .unwrap();
+        let [tsc, lint] = settings.diagnostics.as_slice() else {
+            panic!("expected two checkers: {:?}", settings.diagnostics);
+        };
+        assert_eq!(tsc.when, ["**/*.ts", "**/*.tsx"]);
+        assert_eq!(tsc.timeout_secs, 90);
+        // Omitted: every turn, a minute.
+        assert!(lint.when.is_empty());
+        assert_eq!(lint.timeout_secs, 60);
+
+        // And they survive the rewrite `/mcp add` and friends do.
+        let text = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        let again: Settings = tomlproc::serde::from_str(&text).unwrap();
+        assert_eq!(again.diagnostics.len(), 2);
+        assert_eq!(again.diagnostics[0].command, tsc.command);
     }
 }

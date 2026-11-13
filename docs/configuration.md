@@ -6,7 +6,8 @@ atelier has two configuration layers:
   environment at startup. Not persisted.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
   `atelier.toml` at the project root: configured MCP servers, the
-  always-allow permission list, `[defaults]`, and `[review]`. Read at startup
+  always-allow permission list, `[defaults]`, `[review]`, and
+  `[[diagnostics]]`. Read at startup
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
   "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
@@ -163,6 +164,58 @@ every request, so they count against the model's context window each time;
 keep them short.
 
 **Edits take effect on your next message**; no restart is needed.
+
+## `[[diagnostics]]`
+
+Each turn atelier runs the project's lint/typecheck commands and tells the
+model what they found — and, after an edit, what *changed*: the diagnostics
+that are new, a count of those still there, and how many were fixed. A clean
+project adds nothing to the context.
+
+```toml
+[[diagnostics]]
+name = "tsc"
+command = "npx tsc --noEmit --pretty false"
+when = ["**/*.ts", "**/*.tsx"]
+timeout_secs = 60
+```
+
+| Field          | Type     | Meaning |
+|----------------|----------|---------|
+| `name`         | string   | Label the diagnostics are reported under |
+| `command`      | string   | Command line, run from the project root. It is split on spaces with quotes honored and run directly, without a shell — for pipes or `&&`, use `sh -c '…'` |
+| `when`         | string[] | Globs relative to the project root. The checker re-runs only when a matching file (not ignored by `.gitignore`, not hidden) was added, removed or modified since its last run; otherwise its last result stands. Omitted: it runs every turn |
+| `timeout_secs` | integer  | Seconds before the command and what it started are killed (default 60) |
+
+A diagnostic is an output line that starts with a location —
+`path:line[:col]: message` or `path(line,col): message` — which is what
+compilers and most linters print (pick the linter's "unix", "compact" or
+"concise" format if it has several). A message starting with `warning` counts
+as a warning, `note`/`help`/`info` lines are skipped, and anything else is an
+error. If a command fails without printing any such line, the first lines of
+its output are reported as they are. At most 15 lines are shown per turn,
+errors first, shared between the checkers.
+
+Use commands that only read the tree: they run unprompted, every time a
+matching file changes. A command that can't be started is reported once and
+skipped for the rest of the session; one that times out is reported once,
+tried again after the next change, and skipped after a second timeout in a
+row. The list is read at startup.
+
+**With no `[[diagnostics]]` at all**, atelier picks checkers from the
+project's files, each only if its tool is already installed (nothing is ever
+downloaded):
+
+| Project has | Tool required | Command |
+|-------------|---------------|---------|
+| `Cargo.toml` | `cargo` on `PATH` | `cargo check --message-format short` |
+| `tsconfig.json` | `node_modules/.bin/tsc`, and `npx` on `PATH` | `npx --no-install tsc --noEmit --pretty false` |
+| `go.mod` | `go` on `PATH` | `go vet ./...` |
+| `pyproject.toml` or `setup.py` | `ruff` on `PATH` | `ruff check --no-cache --output-format concise` |
+| 〃 (no `ruff`) | a `python3`/`python` that can `import pyflakes` | `python3 -B -m pyflakes .` |
+
+Configuring any checker turns auto-detection off, so list every one you want
+— or a single always-clean one (`command = "true"`) to have none.
 
 ## `/config`
 

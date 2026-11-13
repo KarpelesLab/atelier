@@ -120,7 +120,7 @@ fn run() -> Result<u8> {
     if let Some(c) = &coordinator {
         coord::tools::register(&mut tools, c);
     }
-    let context = context::default_providers();
+    let context = context::default_providers(settings.diagnostics.clone());
     let mut session = agent::Session::new(cfg, root, tools, context, settings);
     if let Some(c) = coordinator {
         session.attach_coordinator(c);

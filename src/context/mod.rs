@@ -41,6 +41,7 @@ pub use budget::{estimate_tokens, render_budgeted};
 pub use dedup::dedup_items;
 pub use instructions::nested_instructions;
 
+use crate::settings::DiagnosticCheck;
 use std::path::Path;
 
 /// A single piece of injected context.
@@ -83,13 +84,17 @@ pub trait ContextProvider: Send + Sync {
 }
 
 /// The default set of context providers: project instructions, the memory
-/// index, cargo-check diagnostics, git status, recent diff, recent commits,
-/// project layout, open TODOs, and environment facts (in priority order).
-pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
+/// index, lint/typecheck diagnostics, git status, recent diff, recent
+/// commits, project layout, open TODOs, and environment facts (in priority
+/// order).
+///
+/// `checkers` are the `[[diagnostics]]` entries of `atelier.toml`; when
+/// empty, the diagnostics provider picks checkers from the project's files.
+pub fn default_providers(checkers: Vec<DiagnosticCheck>) -> Vec<Box<dyn ContextProvider>> {
     vec![
         Box::new(instructions::InstructionsProvider::new()),
         Box::new(memory::MemoryProvider::new(crate::memory::global_dir())),
-        Box::new(diagnostics::DiagnosticsProvider),
+        Box::new(diagnostics::DiagnosticsProvider::new(checkers)),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),
         Box::new(commits::RecentCommitsProvider),
