@@ -153,11 +153,25 @@ jobs, approval policy (both run a few cheap Haiku turns on your account).
 
 ## Permissions
 
-claude only asks when its own permission rules say a call needs approval;
-those requests come to atelier's prompt. "Always" applies the permission
-update Claude Code suggests, so it is remembered the way Claude Code would
-remember it. `ATELIER_APPROVE=all` allows every request. In `--print` mode
-without it, requests are denied (nobody is there to answer).
+atelier's own tools run under atelier's [permission rules and
+mode](permissions.md) on this backend as on the other.
+
+For claude's built-in tools, claude only asks when its own permission rules
+say a call needs approval. Those requests are answered by the same rules
+and mode: claude's tool is mapped to the atelier tool that does the same
+thing (`Bash` → `bash`, `Edit` → `edit`, `Read` → `read`, `WebFetch` →
+`web_fetch`, …; anything else goes by its lower-cased name — see the
+[table](permissions.md#the-claude-backend)), a `deny` rule refuses it, an
+`allow` rule lets it run without a prompt, `plan` mode refuses what can
+modify, and only what is left comes to atelier's prompt. "Always" saves an
+atelier rule in `atelier.toml`; claude's own settings are left alone.
+`ATELIER_APPROVE=all` (the `yolo` mode) allows every request no `deny` rule
+refuses. In `--print` mode without it, requests no rule allows are denied
+(nobody is there to answer).
+
+Calls that claude's own configuration already allows never become a
+request, so atelier's rules and modes do not see them — this matters with
+`ATELIER_CLAUDE_BUILTINS=keep`.
 
 ## Limitations (for now)
 

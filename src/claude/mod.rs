@@ -13,8 +13,18 @@
 //! contributes its configured MCP servers (`--mcp-config`), its per-turn
 //! project context (prepended to each user turn), and the UI — including
 //! permission prompts, which arrive as `can_use_tool` control requests
-//! (`--permission-prompt-tool stdio`) and are answered through
-//! [`Ui::ask_approval`].
+//! (`--permission-prompt-tool stdio`).
+//!
+//! # Permission requests
+//!
+//! A request for one of claude's own tools is judged like a call to
+//! atelier's: its name and arguments are mapped to the tool the permission
+//! rules know ([`rule_subject`]: `Bash` is `bash`, `Edit` is `edit`, …) and
+//! put to the session's rules and mode ([`ToolHost::permit`], see
+//! [`crate::permissions`]). So a `deny = ["bash(rm *)"]` stops claude's
+//! `Bash` as it stops atelier's, plan mode refuses claude's `Write`, an
+//! allow rule answers without a prompt, and "always" saves an atelier rule.
+//! Only what the rules leave open reaches [`Ui::ask_approval`].
 //!
 //! One child process lives for the whole conversation (stream-json input
 //! accepts any number of turns). It is restarted with `--resume <session>`
@@ -56,7 +66,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::agent::{Approval, Ui};
+use crate::agent::Ui;
+use crate::permissions;
 use crate::provider::ToolSpec;
 use crate::settings::Settings;
 
@@ -228,8 +239,10 @@ pub enum Incoming {
 /// Runs atelier's tools for claude: the session's tool registry and approval
 /// policy, driven with the interface of whichever loop receives the call.
 pub trait ToolHost {
-    /// Skip every approval prompt (claude's permission requests included).
-    fn auto_approve(&self) -> bool;
+    /// Whether a call claude wants to make with one of its own tools may
+    /// run, under the session's permission rules and mode — asking the user
+    /// when they say to. `Err` is the reason given to claude.
+    fn permit(&mut self, req: permissions::Request, ui: &mut dyn Ui) -> Result<(), String>;
     /// Run tool `name` (asking approval if its policy says so), returning
     /// its output and whether it succeeded.
     fn call(
@@ -557,7 +570,7 @@ impl Bridge {
             }
             Event::Background(n) => self.background = n,
             Event::Permission(req) => {
-                let answer = self.decide(&req, ui, host.auto_approve());
+                let answer = answer_permission(&req, ui, host);
                 self.write(&answer)?;
             }
             Event::Lifecycle { uuid, state } => {
@@ -655,26 +668,6 @@ impl Bridge {
             "parent_tool_use_id": null,
             "session_id": self.session_id.clone().unwrap_or_default(),
         }))
-    }
-
-    /// Answer a `can_use_tool` request.
-    fn decide(&self, req: &PermissionRequest, ui: &mut dyn Ui, auto_approve: bool) -> Value {
-        let args = req.input.to_string();
-        let approval = if auto_approve {
-            Approval::Once
-        } else {
-            // Claude's Bash takes the same `command` argument as ours.
-            let risk_name = if req.tool == "Bash" {
-                "bash"
-            } else {
-                req.tool.as_str()
-            };
-            for signal in crate::risk::signals(risk_name, &args) {
-                ui.info(&format!("⚠ {signal}"));
-            }
-            ui.ask_approval(&req.tool, &args)
-        };
-        permission_response(&req.request_id, approval, &req.input, &req.suggestions)
     }
 
     fn write(&mut self, v: &Value) -> Result<()> {
@@ -786,25 +779,76 @@ pub fn user_content(text: &str, images: &[String]) -> Value {
     Value::Array(blocks)
 }
 
-/// The control response for a permission request.
-fn permission_response(
-    request_id: &str,
-    approval: Approval,
-    input: &Value,
-    suggestions: &Value,
-) -> Value {
-    let response = match approval {
-        Approval::Once => json!({ "behavior": "allow", "updatedInput": input }),
-        Approval::Always => {
-            let mut r = json!({ "behavior": "allow", "updatedInput": input });
-            if suggestions.as_array().is_some_and(|a| !a.is_empty()) {
-                r["updatedPermissions"] = suggestions.clone();
-            }
-            r
-        }
-        Approval::Deny => json!({
+/// claude's built-in tools as the permission rules know them: the atelier
+/// tool that does the same thing, and whether it can modify something. The
+/// arguments need no translation — claude's `command`, `url` and
+/// `file_path`/`notebook_path` are read where atelier's own are (see
+/// [`crate::tools::path_arg`]).
+const BUILTIN_SUBJECTS: &[(&str, &str, bool)] = &[
+    ("Bash", "bash", true),
+    ("Edit", "edit", true),
+    ("Write", "write", true),
+    ("MultiEdit", "multiedit", true),
+    ("NotebookEdit", "notebook_edit", true),
+    ("Read", "read", false),
+    ("NotebookRead", "read", false),
+    ("Glob", "glob", false),
+    ("Grep", "grep", false),
+    ("LS", "ls", false),
+    ("WebFetch", "web_fetch", false),
+    ("WebSearch", "web_search", false),
+    ("TodoWrite", "todo", false),
+    ("BashOutput", "bash_output", false),
+    ("KillBash", "bash_kill", false),
+    ("KillShell", "bash_kill", false),
+    ("AskUserQuestion", "ask", false),
+];
+
+/// The tool name a rule is matched against for claude's tool `name`, and
+/// whether the tool can modify something. A built-in atelier has no
+/// counterpart for (`Agent`, `Skill`, …) goes by its own name in lower case,
+/// and an MCP tool by its name as it is (`mcp__server__tool`, the name
+/// atelier's rules already use); both count as modifying, the safe answer
+/// for a tool atelier knows nothing about.
+fn rule_subject(name: &str) -> (String, bool) {
+    if let Some((_, tool, mutates)) = BUILTIN_SUBJECTS.iter().find(|(n, ..)| *n == name) {
+        (tool.to_string(), *mutates)
+    } else if name.starts_with("mcp__") {
+        (name.to_string(), true)
+    } else {
+        (name.to_ascii_lowercase(), true)
+    }
+}
+
+/// Answer a `can_use_tool` request: the session's rules and mode decide,
+/// and the user is asked only where they leave it open. claude asks because
+/// its own rules want approval, so the call counts as one that needs it.
+fn answer_permission(req: &PermissionRequest, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Value {
+    let (tool, mutates) = rule_subject(&req.tool);
+    let arguments = req.input.to_string();
+    let verdict = host.permit(
+        permissions::Request {
+            tool: &tool,
+            arguments: &arguments,
+            needs_approval: true,
+            mutates,
+            hook_allowed: false,
+            hooks: None,
+        },
+        ui,
+    );
+    permission_response(&req.request_id, verdict, &req.input)
+}
+
+/// The control response for a permission request: allow, or deny with the
+/// reason (which claude shows its model).
+fn permission_response(request_id: &str, verdict: Result<(), String>, input: &Value) -> Value {
+    let response = match verdict {
+        Ok(()) => json!({ "behavior": "allow", "updatedInput": input }),
+        Err(reason) => json!({
             "behavior": "deny",
-            "message": "The user denied permission to run this tool.",
+            // Tool results read `error: …`; here the denial is the frame.
+            "message": reason.strip_prefix("error: ").unwrap_or(&reason),
         }),
     };
     json!({
@@ -818,7 +862,6 @@ struct PermissionRequest {
     request_id: String,
     tool: String,
     input: Value,
-    suggestions: Value,
 }
 
 /// What one line of the CLI's stream-json output means to the frontend.
@@ -952,7 +995,6 @@ fn parse_line(line: &str) -> Vec<Event> {
                 request_id,
                 tool,
                 input: r["input"].clone(),
-                suggestions: r["permission_suggestions"].clone(),
             })]
         }
         Some("result") => vec![Event::Result {
@@ -1066,7 +1108,6 @@ mod tests {
         assert_eq!(req.request_id, "r1");
         assert_eq!(req.tool, "Write");
         assert_eq!(req.input, json!({"file_path": "/x"}));
-        assert!(req.suggestions.is_array());
     }
 
     #[test]
@@ -1137,23 +1178,321 @@ mod tests {
     #[test]
     fn permission_responses() {
         let input = json!({"command": "ls"});
-        let sugg = json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]);
-        let once = permission_response("r1", Approval::Once, &input, &sugg);
-        assert_eq!(once["type"], "control_response");
-        assert_eq!(once["response"]["request_id"], "r1");
-        assert_eq!(once["response"]["response"]["behavior"], "allow");
-        assert_eq!(once["response"]["response"]["updatedInput"], input);
-        assert!(
-            once["response"]["response"]
-                .get("updatedPermissions")
-                .is_none()
-        );
+        let allow = permission_response("r1", Ok(()), &input);
+        assert_eq!(allow["type"], "control_response");
+        assert_eq!(allow["response"]["subtype"], "success");
+        assert_eq!(allow["response"]["request_id"], "r1");
+        assert_eq!(allow["response"]["response"]["behavior"], "allow");
+        assert_eq!(allow["response"]["response"]["updatedInput"], input);
 
-        let always = permission_response("r1", Approval::Always, &input, &sugg);
-        assert_eq!(always["response"]["response"]["updatedPermissions"], sugg);
-
-        let deny = permission_response("r1", Approval::Deny, &input, &sugg);
+        let deny = permission_response("r1", Err("error: refused by x.".into()), &input);
+        assert_eq!(deny["response"]["request_id"], "r1");
         assert_eq!(deny["response"]["response"]["behavior"], "deny");
+        assert_eq!(deny["response"]["response"]["message"], "refused by x.");
+        assert!(deny["response"]["response"].get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn builtin_tools_map_to_rule_subjects() {
+        for (name, tool, mutates) in [
+            ("Bash", "bash", true),
+            ("Edit", "edit", true),
+            ("Write", "write", true),
+            ("MultiEdit", "multiedit", true),
+            ("NotebookEdit", "notebook_edit", true),
+            ("Read", "read", false),
+            ("NotebookRead", "read", false),
+            ("Glob", "glob", false),
+            ("Grep", "grep", false),
+            ("LS", "ls", false),
+            ("WebFetch", "web_fetch", false),
+            ("WebSearch", "web_search", false),
+            ("TodoWrite", "todo", false),
+            ("BashOutput", "bash_output", false),
+            ("KillShell", "bash_kill", false),
+            // No counterpart: its own name in lower case, and modifying.
+            ("Agent", "agent", true),
+            ("ExitPlanMode", "exitplanmode", true),
+            ("SomethingNew", "somethingnew", true),
+            // Names are exact: this is not claude's `Bash`.
+            ("bash", "bash", true),
+            ("BASH", "bash", true),
+            // MCP tools keep the name atelier's rules use for them.
+            (
+                "mcp__GitHub__create_issue",
+                "mcp__GitHub__create_issue",
+                true,
+            ),
+        ] {
+            assert_eq!(rule_subject(name), (tool.to_string(), mutates), "{name}");
+        }
+        // Every mapped name is a tool atelier has, and agrees with it on
+        // whether the tool modifies — so a rule or a mode means the same
+        // thing for claude's tool as for atelier's.
+        let registry = crate::tools::builtin_registry();
+        for (name, tool, mutates) in BUILTIN_SUBJECTS {
+            let own = registry
+                .get(tool)
+                .unwrap_or_else(|| panic!("{name} maps to unknown tool {tool}"));
+            let args = match *tool {
+                "bash" => json!({"command": "ls"}),
+                _ => json!({"file_path": "/x", "url": "https://x"}),
+            };
+            assert_eq!(own.mutates(&args), *mutates, "{name} -> {tool}");
+        }
+        // Everything atelier switches off by default is mapped (or, for
+        // `Monitor`, deliberately left to the safe default).
+        for name in REPLACED_BUILTINS {
+            assert!(
+                *name == "Monitor" || BUILTIN_SUBJECTS.iter().any(|(n, ..)| n == name),
+                "{name} has no rule subject"
+            );
+        }
+    }
+
+    /// A [`Ui`] that gives one answer to every prompt and counts them.
+    struct Asker {
+        answer: fn() -> crate::agent::Approval,
+        asked: Vec<String>,
+    }
+
+    impl Asker {
+        fn new(answer: fn() -> crate::agent::Approval) -> Self {
+            let asked = Vec::new();
+            Self { answer, asked }
+        }
+    }
+
+    impl Ui for Asker {
+        fn reasoning(&mut self, _: &str) {}
+        fn content(&mut self, _: &str) {}
+        fn tool_start(&mut self, _: &str, _: &str) {}
+        fn tool_end(&mut self, _: &str, _: &str, _: bool) {}
+        fn info(&mut self, _: &str) {}
+        fn ask_approval(&mut self, tool: &str, _: &str) -> crate::agent::Approval {
+            self.asked.push(tool.to_string());
+            (self.answer)()
+        }
+        fn notice(&mut self, _: &str) {}
+    }
+
+    /// A [`ToolHost`] that judges permission requests as a session does —
+    /// the real decision, under rules and a mode given here instead of read
+    /// from the user's files.
+    struct RuleHost {
+        policy: permissions::Policy,
+        settings: Settings,
+        dir: std::path::PathBuf,
+        mode: permissions::Mode,
+    }
+
+    impl RuleHost {
+        fn new(name: &str, mode: permissions::Mode, allow: &[&str], deny: &[&str]) -> Self {
+            let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+            let rules = crate::settings::Permissions {
+                allow: list(allow),
+                ask: Vec::new(),
+                deny: list(deny),
+            };
+            let dir =
+                std::env::temp_dir().join(format!("atelier-bridge-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self {
+                // `~` in a rule is /home/me here.
+                policy: permissions::Policy::new(
+                    &rules,
+                    &Default::default(),
+                    Some("/home/me".into()),
+                ),
+                settings: Settings::default(),
+                dir,
+                mode,
+            }
+        }
+
+        /// The `behavior` (and denial message) claude gets for a request.
+        fn answer(&mut self, tool: &str, input: Value, ui: &mut Asker) -> (String, String) {
+            let req = PermissionRequest {
+                request_id: "r1".into(),
+                tool: tool.into(),
+                input: input.clone(),
+            };
+            let v = answer_permission(&req, ui, self);
+            let r = &v["response"]["response"];
+            if r["behavior"] == "allow" {
+                assert_eq!(r["updatedInput"], input);
+            }
+            let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+            (text(&r["behavior"]), text(&r["message"]))
+        }
+    }
+
+    impl Drop for RuleHost {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl ToolHost for RuleHost {
+        fn permit(&mut self, req: permissions::Request, ui: &mut dyn Ui) -> Result<(), String> {
+            let (policy, dir) = (&self.policy, &self.dir);
+            permissions::approve_with(policy, &mut self.settings, dir, self.mode, req, ui)
+        }
+        fn call(
+            &mut self,
+            name: &str,
+            _: Value,
+            _: &mut dyn Ui,
+        ) -> (crate::tools::ToolOutput, bool) {
+            panic!("unexpected tool call: {name}")
+        }
+    }
+
+    use crate::agent::Approval;
+    use permissions::Mode;
+
+    #[test]
+    fn deny_rules_stop_claudes_builtin_tools() {
+        let deny = [
+            "bash(rm *)",
+            "read(~/.ssh/**)",
+            "write(.github/**)",
+            "agent",
+        ];
+        // Whatever the user would answer, and in every mode — yolo included.
+        for mode in Mode::ALL {
+            let mut host = RuleHost::new("deny", mode, &["bash"], &deny);
+            let mut ui = Asker::new(|| Approval::Once);
+            let workflow = host.dir.join(".github/workflows/ci.yml");
+            for (tool, input) in [
+                ("Bash", json!({"command": "rm -rf build"})),
+                ("Bash", json!({"command": "ls && sudo rm x"})),
+                ("Read", json!({"file_path": "/home/me/.ssh/id_rsa"})),
+                ("Write", json!({"file_path": workflow, "content": "x"})),
+                ("Agent", json!({"prompt": "do it"})),
+            ] {
+                let (behavior, message) = host.answer(tool, input, &mut ui);
+                assert_eq!(behavior, "deny", "{tool} in {mode}");
+                assert!(
+                    message.starts_with("refused by the permission rule"),
+                    "{tool} in {mode}: {message}"
+                );
+            }
+            assert!(ui.asked.is_empty(), "{mode}: {:?}", ui.asked);
+        }
+    }
+
+    #[test]
+    fn allow_rules_answer_for_claudes_builtin_tools_without_a_prompt() {
+        let allow = ["bash(git diff *)", "web_fetch(domain:docs.rs)"];
+        let mut host = RuleHost::new("allow", Mode::AutoEdit, &allow, &[]);
+        let mut ui = Asker::new(|| Approval::Deny);
+        let diff = json!({"command": "git diff --stat"});
+        assert_eq!(host.answer("Bash", diff, &mut ui).0, "allow");
+        let fetch = json!({"url": "https://docs.rs/serde", "prompt": "summarize"});
+        assert_eq!(host.answer("WebFetch", fetch, &mut ui).0, "allow");
+        assert!(ui.asked.is_empty());
+
+        // What no rule covers is put to the user, under atelier's name for
+        // the tool, and their no is passed on.
+        let push = json!({"command": "git diff; git push"});
+        let (behavior, message) = host.answer("Bash", push, &mut ui);
+        assert_eq!(behavior, "deny");
+        assert_eq!(message, "the user denied permission to run this tool.");
+        let elsewhere = json!({"url": "https://example.com"});
+        assert_eq!(host.answer("WebFetch", elsewhere, &mut ui).0, "deny");
+        // claude asked, so even a tool atelier would run unasked is put to
+        // the user rather than waved through.
+        let read = json!({"file_path": "/etc/hosts"});
+        assert_eq!(host.answer("Read", read, &mut ui).0, "deny");
+        assert_eq!(ui.asked, ["bash", "web_fetch", "read"]);
+    }
+
+    #[test]
+    fn always_on_a_builtin_tool_saves_an_atelier_rule() {
+        let mut host = RuleHost::new("always", Mode::AutoEdit, &[], &[]);
+        let mut ui = Asker::new(|| Approval::Always);
+        let test = json!({"command": "cargo test --lib"});
+        assert_eq!(host.answer("Bash", test, &mut ui).0, "allow");
+        assert_eq!(host.settings.permissions.allow, ["bash(cargo test *)"]);
+        let saved = Settings::load(&host.dir).unwrap();
+        assert_eq!(saved.permissions.allow, ["bash(cargo test *)"]);
+    }
+
+    #[test]
+    fn modes_govern_claudes_builtin_tools() {
+        let edits = [
+            ("Bash", json!({"command": "make install"})),
+            (
+                "Edit",
+                json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            ("Write", json!({"file_path": "a.rs", "content": "x"})),
+            ("MultiEdit", json!({"file_path": "a.rs", "edits": []})),
+            (
+                "NotebookEdit",
+                json!({"notebook_path": "a.ipynb", "new_source": "x"}),
+            ),
+            ("Agent", json!({"prompt": "do it"})),
+            ("mcp__gh__create_issue", json!({"title": "x"})),
+        ];
+        let reads = [
+            ("Read", json!({"file_path": "/etc/hosts"})),
+            ("Grep", json!({"pattern": "x"})),
+            ("WebFetch", json!({"url": "https://example.com"})),
+            ("WebSearch", json!({"query": "x"})),
+        ];
+
+        // plan: what can modify is refused with the plan-mode message, a
+        // whole-tool allow rule notwithstanding, and nobody is asked; what
+        // only reads is put to the user as usual.
+        let mut host = RuleHost::new(
+            "plan",
+            Mode::Plan,
+            &["bash", "write", "bash(git log *)"],
+            &[],
+        );
+        let mut ui = Asker::new(|| Approval::Once);
+        for (tool, input) in edits.clone() {
+            let (behavior, message) = host.answer(tool, input, &mut ui);
+            assert_eq!(behavior, "deny", "{tool}");
+            let subject = rule_subject(tool).0;
+            assert!(
+                message.starts_with(&format!("plan mode: {subject} is not available")),
+                "{tool}: {message}"
+            );
+        }
+        assert!(ui.asked.is_empty(), "{:?}", ui.asked);
+        for (tool, input) in reads.clone() {
+            assert_eq!(host.answer(tool, input, &mut ui).0, "allow", "{tool}");
+        }
+        assert_eq!(ui.asked.len(), reads.len());
+        // …and `Bash` runs what a pattern allow rule names.
+        let log = json!({"command": "git log -3"});
+        assert_eq!(host.answer("Bash", log, &mut ui).0, "allow");
+        assert_eq!(ui.asked.len(), reads.len());
+
+        // ask-edits and auto-edit: claude asked, so the user is asked.
+        for mode in [Mode::AskEdits, Mode::AutoEdit] {
+            let mut host = RuleHost::new("ask", mode, &[], &[]);
+            let mut ui = Asker::new(|| Approval::Deny);
+            for (tool, input) in edits.iter().chain(&reads).cloned() {
+                assert_eq!(
+                    host.answer(tool, input, &mut ui).0,
+                    "deny",
+                    "{tool} in {mode}"
+                );
+            }
+            assert_eq!(ui.asked.len(), edits.len() + reads.len(), "{mode}");
+        }
+
+        // yolo: everything is allowed, unasked.
+        let mut host = RuleHost::new("yolo", Mode::Yolo, &[], &[]);
+        let mut ui = Asker::new(|| Approval::Deny);
+        for (tool, input) in edits.iter().chain(&reads).cloned() {
+            assert_eq!(host.answer(tool, input, &mut ui).0, "allow", "{tool}");
+        }
+        assert!(ui.asked.is_empty());
     }
 
     #[test]
@@ -1231,12 +1570,12 @@ mod tests {
         }
     }
 
-    /// Auto-approves, offers no tools.
+    /// Allows every permission request, offers no tools.
     struct NoTools;
 
     impl ToolHost for NoTools {
-        fn auto_approve(&self) -> bool {
-            true
+        fn permit(&mut self, _: permissions::Request, _: &mut dyn Ui) -> Result<(), String> {
+            Ok(())
         }
         fn call(
             &mut self,

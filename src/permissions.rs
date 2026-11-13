@@ -1093,7 +1093,7 @@ pub fn approve(
 }
 
 /// [`approve`] under a given policy.
-fn approve_with(
+pub(crate) fn approve_with(
     policy: &Policy,
     settings: &mut Settings,
     root: &Path,

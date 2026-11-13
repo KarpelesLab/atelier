@@ -1837,8 +1837,13 @@ impl ToolRunner<'_> {
 }
 
 impl claude::ToolHost for ToolRunner<'_> {
-    fn auto_approve(&self) -> bool {
-        self.mode == Mode::Yolo
+    fn permit(&mut self, req: crate::permissions::Request, ui: &mut dyn Ui) -> Result<(), String> {
+        // claude's own tools get the `permission_request` hooks too.
+        let req = crate::permissions::Request {
+            hooks: Some(self.hooks),
+            ..req
+        };
+        crate::permissions::approve(self.settings, self.root, self.mode, req, ui)
     }
 
     fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {

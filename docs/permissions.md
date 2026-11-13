@@ -309,9 +309,40 @@ subagents off.
 
 Atelier's own tools reach claude as `mcp__atelier__<tool>` and run through
 the same `ToolRunner`, so the rules above apply to them unchanged (under
-their plain names: `bash(…)`, not `mcp__atelier__bash(…)`). Claude's
-*built-in* tools (its own `Bash`, `Edit`, …) are approved through claude's
-permission requests, which do not consult these rules yet.
+their plain names: `bash(…)`, not `mcp__atelier__bash(…)`), and so does the
+mode.
+
+Claude's *built-in* tools are switched off in favour of atelier's by default;
+those that remain (`Agent`, `WebSearch`, …), and all of them with
+`ATELIER_CLAUDE_BUILTINS=keep`, ask through claude's permission requests.
+atelier answers a request with the same rules and mode, after mapping
+claude's tool to the one the rules know:
+
+| claude's tool | judged as | modifies |
+|---------------|-----------|----------|
+| `Bash` | `bash` (the `command`) | yes |
+| `Edit`, `Write`, `MultiEdit`, `NotebookEdit` | `edit`, `write`, `multiedit`, `notebook_edit` (the `file_path` / `notebook_path`) | yes |
+| `Read`, `NotebookRead` | `read` (the path) | no |
+| `WebFetch`, `WebSearch` | `web_fetch` (the `url`), `web_search` | no |
+| `Glob`, `Grep`, `LS`, `TodoWrite`, `BashOutput`, `KillShell` | `glob`, `grep`, `ls`, `todo`, `bash_output`, `bash_kill` (arguments as JSON) | no |
+| an MCP tool | its own name, `mcp__<server>__<tool>` | yes |
+| anything else (`Agent`, `Skill`, …) | its name in lower case (`agent`), arguments as JSON | yes |
+
+So `deny = ["bash(rm *)"]` refuses claude's `Bash` running `rm` (claude is
+given the same message naming the rule), `allow = ["bash(git diff *)"]`
+answers yes without a prompt, and in `plan` mode claude's `Edit`, `Write`
+and `Bash` are refused with the plan-mode message. A request no rule
+decides is put to you — claude asked, so it is never waved through outside
+`yolo` — and "always" saves an atelier rule to `atelier.toml`, exactly as
+for atelier's own tools (claude's own permission settings are not changed).
+
+**The limit:** atelier only sees the calls claude *asks* about. A call that
+claude's own configuration already allows — its `permissions.allow`
+settings, a `Read` inside the working directory — runs without a request,
+and no atelier rule or mode is consulted. With claude's built-ins kept, do
+not rely on atelier's deny rules or `plan` mode for tools claude is
+configured to run unasked; the default (built-ins replaced by atelier's
+tools) has no such gap for the tools it replaces.
 
 ## Risk signals (`bash` only)
 
@@ -340,7 +371,9 @@ signals at once (each category is reported at most once per call).
 
 ## Scope not yet covered
 
-- Rules do not reach the Claude backend's built-in tools (see above).
+- On the Claude backend, rules and modes reach claude's built-in tools only
+  through its permission requests: what claude's own settings allow runs
+  unseen (see above).
 - `web_fetch` rules judge the URL asked for; redirects are followed without
   being re-checked.
 - `grep`, `glob`, `ls` and `tree` are matched on their JSON arguments, not as
