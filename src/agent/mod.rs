@@ -15,8 +15,11 @@
 //!
 //! One tool is not run through the registry: `task`. A subagent is another
 //! [`Session`] on this same loop, which a tool has no way to build, so the
-//! loop runs those calls itself — see the `subagent` module.
+//! loop runs those calls itself — see the `subagent` module. And calls that
+//! only read, when several follow one another in a step, run at the same
+//! time — see the `batch` module.
 
+mod batch;
 mod compact;
 mod prompt;
 mod window;
@@ -1534,7 +1537,8 @@ impl Session {
             // completions tool results are text, so they follow as a user
             // message once every call has its result.
             let mut images: Vec<String> = Vec::new();
-            // Results of `task` calls that ran together with an earlier one.
+            // Results of calls that ran together with an earlier one: `task`
+            // calls, or read-only ones (see `batch`).
             let mut ahead: VecDeque<String> = VecDeque::new();
             for (i, call) in completion.tool_calls.iter().enumerate() {
                 // Once stopped, the remaining calls still need a result each
@@ -1545,6 +1549,9 @@ impl Session {
                 // same time (see `subagent`).
                 if !stopped && ahead.is_empty() && self.runs_task(call) {
                     ahead = self.run_tasks(&completion.tool_calls[i..], ui);
+                } else if !stopped && ahead.is_empty() {
+                    // Nothing, unless this call and the next only read.
+                    ahead = self.run_batch(&completion.tool_calls[i..], &mut images, ui);
                 }
                 if let Some(text) = ahead.pop_front() {
                     self.history
@@ -1552,7 +1559,7 @@ impl Session {
                     continue;
                 }
                 if stopped {
-                    let msg = "error: not run — the user stopped the turn.".to_string();
+                    let msg = batch::NOT_RUN.to_string();
                     self.history
                         .push(Message::tool_result(call.id.clone(), msg));
                     continue;

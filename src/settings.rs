@@ -232,8 +232,8 @@ pub struct ReviewSettings {
 }
 
 /// Per-project defaults from `[defaults]`. Each is overridden by its env var
-/// (`ATELIER_MODEL`, `ATELIER_APPROVE`, `ATELIER_MODE`, `ATELIER_CONTEXT_LIMIT`)
-/// when that's set.
+/// (`ATELIER_MODEL`, `ATELIER_APPROVE`, `ATELIER_MODE`, `ATELIER_CONTEXT_LIMIT`,
+/// `ATELIER_PARALLEL_TOOLS`) when that's set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default)]
@@ -256,6 +256,10 @@ pub struct Defaults {
     /// `0` never defers. Unset means the built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_tool_budget: Option<usize>,
+    /// `false` runs the read-only tool calls of one model step one after the
+    /// other instead of at the same time (see `agent::batch`). Unset: on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tools: Option<bool>,
 }
 
 /// Tool-approval rules: `tool` or `tool(pattern)` strings, in three lists.

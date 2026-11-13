@@ -249,6 +249,7 @@ fn atelier(base_url: &str, cwd: &Path) -> Command {
         .env_remove("ATELIER_CONTEXT_LIMIT")
         .env_remove("ATELIER_REVIEW")
         .env_remove("ATELIER_MODE")
+        .env_remove("ATELIER_PARALLEL_TOOLS")
         .current_dir(cwd);
     cmd
 }
@@ -3116,4 +3117,147 @@ fn an_unwritable_usage_log_is_ignored() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("fine"));
+}
+
+/// The tool results of a request, as `(tool_call_id, content)` in the order
+/// they were sent.
+fn tool_results(request: &serde_json::Value) -> Vec<(String, String)> {
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| (text(&m["tool_call_id"]), text(&m["content"])))
+        .collect()
+}
+
+/// The tool events of a `stream-json` run, as `start <tool>` / `end <tool>`.
+fn tool_events(out: &Output) -> Vec<String> {
+    json_lines(out)
+        .iter()
+        .filter_map(|e| {
+            let kind = e["type"].as_str()?.strip_prefix("tool_")?;
+            Some(format!("{kind} {}", e["name"].as_str()?))
+        })
+        .collect()
+}
+
+/// Parallel tool calls — one step asking for `[read, grep, write, read]`.
+/// The two leading read-only calls run as a batch (both announced before
+/// either ends), the `write` runs by itself after them, and the last `read`
+/// after that: it sees the file the `write` made. Whatever ran when, the
+/// next request carries one result per call, in the order of the calls.
+/// With `ATELIER_PARALLEL_TOOLS=0` the same step runs one call at a time,
+/// to the same results.
+#[test]
+fn read_only_calls_of_a_step_run_together_and_results_keep_call_order() {
+    let step = || -> Responder {
+        Arc::new(|n| match n {
+            0 => tool_calls_response(&[
+                ("call_a", "read", serde_json::json!({"path": "a.txt"})),
+                ("call_b", "grep", serde_json::json!({"pattern": "needle"})),
+                (
+                    "call_c",
+                    "write",
+                    serde_json::json!({"path": "b.txt", "content": "BRAVO"}),
+                ),
+                ("call_d", "read", serde_json::json!({"path": "b.txt"})),
+            ]),
+            _ => text_response("done"),
+        })
+    };
+    let run = |name: &str, env: &[(&str, &str)]| {
+        let mock = Mock::start(step());
+        let dir = unique_dir(name);
+        std::fs::write(dir.join("a.txt"), "ALPHA\n").unwrap();
+        std::fs::write(dir.join("hay.txt"), "a needle\n").unwrap();
+        let out = run_atelier_env(
+            &mock.base_url(),
+            &dir,
+            &["-p", "--output-format", "stream-json", "look around"],
+            None,
+            env,
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+        assert_eq!(mock.requests(), 2);
+        let results = tool_results(&request(&mock.body(1)));
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["call_a", "call_b", "call_c", "call_d"]);
+        assert!(results[0].1.contains("ALPHA"), "{results:?}");
+        assert!(results[1].1.contains("hay.txt"), "{results:?}");
+        assert!(results[3].1.contains("BRAVO"), "{results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        tool_events(&out)
+    };
+
+    assert_eq!(
+        run("parallel-on", &[]),
+        [
+            "start read",
+            "start grep",
+            "end read",
+            "end grep",
+            "start write",
+            "end write",
+            "start read",
+            "end read",
+        ]
+    );
+    assert_eq!(
+        run("parallel-off", &[("ATELIER_PARALLEL_TOOLS", "0")]),
+        [
+            "start read",
+            "end read",
+            "start grep",
+            "end grep",
+            "start write",
+            "end write",
+            "start read",
+            "end read",
+        ]
+    );
+}
+
+/// Parallel tool calls and hooks — a `pre_tool` hook turns the `memory`
+/// `list` in the middle of three read-only calls into a `save`. A call that
+/// changes something does not run alongside others: the batch ends with it,
+/// it runs once the read before it is done, and the read after it goes
+/// through the loop as usual. Each call's hooks ran once, and the results
+/// are still one per call, in order.
+#[test]
+fn a_call_a_hook_rewrites_into_a_write_ends_the_batch() {
+    let mock = Mock::start(Arc::new(|n| match n {
+        0 => tool_calls_response(&[
+            ("call_a", "read", serde_json::json!({"path": "a.txt"})),
+            ("call_b", "memory", serde_json::json!({"action": "list"})),
+            ("call_c", "read", serde_json::json!({"path": "a.txt"})),
+        ]),
+        _ => text_response("done"),
+    }));
+    let dir = unique_dir("parallel-hook");
+    std::fs::write(dir.join("a.txt"), "ALPHA\n").unwrap();
+    let hooks = r#"
+[[hooks]]
+event = "pre_tool"
+match = "memory"
+command = """echo ran >> hook.log; printf '{"arguments": {"action": "save", "name": "from-hook", "description": "d", "type": "project", "content": "c"}}'"""
+"#;
+    let out = run_with_hooks(&mock, &dir, hooks, true);
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let results = tool_results(&request(&mock.body(1)));
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["call_a", "call_b", "call_c"]);
+    assert!(results[0].1.contains("ALPHA"), "{results:?}");
+    assert!(
+        results[1].1.contains("saved memory 'from-hook'"),
+        "{results:?}"
+    );
+    assert!(results[2].1.contains("ALPHA"), "{results:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("hook.log")).unwrap(),
+        "ran\n"
+    );
 }

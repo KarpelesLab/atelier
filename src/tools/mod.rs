@@ -347,6 +347,25 @@ impl FileState {
     pub fn take_new_dirs(&mut self) -> Vec<PathBuf> {
         std::mem::take(&mut self.new_dirs)
     }
+    /// Take in what `other` recorded, as if its reads had been recorded here
+    /// one after the other: its content hashes replace this tracker's for
+    /// the same paths, and the directories it entered that are new here are
+    /// queued for [`take_new_dirs`](Self::take_new_dirs).
+    ///
+    /// This is how tool calls that ran at the same time (see `agent::batch`)
+    /// share one tracker without a lock: each records into an empty one of
+    /// its own, and the loop merges them in call order afterwards — so a
+    /// directory two of them entered is new exactly once, for the first.
+    pub fn merge(&mut self, other: FileState) {
+        self.seen.extend(other.seen);
+        // `other` started empty, so `new_dirs` is every directory it knows,
+        // in the order `record` met them.
+        for dir in other.new_dirs {
+            if self.dirs.insert(dir.clone()) {
+                self.new_dirs.push(dir);
+            }
+        }
+    }
     /// Report every directory afresh from here on — for when the conversation
     /// that was told about them is gone.
     pub fn forget_dirs(&mut self) {
@@ -430,6 +449,19 @@ mod tests {
         assert!(fstate.take_new_dirs().is_empty());
         fstate.record(Path::new("/p/web/api/c.ts"), "c");
         assert_eq!(fstate.take_new_dirs(), vec![PathBuf::from("/p/web/api")]);
+
+        // Two trackers that each entered the same new directory: merged in
+        // turn, it is new once, and both reads count.
+        let (mut one, mut two) = (FileState::new(), FileState::new());
+        one.record(Path::new("/p/web/db/d.ts"), "d");
+        two.record(Path::new("/p/web/db/e.ts"), "e");
+        two.record(Path::new("/p/web/ui/a.ts"), "a3");
+        fstate.merge(one);
+        assert_eq!(fstate.take_new_dirs(), vec![PathBuf::from("/p/web/db")]);
+        fstate.merge(two);
+        assert!(fstate.take_new_dirs().is_empty());
+        assert!(fstate.was_read(Path::new("/p/web/db/e.ts")));
+        assert!(!fstate.is_stale(Path::new("/p/web/ui/a.ts"), "a3"));
 
         // Forgetting directories reports them again, and leaves reads alone.
         fstate.forget_dirs();

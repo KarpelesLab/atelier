@@ -37,6 +37,39 @@ absolute paths outside it. See [Permissions](permissions.md) for the full
 approval model and why confinement is the deciding factor, not "read vs.
 write".
 
+## Read-only calls run in parallel
+
+When the model asks for several tool calls in one step, the ones that only
+look run at the same time (`src/agent/batch.rs`): a run of consecutive calls
+to `read`, `grep`, `glob`, `ls`, `tree`, `web_fetch`, `web_search`, `skill`,
+`memory` (`read` and `list` only) and `bash_output`, up to 8 at once. Any
+other call — one that writes, `bash`, `ask`, `task`, `todo`, an MCP tool —
+ends the run and is executed by itself, in its place: `[read a, grep x,
+write b, read c]` is `read a` and `grep x` together, then `write b`, then
+`read c`.
+
+What does not change:
+
+- **Approval and hooks come first, in order.** Each call of a batch gets its
+  `pre_tool` hooks and its approval (rules, the mode, a prompt if needed) one
+  after the other before any of them runs. A refused call gets its refusal
+  as its result; the others still run. `post_tool` hooks run in call order
+  once the batch is done.
+- **The model sees one result per call, in the order of its calls**,
+  whichever finished first.
+- **Read tracking**: a file read in a batch counts as read for a later
+  `edit`, and a subdirectory's own instruction file still arrives exactly
+  once — with the first call, in call order, that went there.
+
+On screen, the calls of a batch are announced together (`⚙ read …`,
+`⚙ grep …`) and their results follow in the same order. Stopping the turn
+(Ctrl-C) lets the calls that are running finish and skips the ones that have
+not started.
+
+`[defaults] parallel_tools = false` in `atelier.toml`, or
+`ATELIER_PARALLEL_TOOLS=0`, runs every call one at a time. The Claude backend
+is not concerned: claude asks for atelier's tools one call at a time.
+
 ## Long output goes to a file
 
 Tools whose output can be any size — `bash`, `bash_output`, `node`, MCP tools

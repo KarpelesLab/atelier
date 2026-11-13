@@ -44,6 +44,7 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
 | `ATELIER_MODE`            | *(unset)*                        | `main`, `permissions::Mode::from_env` | The permission [mode](permissions.md#modes) to start in: `plan`, `ask-edits`, `auto-edit` (the default) or `yolo`. Overridden by `--mode`; overrides `ATELIER_APPROVE` and `[defaults] mode`. Any other value is an error |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
+| `ATELIER_PARALLEL_TOOLS`  | *(unset)*                        | `agent::batch` | `0`, `off`, `no` or `false` runs the read-only tool calls of one model step one after the other instead of [at the same time](tools.md#read-only-calls-run-in-parallel); any other value turns that on. Overrides `[defaults] parallel_tools` |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
 | `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `hooks::Paths::from_env` | `1` runs the project's [hooks](hooks.md) without your stored approval — for headless runs (`--print`), which never ask and otherwise skip unapproved project hooks. Only for checkouts you control |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000), and any provider's `timeout_secs`. Non-numeric or `<= 0` values are ignored |
@@ -164,6 +165,7 @@ approve = false             # overridden by ATELIER_APPROVE
 mode = "auto-edit"          # overridden by ATELIER_MODE and --mode
 context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
 mcp_tool_budget = 8192      # no environment variable
+parallel_tools = true       # overridden by ATELIER_PARALLEL_TOOLS
 ```
 
 `mode` is the permission [mode](permissions.md#modes) sessions start in:
@@ -177,6 +179,10 @@ switches it during a session.
 schemas) are advertised to the model before the tools are
 [deferred](mcp.md#deferred-tools) behind `mcp_search` and `mcp_call`. The
 default is 8192; `0` never defers.
+
+`parallel_tools` (on when unset) lets the read-only tool calls of one model
+step [run at the same time](tools.md#read-only-calls-run-in-parallel); `false`
+runs every call one after the other.
 
 ## `[[provider]]` — named endpoints
 
