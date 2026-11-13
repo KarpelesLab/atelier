@@ -2897,3 +2897,223 @@ fn roles_and_mid_session_switches() {
     }
     assert!(!stdout.contains("k-second-123") && !stderr.contains("k-second-123"));
 }
+
+/// A streamed plain answer followed by a usage chunk with a cached part.
+fn answer_with_cached_usage(text: &str, prompt: u32, cached: u32, completion: u32) -> Vec<u8> {
+    let answer = serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    let usage = serde_json::json!({"choices": [], "usage": {
+        "prompt_tokens": prompt, "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }});
+    sse_response(&[&answer.to_string(), &usage.to_string()])
+}
+
+/// The lines of the usage log the `atelier()` helper points `cwd`'s runs at.
+fn usage_log(cwd: &Path) -> Vec<serde_json::Value> {
+    let dir = cwd.with_extension("state").join("atelier/usage");
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("a usage directory") {
+        let path = entry.unwrap().path();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("jsonl"));
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            lines.push(serde_json::from_str(line).expect("a JSON line"));
+        }
+    }
+    lines
+}
+
+/// Case 19 — the usage log and `atelier stats`. Every model request appends
+/// a line (provider, model, project, tokens, cached tokens, duration), with
+/// zeros when the endpoint reports no usage; `atelier stats --json` totals
+/// them per day, model and project, with cost where a `[[price]]` applies;
+/// `--project` keeps to the current directory; `/usage` shows the session's.
+#[test]
+fn requests_are_logged_and_stats_totals_them() {
+    let first = Mock::start(Arc::new(|n| match n {
+        // A tool step, then the answer: two requests for one prompt.
+        0 => tool_call_response("call_1", "ls", "{}"),
+        1 => answer_with_cached_usage("done", 1_000, 600, 50),
+        _ => answer_with_cached_usage("again", 2_000, 0, 100),
+    }));
+    let second = Mock::start(Arc::new(|_| answer_with_cached_usage("b", 300, 0, 30)));
+    let dir = unique_dir("usage");
+    let toml = format!(
+        "[[provider]]\nname = \"second\"\nbase_url = \"{}\"\n\n\
+         [[price]]\nmodel = \"env/mock\"\ninput = 2.0\noutput = 10.0\ncached = 0.5\n",
+        second.base_url()
+    );
+    std::fs::write(dir.join("atelier.toml"), &toml).unwrap();
+
+    assert!(run_print(&first.base_url(), &dir, "list").status.success());
+    let mut repl = Repl::start(&first.base_url(), &dir, &[]);
+    repl.line("/usage");
+    repl.line("once more");
+    wait_requests(&first, 3);
+    repl.line("/model second/model-b");
+    repl.line("and you");
+    wait_requests(&second, 1);
+    repl.line("/usage");
+    let (stdout, stderr) = repl.finish();
+
+    // One line per request, in order.
+    let log = usage_log(&dir);
+    assert_eq!(log.len(), 4, "{log:?}");
+    let project = dir.to_string_lossy();
+    for line in &log {
+        assert_eq!(line["project"], *project);
+        assert!(line["ts"].as_u64().unwrap() > 1_700_000_000);
+        assert!(line["duration_ms"].is_u64());
+    }
+    let row = |n: usize| {
+        let l = &log[n];
+        (
+            format!(
+                "{}/{}",
+                l["provider"].as_str().unwrap(),
+                l["model"].as_str().unwrap()
+            ),
+            l["prompt_tokens"].as_u64().unwrap(),
+            l["cached_tokens"].as_u64().unwrap(),
+            l["completion_tokens"].as_u64().unwrap(),
+        )
+    };
+    // The tool step reported no usage: logged all the same, as zeros.
+    assert_eq!(row(0), ("env/mock".to_string(), 0, 0, 0));
+    assert_eq!(row(1), ("env/mock".to_string(), 1_000, 600, 50));
+    assert_eq!(row(2), ("env/mock".to_string(), 2_000, 0, 100));
+    assert_eq!(row(3), ("second/model-b".to_string(), 300, 0, 30));
+
+    // `/usage`: nothing before the first request of the session, then this
+    // session's two requests (the earlier run's are not its own).
+    assert!(
+        stdout.contains("no model requests made yet this session"),
+        "{stdout}\n{stderr}"
+    );
+    let usage_rows: Vec<&str> = stdout
+        .lines()
+        .filter(|l| {
+            l.starts_with("env/mock ")
+                || l.starts_with("second/model-b ")
+                || l.starts_with("total ")
+        })
+        .collect();
+    let cells = |line: &str| -> Vec<String> { line.split_whitespace().map(String::from).collect() };
+    assert_eq!(
+        cells(usage_rows[0]),
+        ["env/mock", "1", "2000", "0", "100", "0.0050"]
+    );
+    assert_eq!(
+        cells(usage_rows[1]),
+        ["second/model-b", "1", "300", "0", "30", "-"]
+    );
+    assert_eq!(
+        cells(usage_rows[2]),
+        ["total", "2", "2300", "0", "130", "0.0050+"]
+    );
+
+    // `atelier stats --json` over the same log.
+    let stats = |cwd: &Path, args: &[&str]| -> Output {
+        let mut full = vec!["stats"];
+        full.extend(args);
+        atelier(&first.base_url(), cwd)
+            // The log of the runs above, wherever the command is run from.
+            .env("XDG_STATE_HOME", dir.with_extension("state"))
+            .args(&full)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run atelier stats")
+    };
+    let out = stats(&dir, &["--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stats --json prints one JSON document");
+    assert_eq!(json["days"], 30);
+    let total = &json["total"];
+    assert_eq!(total["requests"], 4);
+    assert_eq!(total["prompt_tokens"], 3_300);
+    assert_eq!(total["cached_tokens"], 600);
+    assert_eq!(total["completion_tokens"], 180);
+    assert_eq!(total["priced_requests"], 3);
+    // env/mock: (400 + 2000) fresh at 2, 600 cached at 0.5, 150 out at 10.
+    let expected = (2_400.0 * 2.0 + 600.0 * 0.5 + 150.0 * 10.0) / 1e6;
+    assert!(
+        (total["cost"].as_f64().unwrap() - expected).abs() < 1e-12,
+        "{total}"
+    );
+    let by_model = json["by_model"].as_array().unwrap();
+    assert_eq!(by_model.len(), 2);
+    assert_eq!(by_model[0]["model"], "env/mock");
+    assert_eq!(by_model[0]["requests"], 3);
+    assert_eq!(by_model[1]["model"], "second/model-b");
+    assert!(by_model[1]["cost"].is_null(), "no price, no cost");
+    let by_day = json["by_day"].as_array().unwrap();
+    assert_eq!(
+        by_day
+            .iter()
+            .map(|d| d["requests"].as_u64().unwrap())
+            .sum::<u64>(),
+        4
+    );
+    assert_eq!(by_day[0]["day"].as_str().unwrap().len(), "2026-01-01".len());
+    let by_project = json["by_project"].as_array().unwrap();
+    assert_eq!(by_project.len(), 1);
+    assert_eq!(by_project[0]["project"], *project);
+    assert_eq!(by_project[0]["requests"], 4);
+
+    // From another directory: everything without `--project`, nothing with.
+    let elsewhere = unique_dir("usage-elsewhere");
+    let all: serde_json::Value =
+        serde_json::from_slice(&stats(&elsewhere, &["--json", "--days", "1"]).stdout).unwrap();
+    assert_eq!(all["total"]["requests"], 4);
+    assert!(all["total"]["cost"].is_null(), "no prices configured there");
+    let here: serde_json::Value =
+        serde_json::from_slice(&stats(&elsewhere, &["--json", "--project"]).stdout).unwrap();
+    assert_eq!(here["total"]["requests"], 0);
+    assert_eq!(here["by_project"].as_array().unwrap().len(), 0);
+
+    // The tables, and a usage error.
+    let text = String::from_utf8_lossy(&stats(&dir, &["--project"]).stdout).into_owned();
+    for needle in [
+        "day ",
+        "model ",
+        "project ",
+        "env/mock",
+        "second/model-b",
+        "last 30 day(s)",
+    ] {
+        assert!(text.contains(needle), "{needle:?} in:\n{text}");
+    }
+    let bad = stats(&dir, &["--days", "soon"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("usage: atelier stats"));
+    // No request was made by any of the `stats` runs.
+    assert_eq!((first.requests(), second.requests()), (3, 1));
+}
+
+/// Case 20 — a usage log that can't be written doesn't fail the turn.
+#[test]
+fn an_unwritable_usage_log_is_ignored() {
+    let mock = Mock::start(always("fine"));
+    let dir = unique_dir("usage-unwritable");
+    // The state "directory" is a file: nothing can be created under it.
+    let blocker = dir.with_extension("blocker");
+    std::fs::write(&blocker, "").unwrap();
+    let out = run_atelier_env(
+        &mock.base_url(),
+        &dir,
+        &["--print", "hi"],
+        None,
+        &[("XDG_STATE_HOME", blocker.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("fine"));
+}

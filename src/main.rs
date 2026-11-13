@@ -31,6 +31,7 @@ mod tools;
 #[cfg(tui)]
 mod tui;
 mod update;
+mod usage;
 
 use std::process::ExitCode;
 
@@ -76,6 +77,10 @@ fn run() -> Result<u8> {
     // call, and which rule decided (see `permissions`).
     if args.first().map(String::as_str) == Some("permissions") {
         return permissions::run_command(&args[1..]).map(|()| 0);
+    }
+    // `atelier stats …`: totals of the usage log (see `usage`).
+    if args.first().map(String::as_str) == Some("stats") {
+        return usage::run_command(&args[1..]).map(|()| 0);
     }
     // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
     // claude launch — a relay back to the atelier process that owns the

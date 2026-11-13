@@ -365,7 +365,10 @@ impl Session {
             self.settings.clone(),
         );
         child.chatgpt = self.chatgpt.clone();
-        if let Some(model) = &agent.model {
+        // The agent's own `model:` wins; else `[models] subagent`, if set;
+        // else the parent's model, which the cloned config already names.
+        let role = self.cfg.own_model(crate::config::Role::Subagent);
+        if let Some(model) = agent.model.as_deref().or(role) {
             child.set_model(model);
         }
         child.review_enabled = false;

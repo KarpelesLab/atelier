@@ -45,7 +45,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 
 use crate::provider::endpoint::{ENV_PROVIDER, Provider, Target};
-use crate::settings::{ModelRoles, Settings, VariantConfig};
+use crate::settings::{ModelRoles, PriceConfig, Settings, VariantConfig};
 
 /// Default OpenAI-compatible endpoint (our test server).
 pub const DEFAULT_BASE_URL: &str = "http://192.168.0.50:11400/v1";
@@ -141,6 +141,8 @@ pub struct Config {
     roles: ModelRoles,
     /// Request options by variant name.
     variants: BTreeMap<String, Map<String, Value>>,
+    /// `[[price]]` entries in force, the project's first.
+    prices: Vec<PriceConfig>,
 }
 
 impl Config {
@@ -213,6 +215,7 @@ impl Config {
             default_provider: 0,
             roles: ModelRoles::default(),
             variants,
+            prices: Vec::new(),
         }
     }
 
@@ -288,6 +291,7 @@ impl Config {
             self.model = main;
         }
 
+        self.prices = merged_prices(project, user);
         warnings
     }
 
@@ -330,7 +334,7 @@ impl Config {
 
     /// The model configured for `role` itself (or for the role it falls
     /// back to, short of main), as addressed.
-    fn own_model(&self, role: Role) -> Option<&str> {
+    pub fn own_model(&self, role: Role) -> Option<&str> {
         let r = &self.roles;
         match role {
             Role::Main => None,
@@ -399,6 +403,11 @@ impl Config {
         &self.providers
     }
 
+    /// `[[price]]` entries in force.
+    pub fn prices(&self) -> &[PriceConfig] {
+        &self.prices
+    }
+
     /// `/providers`: each endpoint with where its key comes from (never the
     /// key), then which model serves which role.
     pub fn describe(&self) -> Vec<String> {
@@ -459,6 +468,12 @@ fn variant_options(table: &VariantConfig) -> Map<String, Value> {
         options.insert(key.clone(), value.clone());
     }
     options
+}
+
+/// The `[[price]]` entries of both files, the project's ahead of the
+/// user-global ones (the first match is the price — see `usage`).
+pub fn merged_prices(project: &Settings, user: &Settings) -> Vec<PriceConfig> {
+    project.price.iter().chain(&user.price).cloned().collect()
 }
 
 #[cfg(test)]

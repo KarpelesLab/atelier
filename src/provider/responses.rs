@@ -47,7 +47,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::ops::ControlFlow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -65,8 +65,44 @@ use super::{Completion, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 /// connect-timeout / retry hygiene), then drives the typed SSE event stream
 /// line-by-line, folding each event into a [`ResponsesAccum`] that assembles
 /// the final [`Completion`].
-#[allow(dead_code)] // wired into the agent loop; call site lands with sign-in-with-ChatGPT
+///
+/// Every request that completes is logged under the provider name
+/// [`USAGE_PROVIDER`] (see [`crate::usage`]).
 pub fn stream_responses(
+    base_url: &str,
+    access_token: &str,
+    model: &str,
+    options: &Map<String, Value>,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
+) -> Result<Completion> {
+    let started = Instant::now();
+    let completion = responses_stream(
+        base_url,
+        access_token,
+        model,
+        options,
+        messages,
+        tools,
+        on_event,
+    )?;
+    crate::usage::record(
+        USAGE_PROVIDER,
+        model,
+        completion.usage.as_ref(),
+        started.elapsed(),
+    );
+    Ok(completion)
+}
+
+/// What requests made on a ChatGPT sign-in are logged under: not a
+/// configured provider, but the usage log and `[[price]]` name it like one
+/// (`chatgpt/gpt-5`).
+const USAGE_PROVIDER: &str = "chatgpt";
+
+/// [`stream_responses`] proper: the request and its stream.
+fn responses_stream(
     base_url: &str,
     access_token: &str,
     model: &str,
@@ -352,6 +388,10 @@ impl ResponsesAccum {
                         prompt_tokens: u.input_tokens,
                         completion_tokens: u.output_tokens,
                         total_tokens: u.total_tokens,
+                        cached_tokens: u
+                            .input_tokens_details
+                            .as_ref()
+                            .map_or(0, |d| d.cached_tokens),
                     });
                 }
             }
@@ -458,6 +498,14 @@ struct RespUsage {
     output_tokens: u32,
     #[serde(default)]
     total_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<RespInputDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct RespInputDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize, Default)]
@@ -616,7 +664,7 @@ mod tests {
             r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"city\":\"SF\"}"}"#,
             r#"{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_42","name":"get_weather","arguments":"{\"city\":\"SF\"}"}}"#,
             r#"{"type":"response.some_future_event","delta":"ignored"}"#,
-            r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19}}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":8},"output_tokens":7,"total_tokens":19}}}"#,
         ];
 
         let mut accum = ResponsesAccum::default();
@@ -650,6 +698,7 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 12);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 19);
+        assert_eq!(usage.cached_tokens, 8);
         assert_eq!(completion.finish_reason, None);
     }
 

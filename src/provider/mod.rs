@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::ops::ControlFlow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -272,15 +272,49 @@ pub struct Completion {
 
 /// Token usage for a completion, as reported on the final SSE chunk when the
 /// request set `stream_options.include_usage`. Consumed by the caller.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Usage {
-    #[serde(default)]
     pub prompt_tokens: u32,
-    #[serde(default)]
     pub completion_tokens: u32,
-    #[serde(default)]
     pub total_tokens: u32,
+    /// The part of `prompt_tokens` the provider read from its prompt cache
+    /// (`prompt_tokens_details.cached_tokens`); 0 when it doesn't say.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cached_tokens: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// [`Usage`] as chat completions reports it.
+#[derive(Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl From<WireUsage> for Usage {
+    fn from(wire: WireUsage) -> Self {
+        Self {
+            prompt_tokens: wire.prompt_tokens,
+            completion_tokens: wire.completion_tokens,
+            total_tokens: wire.total_tokens,
+            cached_tokens: wire.prompt_tokens_details.map_or(0, |d| d.cached_tokens),
+        }
+    }
 }
 
 /// How much of an error response's body is read: enough for any server's
@@ -407,8 +441,27 @@ pub enum StreamEvent<'a> {
 /// connection is dropped): the result is marked `interrupted`, keeps the
 /// partial text, and carries no tool calls, since those may be incomplete.
 ///
-/// Returns the accumulated [`Completion`] once the stream ends.
+/// Returns the accumulated [`Completion`] once the stream ends. Every
+/// request that gets that far is logged (see [`crate::usage`]).
 pub fn stream_chat(
+    target: &Target,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
+) -> Result<Completion> {
+    let started = Instant::now();
+    let completion = chat_stream(target, messages, tools, on_event)?;
+    crate::usage::record(
+        &target.provider.name,
+        &target.model,
+        completion.usage.as_ref(),
+        started.elapsed(),
+    );
+    Ok(completion)
+}
+
+/// [`stream_chat`] proper: the request and its stream.
+fn chat_stream(
     target: &Target,
     messages: &[Message],
     tools: &[ToolSpec],
@@ -464,7 +517,7 @@ pub fn stream_chat(
         // carries `usage` and typically an empty `choices` array, so read it
         // before falling through the empty-choices early-exit below.
         if let Some(usage) = chunk.usage {
-            out.usage = Some(usage);
+            out.usage = Some(usage.into());
         }
         let Some(choice) = chunk.choices.into_iter().next() else {
             continue;
@@ -624,7 +677,7 @@ struct ChatChunk {
     #[serde(default)]
     choices: Vec<Choice>,
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<WireUsage>,
 }
 
 #[derive(Deserialize)]
@@ -911,10 +964,28 @@ mod tests {
         let data = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
         let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
         assert!(chunk.choices.is_empty());
-        let usage = chunk.usage.expect("usage present");
+        let usage: Usage = chunk.usage.expect("usage present").into();
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        assert_eq!(usage.cached_tokens, 0);
+    }
+
+    /// The cached part of the prompt, where the provider reports it.
+    #[test]
+    fn parses_cached_prompt_tokens() {
+        let data = r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80,"audio_tokens":0}}}"#;
+        let chunk: ChatChunk = serde_json::from_str(data).expect("valid chunk");
+        let usage: Usage = chunk.usage.expect("usage present").into();
+        assert_eq!(usage.cached_tokens, 80);
+        // Details without the count, or a null, are no cached tokens.
+        for details in ["{}", "null"] {
+            let data = format!(
+                r#"{{"choices":[],"usage":{{"prompt_tokens":1,"prompt_tokens_details":{details}}}}}"#
+            );
+            let chunk: ChatChunk = serde_json::from_str(&data).expect("valid chunk");
+            assert_eq!(Usage::from(chunk.usage.unwrap()).cached_tokens, 0);
+        }
     }
 
     /// A normal content chunk has no `usage` field at all; it must parse
@@ -1281,6 +1352,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                cached_tokens: 0,
             }),
             finish_reason: Some("tool_calls".to_string()),
             interrupted: false,

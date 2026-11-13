@@ -24,6 +24,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier --print [options] [--] [prompt...]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
+       atelier stats [--days N] [--project] [--json]
 
   -c, --continue             resume the saved session for this directory
   -p, --print                run one prompt non-interactively and exit

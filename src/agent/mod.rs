@@ -203,6 +203,7 @@ const HELP: &[&str] = &[
     "  /compact [instructions]               shrink the conversation now: prune old tool output,",
     "                                        summarize older turns (instructions guide the summary)",
     "  /context                              show where the context window goes, in tokens",
+    "  /usage                                this session's model requests, tokens and cost",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
@@ -293,6 +294,15 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         }
         "/providers" | "/effort" if session.is_claude() => {
             ui.info("not used with the Claude backend: claude calls its own models");
+        }
+        "/usage" => {
+            let (context, output) = session.usage();
+            let cfg = session.config();
+            for line in
+                crate::usage::session_report(cfg.prices(), session.is_claude(), context, output)
+            {
+                ui.info(&line);
+            }
         }
         "/providers" => {
             for line in session.config().describe() {

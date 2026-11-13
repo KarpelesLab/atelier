@@ -306,6 +306,65 @@ With the ChatGPT backend (the Responses API) `reasoning_effort` is sent as
 options are sent as written. Variants and providers don't apply to the
 [Claude backend](claude.md), where claude calls its own models.
 
+## Usage and cost: `[[price]]`, `atelier stats`, `/usage`
+
+Every model request atelier makes — the conversation's, the reviewer's, a
+compaction summary — appends one line to a log under
+`$XDG_STATE_HOME/atelier/usage/` (`~/.local/state/atelier/usage/` when that
+variable is unset), one file per month (`2026-11.jsonl`):
+
+```json
+{"ts":1794528000,"provider":"local","model":"qwen3-coder:30b","project":"/home/me/src/app","prompt_tokens":12000,"completion_tokens":800,"cached_tokens":9000,"duration_ms":4120}
+```
+
+| Field               | Meaning |
+|---------------------|---------|
+| `ts`                | When the request finished, seconds since the Unix epoch |
+| `provider`, `model` | Where it went: the provider's name (`env` for the endpoint from the environment, `chatgpt` when signed in with ChatGPT) and the model id as sent |
+| `project`           | The directory atelier was run in |
+| `prompt_tokens`, `completion_tokens` | As the endpoint reported them; 0 when it reports no usage |
+| `cached_tokens`     | The part of `prompt_tokens` served from the provider's prompt cache, where it says (`prompt_tokens_details.cached_tokens`) |
+| `duration_ms`       | From sending the request to the end of the response |
+
+Nothing else is logged — no prompts, no answers. Writing is best-effort: a
+log that can't be written never fails a turn. The files are yours to delete.
+
+```
+atelier stats [--days N] [--project] [--json]
+```
+
+prints totals for the last `N` days (default 30; days are UTC, today
+included) — per day, per model, and per project. `--project` counts only
+requests made from the current directory; `--json` prints one JSON document
+(`total`, `by_day`, `by_model`, `by_project`, each with `requests`,
+`prompt_tokens`, `cached_tokens`, `completion_tokens`, `duration_ms`, `cost`
+and `priced_requests`). `/usage` prints the same per-model table for the
+requests of the current session.
+
+Cost appears where you have given a price:
+
+```toml
+[[price]]
+model = "hosted/big"     # provider/model, or a bare model id for any provider
+input = 3.0              # per million prompt tokens
+output = 15.0            # per million completion tokens
+cached = 0.3             # per million cached prompt tokens (default: the input price)
+```
+
+Prices are per million tokens in whatever currency you write them in, and
+are applied when the totals are printed — from the `atelier.toml` of the
+directory you run `atelier stats` in, then your user-global one — so a
+changed price re-prices the past. A model without a price has no cost (`-`,
+or `null` in JSON); a total that includes such requests is marked `+` and
+`priced_requests` says how many requests the cost covers. The first
+matching entry wins, a `provider/model` one before a bare one.
+
+There are no budgets or limits: this only counts.
+
+With the [Claude backend](claude.md), claude makes and bills the requests,
+so nothing is logged; `/usage` shows the token counts claude reports
+(context at its latest request, output over the session).
+
 ## `[review]`
 
 The parallel "subconscious" reviewer — see [Review mode](review.md) for what
