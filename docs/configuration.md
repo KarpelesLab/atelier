@@ -89,6 +89,14 @@ startup (`Session::connect_configured_mcp`):
 | `name`    | string     | Logical server name; tools are namespaced `mcp__<name>__<tool>` |
 | `command` | string     | Executable to spawn |
 | `args`    | string[]   | Arguments to the command (default: empty) |
+| `enabled` | bool       | `false` keeps the server configured but not connected (default: `true`) |
+| `enabled_tools`  | string[] | If non-empty, only tools matching one of these names (`*` wildcards) are registered |
+| `disabled_tools` | string[] | Tools never registered; wins over `enabled_tools` |
+| `startup_timeout_secs` | integer | Seconds each handshake request may take before the server is skipped (default: `10`) |
+| `tool_timeout_secs`    | integer | Seconds one tool call may take before it fails (default: `120`) |
+
+The last five are shared with `[[mcp_http]]`; see
+[MCP → Per-server options](mcp.md#per-server-options).
 
 Managed via `/mcp add <name> <command> [args...]` and `/mcp remove <name>`
 (see [MCP](mcp.md)) — both read-modify-write this file, so hand edits are
@@ -104,6 +112,7 @@ transport at startup, same as `[[mcp]]`:
 | `name`    | string     | Logical server name; tools are namespaced `mcp__<name>__<tool>` |
 | `url`     | string     | The server's MCP endpoint URL |
 | `headers` | string[]   | `"Name: Value"` strings sent on every request (default: empty) |
+| `enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_secs`, `tool_timeout_secs` | | As for `[[mcp]]` |
 
 Managed via `/mcp add <name> <http(s)://url> [Header: Value ...]` and `/mcp
 remove <name>` — the same subcommands as stdio servers; atelier tells the two

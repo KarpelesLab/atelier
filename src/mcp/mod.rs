@@ -20,8 +20,7 @@
 //! over its stdin/stdout. An HTTP server is a URL; requests are POSTed and
 //! responses may come back as a single JSON object or an SSE stream. Both
 //! transports implement the shared `jsonrpc::JsonRpc` trait so the handshake
-//! (`handshake_and_list_tools`) and tool-wrapping (`wrap_tools`) logic is
-//! written once. Wrap each advertised tool in a type implementing
+//! (`discover`) and tool-wrapping (`assemble`) logic is written once. Wrap each advertised tool in a type implementing
 //! [`Tool`](crate::tools::Tool) whose `call` issues a `tools/call`. Do not
 //! edit files outside `src/mcp/`.
 //!
@@ -40,6 +39,17 @@
 //! `name` (plus optional `arguments`) via `prompts/get` into a readable
 //! transcript. A server that doesn't support prompts (an erroring or empty
 //! `prompts/list`) simply gets no such tool — the connection still succeeds.
+//!
+//! # Per-server options
+//!
+//! [`ServerOptions`] carries what the user may set on any server, whichever
+//! the transport: which of its tools to offer (`enabled_tools` /
+//! `disabled_tools`, matched against the server's own names) and how long to
+//! wait for it. The handshake runs under the *startup* timeout — a server
+//! that doesn't answer is reported and skipped rather than holding up the
+//! session — and the connection is then switched to the *tool* timeout, past
+//! which a call returns an error to the model and the connection stays
+//! usable (see `conn.rs` and `http.rs` for how each transport gives up).
 
 // Contract surface is consumed by the MCP implementation (in progress) and by
 // `main` once registration is wired up.
@@ -50,12 +60,15 @@ mod http;
 mod jsonrpc;
 mod prompt;
 mod resource;
+#[cfg(test)]
+pub(crate) mod testutil;
 mod tool;
 
 use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -73,6 +86,49 @@ use tool::McpTool;
 #[allow(unused_imports)]
 pub use http::{HttpServer, connect_http};
 
+/// Seconds a handshake request may take unless the server's
+/// `startup_timeout_secs` says otherwise.
+pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 10;
+/// Seconds a tool call may take unless `tool_timeout_secs` says otherwise.
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
+
+/// What can be set on a server of either transport (see the module docs).
+#[derive(Debug, Clone)]
+pub struct ServerOptions {
+    /// When non-empty, only tools matching one of these (`*` wildcards) are
+    /// kept.
+    pub enabled_tools: Vec<String>,
+    /// Tools dropped even if `enabled_tools` matches them.
+    pub disabled_tools: Vec<String>,
+    /// How long each handshake request may take.
+    pub startup_timeout: Duration,
+    /// How long each later request — a tool call — may take.
+    pub tool_timeout: Duration,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            startup_timeout: Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS),
+            tool_timeout: Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl ServerOptions {
+    /// Whether the tool the server calls `name` is offered to the model.
+    /// The synthetic `read_resource` and `get_prompt` tools go by those
+    /// names here, so they can be filtered like any other.
+    pub fn allows(&self, name: &str) -> bool {
+        let matches =
+            |patterns: &[String]| patterns.iter().any(|p| crate::permissions::wild(p, name));
+        (self.enabled_tools.is_empty() || matches(&self.enabled_tools))
+            && !matches(&self.disabled_tools)
+    }
+}
+
 /// Configuration for one stdio MCP server.
 pub struct StdioServer {
     /// Logical server name, used for the `mcp__<server>__<tool>` prefix.
@@ -81,6 +137,8 @@ pub struct StdioServer {
     pub command: String,
     /// Arguments to the command.
     pub args: Vec<String>,
+    /// Tool filters and timeouts.
+    pub options: ServerOptions,
 }
 
 /// Launch an MCP server over stdio and return its tools.
@@ -91,7 +149,7 @@ pub struct StdioServer {
 /// process and connection are shared (behind `Arc<Mutex<_>>`) across every
 /// returned tool, and calls are serialized through it; the child is kept
 /// alive for as long as any of the returned tools are, and is killed once
-/// they're all dropped.
+/// they're all dropped — or right here, if the handshake fails or times out.
 pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
     let mut child = Command::new(&server.command)
         .args(&server.args)
@@ -119,30 +177,69 @@ pub fn connect_stdio(server: &StdioServer) -> Result<Vec<Box<dyn Tool>>> {
         });
     }
 
-    let mut conn = Conn::new(child, stdin, stdout);
-
-    let advertised = handshake_and_list_tools(&mut conn, &server.name, "2024-11-05")?;
-    let resources = list_resources(&mut conn);
-    let prompts = list_prompts(&mut conn);
-
-    let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
-    let mut tools = wrap_tools(conn.clone(), &server.name, advertised);
-    if let Some(resource_tool) = maybe_resource_tool(conn.clone(), &server.name, resources) {
-        tools.push(resource_tool);
-    }
-    if let Some(prompt_tool) = maybe_prompt_tool(conn, &server.name, prompts) {
-        tools.push(prompt_tool);
-    }
-    Ok(tools)
+    let options = &server.options;
+    let mut conn = Conn::new(Some(child), stdin, stdout, options.startup_timeout);
+    let found = discover(&mut conn, &server.name, "2024-11-05")?;
+    conn.set_timeout(options.tool_timeout);
+    Ok(assemble(
+        Arc::new(Mutex::new(conn)),
+        &server.name,
+        options,
+        found,
+    ))
 }
 
-/// Run the `initialize` → `notifications/initialized` → `tools/list`
-/// handshake over an already-connected [`JsonRpc`] transport (stdio or HTTP)
-/// and return the raw `tools` array it advertised.
+/// What a server said it offers, as raw protocol objects.
+pub(crate) struct Discovered {
+    tools: Vec<Value>,
+    resources: Vec<Value>,
+    prompts: Vec<Value>,
+}
+
+/// Everything asked of a server at connect time, over an already-connected
+/// [`JsonRpc`] transport: the handshake and `tools/list`, which must
+/// succeed, then the optional resources and prompts.
 ///
 /// Shared by [`connect_stdio`] and [`connect_http`](http::connect_http) so
 /// the two transports can't drift on protocol behavior.
-pub(crate) fn handshake_and_list_tools(
+pub(crate) fn discover(
+    conn: &mut dyn JsonRpc,
+    server_name: &str,
+    protocol_version: &str,
+) -> Result<Discovered> {
+    Ok(Discovered {
+        tools: handshake_and_list_tools(conn, server_name, protocol_version)?,
+        resources: list_resources(conn),
+        prompts: list_prompts(conn),
+    })
+}
+
+/// Turn what [`discover`] found into the server's [`Tool`]s, all sharing
+/// `conn`: one per advertised tool, then `read_resource` and `get_prompt`
+/// where the server has any — each only if `options` allows it.
+pub(crate) fn assemble(
+    conn: Arc<Mutex<dyn JsonRpc>>,
+    server_name: &str,
+    options: &ServerOptions,
+    found: Discovered,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = wrap_tools(conn.clone(), server_name, options, found.tools);
+    if options.allows("read_resource")
+        && let Some(tool) = maybe_resource_tool(conn.clone(), server_name, found.resources)
+    {
+        tools.push(tool);
+    }
+    if options.allows("get_prompt")
+        && let Some(tool) = maybe_prompt_tool(conn, server_name, found.prompts)
+    {
+        tools.push(tool);
+    }
+    tools
+}
+
+/// Run the `initialize` → `notifications/initialized` → `tools/list`
+/// handshake and return the raw `tools` array the server advertised.
+fn handshake_and_list_tools(
     conn: &mut dyn JsonRpc,
     server_name: &str,
     protocol_version: &str,
@@ -171,12 +268,12 @@ pub(crate) fn handshake_and_list_tools(
         .unwrap_or_default())
 }
 
-/// Wrap each raw advertised-tool object (as returned by `tools/list`) as a
-/// namespaced [`Tool`] sharing one connection. Shared by [`connect_stdio`]
-/// and [`connect_http`](http::connect_http).
-pub(crate) fn wrap_tools(
+/// Wrap each raw advertised-tool object (as returned by `tools/list`) that
+/// `options` allows as a namespaced [`Tool`] sharing one connection.
+fn wrap_tools(
     conn: Arc<Mutex<dyn JsonRpc>>,
     server_name: &str,
+    options: &ServerOptions,
     advertised: Vec<Value>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::with_capacity(advertised.len());
@@ -184,6 +281,9 @@ pub(crate) fn wrap_tools(
         let Some(original_name) = t.get("name").and_then(Value::as_str) else {
             continue;
         };
+        if !options.allows(original_name) {
+            continue;
+        }
         let description = t
             .get("description")
             .and_then(Value::as_str)
@@ -212,8 +312,7 @@ pub(crate) fn wrap_tools(
 /// `resources` array. Resource support is optional per the MCP spec: a
 /// server that doesn't implement it (or errors for any other reason) simply
 /// yields no resources here, rather than failing the whole connection.
-/// Shared by [`connect_stdio`] and [`connect_http`](http::connect_http).
-pub(crate) fn list_resources(conn: &mut dyn JsonRpc) -> Vec<Value> {
+fn list_resources(conn: &mut dyn JsonRpc) -> Vec<Value> {
     conn.request("resources/list", json!({}))
         .ok()
         .and_then(|result| result.get("resources").and_then(Value::as_array).cloned())
@@ -223,9 +322,8 @@ pub(crate) fn list_resources(conn: &mut dyn JsonRpc) -> Vec<Value> {
 /// If `resources` is non-empty, build the one namespaced
 /// `mcp__<server>__read_resource` [`Tool`] that reads any of them by URI.
 /// Returns `None` when the server advertised no resources (including when
-/// `resources/list` isn't supported at all). Shared by [`connect_stdio`] and
-/// [`connect_http`](http::connect_http).
-pub(crate) fn maybe_resource_tool(
+/// `resources/list` isn't supported at all).
+fn maybe_resource_tool(
     conn: Arc<Mutex<dyn JsonRpc>>,
     server_name: &str,
     resources: Vec<Value>,
@@ -275,9 +373,8 @@ fn describe_resources(resources: &[Value]) -> String {
 /// Try `prompts/list` on an already-connected transport and return the raw
 /// `prompts` array. Prompt support is optional per the MCP spec: a server
 /// that doesn't implement it (or errors for any other reason) simply yields
-/// no prompts here, rather than failing the whole connection. Shared by
-/// [`connect_stdio`] and [`connect_http`](http::connect_http).
-pub(crate) fn list_prompts(conn: &mut dyn JsonRpc) -> Vec<Value> {
+/// no prompts here, rather than failing the whole connection.
+fn list_prompts(conn: &mut dyn JsonRpc) -> Vec<Value> {
     conn.request("prompts/list", json!({}))
         .ok()
         .and_then(|result| result.get("prompts").and_then(Value::as_array).cloned())
@@ -287,9 +384,8 @@ pub(crate) fn list_prompts(conn: &mut dyn JsonRpc) -> Vec<Value> {
 /// If `prompts` is non-empty, build the one namespaced
 /// `mcp__<server>__get_prompt` [`Tool`] that renders any of them by `name`
 /// via `prompts/get`. Returns `None` when the server advertised no prompts
-/// (including when `prompts/list` isn't supported at all). Shared by
-/// [`connect_stdio`] and [`connect_http`](http::connect_http).
-pub(crate) fn maybe_prompt_tool(
+/// (including when `prompts/list` isn't supported at all).
+fn maybe_prompt_tool(
     conn: Arc<Mutex<dyn JsonRpc>>,
     server_name: &str,
     prompts: Vec<Value>,
@@ -410,7 +506,91 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             name: "fake".into(),
             command: "sh".into(),
             args: vec!["-c".into(), FAKE_SERVER_SCRIPT.into()],
+            options: ServerOptions::default(),
         }
+    }
+
+    fn names(tools: &[Box<dyn Tool>]) -> Vec<&str> {
+        tools.iter().map(|t| t.name()).collect()
+    }
+
+    fn filters(enabled: &[&str], disabled: &[&str]) -> ServerOptions {
+        ServerOptions {
+            enabled_tools: enabled.iter().map(|s| s.to_string()).collect(),
+            disabled_tools: disabled.iter().map(|s| s.to_string()).collect(),
+            ..ServerOptions::default()
+        }
+    }
+
+    #[test]
+    fn filters_match_the_servers_own_tool_names() {
+        let all = ServerOptions::default();
+        assert!(all.allows("anything"));
+
+        let only = filters(&["list_*", "get_issue"], &[]);
+        assert!(only.allows("list_issues"));
+        assert!(only.allows("get_issue"));
+        assert!(!only.allows("get_issues"));
+        assert!(!only.allows("delete_issue"));
+
+        // A deny wins over an allow, and works alone.
+        let both = filters(&["list_*"], &["list_secrets"]);
+        assert!(both.allows("list_issues"));
+        assert!(!both.allows("list_secrets"));
+        let without = filters(&[], &["delete_*"]);
+        assert!(without.allows("list_issues"));
+        assert!(!without.allows("delete_repo"));
+    }
+
+    /// A server with three tools, a resource and a prompt.
+    fn github(method: &str, params: &Value) -> Option<Value> {
+        match method {
+            "resources/list" => Some(json!({ "resources": [{ "uri": "gh://readme" }] })),
+            "prompts/list" => Some(json!({ "prompts": [{ "name": "triage" }] })),
+            _ => testutil::tools_only(json!([
+                { "name": "list_issues" },
+                { "name": "get_issue" },
+                { "name": "delete_issue" },
+            ]))(method, params),
+        }
+    }
+
+    fn connect_fake(options: &ServerOptions) -> Vec<Box<dyn Tool>> {
+        let mut rpc = testutil::FakeRpc::new(github);
+        let found = discover(&mut rpc, "gh", "2024-11-05").unwrap();
+        assemble(Arc::new(Mutex::new(rpc)), "gh", options, found)
+    }
+
+    #[test]
+    fn only_the_tools_the_filters_allow_are_returned() {
+        assert_eq!(
+            names(&connect_fake(&ServerOptions::default())),
+            [
+                "mcp__gh__list_issues",
+                "mcp__gh__get_issue",
+                "mcp__gh__delete_issue",
+                "mcp__gh__read_resource",
+                "mcp__gh__get_prompt",
+            ]
+        );
+        assert_eq!(
+            names(&connect_fake(&filters(&[], &["delete_*", "get_prompt"]))),
+            [
+                "mcp__gh__list_issues",
+                "mcp__gh__get_issue",
+                "mcp__gh__read_resource",
+            ]
+        );
+        // An allow list leaves out the synthetic tools too unless it names
+        // them.
+        assert_eq!(
+            names(&connect_fake(&filters(&["*_issue", "read_resource"], &[]))),
+            [
+                "mcp__gh__get_issue",
+                "mcp__gh__delete_issue",
+                "mcp__gh__read_resource",
+            ]
+        );
     }
 
     #[test]
@@ -513,6 +693,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             name: "fake".into(),
             command: "sh".into(),
             args: vec!["-c".into(), FAKE_SERVER_NO_RESOURCES_SCRIPT.into()],
+            options: ServerOptions::default(),
         };
         let tools = connect_stdio(&server)
             .expect("connect_stdio should succeed even when resources/list errors");
@@ -549,7 +730,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             json!({"name": "truthy", "annotations": {"readOnlyHint": "true"}}),
             json!({"name": "plain"}),
         ];
-        let tools = wrap_tools(Arc::new(Mutex::new(Unused)), "srv", advertised);
+        let tools = wrap_tools(
+            Arc::new(Mutex::new(Unused)),
+            "srv",
+            &ServerOptions::default(),
+            advertised,
+        );
         let mutates: Vec<(String, bool)> = tools
             .iter()
             .map(|t| (t.name().to_string(), t.mutates(&json!({}))))
@@ -576,6 +762,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
             name: "nope".into(),
             command: "definitely-not-a-real-binary-atelier-mcp-test".into(),
             args: vec![],
+            options: ServerOptions::default(),
         };
         match connect_stdio(&server) {
             Ok(_) => panic!("spawning a missing binary should fail"),

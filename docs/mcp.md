@@ -71,6 +71,58 @@ to connect '<name>': ...`) but doesn't stop the others from connecting or
 abort startup. Names are shared across both kinds — you can't reuse a name
 already taken by a stdio *or* HTTP server.
 
+## Per-server options
+
+Both kinds of table take the same optional keys, all left out of the file at
+their defaults:
+
+```toml
+[[mcp]]
+name = "github"
+command = "github-mcp"
+enabled_tools = ["list_*", "get_*", "create_issue"]
+disabled_tools = ["get_secret*"]
+startup_timeout_secs = 20
+tool_timeout_secs = 300
+
+[[mcp_http]]
+name = "search"
+url = "https://mcp.example.com/mcp"
+enabled = false            # kept in the file, not connected
+```
+
+| Field                  | Default | Meaning |
+|------------------------|---------|---------|
+| `enabled`              | `true`  | `false` keeps the server configured without connecting it; `/mcp` lists it as `(disabled)` |
+| `enabled_tools`        | all     | When non-empty, only the tools matching one of these names are registered |
+| `disabled_tools`       | none    | Tools never registered, even when `enabled_tools` matches them |
+| `startup_timeout_secs` | `10`    | How long each request of the connection handshake may take |
+| `tool_timeout_secs`    | `120`   | How long one tool call may take |
+
+**Tool filters** are matched against the server's own tool names — `list_issues`,
+not `mcp__github__list_issues` — in full, with `*` standing for any run of
+characters. The two tools atelier adds itself go by `read_resource` and
+`get_prompt` here, so `disabled_tools = ["get_prompt"]` drops that one, and
+an `enabled_tools` list keeps them only if it names them. A filtered tool is
+never shown to the model and cannot be called; this is a different thing from
+a [permission rule](permissions.md), which decides whether a tool the model
+*can* see runs unasked.
+
+**Timeouts.** A server that doesn't answer `initialize` (or `tools/list`)
+within `startup_timeout_secs` is reported — `mcp: failed to connect '<name>':
+… did not answer `initialize` within 10s` — and skipped; a stdio server's
+process is killed. Without this a server that hung at startup held the session
+forever (stdio) or for as long as the HTTP client's own read timeout (HTTP).
+The limit is per request, so a server that answers each step slowly can take
+a few times as long in total. A tool call that runs past `tool_timeout_secs`
+returns an error to the model and the connection stays usable: over stdio the
+server is sent `notifications/cancelled` and whatever it still answers for
+that call is discarded; over HTTP each call is its own exchange.
+
+With the [Claude backend](claude.md) the servers are handed to `claude`, which
+connects them itself: `enabled = false` is honoured (the server is left out),
+tool filters and timeouts are not.
+
 ## Managing servers
 
 - `/mcp` (no arguments) — list every configured server, stdio and HTTP alike

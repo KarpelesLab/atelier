@@ -277,6 +277,8 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(flatten)]
+    pub options: McpOptions,
 }
 
 /// One HTTP (Streamable) MCP server the user has configured. `headers` are
@@ -287,6 +289,63 @@ pub struct HttpServerConfig {
     pub url: String,
     #[serde(default)]
     pub headers: Vec<String>,
+    #[serde(flatten)]
+    pub options: McpOptions,
+}
+
+/// What `[[mcp]]` and `[[mcp_http]]` tables have in common beyond how the
+/// server is reached. Every field is left out of the file at its default, so
+/// `/mcp add` keeps writing the three-line table it always did.
+///
+/// ```toml
+/// [[mcp]]
+/// name = "github"
+/// command = "github-mcp"
+/// disabled_tools = ["delete_*"]
+/// tool_timeout_secs = 300
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOptions {
+    /// `false` keeps the server in the file without connecting it.
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// When non-empty, only the server's tools matching one of these names
+    /// (`*` wildcards) are offered to the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_tools: Vec<String>,
+    /// Tools never offered, even when `enabled_tools` matches them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
+    /// Seconds each request of the connection handshake may take (default
+    /// 10); past it the server is reported and skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_timeout_secs: Option<u64>,
+    /// Seconds one tool call may take (default 120); past it the model gets
+    /// an error and the connection stays usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+impl Default for McpOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            startup_timeout_secs: None,
+            tool_timeout_secs: None,
+        }
+    }
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+// serde's `skip_serializing_if` hands the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Settings {
@@ -448,5 +507,54 @@ command = "make lint"
         let again: Settings = tomlproc::serde::from_str(&text).unwrap();
         assert_eq!(again.diagnostics.len(), 2);
         assert_eq!(again.diagnostics[0].command, tsc.command);
+    }
+
+    #[test]
+    fn mcp_options_parse_default_and_stay_out_of_a_plain_table() {
+        let settings: Settings = tomlproc::serde::from_str(
+            r#"
+[[mcp]]
+name = "fs"
+command = "fs-server"
+
+[[mcp]]
+name = "gh"
+command = "gh-server"
+enabled = false
+enabled_tools = ["list_*", "get_issue"]
+disabled_tools = ["list_secrets"]
+startup_timeout_secs = 3
+tool_timeout_secs = 300
+
+[[mcp_http]]
+name = "web"
+url = "https://example.invalid/mcp"
+disabled_tools = ["*"]
+"#,
+        )
+        .unwrap();
+        let [fs, gh] = settings.mcp.as_slice() else {
+            panic!("expected two stdio servers: {:?}", settings.mcp);
+        };
+        assert!(fs.options.enabled);
+        assert!(fs.options.enabled_tools.is_empty());
+        assert_eq!(fs.options.startup_timeout_secs, None);
+        assert!(!gh.options.enabled);
+        assert_eq!(gh.options.enabled_tools, ["list_*", "get_issue"]);
+        assert_eq!(gh.options.disabled_tools, ["list_secrets"]);
+        assert_eq!(gh.options.startup_timeout_secs, Some(3));
+        assert_eq!(gh.options.tool_timeout_secs, Some(300));
+        assert_eq!(settings.mcp_http[0].options.disabled_tools, ["*"]);
+
+        // The rewrite `/mcp add` does: options survive it, and a server
+        // without any gets no extra keys.
+        let text = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        let again: Settings = tomlproc::serde::from_str(&text).unwrap();
+        assert!(!again.mcp[1].options.enabled);
+        assert_eq!(again.mcp[1].options.tool_timeout_secs, Some(300));
+        assert_eq!(again.mcp_http[0].options.disabled_tools, ["*"]);
+        let fs_table = text.split("[[mcp]]").nth(1).unwrap();
+        assert!(!fs_table.contains("enabled"), "{text}");
+        assert!(!fs_table.contains("timeout"), "{text}");
     }
 }

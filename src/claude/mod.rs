@@ -731,16 +731,18 @@ pub(crate) fn new_uuid() -> String {
 }
 
 /// Build the `--mcp-config` JSON for atelier's configured servers, or `None`
-/// if there are none.
+/// if there are none. A server with `enabled = false` is left out; the other
+/// per-server options (tool filters, timeouts) are atelier's own client's and
+/// have no counterpart in what claude takes here.
 fn mcp_config(settings: &Settings) -> Option<Value> {
     let mut servers = serde_json::Map::new();
-    for s in &settings.mcp {
+    for s in settings.mcp.iter().filter(|s| s.options.enabled) {
         servers.insert(
             s.name.clone(),
             json!({ "type": "stdio", "command": s.command, "args": s.args }),
         );
     }
-    for s in &settings.mcp_http {
+    for s in settings.mcp_http.iter().filter(|s| s.options.enabled) {
         let headers: serde_json::Map<String, Value> = s
             .headers
             .iter()
@@ -1030,7 +1032,7 @@ fn result_text(content: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{HttpServerConfig, McpServerConfig};
+    use crate::settings::{HttpServerConfig, McpOptions, McpServerConfig};
 
     #[test]
     fn parses_init() {
@@ -1516,13 +1518,26 @@ mod tests {
             name: "fs".into(),
             command: "srv".into(),
             args: vec!["-x".into()],
+            options: McpOptions::default(),
         });
         s.mcp_http.push(HttpServerConfig {
             name: "web".into(),
             url: "https://e.x/mcp".into(),
             headers: vec!["Authorization: Bearer t".into()],
+            options: McpOptions::default(),
+        });
+        // Configured but switched off: claude isn't told about it.
+        s.mcp_http.push(HttpServerConfig {
+            name: "off".into(),
+            url: "https://e.x/off".into(),
+            headers: Vec::new(),
+            options: McpOptions {
+                enabled: false,
+                ..McpOptions::default()
+            },
         });
         let c = mcp_config(&s).unwrap();
+        assert!(c["mcpServers"]["off"].is_null());
         assert_eq!(
             c["mcpServers"]["fs"],
             json!({"type": "stdio", "command": "srv", "args": ["-x"]})

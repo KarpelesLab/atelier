@@ -27,14 +27,28 @@
 //! These match "the common path" called out for a first version: a client
 //! that sends requests and reads back either a plain JSON or a single-shot
 //! SSE response, which is what most current MCP servers implement.
+//!
+//! ## Timeouts
+//!
+//! Every POST is given the connection's current timeout (the server's
+//! startup timeout during the handshake, its tool timeout afterwards) from
+//! start to end. The exchange runs on a thread of its own and the caller
+//! waits on a channel for that long ([`send_within`]): the bound then holds
+//! whatever the HTTP client is blocked in — connecting, a response that
+//! never starts, one that trickles. The same limits are also set on the
+//! request, so an exchange that was given up on ends by itself rather than
+//! lingering. Nothing needs resetting afterwards: each message is its own
+//! HTTP exchange, so the next call starts clean.
 
+use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use super::ServerOptions;
 use super::jsonrpc::JsonRpc;
 use crate::tools::Tool;
 
@@ -46,6 +60,8 @@ pub struct HttpServer {
     pub url: String,
     /// Extra headers to send on every request (e.g. `Authorization`).
     pub headers: Vec<(String, String)>,
+    /// Tool filters and timeouts.
+    pub options: ServerOptions,
 }
 
 /// Connect to an MCP server over Streamable HTTP and return its tools.
@@ -55,24 +71,24 @@ pub struct HttpServer {
 /// [`Tool`]. The connection (and any session id the server assigned) is
 /// shared across every returned tool; calls are serialized through it.
 pub fn connect_http(server: &HttpServer) -> Result<Vec<Box<dyn Tool>>> {
-    let mut conn = HttpConn::new(server.url.clone(), server.headers.clone());
+    let options = &server.options;
+    let mut conn = HttpConn::new(
+        server.url.clone(),
+        server.headers.clone(),
+        options.startup_timeout,
+    );
 
     // "2025-03-26" is the protocol revision that introduced Streamable HTTP;
     // servers speaking the older "2024-11-05" revision still accept this
     // value in `initialize` and negotiate down themselves per the spec.
-    let advertised = super::handshake_and_list_tools(&mut conn, &server.name, "2025-03-26")?;
-    let resources = super::list_resources(&mut conn);
-    let prompts = super::list_prompts(&mut conn);
-
-    let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(conn));
-    let mut tools = super::wrap_tools(conn.clone(), &server.name, advertised);
-    if let Some(resource_tool) = super::maybe_resource_tool(conn.clone(), &server.name, resources) {
-        tools.push(resource_tool);
-    }
-    if let Some(prompt_tool) = super::maybe_prompt_tool(conn, &server.name, prompts) {
-        tools.push(prompt_tool);
-    }
-    Ok(tools)
+    let found = super::discover(&mut conn, &server.name, "2025-03-26")?;
+    conn.timeout = options.tool_timeout;
+    Ok(super::assemble(
+        Arc::new(Mutex::new(conn)),
+        &server.name,
+        options,
+        found,
+    ))
 }
 
 /// A JSON-RPC connection to an MCP server over Streamable HTTP: every message
@@ -83,15 +99,18 @@ pub(crate) struct HttpConn {
     headers: Vec<(String, String)>,
     session_id: Option<String>,
     next_id: u64,
+    /// How long one POST may take, start to end.
+    timeout: Duration,
 }
 
 impl HttpConn {
-    pub(crate) fn new(url: String, headers: Vec<(String, String)>) -> Self {
+    pub(crate) fn new(url: String, headers: Vec<(String, String)>, timeout: Duration) -> Self {
         Self {
             url,
             headers,
             session_id: None,
             next_id: 0,
+            timeout,
         }
     }
 
@@ -104,6 +123,8 @@ impl HttpConn {
             .context("building HTTP request")?
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
+            .max_time(self.timeout)
+            .read_timeout(Some(self.timeout))
             .body(body);
         for (name, value) in &self.headers {
             req = req.header(name, value);
@@ -112,7 +133,7 @@ impl HttpConn {
             req = req.header("mcp-session-id", session_id);
         }
 
-        let resp = req.send().context("sending request to MCP HTTP server")?;
+        let resp = send_within(req, self.timeout)?;
         if !(200..300).contains(&resp.status) {
             bail!(
                 "MCP HTTP server returned HTTP {}: {}",
@@ -130,6 +151,22 @@ impl HttpConn {
             content_type,
             body: resp.body,
         })
+    }
+}
+
+/// Send `req`, giving up once `timeout` has passed (see the module docs).
+fn send_within(req: rsurl::Request, timeout: Duration) -> Result<rsurl::Response> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        // Nobody is listening any more if the caller gave up.
+        let _ = tx.send(req.send());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(resp) => resp.context("sending request to MCP HTTP server"),
+        Err(_) => bail!(
+            "no answer from the MCP HTTP server within {}s",
+            timeout.as_secs_f32()
+        ),
     }
 }
 
@@ -525,6 +562,7 @@ mod tests {
             name: "fake".into(),
             url: format!("http://{addr}/mcp"),
             headers: vec![],
+            options: ServerOptions::default(),
         };
         let tools = connect_http(&server).expect("connect_http should succeed");
         assert_eq!(tools.len(), 3);
@@ -588,5 +626,63 @@ mod tests {
         server_thread
             .join()
             .expect("server thread should not panic");
+    }
+
+    use crate::mcp::testutil::{FakeHttp, tools_only};
+
+    fn server(fake: &FakeHttp, startup_ms: u64, tool_ms: u64) -> HttpServer {
+        HttpServer {
+            name: "fake".into(),
+            url: fake.url("/mcp"),
+            headers: vec![],
+            options: ServerOptions {
+                startup_timeout: Duration::from_millis(startup_ms),
+                tool_timeout: Duration::from_millis(tool_ms),
+                ..ServerOptions::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_server_that_does_not_answer_initialize_is_given_up_on() {
+        let fake = FakeHttp::mcp(|method, params| {
+            if method == "initialize" {
+                thread::sleep(Duration::from_secs(2));
+            }
+            tools_only(json!([]))(method, params)
+        });
+        let started = std::time::Instant::now();
+        let err = match connect_http(&server(&fake, 200, 5_000)) {
+            Ok(_) => panic!("the handshake should have timed out"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("initializing MCP server `fake`"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(1_500), "{err}");
+    }
+
+    #[test]
+    fn a_tool_call_past_its_timeout_fails_and_the_next_one_works() {
+        let fake = FakeHttp::mcp(|method, params| {
+            if method == "tools/call" && params["name"] == "slow" {
+                thread::sleep(Duration::from_secs(2));
+            }
+            tools_only(json!([{ "name": "slow" }, { "name": "fast" }]))(method, params)
+        });
+        let tools = connect_http(&server(&fake, 5_000, 300)).expect("connects");
+        let call = |name: &str| {
+            let mut fstate = crate::tools::FileState::new();
+            let mut ctx = crate::tools::ToolCtx {
+                project_root: std::path::Path::new("/"),
+                fstate: &mut fstate,
+                approved: true,
+            };
+            let tool = tools.iter().find(|t| t.name() == name).unwrap();
+            tool.call(&mut ctx, json!({}))
+        };
+        let started = std::time::Instant::now();
+        let err = call("mcp__fake__slow").unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        assert!(format!("{err:#}").contains("no answer from the MCP HTTP server within"));
+        assert_eq!(call("mcp__fake__fast").unwrap(), "called \"fast\"");
     }
 }

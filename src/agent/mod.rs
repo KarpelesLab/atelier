@@ -38,7 +38,7 @@ use crate::hooks::{self, Hooks};
 use crate::mcp::{self, HttpServer, StdioServer};
 use crate::permissions::Mode;
 use crate::provider::{self, Completion, Message, StreamEvent};
-use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
+use crate::settings::{HttpServerConfig, McpOptions, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 
@@ -1044,15 +1044,23 @@ impl Session {
         // With the Claude backend the servers are handed to claude itself
         // (`--mcp-config`); connecting them here too would run them twice.
         if self.is_claude() {
-            for name in self.settings.mcp.iter().map(|m| &m.name) {
-                status.push(format!("mcp: '{name}' will be passed to claude"));
+            let fate = |o: &McpOptions| match o.enabled {
+                true => "will be passed to claude",
+                false => "is disabled",
+            };
+            for m in &self.settings.mcp {
+                status.push(format!("mcp: '{}' {}", m.name, fate(&m.options)));
             }
-            for name in self.settings.mcp_http.iter().map(|m| &m.name) {
-                status.push(format!("mcp: '{name}' (http) will be passed to claude"));
+            for m in &self.settings.mcp_http {
+                status.push(format!("mcp: '{}' (http) {}", m.name, fate(&m.options)));
             }
             return status;
         }
         for s in self.settings.mcp.clone() {
+            if !s.options.enabled {
+                status.push(format!("mcp: '{}' is disabled", s.name));
+                continue;
+            }
             match mcp::connect_stdio(&to_stdio(&s)) {
                 Ok(tools) => {
                     let n = tools.len();
@@ -1065,6 +1073,10 @@ impl Session {
             }
         }
         for s in self.settings.mcp_http.clone() {
+            if !s.options.enabled {
+                status.push(format!("mcp: '{}' (http) is disabled", s.name));
+                continue;
+            }
             match mcp::connect_http(&to_http(&s)) {
                 Ok(tools) => {
                     let n = tools.len();
@@ -1081,18 +1093,20 @@ impl Session {
 
     /// One display line per configured MCP server (stdio and HTTP).
     pub fn mcp_list(&self) -> Vec<String> {
+        let off = |o: &McpOptions| if o.enabled { "" } else { " (disabled)" };
         let stdio = self.settings.mcp.iter().map(|m| {
+            let off = off(&m.options);
             if m.args.is_empty() {
-                format!("{} → {}", m.name, m.command)
+                format!("{} → {}{off}", m.name, m.command)
             } else {
-                format!("{} → {} {}", m.name, m.command, m.args.join(" "))
+                format!("{} → {} {}{off}", m.name, m.command, m.args.join(" "))
             }
         });
         let http = self
             .settings
             .mcp_http
             .iter()
-            .map(|m| format!("{} → {} (http)", m.name, m.url));
+            .map(|m| format!("{} → {} (http){}", m.name, m.url, off(&m.options)));
         stdio.chain(http).collect()
     }
 
@@ -1111,6 +1125,7 @@ impl Session {
             name: name.to_string(),
             command: command.to_string(),
             args,
+            options: McpOptions::default(),
         };
         if self.is_claude() {
             self.settings.mcp.push(cfg);
@@ -1136,6 +1151,7 @@ impl Session {
             name: name.to_string(),
             url: url.to_string(),
             headers,
+            options: McpOptions::default(),
         };
         if self.is_claude() {
             self.settings.mcp_http.push(cfg);
@@ -2059,6 +2075,7 @@ fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
         name: cfg.name.clone(),
         command: cfg.command.clone(),
         args: cfg.args.clone(),
+        options: to_options(&cfg.options),
     }
 }
 
@@ -2073,6 +2090,19 @@ fn to_http(cfg: &HttpServerConfig) -> HttpServer {
         name: cfg.name.clone(),
         url: cfg.url.clone(),
         headers,
+        options: to_options(&cfg.options),
+    }
+}
+
+/// A server's filters and timeouts as the MCP client takes them, the
+/// timeouts falling back to its defaults.
+fn to_options(o: &McpOptions) -> mcp::ServerOptions {
+    let secs = |set: Option<u64>, default| std::time::Duration::from_secs(set.unwrap_or(default));
+    mcp::ServerOptions {
+        enabled_tools: o.enabled_tools.clone(),
+        disabled_tools: o.disabled_tools.clone(),
+        startup_timeout: secs(o.startup_timeout_secs, mcp::DEFAULT_STARTUP_TIMEOUT_SECS),
+        tool_timeout: secs(o.tool_timeout_secs, mcp::DEFAULT_TOOL_TIMEOUT_SECS),
     }
 }
 
