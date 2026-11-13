@@ -26,6 +26,11 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
 - **The agent is fed, not just prompted.** Per-turn context providers inject
   the current repo state (git status, diff, layout, `cargo check`
   diagnostics) so the model reasons about now, not a stale snapshot.
+- **Your rules, where you already keep them.** `AGENTS.md` (or `CLAUDE.md`,
+  `.cursorrules`) is read from your user config and every directory from the
+  repository root down, with `@path` imports; a subdirectory's file applies
+  once the agent works there. See
+  [Configuration](docs/configuration.md#instruction-files).
 - **Confinement over coarse yes/no.** Every file tool and the `node`
   scripting tool are sandboxed to the project root and run without
   prompting; only genuinely unconfined execution (`bash`, MCP tools,
@@ -91,7 +96,7 @@ first conversation, the REPL/TUI fallback).
 |-----|--------|
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
-| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), the `/config` settings screen |
+| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |

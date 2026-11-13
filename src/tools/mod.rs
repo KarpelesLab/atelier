@@ -20,7 +20,7 @@
 // the agent loop; drop this once every item is wired up.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -242,11 +242,17 @@ pub fn builtin_registry() -> ToolRegistry {
 }
 
 /// Tracks the content the agent has read, so an [`Edit`] can detect that a file
-/// changed underneath it since it was last read.
+/// changed underneath it since it was last read — and which directories it has
+/// worked in, so the agent loop can hand over a directory's own instruction
+/// file the first time the agent gets there.
 #[derive(Default)]
 pub struct FileState {
     /// path -> hash of the content last read/written by the agent.
     seen: HashMap<PathBuf, u64>,
+    /// Every directory above a recorded path.
+    dirs: HashSet<PathBuf>,
+    /// Those of `dirs` not yet handed out by [`take_new_dirs`](Self::take_new_dirs).
+    new_dirs: Vec<PathBuf>,
 }
 
 impl FileState {
@@ -256,6 +262,27 @@ impl FileState {
     /// Record the content the agent has now observed for `path`.
     pub fn record(&mut self, path: &Path, content: &str) {
         self.seen.insert(path.to_path_buf(), hash(content));
+        // All ancestors, not just the parent: the first file touched may sit
+        // several levels below a directory that has instructions. Walking up
+        // stops at the first known one — its own ancestors went in with it.
+        for dir in path.ancestors().skip(1) {
+            if !self.dirs.insert(dir.to_path_buf()) {
+                break;
+            }
+            self.new_dirs.push(dir.to_path_buf());
+        }
+    }
+    /// The directories first read or written under since the last call. Each
+    /// is reported once per session (or once more after
+    /// [`forget_dirs`](Self::forget_dirs)).
+    pub fn take_new_dirs(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.new_dirs)
+    }
+    /// Report every directory afresh from here on — for when the conversation
+    /// that was told about them is gone.
+    pub fn forget_dirs(&mut self) {
+        self.dirs.clear();
+        self.new_dirs.clear();
     }
     /// Whether the agent has read `path` at all this session.
     pub fn was_read(&self, path: &Path) -> bool {
@@ -291,4 +318,36 @@ fn normalize(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_directory_is_reported_once() {
+        let mut fstate = FileState::new();
+        fstate.record(Path::new("/p/web/ui/a.ts"), "a");
+        let mut dirs = fstate.take_new_dirs();
+        dirs.sort();
+        let expected: Vec<PathBuf> = ["/", "/p", "/p/web", "/p/web/ui"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(dirs, expected);
+
+        // A sibling file, the same file again: nothing new. A new directory
+        // under known ones: only that directory.
+        fstate.record(Path::new("/p/web/ui/b.ts"), "b");
+        fstate.record(Path::new("/p/web/ui/a.ts"), "a2");
+        assert!(fstate.take_new_dirs().is_empty());
+        fstate.record(Path::new("/p/web/api/c.ts"), "c");
+        assert_eq!(fstate.take_new_dirs(), vec![PathBuf::from("/p/web/api")]);
+
+        // Forgetting directories reports them again, and leaves reads alone.
+        fstate.forget_dirs();
+        assert!(fstate.was_read(Path::new("/p/web/ui/a.ts")));
+        fstate.record(Path::new("/p/web/api/c.ts"), "c");
+        assert_eq!(fstate.take_new_dirs().len(), 4);
+    }
 }

@@ -131,8 +131,8 @@ fn handle_conn(
         }
     }
 
-    // Read the body so the client's write completes before we reply, and
-    // keep it for the test to inspect.
+    // Drain the body so the client's write completes before we reply, and
+    // keep it for tests that assert on what was sent.
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
     bodies
@@ -195,9 +195,11 @@ fn run_print(base_url: &str, cwd: &Path, prompt: &str) -> Output {
         .env("ATELIER_APPROVE", "all")
         // No coordinator daemon left behind by the test run.
         .env("ATELIER_NO_COORDINATOR", "1")
-        // Global memory goes next to the temp project, never the real home.
+        // Keep the run hermetic regardless of the outer environment: no API
+        // key, no user config (global instructions, a saved login), and
+        // global memory next to the temp project, never the real home.
+        .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
-        // Keep the run hermetic regardless of the outer environment.
         .env_remove("ATELIER_API_KEY")
         .env_remove("ATELIER_TRACE")
         .env_remove("ATELIER_DEBUG")
@@ -401,4 +403,44 @@ fn memory_saved_in_one_run_is_recalled_in_the_next() {
         !system.contains("clippy clean before every commit"),
         "only the index is ambient, not the note: {system}"
     );
+}
+
+/// Case 5 — instruction files reach the model. The project root's `AGENTS.md`
+/// is in the system message from the first request; a subdirectory's own
+/// `AGENTS.md` arrives only with the result of the first tool call under it.
+#[test]
+fn instruction_files_are_sent_root_first_and_nested_on_demand() {
+    let responder: Responder = Arc::new(|n| {
+        if n == 0 {
+            sse_response(&[
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"web/page.txt\"}"}}]}}]}"#,
+            ])
+        } else {
+            sse_response(&[r#"{"choices":[{"index":0,"delta":{"content":"done"}}]}"#])
+        }
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("instructions");
+    std::fs::create_dir_all(dir.join("web")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "ROOT-RULE-7f3a").unwrap();
+    std::fs::write(dir.join("web/AGENTS.md"), "WEB-RULE-91cc").unwrap();
+    std::fs::write(dir.join("web/page.txt"), "page content").unwrap();
+
+    let out = run_print(&mock.base_url(), &dir, "read the page");
+
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert!(
+        bodies.len() >= 2,
+        "expected two requests, got {}.\n stderr: {:?}",
+        bodies.len(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(bodies[0].contains("ROOT-RULE-7f3a"));
+    assert!(
+        !bodies[0].contains("WEB-RULE-91cc"),
+        "not before it's needed"
+    );
+    let last = bodies.last().unwrap();
+    assert!(last.contains("ROOT-RULE-7f3a"));
+    assert!(last.contains("page content") && last.contains("WEB-RULE-91cc"));
 }

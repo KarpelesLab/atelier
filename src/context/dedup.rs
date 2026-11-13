@@ -7,6 +7,15 @@
 //! [`dedup_items`] drops items whose body is byte-identical to what was sent
 //! for the same title last turn.
 //!
+//! That is only sound where what was sent is still in front of the model.
+//! With the Claude backend it is: context travels inside user messages, which
+//! stay in the transcript. atelier's own loop instead rebuilds the system
+//! message for every request, so there a dropped item is simply gone — fine
+//! for a snapshot like git status ("nothing new"), wrong for
+//! [standing](ContextItem::standing) items such as the instruction files,
+//! which must not disappear after the first turn. The caller says which case
+//! it is through `resend_standing`.
+//!
 //! This module is pure: it doesn't decide when it runs or how the snapshot is
 //! persisted across turns — the agent loop owns that (see the module docs in
 //! `mod.rs` for the intended call shape).
@@ -21,8 +30,10 @@ use std::collections::HashMap;
 /// it last turn. An item is kept in `to_render` when its title isn't in
 /// `previous` at all, or when its body differs from `previous[title]`; an
 /// item whose title and body both match `previous` is considered unchanged
-/// and dropped. The relative order of kept items matches their order in
-/// `items`.
+/// and dropped — unless it is a [standing](ContextItem::standing) item and
+/// `resend_standing` is set (the caller's transcript doesn't retain context;
+/// see the module docs), in which case it is kept every time. The relative
+/// order of kept items matches their order in `items`.
 ///
 /// `snapshot` always contains an entry for every item in `items` (title ->
 /// body), regardless of whether that item was kept or dropped, so the caller
@@ -36,15 +47,17 @@ use std::collections::HashMap;
 pub fn dedup_items(
     previous: &HashMap<String, String>,
     items: Vec<ContextItem>,
+    resend_standing: bool,
 ) -> (Vec<ContextItem>, HashMap<String, String>) {
     let mut snapshot = HashMap::with_capacity(items.len());
     let mut to_render = Vec::with_capacity(items.len());
 
     for item in items {
-        let changed = match previous.get(&item.title) {
-            Some(prev_body) => prev_body != &item.body,
-            None => true,
-        };
+        let changed = (resend_standing && item.standing)
+            || match previous.get(&item.title) {
+                Some(prev_body) => prev_body != &item.body,
+                None => true,
+            };
         snapshot.insert(item.title.clone(), item.body.clone());
         if changed {
             to_render.push(item);
@@ -71,7 +84,7 @@ mod tests {
         let previous = HashMap::new();
         let items = vec![item("git status", "clean", 50), item("layout", "src/", 10)];
 
-        let (kept, snapshot) = dedup_items(&previous, items);
+        let (kept, snapshot) = dedup_items(&previous, items, false);
 
         assert_eq!(titles(&kept), vec!["git status", "layout"]);
         assert_eq!(
@@ -93,7 +106,7 @@ mod tests {
             item("layout", "src/", 10),
         ];
 
-        let (kept, snapshot) = dedup_items(&previous, items);
+        let (kept, snapshot) = dedup_items(&previous, items, false);
 
         assert_eq!(titles(&kept), vec!["git status"]);
         assert_eq!(kept[0].body, "1 file changed");
@@ -112,7 +125,7 @@ mod tests {
 
         let items = vec![item("git status", "clean", 50), item("layout", "src/", 10)];
 
-        let (kept, snapshot) = dedup_items(&previous, items);
+        let (kept, snapshot) = dedup_items(&previous, items, false);
 
         assert!(kept.is_empty());
         assert_eq!(snapshot.len(), 2);
@@ -132,7 +145,7 @@ mod tests {
         // "layout" had nothing to say this turn, so it's absent entirely.
         let items = vec![item("git status", "clean", 50)];
 
-        let (kept, snapshot) = dedup_items(&previous, items);
+        let (kept, snapshot) = dedup_items(&previous, items, false);
 
         assert!(kept.is_empty());
         assert_eq!(snapshot.len(), 1);
@@ -148,15 +161,35 @@ mod tests {
             item("b", "body b", 3),
         ];
 
-        let (kept, _snapshot) = dedup_items(&previous, items);
+        let (kept, _snapshot) = dedup_items(&previous, items, false);
 
         assert_eq!(titles(&kept), vec!["c", "a", "b"]);
     }
 
     #[test]
+    fn standing_items_are_resent_only_when_asked() {
+        let mut previous = HashMap::new();
+        previous.insert("rules".to_string(), "be kind".to_string());
+        previous.insert("git status".to_string(), "clean".to_string());
+        let items = || {
+            vec![
+                item("rules", "be kind", 250).standing(),
+                item("git status", "clean", 50),
+            ]
+        };
+
+        let (kept, _) = dedup_items(&previous, items(), false);
+        assert!(kept.is_empty());
+
+        let (kept, snapshot) = dedup_items(&previous, items(), true);
+        assert_eq!(titles(&kept), vec!["rules"]);
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    #[test]
     fn empty_items_produces_empty_output_and_empty_snapshot() {
         let previous = HashMap::new();
-        let (kept, snapshot) = dedup_items(&previous, Vec::new());
+        let (kept, snapshot) = dedup_items(&previous, Vec::new(), false);
         assert!(kept.is_empty());
         assert!(snapshot.is_empty());
     }

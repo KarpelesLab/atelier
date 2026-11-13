@@ -59,6 +59,11 @@ atelier only keeps the session id in `.atelier/claude-session`).
 - **Per-turn context.** atelier's context providers (git status, diff,
   layout, diagnostics) are prepended to each message in an
   `<atelier-context>` block, deduplicated across turns.
+- **Instruction files.** atelier's own
+  [instruction files](configuration.md#instruction-files) travel the same
+  way: sent with the first message and again only when one changes. A
+  subdirectory's file comes with the result of the first atelier tool call
+  under it. (claude also loads `CLAUDE.md` by itself, as it always does.)
 
 ## Tools
 

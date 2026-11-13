@@ -54,6 +54,11 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// (since they are lower priority and the budget is already spent). A
 /// trailing line notes how many items were left out.
 ///
+/// [Standing](ContextItem::standing) items are the exception: they come
+/// first, whole, and don't count against `max_tokens`. They are the
+/// instruction files, which carry a byte budget of their own and are no use
+/// to the model cut down to what a per-turn snapshot may cost.
+///
 /// Returns `None` if `items` is empty, or if nothing at all could be made to
 /// fit (e.g. `max_tokens` is too small even for the header).
 pub fn render_budgeted(items: Vec<ContextItem>, max_tokens: usize) -> Option<String> {
@@ -61,16 +66,20 @@ pub fn render_budgeted(items: Vec<ContextItem>, max_tokens: usize) -> Option<Str
         return None;
     }
 
-    let mut items = items;
+    let (standing, mut items): (Vec<_>, Vec<_>) = items.into_iter().partition(|it| it.standing);
     items.sort_by_key(|it| std::cmp::Reverse(it.priority));
 
+    let mut body = String::new();
+    for item in &standing {
+        body.push_str(&format!("\n## {}\n{}\n", item.title, item.body));
+    }
+
     let header_tokens = estimate_tokens(HEADER);
-    if header_tokens >= max_tokens {
+    if header_tokens >= max_tokens && standing.is_empty() {
         return None;
     }
-    let mut remaining = max_tokens - header_tokens;
+    let mut remaining = max_tokens.saturating_sub(header_tokens);
 
-    let mut body = String::new();
     let mut included = 0usize;
 
     for item in &items {
@@ -253,5 +262,20 @@ mod tests {
         assert!(out.contains("## first\nfirst body here"));
         assert!(!out.contains("## second"));
         assert!(out.contains("[1 lower-priority context item(s) omitted]"));
+    }
+
+    #[test]
+    fn standing_items_are_rendered_whole_outside_the_budget() {
+        let rules = "r".repeat(4_000);
+        let items = vec![
+            item("git status", "clean", 200),
+            item("rules", &rules, 10).standing(),
+        ];
+        // Room for the header and git status only; the rules are far larger.
+        let out = render_budgeted(items, 20).expect("should render");
+        assert!(out.contains(&rules));
+        assert!(out.contains("## git status\nclean"));
+        assert!(out.find("## rules").unwrap() < out.find("## git status").unwrap());
+        assert!(!out.contains("omitted"));
     }
 }

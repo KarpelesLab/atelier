@@ -717,6 +717,7 @@ impl Session {
         self.summary = None;
         self.pending_images.clear();
         self.last_ctx.clear();
+        self.fstate.forget_dirs();
         self.claude = None;
         self.claude_session = None;
         let _ = crate::session::clear(&self.root);
@@ -1289,7 +1290,11 @@ impl Session {
             .collect();
         // Drop items unchanged since last turn so we don't re-send identical
         // context every turn; remember the full snapshot for next time.
-        let (kept, snapshot) = crate::context::dedup_items(&self.last_ctx, items);
+        // Claude keeps context in its transcript; our own loop rebuilds the
+        // system message per request, so standing items (the instruction
+        // files) must be restated there or they'd be gone after one turn.
+        let (kept, snapshot) =
+            crate::context::dedup_items(&self.last_ctx, items, !self.is_claude());
         self.last_ctx = snapshot;
         crate::context::render_budgeted(kept, CONTEXT_TOKEN_BUDGET)
     }
@@ -1376,7 +1381,16 @@ impl ToolRunner<'_> {
             approved: true,
         };
         match tool.call_output(&mut ctx, args) {
-            Ok(out) => (out, true),
+            Ok(mut out) => {
+                // A subdirectory's own instruction file comes with the first
+                // result from under it: in time for the model's next step,
+                // and kept in the transcript of either backend.
+                let entered = self.fstate.take_new_dirs();
+                if let Some(note) = crate::context::nested_instructions(self.root, &entered) {
+                    out.text.push_str(&note);
+                }
+                (out, true)
+            }
             Err(e) => (ToolOutput::text(format!("error: {e:#}")), false),
         }
     }
@@ -1904,6 +1918,55 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn nested_instructions_come_with_the_first_result_from_a_directory() {
+        let root = std::env::temp_dir().join(format!("atl-agent-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("web")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "ROOT rules").unwrap();
+        std::fs::write(root.join("web/AGENTS.md"), "WEB rules").unwrap();
+        std::fs::write(root.join("web/a.txt"), "file a").unwrap();
+        std::fs::write(root.join("top.txt"), "file top").unwrap();
+
+        let tools = crate::tools::builtin_registry();
+        let mut fstate = FileState::new();
+        let mut allow = HashSet::new();
+        let mut settings = Settings::default();
+        let mut runner = ToolRunner {
+            tools: &tools,
+            root: &root,
+            fstate: &mut fstate,
+            allow: &mut allow,
+            settings: &mut settings,
+            auto_approve: true,
+        };
+        let mut call = |name: &str, args: Value| {
+            let (out, ok) = runner.exec(name, args);
+            assert!(ok, "{name} failed: {}", out.text);
+            out.text
+        };
+
+        // At the project root there is nothing to add: its file is ambient.
+        let top = call("read", serde_json::json!({"path": "top.txt"}));
+        assert!(!top.contains("nested-instructions"), "{top}");
+
+        let first = call("read", serde_json::json!({"path": "web/a.txt"}));
+        assert!(first.contains("file a"));
+        assert!(first.contains("<nested-instructions>") && first.contains("WEB rules"));
+        assert!(!first.contains("ROOT rules"));
+
+        // Once per session, whether reading or writing.
+        let again = call("read", serde_json::json!({"path": "web/a.txt"}));
+        assert!(!again.contains("WEB rules"));
+        let write = call(
+            "write",
+            serde_json::json!({"path": "web/b.txt", "content": "b"}),
+        );
+        assert!(!write.contains("WEB rules"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

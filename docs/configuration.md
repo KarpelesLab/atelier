@@ -127,6 +127,42 @@ model = "qwen3-coder:30b"    # optional; defaults to the main model
 | `enabled` | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
 | `model`   | string | Model override for the reviewer; unset reuses the active model |
 
+## Instruction files
+
+Standing instructions for the agent — conventions, commands, things not to
+touch — live in plain Markdown files. atelier loads every one that applies,
+broadest first, so a closer file can refine a broader one:
+
+1. your own, for every project: `$XDG_CONFIG_HOME/atelier/AGENTS.md`
+   (`~/.config/atelier/AGENTS.md` when that variable is unset);
+2. one per directory from the repository root (the nearest parent containing
+   `.git`) down to the directory atelier was launched in. Outside a
+   repository, only the launch directory counts.
+
+In each directory the first of `AGENTS.md`, `.atelier/instructions.md`,
+`CLAUDE.md`, `.cursorrules` is used and the others are ignored. Each file is
+shown to the model under a header with its path.
+
+**Subdirectories.** An instruction file *below* the launch directory (say
+`web/AGENTS.md`) is not loaded up front. It is handed to the model with the
+result of the first `read`, `write` or edit of a file under that directory,
+once per conversation.
+
+**Imports.** A line containing only `@path` is replaced by that file's
+content. The path is relative to the file doing the importing, absolute, or
+starts with `~/`. Imports may nest five levels deep. One that can't be
+followed — missing, a cycle, not text, or over 32 KiB — leaves a one-line
+`[import @… skipped: …]` note in its place. Lines inside a fenced code block
+are never imports.
+
+**Size.** The loaded files share a budget of 32 KiB. Past it the text is cut,
+and a closing note names the file that was cut and any that were left out —
+the more specific ones, since they come last. Instructions are sent with
+every request, so they count against the model's context window each time;
+keep them short.
+
+**Edits take effect on your next message**; no restart is needed.
+
 ## `/config`
 
 `/config` opens a settings view covering the model, auto-approve, the context

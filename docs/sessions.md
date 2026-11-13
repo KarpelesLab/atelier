@@ -88,8 +88,9 @@ now-stale pre-compaction number).
 
 **How it's used afterward:** every request's single leading system message
 carries, in order: the fixed system prompt, `Summary of earlier
-conversation:` + the rolling summary (if any), then fresh per-turn context
-(git status, diff, layout, diagnostics). The model always sees the summary,
+conversation:` + the rolling summary (if any), then the
+[instruction files](configuration.md#instruction-files) and fresh per-turn
+context (git status, diff, layout, diagnostics). The model always sees the summary,
 never the raw messages it was built from.
 
 ## See also

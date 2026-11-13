@@ -39,6 +39,7 @@ mod todos;
 pub use budget::{estimate_tokens, render_budgeted};
 #[allow(unused_imports)]
 pub use dedup::dedup_items;
+pub use instructions::nested_instructions;
 
 use std::path::Path;
 
@@ -50,6 +51,10 @@ pub struct ContextItem {
     pub body: String,
     /// Higher priority survives truncation when the context budget is tight.
     pub priority: u8,
+    /// Standing context (the instruction files) rather than a snapshot of the
+    /// moment: the model must have it on every request, and it is rendered
+    /// whole — its provider keeps it within a budget of its own.
+    pub standing: bool,
 }
 
 impl ContextItem {
@@ -58,7 +63,14 @@ impl ContextItem {
             title: title.into(),
             body: body.into(),
             priority,
+            standing: false,
         }
+    }
+
+    /// Marks the item as standing context (see [`ContextItem::standing`]).
+    pub fn standing(mut self) -> Self {
+        self.standing = true;
+        self
     }
 }
 
@@ -75,7 +87,7 @@ pub trait ContextProvider: Send + Sync {
 /// project layout, open TODOs, and environment facts (in priority order).
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
     vec![
-        Box::new(instructions::InstructionsProvider),
+        Box::new(instructions::InstructionsProvider::new()),
         Box::new(memory::MemoryProvider::new(crate::memory::global_dir())),
         Box::new(diagnostics::DiagnosticsProvider),
         Box::new(git::GitStatusProvider),
