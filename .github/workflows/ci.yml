@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# A newer push to the same branch (or pull request) supersedes this run:
+# cancel the older one instead of queueing every intermediate commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
