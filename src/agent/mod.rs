@@ -163,6 +163,7 @@ const HELP: &[&str] = &[
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
+    "  /skills                               list the skills the agent can load, and where they are",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
     "  /subscribe <topic>                    receive what instances publish to a topic",
@@ -328,6 +329,11 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 ui.info(&l);
             }
         }
+        "/skills" => {
+            for l in crate::skills::command(&session.root, &crate::skills::global_dirs()) {
+                ui.info(&l);
+            }
+        }
         "/peers" | "/subscribe" | "/unsubscribe" => dispatch_peers(session, cmd, &args, ui),
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),
@@ -362,7 +368,7 @@ fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option
         let mut runner = session.runner();
         let arguments = serde_json::json!({ "command": shell }).to_string();
         // `approve` passes tools it doesn't know; never run a shell on that.
-        runner.tools.get("bash").is_some() && runner.approve("bash", &arguments, ui)
+        runner.tools.get("bash").is_some() && runner.approve("bash", &arguments, ui).is_ok()
     };
     let expanded = crate::commands::expand(&command, arguments.trim(), &root, &mut approve);
     Some(match expanded {

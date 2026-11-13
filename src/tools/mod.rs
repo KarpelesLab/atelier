@@ -39,6 +39,7 @@ mod memory;
 mod multiedit;
 mod notebook;
 mod read;
+mod skill;
 mod todo;
 mod tree;
 mod web_fetch;
@@ -238,6 +239,9 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(memory::MemoryTool::new(
         crate::memory::global_dir(),
     )));
+    reg.register(Box::new(
+        skill::SkillTool::new(crate::skills::global_dirs()),
+    ));
     reg.register(Box::new(tree::TreeTool));
     reg.register(Box::new(crate::js::NodeTool));
     reg

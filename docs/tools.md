@@ -17,6 +17,7 @@ model verbatim as the tool result.
 | `tree`      | auto     | yes |
 | `todo`      | auto     | yes |
 | `memory`    | auto     | to the memory directories (the project's `.atelier/memory/` and the user-global one) |
+| `skill`     | auto     | to the skill directories (read-only; a skill's files only from inside that skill's directory) |
 | `notebook_edit` | auto | yes |
 | `bash`      | **required** | no (arbitrary shell) |
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
@@ -345,6 +346,38 @@ Errors the model can act on: an invalid name, a note over 8 KiB, a full
 directory (200 memories), and content that looks like a secret (private-key
 blocks, `sk-…`/`ghp_…`/AWS-style keys, `password=…` and the like) — the save
 is refused. Confined to the memory directories and auto-approved.
+
+## `skill`
+
+Load a [skill](skills.md): instructions (often with scripts and reference
+files) for one kind of task. The skills' names and descriptions are injected
+as context every turn; this tool returns the rest when a task calls for it.
+
+| Param  | Type   | Required | Meaning |
+|--------|--------|----------|---------|
+| `name` | string | no       | the skill to load, as listed. Omitted: list every skill (`- name — description`) |
+| `file` | string | no       | with `name`: return this file of the skill instead, by its path relative to the skill's directory |
+
+Loading a skill returns:
+
+```
+skill: release
+directory: /path/to/project/.atelier/skills/release
+files (read one with {"name": "release", "file": <path>}; run scripts by their path under the directory):
+  checklist.md
+  scripts/bump-version.sh
+
+# Releasing
+…the body of SKILL.md, without its front matter…
+```
+
+Up to 100 files are listed (hidden files left out, four levels deep). `file`
+returns a text file of at most 256 KiB, and only from inside the skill's own
+directory: the path is resolved first, so `..`, an absolute path, or a
+symlink leading out of the skill is an error. That confinement is what lets
+the tool be auto-approved even though a user-global skill is outside the
+project, where `read` would ask. An unknown name is an error that lists the
+available ones.
 
 ## `peers`, `peer_send`
 

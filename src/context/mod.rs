@@ -31,6 +31,7 @@ mod git;
 mod instructions;
 mod layout;
 mod memory;
+mod skills;
 mod todos;
 
 // Not yet called from the agent loop (wiring is done separately); re-exported
@@ -84,9 +85,9 @@ pub trait ContextProvider: Send + Sync {
 }
 
 /// The default set of context providers: project instructions, the memory
-/// index, lint/typecheck diagnostics, git status, recent diff, recent
-/// commits, project layout, open TODOs, and environment facts (in priority
-/// order).
+/// index, the available skills, lint/typecheck diagnostics, git status,
+/// recent diff, recent commits, project layout, open TODOs, and environment
+/// facts (in priority order).
 ///
 /// `checkers` are the `[[diagnostics]]` entries of `atelier.toml`; when
 /// empty, the diagnostics provider picks checkers from the project's files.
@@ -94,6 +95,7 @@ pub fn default_providers(checkers: Vec<DiagnosticCheck>) -> Vec<Box<dyn ContextP
     vec![
         Box::new(instructions::InstructionsProvider::new()),
         Box::new(memory::MemoryProvider::new(crate::memory::global_dir())),
+        Box::new(skills::SkillsProvider::new(crate::skills::global_dirs())),
         Box::new(diagnostics::DiagnosticsProvider::new(checkers)),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),

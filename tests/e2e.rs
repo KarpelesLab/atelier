@@ -217,6 +217,8 @@ fn run_atelier(base_url: &str, cwd: &Path, args: &[&str], stdin: Option<&str>) -
         // global memory next to the temp project, never the real home.
         .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
+        // Likewise the user's skills under ~/.claude and ~/.agents.
+        .env("HOME", cwd.with_extension("home"))
         .env_remove("ATELIER_API_KEY")
         .env_remove("ATELIER_TRACE")
         .env_remove("ATELIER_DEBUG")
@@ -979,4 +981,84 @@ fn custom_command_expands_into_the_prompt() {
     assert!(stdout.contains("/standup"), "{stdout}");
     assert!(!stdout[custom..].contains("\n  /help"), "{stdout}");
     assert!(stdout.contains("unknown command '/nope'"), "{stdout}");
+}
+
+/// Case 6 — skills. A project skill and a user-global one are advertised in
+/// the system message by name and description only. The mock model then
+/// loads the global skill and one of its files with the `skill` tool: both
+/// come back without an approval prompt (nothing is auto-approved in this
+/// run, and a prompt would be refused at end of input), although the files
+/// are outside the project.
+#[cfg(unix)]
+#[test]
+fn skills_are_advertised_and_loaded_on_demand() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => sse_response(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"skill","arguments":"{\"name\":\"deploy\"}"}}]}}]}"#,
+        ]),
+        1 => sse_response(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"skill","arguments":"{\"name\":\"deploy\",\"file\":\"hosts.md\"}"}}]}}]}"#,
+        ]),
+        _ => sse_response(&[r#"{"choices":[{"index":0,"delta":{"content":"deployed"}}]}"#]),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("skills");
+
+    let project = dir.join(".claude/skills/changelog");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("SKILL.md"),
+        "---\nname: changelog\ndescription: write the changelog entry\n---\nPROJECT-BODY\n",
+    )
+    .unwrap();
+    let global = dir.with_extension("home").join(".agents/skills/deploy");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::write(
+        global.join("SKILL.md"),
+        "---\nname: deploy\ndescription: ship to production\n---\nGLOBAL-BODY: see hosts.md\n",
+    )
+    .unwrap();
+    std::fs::write(global.join("hosts.md"), "HOSTS-CONTENT\n").unwrap();
+
+    let out = run_repl(&mock.base_url(), &dir, "/skills\nship it\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("2 skill(s):"), "{stdout}");
+    assert!(
+        stdout.contains("changelog — write the changelog entry\n      .claude/skills/changelog"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("deployed"), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("allow tool"), "{stdout}");
+
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3, "stdout: {stdout}\nstderr: {stderr}");
+    let system = system_message(&bodies[0]);
+    assert!(
+        system.contains("## skills") && system.contains("`skill` tool"),
+        "{system}"
+    );
+    assert!(
+        system.contains("- changelog — write the changelog entry\n- deploy — ship to production"),
+        "{system}"
+    );
+    assert!(
+        !bodies[0].contains("PROJECT-BODY") && !bodies[0].contains("GLOBAL-BODY"),
+        "only names and descriptions are ambient: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains(r#""name":"skill""#),
+        "the skill tool is advertised"
+    );
+    assert!(
+        bodies[1].contains("GLOBAL-BODY: see hosts.md") && bodies[1].contains("  hosts.md"),
+        "the instructions and file listing are the tool result: {}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1].contains("HOSTS-CONTENT") && bodies[2].contains("HOSTS-CONTENT"),
+        "the file arrives when asked for: {}",
+        bodies[2]
+    );
 }

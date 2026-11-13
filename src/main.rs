@@ -24,6 +24,7 @@ mod schema;
 mod session;
 mod settings;
 mod shlex;
+mod skills;
 mod tools;
 #[cfg(tui)]
 mod tui;

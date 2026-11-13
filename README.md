@@ -103,6 +103,7 @@ first conversation, the REPL/TUI fallback).
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |
+| [Skills](docs/skills.md) | `SKILL.md` directories the agent loads on demand: `.atelier/skills/` (also `.claude/skills/`, `.agents/skills/`), the `skill` tool, `/skills` |
 | [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
