@@ -36,8 +36,12 @@
 //! session; the others fall back towards it, so a file with no `[models]`
 //! table sends every request where it always went.
 //!
-//! None of this applies to the Claude backend, where the `claude` CLI picks
-//! and calls its own models.
+//! The Claude backend is apart: the `claude` CLI picks and calls its own
+//! models, so the main model, the roles and the variants mean nothing to the
+//! conversation there. The tables are read all the same, because one request
+//! is still atelier's own under that backend — the approval reviewer's (see
+//! [`crate::permissions::reviewer`]), which needs a model on a configured
+//! provider to exist at all.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -224,10 +228,11 @@ impl Config {
     /// both name the same thing. Returns what was wrong with them, for the
     /// caller to print; a faulty entry is skipped, the rest still applies.
     pub fn apply_settings(&mut self, project: &Settings, user: &Settings) -> Vec<String> {
-        // claude picks and calls its own models (see the module docs).
-        if matches!(self.backend, Backend::Claude { .. }) {
-            return Vec::new();
-        }
+        // claude picks and calls its own models (see the module docs): the
+        // main model is not atelier's to set there. The providers and the
+        // other roles are still read, for the one request atelier makes
+        // itself under that backend — the approval reviewer's.
+        let claude = matches!(self.backend, Backend::Claude { .. });
         let mut warnings = Vec::new();
 
         for table in user.provider.iter().chain(&project.provider) {
@@ -283,7 +288,8 @@ impl Config {
             summary: pick(|m| &m.summary),
         };
         // ATELIER_MODEL wins; then the role, then the older spelling of it.
-        if !self.model_from_env
+        if !claude
+            && !self.model_from_env
             && let Some(main) = pick(|m| &m.main)
                 .or_else(|| project.defaults.model.clone())
                 .or_else(|| user.defaults.model.clone())

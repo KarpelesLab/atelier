@@ -686,6 +686,68 @@ fn an_unanswered_approval_times_out_as_a_denial() {
     assert!(!dir.join("a.txt").exists());
 }
 
+/// With the approval reviewer on, the call a client leaves unanswered is not
+/// simply refused: once `--approval-timeout` runs out the reviewer judges
+/// it, and its verdict is an `event/approval`. (The client was asked first —
+/// `when` is "unattended", and a client is somebody to ask.)
+#[test]
+fn an_approval_the_client_leaves_open_goes_to_the_reviewer() {
+    let mock = Mock::scripted(|_, body| {
+        if body.contains("You are atelier's approval reviewer") {
+            return answer(
+                &json!({"decision": "allow", "risk": "low", "reason": "writes one file"})
+                    .to_string(),
+            );
+        }
+        // A prompt is answered with the call, the call's result with "done".
+        let request: Value = serde_json::from_str(body).expect("a JSON body");
+        let last = request["messages"].as_array().and_then(|m| m.last());
+        match last.is_some_and(|m| m["role"] == "user") {
+            true => tool_call("call_1", "bash", json!({"command": "echo one > a.txt"})),
+            false => answer("done"),
+        }
+    });
+    let dir = unique_dir("reviewer");
+    let user = dir.join(".no-user-config/atelier");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(
+        user.join("atelier.toml"),
+        "[permissions.reviewer]\nenabled = true\n",
+    )
+    .unwrap();
+    let mut client = Client::ready(&mock, &dir, &["--approval-timeout", "1"]);
+
+    let turn = client.start_turn("run it");
+    let asked = client.asked("approval/request");
+    let cancelled = client.notification("request/cancelled");
+    assert_eq!(cancelled, json!({"id": asked["id"], "reason": "timeout"}));
+    let reviewed = client.notification("event/approval");
+    assert_eq!(reviewed["by"], "reviewer", "{reviewed}");
+    assert_eq!(reviewed["decision"], "allowed");
+    assert_eq!(reviewed["risk"], "low");
+    assert_eq!(reviewed["reason"], "writes one file");
+    assert_eq!(reviewed["tool"], "bash");
+    assert_eq!(reviewed["arguments"]["command"], "echo one > a.txt");
+    assert_eq!(reviewed["turn"], 1);
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap().trim(),
+        "one"
+    );
+
+    // An answer the client does give is the answer: the reviewer, which
+    // would allow, is not consulted about a refusal.
+    let before = mock.requests();
+    let turn = client.start_turn("again");
+    let asked = client.asked("approval/request");
+    client.reply(&asked, json!({"decision": "deny"}));
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    let reviews = (before..mock.requests())
+        .filter(|&n| mock.body(n).contains("You are atelier's approval reviewer"))
+        .count();
+    assert_eq!(reviews, 0);
+}
+
 /// `turn/steer` puts a message into the running turn: the model gets it at
 /// its next step, and `event/delivered` says when. (The approval request
 /// is what holds the turn still while the message is queued.)

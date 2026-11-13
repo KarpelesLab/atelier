@@ -34,6 +34,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier acp [--claude] [--mode MODE] [--max-turns N]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
+       atelier permissions reviewer-policy
        atelier stats [--days N] [--project] [--json]
        atelier trust [status|accept|revoke] [path]
        atelier mcp [--mode MODE] [--allow-all] [--tools a,b] [--no-tools x,y]

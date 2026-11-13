@@ -45,8 +45,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::Outcome;
+use crate::agent::approvals::Detached;
 use crate::agent::jobs::{Audience, Notice};
-use crate::permissions::{self, Mode, Policy};
+use crate::permissions::{self, Mode, Policy, Shown};
 use crate::settings::Permissions;
 use crate::tools::ToolRegistry;
 use crate::tools::bash::runtime;
@@ -414,17 +415,34 @@ pub(super) struct Rules {
     pub(super) mode: Mode,
     pub(super) root: PathBuf,
     pub(super) tools: ToolRegistry,
+    /// The way to the approval reviewer, which — when the rules have one —
+    /// judges the calls that would have asked: copies of the parent's
+    /// configuration and context, the agent's own to use from its thread.
+    pub(super) reviewer: Mutex<Detached>,
 }
 
 impl Rules {
     /// Whether the agent may make this call. `Err` is the tool result for a
-    /// refused one.
-    pub(super) fn decide(&self, tool: &str, arguments: &str) -> Result<(), String> {
-        self.decide_under(&Policy::load(&self.permissions), tool, arguments)
+    /// refused one. `activity` gets the reviewer's verdict, if it gave one,
+    /// as a line of the agent's progress.
+    pub(super) fn decide(
+        &self,
+        tool: &str,
+        arguments: &str,
+        activity: &mut dyn FnMut(String),
+    ) -> Result<(), String> {
+        let policy = Policy::load(&self.permissions);
+        self.decide_under(&policy, tool, arguments, activity)
     }
 
     /// [`decide`](Self::decide) under a given policy.
-    fn decide_under(&self, policy: &Policy, tool: &str, arguments: &str) -> Result<(), String> {
+    fn decide_under(
+        &self,
+        policy: &Policy,
+        tool: &str,
+        arguments: &str,
+        activity: &mut dyn FnMut(String),
+    ) -> Result<(), String> {
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         let known = self.tools.get(tool);
         let req = permissions::Request {
@@ -435,7 +453,25 @@ impl Rules {
             hook_allowed: false,
             hooks: None,
         };
-        permissions::approve_unattended(policy, &self.root, self.mode, &req, NOBODY_TO_ASK)
+        let mut show = |shown: Shown| match shown {
+            Shown::Verdict(record) => activity(record.line()),
+            Shown::Notice(text) => activity(text.to_string()),
+        };
+        let (root, mode) = (&self.root, self.mode);
+        // Held for the review: this agent's calls are decided one at a time.
+        let mut reviewer = self.reviewer.lock().unwrap_or_else(|e| e.into_inner());
+        reviewer.host(|host| {
+            let host = Some(host);
+            permissions::approve_unattended(
+                policy,
+                root,
+                mode,
+                &req,
+                NOBODY_TO_ASK,
+                host,
+                &mut show,
+            )
+        })
     }
 }
 
@@ -627,13 +663,19 @@ mod tests {
                     allow: allow.iter().map(|r| r.to_string()).collect(),
                     ask: Vec::new(),
                     deny: deny.iter().map(|r| r.to_string()).collect(),
+                    reviewer: None,
                 },
                 mode,
                 root: root.clone(),
                 tools: crate::tools::builtin_registry(),
+                reviewer: Mutex::new(Detached {
+                    cfg: crate::config::Config::from_env(false),
+                    chatgpt: None,
+                    context: Default::default(),
+                }),
             };
             let policy = Policy::new(&rules.permissions, &Permissions::default(), None);
-            rules.decide_under(&policy, tool, arguments)
+            rules.decide_under(&policy, tool, arguments, &mut |_| {})
         };
         let bash = r#"{"command": "cargo test"}"#;
         let write = r#"{"path": "a.txt", "content": "x"}"#;

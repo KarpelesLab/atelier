@@ -80,10 +80,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Approval, Session, Ui};
+use super::{Approval, Session, Ui, approvals};
 use crate::agents::{self, Agent, Isolation, TASK_TOOL};
 use crate::context;
-use crate::permissions::DENIED;
+use crate::permissions::{DENIED, reviewer};
 use crate::provider::ToolCall;
 use crate::tools::task::TaskCall;
 
@@ -144,7 +144,9 @@ impl Link {
     pub(super) fn approve(&self, tool: &str, arguments: &str) -> Result<(), String> {
         let (index, events) = match &self.to {
             Parent::Waiting { index, events } => (*index, events),
-            Parent::Detached { rules, .. } => return rules.decide(tool, arguments),
+            Parent::Detached { rules, seat } => {
+                return rules.decide(tool, arguments, &mut |line| seat.activity(line));
+            }
         };
         let (reply, verdict) = mpsc::channel();
         let asked = events.send(Event::Approve {
@@ -571,6 +573,19 @@ impl Session {
             mode: self.mode,
             root: root.unwrap_or(&self.root).to_path_buf(),
             tools: self.tools.filtered(|tool| task.agent.allows(tool)),
+            reviewer: std::sync::Mutex::new(approvals::Detached {
+                cfg: self.cfg.clone(),
+                chatgpt: self.chatgpt.clone(),
+                // What the user asked for, and — in place of the
+                // assistant's last text — the task it handed over.
+                context: reviewer::Context {
+                    reply: format!(
+                        "(starting a background subagent with the task:) {}",
+                        task.prompt
+                    ),
+                    ..approvals::context(&self.history, &self.claude_prompt)
+                },
+            }),
         };
         let link = Link {
             stop: seat.stop_flag(),
@@ -783,6 +798,15 @@ impl Ui for AskingFor<'_> {
         self.inner
             .info(&format!("⤷ the subagent {} asks to run:", self.label));
         self.inner.ask_approval(tool, arguments)
+    }
+    fn unattended(&mut self) -> bool {
+        self.inner.unattended()
+    }
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        // No prompt follows to say whose call it was.
+        self.inner
+            .info(&format!("⤷ the subagent {} asked to run:", self.label));
+        self.inner.approval_reviewed(review);
     }
     fn notice(&mut self, text: &str) {
         self.inner.notice(text);

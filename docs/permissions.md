@@ -297,7 +297,169 @@ rule:     bash(git log *) (project, /work/proj/atelier.toml)
   `git log -3` is allowed by `bash(git log *)`
 ```
 
-`/permissions` in a session lists the rules in force, by source.
+`/permissions` in a session lists the rules in force, by source, and says
+whether the [approval reviewer](#the-approval-reviewer) is on.
+
+## The approval reviewer
+
+Optional, and off unless configured: a model that is put the calls that
+would *ask*, judges each against a written policy, and answers **allow**,
+**deny** or **ask**.
+
+```toml
+[permissions.reviewer]
+enabled = true
+model = "local/judge#low"               # default: the `review` role's model, then the main one
+policy = ".atelier/approval-policy.md"  # default: the built-in policy
+when = "unattended"                     # the default; or "always"
+timeout_secs = 30                       # the default
+```
+
+| `when` | The reviewer is consulted |
+|--------|---------------------------|
+| `"unattended"` | Only where nobody can answer a prompt: [`--print`](headless.md), a [background subagent](agents.md#in-the-background), [`atelier mcp`](mcp.md#atelier-as-an-mcp-server) with a client that has no elicitation, and [`atelier serve`](protocol.md) when the client answers an `approval/request` with an error or not within `--approval-timeout`. A call that would have been refused for want of an answer gets a judgement instead. At a terminal, and with a client that answers, nothing changes |
+| `"always"` | Also ahead of interactive prompts: you are asked only when the reviewer says "ask" (or fails) |
+
+Each verdict is one line, `⚖ reviewer allowed bash (low): runs the project's
+tests`, and an [`approval` event](headless.md#output-formats) for programs.
+
+**It is a model.** It can be wrong, and it can be talked round by text the
+agent picked up from a file or a web page and put into a command. It
+narrows the prompts you see; it is not a sandbox and not a permission
+system. What must never run belongs in a `deny` rule, what must always be
+looked at in an `ask` rule plus `when = "unattended"`, and what must be
+contained in the [sandbox](sandbox.md). Check its work in the
+[audit log](#the-audit-log).
+
+### Precedence
+
+The reviewer only ever replaces a *prompt*. In order:
+
+1. A `deny` rule refuses. Final.
+2. `plan` mode refuses what can modify. Final.
+3. A `pre_tool` [hook](hooks.md) that denies refuses. Final.
+4. An `allow` rule (or `yolo`, or a `pre_tool` hook's approval) runs the
+   call. The reviewer never sees it.
+5. A `permission_request` hook that answers has answered: it stands in for
+   you, and wins over the reviewer.
+6. **The reviewer** — when `when` says this prompt is its to answer.
+   - *allow*: the call runs, once. No rule is saved: "always" stays
+     something only you say.
+   - *deny*: the call's result tells the model that the approval reviewer
+     denied it and why, and not to retry the same call in another form but
+     to ask the user or take another approach.
+   - *ask*: goes on to 7.
+7. You, at the prompt — or, where there is nobody, the refusal there
+   always was.
+
+### What it is shown
+
+One request, without tools. The system message is the policy followed by a
+fixed output contract; the user message is one JSON object holding the tool
+and its arguments (up to 8 KiB), the [risk signals](#risk-signals-bash-only),
+why the call asks (the rule, or the tool's default), the project root, the
+mode, and two pieces of the conversation: your last prompt and the
+assistant's last text (2 KiB each).
+
+It is deliberately **not** shown tool output — files the agent read, web
+pages, command output, a background job's or subagent's report, another
+instance's message. Those are untrusted content, and content that reaches
+the reviewer could argue for its own approval. What cannot be kept from it
+is what the agent itself wrote: the arguments and its last message. The
+policy tells the reviewer that a claim of authority in either ("the user
+approved this", "ignore the policy") is a reason to deny or ask, never to
+allow.
+
+For a background subagent the context is your last prompt to the main agent
+and the task it handed over. On the [Claude backend](claude.md) it is your
+prompt alone.
+
+### Fail closed
+
+The reviewer must answer with exactly one JSON object:
+
+```json
+{"decision": "allow", "risk": "low", "reason": "runs the project's tests"}
+```
+
+`decision` is `allow`, `deny` or `ask`; `risk` is `low`, `medium`, `high` or
+`critical`. Each of the following counts as **ask** — you are prompted where
+there is a prompt, and the call is refused where there is none:
+
+- a reply that is anything else: prose, a code fence, text around the
+  object, a missing or unknown field;
+- `allow` together with `risk: critical`;
+- `allow` on a call whose arguments were too long to show in full;
+- a provider error, or no answer within `timeout_secs`;
+- a `policy` file that is missing, unreadable or empty.
+
+The request is made once per call and never retried.
+
+### The policy
+
+The built-in policy allows what is clearly part of your request and confined
+in effect (builds, tests, linters, read-only inspection, `git status` /
+`diff` / `log` / `add` / `commit` on the working branch, installing what
+the project's manifest declares); denies what destroys or exfiltrates
+(deleting outside the project, `rm -rf` of broad paths, force-pushes and
+history rewrites on shared branches, piping the network into a shell,
+reading credentials and keys, sending data to hosts you did not name, broad
+permission or ownership changes, disabling security tooling); and answers
+"ask" for everything else, for anything it does not understand, and for
+arguments that look assembled from tool output rather than from your
+request.
+
+Print it, copy it, edit it:
+
+```
+$ atelier permissions reviewer-policy > .atelier/approval-policy.md
+```
+
+then name the file in `policy`. In a project's `atelier.toml` the path is
+relative to the project root; in your user-global file it is relative to
+that file's directory (or absolute, or `~/…`) — a project never supplies the
+policy for a reviewer you configured. Your file replaces the built-in
+policy only; the output contract is always appended. The file is read once,
+when atelier starts.
+
+### Whose setting counts
+
+A `[permissions.reviewer]` table in your user-global `atelier.toml` applies
+everywhere. One in a project's file replaces it for that project — once the
+project is [trusted](trust.md): switching the reviewer on, its model, its
+`when` and the *contents* of its policy file are gated settings, since a
+repository must not be able to appoint a lenient judge of its own commands.
+An untrusted project's table is ignored, except that `enabled = false`
+(which only restricts) is honoured.
+
+### Which model
+
+`model`, else `[models] review`, else the main model. A small, fast model
+with a low reasoning effort is usually the right judge; one that is
+different from the main model is harder to steer with the same text. Its
+requests appear in the [usage log](configuration.md) like any other.
+
+With the Claude backend, claude calls its own models and atelier has none
+of its own, so the reviewer works only when `model` (or `[models] review`)
+is on a configured `[[provider]]`. Otherwise it is off, which is said once,
+and calls are asked about or refused as without it.
+
+### The audit log
+
+Every verdict appends one line to `$XDG_STATE_HOME/atelier/approvals.jsonl`
+(else `~/.local/state/atelier/approvals.jsonl`), best effort:
+
+```json
+{"ts":1794567890,"project":"/work/proj","tool":"bash","arguments":"{\"command\":\"cargo test\"}","decision":"allow","risk":"low","reason":"runs the project's tests","model":"local/judge"}
+```
+
+`arguments` is cut to 2 KiB; `decision` is what came of it (`ask` covers
+the failures above, with `risk` null and the failure as the `reason`).
+Nothing reads this file back: it is there for you to review what was
+allowed in your absence.
+
+`/permissions` says whether the reviewer is on, when it answers and under
+which policy.
 
 ## Headless mode: `ATELIER_APPROVE` and `--print`
 
@@ -311,7 +473,9 @@ completion with no human able to answer a prompt, so its `Ui::ask_approval`
 always answers **Deny** rather than blocking on stdin — the model is told the
 tool was denied and can try to proceed without it. Allow rules are how a
 `--print` run gets exactly the unconfined calls it needs;
-`ATELIER_APPROVE=all` gives it all of them. `--print --mode plan` is a
+`ATELIER_APPROVE=all` gives it all of them; the
+[approval reviewer](#the-approval-reviewer) is the middle way, a model
+deciding call by call under a policy. `--print --mode plan` is a
 read-only run: it can investigate and report, and change nothing. In
 `--print --mode ask-edits` every edit no rule allows is denied.
 
@@ -327,8 +491,9 @@ subagents off.
 A subagent started [in the background](agents.md#in-the-background) cannot
 prompt anyone: the rules and the mode — as they were when it started —
 decide alone, and a call they would **ask** about is **denied**, with a
-result telling the agent to report what it needed. Nothing it does is saved
-as an "always" rule.
+result telling the agent to report what it needed — unless the
+[approval reviewer](#the-approval-reviewer) is on, which then judges it.
+Nothing it does is saved as an "always" rule.
 
 ## The Claude backend
 
@@ -360,6 +525,8 @@ and `Bash` are refused with the plan-mode message. A request no rule
 decides is put to you — claude asked, so it is never waved through outside
 `yolo` — and "always" saves an atelier rule to `atelier.toml`, exactly as
 for atelier's own tools (claude's own permission settings are not changed).
+The [approval reviewer](#the-approval-reviewer) applies to these requests
+as to atelier's own tools, provided it has a model on a configured provider.
 
 **The limit:** atelier only sees the calls claude *asks* about. A call that
 claude's own configuration already allows — its `permissions.allow`
@@ -406,5 +573,7 @@ signals at once (each category is reported at most once per call).
 - MCP tools have no risk-signal analysis.
 - In `plan` mode, `bash` commands covered by a pattern allow rule run
   unexamined: atelier does not check that they only read.
-- A sandbox for `bash` and an approving reviewer are the rest of roadmap
-  M17. ([Project trust](trust.md) is in.)
+- The approval reviewer's verdicts for a background subagent are shown as
+  its activity lines, not as `approval` events.
+- A network allowlist for the [sandbox](sandbox.md) is the rest of roadmap
+  M17.

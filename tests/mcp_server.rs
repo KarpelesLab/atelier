@@ -1,8 +1,9 @@
 //! End-to-end tests of `atelier mcp`: the real binary as an MCP server,
 //! driven over its stdin and stdout the way an MCP client drives it.
 //!
-//! No model, no network: every test starts the server in a fresh project
-//! directory, sends JSON-RPC lines and reads the answers. Every line the
+//! No model, no network (but for the approval reviewer's case, which brings
+//! a local stand-in for its model): every test starts the server in a fresh
+//! project directory, sends JSON-RPC lines and reads the answers. Every line the
 //! server writes to stdout must be a JSON-RPC message — [`Client::recv`]
 //! fails the test on anything else, so each test also checks that nothing
 //! but protocol goes there.
@@ -349,6 +350,113 @@ fn bash_is_denied_without_a_rule_and_allowed_with_one() {
     assert!(text.contains("is not trusted"), "{text}");
     let stderr = client.finish();
     assert!(stderr.contains("not trusted"), "{stderr}");
+}
+
+/// A one-thread stand-in for a chat-completions endpoint that answers every
+/// request with `reply` as the streamed text; returns its base URL and the
+/// count of requests it has served.
+fn model_answering(reply: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&served);
+    // Ends with the test process; the server under test is its only client.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut length = 0;
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line.trim() != "" {
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            count.fetch_add(1, Ordering::SeqCst);
+            let chunk = json!({"choices": [{"index": 0, "delta": {"content": reply}}]});
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Connection: close\r\n\r\ndata: {chunk}\n\ndata: [DONE]\n\n"
+            );
+        }
+    });
+    (url, served)
+}
+
+/// With the approval reviewer on, a call that would be refused for want of
+/// anyone to ask (no elicitation) is judged by its model instead: allowed
+/// and run, or refused with the reviewer's reason — and a reply that is no
+/// verdict leaves the usual "nobody to ask" refusal in place.
+#[test]
+fn the_approval_reviewer_answers_where_the_client_cannot_ask() {
+    use std::sync::atomic::Ordering;
+    let reviewer = "[permissions.reviewer]\nenabled = true\n";
+    let command = json!({ "command": "echo ran > proof.txt" });
+    let verdict = |decision: &str, reason: &str| {
+        json!({"decision": decision, "risk": "low", "reason": reason}).to_string()
+    };
+    let serve = |name: &str, reply: String| {
+        let (url, served) = model_answering(reply);
+        let dir = project(name, reviewer);
+        let env = [
+            ("ATELIER_TRUST_PROJECT", "1"),
+            ("ATELIER_BASE_URL", url.as_str()),
+            ("ATELIER_MODEL", "judge"),
+        ];
+        (Client::connect(&dir, &[], &env), dir, served)
+    };
+
+    let (mut client, dir, served) = serve("reviewer-allow", verdict("allow", "writes one file"));
+    let (text, ok) = client.call("bash", command.clone());
+    assert!(ok, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("proof.txt")).unwrap(),
+        "ran\n"
+    );
+    // What the rules decide alone never reaches it.
+    let (_, ok) = client.call("write", json!({"path": "a.txt", "content": "x"}));
+    assert!(ok);
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+    let stderr = client.finish();
+    assert!(
+        stderr.contains("⚖ reviewer allowed bash (low): writes one file"),
+        "{stderr}"
+    );
+
+    let (mut client, dir, _) = serve("reviewer-deny", verdict("deny", "not asked for"));
+    let (text, ok) = client.call("bash", command.clone());
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("the approval reviewer denied this call"),
+        "{text}"
+    );
+    assert!(text.contains("not asked for"), "{text}");
+    assert!(!dir.join("proof.txt").exists());
+    client.finish();
+
+    let (mut client, dir, served) = serve("reviewer-garbage", "Looks fine to me.".to_string());
+    let (text, ok) = client.call("bash", command);
+    assert!(!ok, "{text}");
+    assert!(text.contains("nobody to ask"), "{text}");
+    assert!(!dir.join("proof.txt").exists());
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+    client.finish();
+
+    // Untrusted, the project's table switches nothing on: no request.
+    let (url, served) = model_answering(verdict("allow", "anything"));
+    let dir = project("reviewer-untrusted", reviewer);
+    let env = [("ATELIER_BASE_URL", url.as_str())];
+    let mut client = Client::connect(&dir, &[], &env);
+    let (text, ok) = client.call("bash", json!({ "command": "echo ran > proof.txt" }));
+    assert!(!ok, "{text}");
+    assert_eq!(served.load(Ordering::SeqCst), 0);
+    client.finish();
 }
 
 /// `--allow-all` is `yolo`: what would ask runs.

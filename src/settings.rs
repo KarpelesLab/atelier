@@ -435,6 +435,56 @@ pub struct Permissions {
     /// Calls that are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// `[permissions.reviewer]`: a model that answers approval prompts
+    /// (see [`crate::permissions::reviewer`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<ReviewerSettings>,
+}
+
+/// `[permissions.reviewer]`: a model that judges a tool call against a
+/// written policy before the user would be asked about it (see
+/// [`crate::permissions::reviewer`]).
+///
+/// ```toml
+/// [permissions.reviewer]
+/// enabled = true
+/// model = "local/judge#low"
+/// policy = ".atelier/approval-policy.md"
+/// when = "unattended"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReviewerSettings {
+    /// Whether the reviewer is consulted at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The model that judges, as `provider/model#variant` (default: the
+    /// `review` role, then the main model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A file holding the policy, in place of the built-in one. In a
+    /// project's file it is relative to the project root; in the
+    /// user-global file, to that file's directory (or absolute, or `~/…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Which prompts the reviewer answers.
+    #[serde(default)]
+    pub when: ReviewerWhen,
+    /// Seconds the reviewer's one request may take (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Which approval prompts go to the reviewer first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewerWhen {
+    /// Only where there is no user to ask: a call that would be refused
+    /// for want of an answer is put to the reviewer instead.
+    #[default]
+    Unattended,
+    /// Before interactive prompts too: the user is asked only when the
+    /// reviewer leaves the call to them.
+    Always,
 }
 
 /// One stdio MCP server the user has configured.

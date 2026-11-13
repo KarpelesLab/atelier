@@ -132,6 +132,12 @@ impl Ui for JobsUi<'_> {
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.inner.ask_approval(tool, arguments)
     }
+    fn unattended(&mut self) -> bool {
+        self.inner.unattended()
+    }
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        self.inner.approval_reviewed(review);
+    }
     fn ask_user(&mut self, question: &Question) -> Option<Answer> {
         self.inner.ask_user(question)
     }

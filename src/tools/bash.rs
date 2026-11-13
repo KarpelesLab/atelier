@@ -1260,6 +1260,7 @@ mod tests {
             allow: Vec::new(),
             ask: vec!["bash(git push *)".to_string()],
             deny: vec!["bash(rm -rf *)".to_string()],
+            reviewer: None,
         };
         let policy = Policy::new(&project, &Default::default(), None);
         let denied = json!({"command": "echo hi && rm -rf build"});

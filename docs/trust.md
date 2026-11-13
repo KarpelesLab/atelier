@@ -24,6 +24,7 @@ wait for `/trust`.
 | Auto-detected checkers (no `[[diagnostics]]`, and a `Cargo.toml`, `tsconfig.json`, `go.mod`, `pyproject.toml` or `setup.py`) | They run the project's own build: `cargo check` runs build scripts and proc macros, `npx tsc` runs a binary from `node_modules`. Detection itself is skipped too — one probe (`python -c 'import pyflakes'`) runs in the project directory |
 | `[[provider]]` (every entry) | An endpoint the whole conversation — your prompts, file contents, memory — can be sent to; `api_key_env` sends an environment variable of the file's choosing there, `api_key_command` runs a shell command, `headers` are sent along |
 | `[permissions] allow` | Calls the agent then makes without asking: a file that says `allow = ["bash"]` would approve its own commands |
+| `[permissions.reviewer]` with `enabled = true` | A model answering approval prompts in your place, under a policy file of the repository's choosing: a file that could switch it on could appoint a lenient judge of its own commands |
 | `[defaults] mode = "yolo"`, or `approve = true` | Turns every approval prompt off |
 | `[[hooks]]` | Shell commands run on lifecycle events |
 | `[search] key_env`, `[search] url` | An environment variable of the file's choosing, sent as the key to a search endpoint — and the endpoint itself, which would also be sent the key in your own `ATELIER_SEARCH_KEY`, and the agent's queries |
@@ -32,6 +33,9 @@ wait for `/trust`.
 Not gated, because they only restrict or are harmless:
 
 - `[permissions] deny` and `ask` — they apply in an untrusted project too.
+- `[permissions.reviewer]` with `enabled = false` — it switches your own
+  [approval reviewer](permissions.md#the-approval-reviewer) off for the
+  project, which only means more prompts.
 - `[defaults] mode = "plan"`, `"ask-edits"` or `"auto-edit"` (the built-in
   default), `context_limit`, `model`.
 - `[review]`, `[variant.*]`, `[[price]]`, `[search] provider` on its own.
@@ -66,6 +70,8 @@ endpoint and model.
 - Only your own allow rules count: the user-global ones, and those you save
   with "always" during the session (they are written to `atelier.toml` as
   usual, and count in later sessions once the project is trusted).
+- The project's approval reviewer is not consulted; yours (from the
+  user-global file) is, under your policy.
 - Sessions start in `auto-edit` unless you choose otherwise (`--mode`,
   `ATELIER_MODE`, `ATELIER_APPROVE`).
 - Project hooks do not run. Your own do.
@@ -125,14 +131,18 @@ accept anything. What goes into the hash, in the file's order:
 - each `[[provider]]`: `name`, `base_url`, `api_key_env`, `api_key_command`,
   `headers`;
 - each `[permissions] allow` rule;
+- `[permissions.reviewer]`, when enabled: `model`, `policy`, `when`,
+  `timeout_secs`, and a hash of the policy file's contents;
 - whether `[defaults]` starts sessions in `yolo`;
 - each `[[hooks]]`: `event`, `match`, `command`, `timeout_secs`;
 - `[search]` `provider`, `url` and `key_env`, when `key_env` or `url` is set;
 - `[sandbox] enabled`, when it is set.
 
 So a `git pull` that edits a hook's command, or the agent editing
-`atelier.toml` to add an allow rule, makes the project untrusted again at the
-next start, and the notice says the settings changed. Editing anything else
+`atelier.toml` to add an allow rule or rewriting the reviewer's policy file,
+makes the project untrusted again at the next start, and the notice says the
+settings changed. (Within a session the policy file is not re-read, so such
+a rewrite changes nothing before then either.) Editing anything else
 (`[review] enabled`, a `deny` rule, a checker's `when` globs) does not.
 
 Trust is about the project's *settings*. Once you accept `cargo check` as a

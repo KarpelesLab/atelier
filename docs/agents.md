@@ -218,7 +218,7 @@ so **nobody is asked on its behalf**. Its calls are decided by the
 |---|---|
 | run (an `allow` rule, a confined tool, `yolo`) | runs |
 | refuse (a `deny` rule, plan mode) | refused, as everywhere |
-| **ask** | **denied** — the agent is told it runs in the background with no user to ask, not to retry, and to say in its report what it needed |
+| **ask** | **denied** — the agent is told it runs in the background with no user to ask, not to retry, and to say in its report what it needed. With the [approval reviewer](permissions.md#the-approval-reviewer) on, its model judges the call first, and only what it leaves open is denied this way; the verdict is a line of the agent's activity |
 
 So a background agent is useful for what your rules already permit: read-only
 agents such as `explore`, edits inside the project in the default mode,

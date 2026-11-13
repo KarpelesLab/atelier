@@ -682,6 +682,20 @@ impl Ui for HeadlessUi {
         Approval::Deny
     }
 
+    /// Always: which is what sends a call that would ask to the approval
+    /// reviewer, when one is configured, instead of straight to a refusal.
+    fn unattended(&mut self) -> bool {
+        true
+    }
+
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        if self.streaming() {
+            emit(&typed("approval", review.event()));
+        } else {
+            eprintln!("{}", review.line());
+        }
+    }
+
     /// Only a parent process on both ends of `stream-json` can be asked:
     /// the question is an event, the answer a line on stdin. Anything else
     /// that arrives meanwhile is a prompt sent early and is kept for later;

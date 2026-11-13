@@ -688,6 +688,9 @@ struct ServeUi<'a> {
     permissions: Permissions,
     /// The loop was told to stop (it asked, and the answer was yes).
     stopped: bool,
+    /// The last `approval/request` got no answer from the client — an
+    /// error, or `--approval-timeout` ran out — rather than a decision.
+    unanswered: bool,
 }
 
 impl<'a> ServeUi<'a> {
@@ -699,6 +702,7 @@ impl<'a> ServeUi<'a> {
             scope,
             permissions: session.settings().permissions.clone(),
             stopped: false,
+            unanswered: false,
         }
     }
 
@@ -801,7 +805,11 @@ impl Ui for ServeUi<'_> {
         if let Some(rule) = asking_rule(&self.permissions, &self.shared.cwd, tool, arguments) {
             params["rule"] = Value::from(rule);
         }
-        match self.request("approval/request", params) {
+        let reply = self.request("approval/request", params);
+        // An interrupt is the user's own doing; an error or a timeout is
+        // nobody's answer.
+        self.unanswered = matches!(reply, Reply::Error(_) | Reply::Cancelled(Why::Timeout));
+        match reply {
             Reply::Result(answer) => match answer["decision"].as_str() {
                 Some("once") => Approval::Once,
                 Some("always") => Approval::Always,
@@ -816,6 +824,18 @@ impl Ui for ServeUi<'_> {
             },
             Reply::Error(_) | Reply::Cancelled(_) => Approval::Deny,
         }
+    }
+
+    /// A client is there to be asked — until it turns out not to answer:
+    /// then the approval reviewer, if configured, gets the call the
+    /// client left open.
+    fn unattended(&mut self) -> bool {
+        std::mem::take(&mut self.unanswered)
+    }
+
+    /// `event/approval`: the approval reviewer's verdict on a call.
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        self.emit("approval", review.event());
     }
 
     /// `question/request`. A client that answers with an error, or not in

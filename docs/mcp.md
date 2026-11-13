@@ -527,7 +527,11 @@ that would *ask*:
   ```
 
   The rule is the narrow one "always" would have saved at a prompt. The
-  client's agent can relay it; a person decides.
+  client's agent can relay it; a person decides. (With the
+  [approval reviewer](permissions.md#the-approval-reviewer) switched on, the
+  call is judged by its model before it comes to this: allowed and run,
+  refused with the reviewer's reason, or left to the refusal above. Its
+  verdicts go to the server's stderr.)
 
 - or, if the client declared the MCP **elicitation** capability in
   `initialize`, is **put to the client's user**: the server sends

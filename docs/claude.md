@@ -169,6 +169,13 @@ atelier rule in `atelier.toml`; claude's own settings are left alone.
 refuses. In `--print` mode without it, requests no rule allows are denied
 (nobody is there to answer).
 
+The [approval reviewer](permissions.md#the-approval-reviewer) works on this
+backend for both kinds of tools, with one condition: claude calls its own
+models and atelier has no endpoint of its own here, so the reviewer needs a
+model on a configured `[[provider]]` (`[permissions.reviewer] model =
+"provider/model"`, or `[models] review`). Without one it is off, and says so
+once. It is told your prompt, not claude's last message.
+
 Calls that claude's own configuration already allows never become a
 request, so atelier's rules and modes do not see them — this matters with
 `ATELIER_CLAUDE_BUILTINS=keep`.

@@ -40,7 +40,10 @@ that starts with a dash. The headless flags are an error without `--print`.
 Nothing can answer an approval prompt in this mode, so tool calls that need
 approval are **denied** — the model is told and carries on without them —
 unless the tool is allowed in `atelier.toml` or `ATELIER_APPROVE=all` is set
-(see [Permissions](permissions.md)).
+(see [Permissions](permissions.md)). With the
+[approval reviewer](permissions.md#the-approval-reviewer) on, such a call is
+put to a model first, which allows it, denies it with a reason, or leaves it
+denied as before.
 
 ## Output formats
 
@@ -68,7 +71,7 @@ don't know: the set will grow.
 | `tool_start` | `name`, `arguments` | A tool is about to run. `arguments` is the parsed JSON object (or the raw string, if the model wrote invalid JSON) |
 | `tool_end` | `name`, `ok`, `output`, `truncated`? | A tool finished; `ok` is false for an error result. `output` is cut to 16 KiB, with `"truncated": true` when it was |
 | `question` | `id`, `question`, `options`, `multi_select`, `allow_other` | The model asked the user something (the [`ask` tool](tools.md#ask)) and the run is waiting for an `answer` line on stdin. Only with `--input-format stream-json`; see [Questions](#questions) |
-| `approval` | `tool`, `arguments`, `decision` | A tool call needed approval. `decision` is always `"denied"` today (headless runs have nobody to ask); `"allowed"` is reserved. A `tool_end` with `ok: false` follows, without a `tool_start` |
+| `approval` | `tool`, `arguments`, `decision`, `by`?, `risk`?, `reason`? | A tool call needed approval. Without `by`: the run itself refused it, there being nobody to ask — `decision` is `"denied"`, and a `tool_end` with `ok: false` follows, without a `tool_start`. With `"by": "reviewer"`: the [approval reviewer](permissions.md#the-approval-reviewer)'s verdict, with its `reason` and (when it gave a valid verdict) its `risk` (`low`, `medium`, `high`, `critical`) — `decision` is `"allowed"` (the call runs: `tool_start` follows), `"denied"` (`tool_end` with `ok: false` follows) or `"escalated"` (the reviewer left the call open or gave no usable verdict; the `"denied"` event without `by` follows) |
 | `info` | `text` | Informational output, e.g. the risk signals of a call that needs approval, or the progress lines of a [subagent](agents.md) (`⤷ explore: …`, its tool calls, `⤶ explore: done (7 steps)`) between the `task` call's `tool_start` and `tool_end`. A subagent's own text, reasoning and tool results are not streamed |
 | `notice` | `text` | Out-of-band status, e.g. the schema retry, or an error from background work |
 | `review` | `text` | A note from the [subconscious reviewer](review.md), when it is on |

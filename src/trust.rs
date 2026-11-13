@@ -14,6 +14,8 @@
 //!   an environment variable of the file's choosing as its key
 //!   (`api_key_env`) or a shell command to produce one (`api_key_command`);
 //! - `[permissions] allow`: calls the agent makes without asking;
+//! - `[permissions.reviewer]` switched on: a model, under a policy the file
+//!   names, answering approval prompts in the user's place;
 //! - `[defaults] mode = "yolo"` (or `approve = true`): no asking at all;
 //! - `[[hooks]]`: commands run on lifecycle events;
 //! - `[search] key_env` and `url`: an environment variable sent to a search
@@ -59,7 +61,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use crate::permissions::Mode;
-use crate::settings::{HookConfig, Permissions, Settings};
+use crate::settings::{HookConfig, Permissions, ReviewerWhen, Settings};
 
 /// Set to `1` to accept the project's gated settings for one run, without
 /// recording anything (for headless runs, which never ask).
@@ -201,6 +203,8 @@ enum Kind {
     Hook,
     Search,
     Sandbox,
+    /// `[permissions.reviewer]`, switched on.
+    Reviewer,
 }
 
 impl Kind {
@@ -217,6 +221,7 @@ impl Kind {
             Kind::Hook => "hooks",
             Kind::Search => "search",
             Kind::Sandbox => "sandbox",
+            Kind::Reviewer => "reviewer",
         }
     }
 
@@ -232,6 +237,7 @@ impl Kind {
             Kind::Hook => ("hook", "hooks"),
             Kind::Search => return "the search endpoint and key".to_string(),
             Kind::Sandbox => return "the sandbox switch".to_string(),
+            Kind::Reviewer => return "the approval reviewer".to_string(),
         };
         format!("{n} {}", if n == 1 { one } else { many })
     }
@@ -392,6 +398,36 @@ fn items(root: &Path, settings: &Settings) -> Vec<Item> {
             format!("allow rule, run without asking: {rule}"),
         );
     }
+    if let Some(r) = settings.permissions.reviewer.as_ref().filter(|r| r.enabled) {
+        // The policy file is hashed by what it says, not by where it is: a
+        // pull that rewrites it into "allow everything" asks again.
+        let policy = crate::permissions::reviewer::project_policy(root, r);
+        let under = match &r.policy {
+            Some(file) => format!("the policy in {file}"),
+            None => "the built-in policy".to_string(),
+        };
+        let model = match &r.model {
+            Some(model) => format!("the model {model}"),
+            None => "the review model".to_string(),
+        };
+        let when = match r.when {
+            ReviewerWhen::Always => "before every approval prompt",
+            ReviewerWhen::Unattended => "where nobody can be asked",
+        };
+        add(
+            Kind::Reviewer,
+            json!([
+                r.model,
+                r.policy,
+                policy.as_deref().map(sha256_hex),
+                r.when,
+                r.timeout_secs
+            ]),
+            format!(
+                "approval reviewer: {model} approves or refuses tool calls {when}, under {under}"
+            ),
+        );
+    }
     if starts_in_yolo(settings) {
         add(
             Kind::Yolo,
@@ -503,6 +539,10 @@ impl Trust {
     /// Work out where the project at `root` stands, given the `settings`
     /// its session loaded.
     pub fn load(root: &Path, settings: &Settings, store: Store) -> Trust {
+        // The reviewer's policy file is read here, as the session starts:
+        // what is trusted is what it says now, not what the agent may have
+        // made of it by the time a call is reviewed.
+        crate::permissions::reviewer::pin(root, settings);
         let items = items(root, settings);
         let key = project_key(root);
         let hooks_approved = !settings.hooks.is_empty()
@@ -621,7 +661,8 @@ impl Trust {
 
     /// The project's permission rules as they apply: `deny` and `ask`
     /// always (they only restrict), `allow` when the project is trusted —
-    /// else only what the user allowed during this session.
+    /// else only what the user allowed during this session. Likewise the
+    /// approval reviewer: an untrusted project can switch it off, not on.
     pub fn permissions(&self, rules: &Permissions) -> Permissions {
         let shared = self.shared();
         if shared.state.active() {
@@ -631,6 +672,10 @@ impl Trust {
             allow: shared.own_rules.clone(),
             ask: rules.ask.clone(),
             deny: rules.deny.clone(),
+            // A table that switches the reviewer off only restricts; one
+            // that switches it on would have the file pick the judge of
+            // its own commands.
+            reviewer: rules.reviewer.clone().filter(|r| !r.enabled),
         }
     }
 
@@ -1201,6 +1246,74 @@ key_env = "GITHUB_TOKEN"
         assert!(
             shown[0].contains("/trust") && shown[0].contains("new safety check"),
             "{shown:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The approval reviewer, switched on, is gated: the table, and what
+    /// the policy file it names says.
+    #[test]
+    fn the_approval_reviewer_is_gated_with_its_policy_file() {
+        let root = dir("reviewer");
+        const ON: &str = "[permissions.reviewer]\nenabled = true\npolicy = \"policy.md\"\n";
+        std::fs::write(root.join("policy.md"), "Allow the tests.").unwrap();
+        let base = hash(&root, ON).expect("gated");
+        assert_eq!(hash(&root, ON), Some(base.clone()));
+        // The table's fields each count…
+        for changed in [
+            "[permissions.reviewer]\nenabled = true\n",
+            &format!("{ON}when = \"always\"\n"),
+            &format!("{ON}model = \"evil/judge\"\n"),
+            &format!("{ON}timeout_secs = 600\n"),
+        ] {
+            assert_ne!(hash(&root, changed), Some(base.clone()), "{changed}");
+        }
+        // …and so does the policy itself: a pull that makes it lenient
+        // asks again.
+        std::fs::write(root.join("policy.md"), "Allow everything.").unwrap();
+        assert_ne!(hash(&root, ON), Some(base));
+        // Switched off, there is nothing to accept.
+        assert_eq!(
+            hash(&root, "[permissions.reviewer]\nenabled = false\n"),
+            None
+        );
+
+        let on = settings(ON);
+        let trust = Trust::load(&root, &on, Store::default());
+        assert_eq!(trust.state(), State::Untrusted);
+        let shown = trust.startup(&on, true).join("\n");
+        assert!(
+            shown.contains(
+                "approval reviewer: the review model approves or refuses tool calls where \
+                 nobody can be asked, under the policy in policy.md"
+            ),
+            "{shown}"
+        );
+        assert!(
+            trust.startup(&on, false)[0].contains("skipped the approval reviewer"),
+            "{:?}",
+            trust.startup(&on, false)
+        );
+        // Not in effect until accepted — while a table that only switches
+        // the reviewer off applies as it is.
+        assert_eq!(trust.effective(&on).permissions.reviewer, None);
+        let hostile_and_off = settings(&format!(
+            "{HOSTILE}\n[permissions.reviewer]\nenabled = false\nmodel = \"m\"\n"
+        ));
+        let trust = Trust::load(&root, &hostile_and_off, Store::default());
+        let kept = trust.effective(&hostile_and_off).permissions.reviewer;
+        assert!(kept.is_some_and(|r| !r.enabled));
+        let env = Store {
+            accept_all: true,
+            ..Store::default()
+        };
+        let trust = Trust::load(&root, &on, env);
+        assert!(
+            trust
+                .effective(&on)
+                .permissions
+                .reviewer
+                .is_some_and(|r| r.enabled)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

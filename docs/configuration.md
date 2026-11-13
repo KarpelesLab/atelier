@@ -146,6 +146,7 @@ Servers of either kind are started or contacted only in a
 | `allow` | string[]   | Rules for calls that run without asking. "Always" at an approval prompt appends here |
 | `ask`   | string[]   | Rules for calls that prompt even when they would otherwise run unasked |
 | `deny`  | string[]   | Rules for calls that are refused |
+| `reviewer` | table   | `[permissions.reviewer]`: a model that answers approval prompts — see below |
 
 A rule is `tool` or `tool(pattern)`; deny wins, then ask, then allow, then
 the tool's default:
@@ -165,6 +166,34 @@ for the pattern syntax per tool and how compound shell commands are judged.
 
 The project's `allow` list counts only in a [trusted project](trust.md);
 its `ask` and `deny` lists always do.
+
+#### `[permissions.reviewer]` — a model that answers approval prompts
+
+Off unless enabled. When a call would *ask*, a model judges it against a
+written policy and allows it, denies it, or leaves it to you — see
+[Permissions → The approval reviewer](permissions.md#the-approval-reviewer)
+for precedence, what the model is shown, and how it fails closed.
+
+```toml
+[permissions.reviewer]
+enabled = true
+model = "local/judge#low"
+policy = ".atelier/approval-policy.md"
+when = "unattended"
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `enabled` | bool | Whether the reviewer is consulted. Default `false` |
+| `model` | string | The judging model, a [model address](#addressing-a-model). Default: `[models] review`, then the main model. Required (on a configured `[[provider]]`) with the Claude backend |
+| `policy` | string | A file holding the policy, in place of the built-in one (`atelier permissions reviewer-policy` prints that). Relative to the project root in a project's file; to the user config directory in the user-global file, where it may also be absolute or `~/…` |
+| `when` | string | `"unattended"` (default): only where nobody can answer a prompt — `--print`, background subagents, `atelier mcp` without elicitation, a `serve` client that does not answer. `"always"`: ahead of interactive prompts too |
+| `timeout_secs` | integer | Seconds the reviewer's one request may take before it counts as no verdict. Default 30 |
+
+The table is read from the user-global file as well; a project's replaces it
+whole, and counts only in a [trusted project](trust.md) (an untrusted
+project can switch your reviewer off, never on). Verdicts are appended to
+`$XDG_STATE_HOME/atelier/approvals.jsonl`.
 
 ## `[defaults]`
 

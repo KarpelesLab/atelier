@@ -369,6 +369,12 @@ impl Ui for Unseen<'_> {
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.0.ask_approval(tool, arguments)
     }
+    fn unattended(&mut self) -> bool {
+        self.0.unattended()
+    }
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        self.0.approval_reviewed(review);
+    }
     fn notice(&mut self, text: &str) {
         self.0.notice(text);
     }

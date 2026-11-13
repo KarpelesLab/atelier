@@ -106,7 +106,17 @@
 //!
 //! Deny rules refuse in every mode, and an ask rule prompts in every mode
 //! but `yolo`.
+//!
+//! # The approval reviewer
+//!
+//! Where all of the above comes to *ask*, an optional model can answer
+//! first — see [`reviewer`]. It is consulted in one place, [`reviewed`],
+//! which both [`approve_with`] (a session with an interface) and
+//! [`approve_unattended`] (a background subagent) go through, and it only
+//! ever stands in for the prompt: nothing that decided without asking is
+//! put to it.
 
+pub mod reviewer;
 mod shell;
 
 use std::path::{Path, PathBuf};
@@ -518,17 +528,26 @@ pub struct Policy {
     problems: Vec<String>,
     /// For `~/` in path patterns.
     home: Option<PathBuf>,
+    /// `[permissions.reviewer]`: the project's table if it has one (the
+    /// caller passes the rules as they apply, so an untrusted project's
+    /// cannot switch the reviewer on), else the user's.
+    reviewer: Option<reviewer::Setup>,
 }
 
 impl Policy {
     /// The policy for `project` rules over `user` ones.
     pub fn new(project: &Permissions, user: &Permissions, home: Option<PathBuf>) -> Self {
+        let setup = |perms: &Permissions, source| {
+            let settings = perms.reviewer.clone()?;
+            Some(reviewer::Setup { settings, source })
+        };
         let mut policy = Self {
             deny: Vec::new(),
             ask: Vec::new(),
             allow: Vec::new(),
             problems: Vec::new(),
             home,
+            reviewer: setup(project, Source::Project).or_else(|| setup(user, Source::User)),
         };
         for (perms, source) in [(project, Source::Project), (user, Source::User)] {
             for (name, texts) in [
@@ -579,6 +598,11 @@ impl Policy {
         let mut policy = Self::new(project, user, home);
         policy.problems.extend(error.clone());
         policy
+    }
+
+    /// The approval reviewer, if one is switched on.
+    pub fn reviewer(&self) -> Option<&reviewer::Setup> {
+        self.reviewer.as_ref().filter(|r| r.settings.enabled)
     }
 
     /// This policy with more project allow rules — to try rules out before
@@ -803,6 +827,10 @@ impl Policy {
             }
         }
         out.extend(self.problems.iter().map(|p| format!("  ! {p}")));
+        out.push(match self.reviewer() {
+            Some(setup) => setup.describe(root),
+            None => "approval reviewer: off".to_string(),
+        });
         out
     }
 }
@@ -1082,13 +1110,16 @@ fn deny_refusal(verdict: &Verdict, root: &Path) -> String {
 /// through `ui` when they (or the tool's default) say to ask. `Err` carries
 /// the tool result for the model — which rule refused, that plan mode did, or
 /// that the user did. "Always" saves a rule to the project's `atelier.toml`.
-/// `trust` says whether the project's own allow rules count.
+/// `trust` says whether the project's own allow rules count. `host` is the
+/// way to the approval reviewer's model (see [`reviewer`]); without one,
+/// nothing is reviewed.
 pub fn approve(
     settings: &mut Settings,
     root: &Path,
     mode: Mode,
     req: Request,
     trust: &Trust,
+    host: Option<&mut reviewer::Host>,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
     let policy = Policy::load(&trust.permissions(&settings.permissions));
@@ -1099,10 +1130,11 @@ pub fn approve(
             ui.info(&format!("⚠ {problem}"));
         }
     }
-    approve_with(&policy, settings, root, mode, req, trust, ui)
+    approve_with(&policy, settings, root, mode, req, trust, host, ui)
 }
 
 /// [`approve`] under a given policy.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn approve_with(
     policy: &Policy,
     settings: &mut Settings,
@@ -1110,6 +1142,7 @@ pub(crate) fn approve_with(
     mode: Mode,
     req: Request,
     trust: &Trust,
+    host: Option<&mut reviewer::Host>,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
     let args: Value = serde_json::from_str(req.arguments).unwrap_or(Value::Null);
@@ -1141,9 +1174,29 @@ pub(crate) fn approve_with(
         Some(false) => return Err(DENIED.to_string()),
         None => {}
     }
+    // The approval reviewer answers in the user's place: always where there
+    // is nobody to ask, and ahead of the prompt when it is set to. What it
+    // leaves open goes on to the prompt.
+    let mut reviewer = policy.reviewer().zip(host);
+    let ahead = ui.unattended() || policy.reviewer().is_some_and(|r| r.always());
+    let review = |(setup, host): (&reviewer::Setup, &mut reviewer::Host), ui: &mut dyn Ui| {
+        let mut show = |shown: Shown| match shown {
+            Shown::Verdict(record) => ui.approval_reviewed(record),
+            Shown::Notice(text) => ui.info(text),
+        };
+        reviewed(setup, host, &req, &verdict, root, mode, &mut show)
+    };
+    if let Some(decided) = reviewer.take_if(|_| ahead).and_then(|r| review(r, ui)) {
+        return decided;
+    }
     match ui.ask_approval(req.tool, req.arguments) {
         Approval::Once => Ok(()),
-        Approval::Deny => Err(DENIED.to_string()),
+        // Nobody's no — the client that was asked did not answer: the
+        // reviewer, if it has not seen the call yet, decides after all.
+        Approval::Deny => reviewer
+            .take_if(|_| ui.unattended())
+            .and_then(|r| review(r, ui))
+            .unwrap_or_else(|| Err(DENIED.to_string())),
         Approval::Always => {
             remember(policy, settings, root, trust, &verdict, req.tool, &args, ui);
             Ok(())
@@ -1151,17 +1204,86 @@ pub(crate) fn approve_with(
     }
 }
 
+/// What [`reviewed`] has to show whoever is watching.
+pub enum Shown<'a> {
+    /// The reviewer's verdict on the call.
+    Verdict(&'a reviewer::Record),
+    /// Something to say once (the reviewer cannot be reached here).
+    Notice(&'a str),
+}
+
+/// Put a call that came to *ask* to the approval reviewer — the one place
+/// that happens, whoever would otherwise have been asked. `Some` is the
+/// reviewer's decision: the call runs (once; nothing is saved), or is
+/// refused with the reviewer's reason as its tool result. `None` leaves the
+/// call where it was — the reviewer said "ask", gave no usable verdict
+/// (which fails closed, see [`reviewer`]), or is off: the caller goes on
+/// to its prompt, or to its refusal where it has none.
+fn reviewed(
+    setup: &reviewer::Setup,
+    host: &mut reviewer::Host,
+    req: &Request,
+    verdict: &Verdict,
+    root: &Path,
+    mode: Mode,
+    show: &mut dyn FnMut(Shown),
+) -> Option<Result<(), String>> {
+    let why = why_asked(req, verdict, mode);
+    let call = reviewer::Call {
+        tool: req.tool,
+        arguments: req.arguments,
+        why: &why,
+        root,
+        mode,
+    };
+    match reviewer::consult(setup, &call, host) {
+        reviewer::Consulted::Off(notice) => {
+            if let Some(notice) = &notice {
+                show(Shown::Notice(notice));
+            }
+            None
+        }
+        reviewer::Consulted::Verdict(record) => {
+            show(Shown::Verdict(&record));
+            match record.decision {
+                reviewer::Decision::Allow => Some(Ok(())),
+                reviewer::Decision::Deny => Some(Err(record.refusal())),
+                reviewer::Decision::Ask => None,
+            }
+        }
+    }
+}
+
+/// Why a call asks, in words, for the reviewer: the rule, that the command
+/// could not be followed, the mode, or the tool's own default.
+fn why_asked(req: &Request, verdict: &Verdict, mode: Mode) -> String {
+    let tool = req.tool;
+    match &verdict.by {
+        Some(by) => format!("the permission rule `{}` asks before this runs", by.rule),
+        None if verdict.decision == Decision::Ask => verdict.notes.join("; "),
+        None if !req.needs_approval && mode == Mode::AskEdits => {
+            format!("`{tool}` can modify files, and the ask-edits mode asks before every change")
+        }
+        None => format!("`{tool}` asks by default, and no allow rule covers this call"),
+    }
+}
+
 /// [`approve`] with nobody to ask — a subagent running in the background:
 /// the rules and the `mode` decide alone, nothing is prompted and nothing is
-/// saved. A call they would put to the user is refused, with `nobody` as
-/// the tool result. (A `permission_request` hook answers in the user's
-/// place at a prompt; there is none here, so it is not consulted.)
+/// saved. A call they would put to the user goes to the approval reviewer
+/// when the policy has one and `host` leads to its model (`show` gets its
+/// verdict); otherwise, and when the reviewer leaves the call open, it is
+/// refused with `nobody` as the tool result. (A `permission_request` hook
+/// answers in the user's place at a prompt; there is none here, so it is
+/// not consulted.)
 pub fn approve_unattended(
     policy: &Policy,
     root: &Path,
     mode: Mode,
     req: &Request,
     nobody: &str,
+    host: Option<&mut reviewer::Host>,
+    show: &mut dyn FnMut(Shown),
 ) -> Result<(), String> {
     let args: Value = serde_json::from_str(req.arguments).unwrap_or(Value::Null);
     let (ruling, verdict) = judge(policy, mode, req, &args, root);
@@ -1170,7 +1292,11 @@ pub fn approve_unattended(
         Ruling::Denied => Err(deny_refusal(&verdict, root)),
         Ruling::Planning => Err(plan_refusal(req.tool)),
         Ruling::Ask if req.hook_allowed => Ok(()),
-        Ruling::Ask => Err(nobody.to_string()),
+        Ruling::Ask => policy
+            .reviewer()
+            .zip(host)
+            .and_then(|(setup, host)| reviewed(setup, host, req, &verdict, root, mode, show))
+            .unwrap_or_else(|| Err(nobody.to_string())),
     }
 }
 
@@ -1232,12 +1358,22 @@ fn remember(
 }
 
 const USAGE: &str = "usage: atelier permissions check [--mode <mode>] -- <command…>\n       \
-                     atelier permissions check [--mode <mode>] --tool <name> [--args '<json>']";
+                     atelier permissions check [--mode <mode>] --tool <name> [--args '<json>']\n       \
+                     atelier permissions reviewer-policy";
 
 /// `atelier permissions check …`: print what the rules and the mode decide
 /// for a call, and which rule decided. Without `--mode`, the mode is the one
 /// a session started here would be in.
+///
+/// `atelier permissions reviewer-policy`: print the approval reviewer's
+/// built-in policy, to copy into a file and edit (see [`reviewer`]).
 pub fn run_command(args: &[String]) -> Result<()> {
+    if let [only] = args
+        && only == "reviewer-policy"
+    {
+        println!("{}", reviewer::DEFAULT_POLICY);
+        return Ok(());
+    }
     let Some(("check", rest)) = args.split_first().map(|(a, r)| (a.as_str(), r)) else {
         bail!(USAGE);
     };
@@ -1361,6 +1497,7 @@ mod tests {
             allow: list(allow),
             ask: list(ask),
             deny: list(deny),
+            reviewer: None,
         }
     }
 
@@ -2131,6 +2268,13 @@ mod tests {
         answer: fn() -> Approval,
         asked: usize,
         infos: Vec<String>,
+        /// Nobody can be asked here (a headless run).
+        absent: bool,
+        /// Somebody can be asked, and does not answer (a client that times
+        /// out): the refusal from `answer` is nobody's.
+        unanswered: bool,
+        /// The approval reviewer's verdicts, as shown.
+        reviews: Vec<String>,
     }
 
     impl Scripted {
@@ -2139,6 +2283,9 @@ mod tests {
                 answer,
                 asked: 0,
                 infos: Vec::new(),
+                absent: false,
+                unanswered: false,
+                reviews: Vec::new(),
             }
         }
     }
@@ -2154,6 +2301,12 @@ mod tests {
         fn ask_approval(&mut self, _: &str, _: &str) -> Approval {
             self.asked += 1;
             (self.answer)()
+        }
+        fn unattended(&mut self) -> bool {
+            self.absent || (self.unanswered && self.asked > 0)
+        }
+        fn approval_reviewed(&mut self, review: &reviewer::Record) {
+            self.reviews.push(review.line());
         }
         fn notice(&mut self, _: &str) {}
     }
@@ -2198,6 +2351,30 @@ mod tests {
             needs_approval: bool,
             ui: &mut Scripted,
         ) -> Result<(), String> {
+            self.judged(
+                tool,
+                args,
+                (!needs_approval).then_some(false),
+                None,
+                None,
+                ui,
+            )
+        }
+
+        /// A call with everything that can answer in the user's place: a
+        /// `pre_tool` hook's word on it (`Some(true)`: approved; `None`:
+        /// none, and the tool asks by default; `Some(false)`: none, and it
+        /// does not), `permission_request` hooks, and the approval
+        /// reviewer's model.
+        fn judged(
+            &mut self,
+            tool: &str,
+            args: Value,
+            pre_tool: Option<bool>,
+            hooks: Option<&crate::hooks::Hooks>,
+            judge: Option<&mut Judge>,
+            ui: &mut Scripted,
+        ) -> Result<(), String> {
             // As `approve` builds it: the project's rules as they apply.
             let policy = Policy::new(
                 &self.trust.permissions(&self.settings.permissions),
@@ -2208,13 +2385,35 @@ mod tests {
             let req = Request {
                 tool,
                 arguments: &arguments,
-                needs_approval,
-                hook_allowed: false,
-                hooks: None,
+                needs_approval: pre_tool != Some(false),
+                hook_allowed: pre_tool == Some(true),
+                hooks,
                 mutates: modifies(tool, &args),
             };
-            let (dir, trust) = (&self.dir, &self.trust);
-            approve_with(&policy, &mut self.settings, dir, self.mode, req, trust, ui)
+            let (dir, mode, trust) = (&self.dir, self.mode, &self.trust);
+            let settings = &mut self.settings;
+            match judge {
+                Some(judge) => {
+                    let mut host = reviewer::Host {
+                        call: &mut |_| judge.answer(),
+                        context: &reviewer::Context::default,
+                    };
+                    let host = Some(&mut host);
+                    approve_with(&policy, settings, dir, mode, req, trust, host, ui)
+                }
+                None => approve_with(&policy, settings, dir, mode, req, trust, None, ui),
+            }
+        }
+
+        /// A `bash` call with the reviewer's model at hand.
+        fn judged_bash(
+            &mut self,
+            command: &str,
+            judge: &mut Judge,
+            ui: &mut Scripted,
+        ) -> Result<(), String> {
+            let args = json!({ "command": command });
+            self.judged("bash", args, None, None, Some(judge), ui)
         }
 
         fn bash(&mut self, command: &str, ui: &mut Scripted) -> Result<(), String> {
@@ -2418,6 +2617,7 @@ mod tests {
                 Mode::AutoEdit,
                 req,
                 &gate.trust,
+                None,
                 ui,
             )
         };
@@ -2449,7 +2649,17 @@ mod tests {
         };
         let policy = policy(&["bash(ls *)"], &[], &[]);
         let (dir, mode, trust) = (&gate.dir, Mode::AutoEdit, &gate.trust);
-        assert!(approve_with(&policy, &mut gate.settings, dir, mode, req, trust, &mut ui).is_err());
+        let refused = approve_with(
+            &policy,
+            &mut gate.settings,
+            dir,
+            mode,
+            req,
+            trust,
+            None,
+            &mut ui,
+        );
+        assert!(refused.is_err());
         assert_eq!(ui.asked, 2);
     }
 
@@ -2926,6 +3136,458 @@ mod tests {
         let out = run("read", json!({"path": "src/a.rs"}), false);
         assert_eq!(out[0], "decision: allow");
         assert!(out[1].contains("by default"));
+    }
+
+    // ── the approval reviewer ───────────────────────────────────────────
+
+    /// A reviewer's model that answers every request the same way, and
+    /// counts them.
+    struct Judge {
+        reply: Result<&'static str, reviewer::Failure>,
+        asked: usize,
+    }
+
+    impl Judge {
+        fn new(reply: &'static str) -> Self {
+            Self {
+                reply: Ok(reply),
+                asked: 0,
+            }
+        }
+
+        fn failing(why: &str) -> Self {
+            Self {
+                reply: Err(reviewer::Failure::Failed(why.to_string())),
+                asked: 0,
+            }
+        }
+
+        fn answer(&mut self) -> Result<reviewer::Reply, reviewer::Failure> {
+            self.asked += 1;
+            self.reply.clone().map(|text| reviewer::Reply {
+                text: text.to_string(),
+                model: "test/judge".to_string(),
+            })
+        }
+    }
+
+    const ALLOWS: &str = r#"{"decision":"allow","risk":"low","reason":"runs the tests"}"#;
+    const DENIES: &str = r#"{"decision":"deny","risk":"high","reason":"wipes the build cache"}"#;
+    const ASKS: &str = r#"{"decision":"ask","risk":"medium","reason":"not sure what it does"}"#;
+
+    /// Rules with the reviewer switched on.
+    fn reviewing(when: ReviewerWhen, allow: &[&str], deny: &[&str]) -> Permissions {
+        Permissions {
+            reviewer: Some(ReviewerSettings {
+                enabled: true,
+                when,
+                ..ReviewerSettings::default()
+            }),
+            ..perms(allow, &[], deny)
+        }
+    }
+
+    use crate::settings::{ReviewerSettings, ReviewerWhen};
+    use ReviewerWhen::{Always, Unattended};
+
+    /// Everything that decides without asking decides first, and the
+    /// reviewer never hears of the call.
+    #[test]
+    fn the_reviewer_is_put_only_what_would_ask() {
+        let rules = reviewing(Always, &["bash(ls *)"], &["bash(rm *)"]);
+        let mut gate = Gate::new("reviewer-order", rules);
+        let mut judge = Judge::new(ALLOWS);
+        let mut ui = Scripted::new(|| Approval::Deny);
+
+        // A deny rule: final.
+        let err = gate
+            .judged_bash("rm -rf x", &mut judge, &mut ui)
+            .unwrap_err();
+        assert!(err.contains("refused by the permission rule"), "{err}");
+        // An allow rule: nothing to review.
+        assert!(gate.judged_bash("ls -la", &mut judge, &mut ui).is_ok());
+        // Plan mode: nobody is asked to approve a change, the reviewer
+        // included.
+        gate.mode = Mode::Plan;
+        let err = gate.judged_bash("make", &mut judge, &mut ui).unwrap_err();
+        assert!(err.contains("plan mode"), "{err}");
+        gate.mode = Mode::AutoEdit;
+        // A `pre_tool` hook's approval answers the prompt.
+        let hooked = gate.judged(
+            "bash",
+            json!({"command": "make"}),
+            Some(true),
+            None,
+            Some(&mut judge),
+            &mut ui,
+        );
+        assert!(hooked.is_ok());
+        assert_eq!((judge.asked, ui.asked), (0, 0));
+        assert!(ui.reviews.is_empty());
+
+        // What is left would ask: that goes to the reviewer.
+        assert!(gate.judged_bash("cargo test", &mut judge, &mut ui).is_ok());
+        assert_eq!((judge.asked, ui.asked), (1, 0));
+        assert_eq!(
+            ui.reviews,
+            ["⚖ reviewer allowed bash (low): runs the tests"]
+        );
+    }
+
+    /// A `permission_request` hook answers in the user's place, and so
+    /// before the reviewer does.
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_request_hooks_answer_wins_over_the_reviewer() {
+        let mut gate = Gate::new("reviewer-hook", reviewing(Always, &[], &[]));
+        let hook = |command: &str| {
+            let config = crate::settings::HookConfig {
+                event: "permission_request".to_string(),
+                matcher: None,
+                command: command.to_string(),
+                timeout_secs: None,
+            };
+            crate::hooks::Hooks::load(&gate.dir, &[config], None, crate::trust::State::Trusted)
+        };
+        let (allows, denies) = (hook(r#"echo '{"decision":"allow"}'"#), hook("exit 2"));
+        let make = || json!({"command": "make"});
+        let mut ui = Scripted::new(|| Approval::Deny);
+
+        // The hook allows what the reviewer would deny…
+        let mut judge = Judge::new(DENIES);
+        let allowed = gate.judged(
+            "bash",
+            make(),
+            None,
+            Some(&allows),
+            Some(&mut judge),
+            &mut ui,
+        );
+        assert!(allowed.is_ok());
+        // …and denies what the reviewer would allow.
+        let mut lenient = Judge::new(ALLOWS);
+        let denied = gate.judged(
+            "bash",
+            make(),
+            None,
+            Some(&denies),
+            Some(&mut lenient),
+            &mut ui,
+        );
+        assert_eq!(denied.unwrap_err(), DENIED);
+        assert_eq!((judge.asked, lenient.asked, ui.asked), (0, 0, 0));
+    }
+
+    /// The reviewer's allow runs the call once: no rule is saved, so the
+    /// next call like it is reviewed again. "Always" stays a person's.
+    #[test]
+    fn the_reviewers_allow_saves_nothing() {
+        let mut gate = Gate::new("reviewer-saves", reviewing(Always, &[], &[]));
+        let mut judge = Judge::new(ALLOWS);
+        let mut ui = Scripted::new(|| Approval::Always);
+        for _ in 0..2 {
+            assert!(gate.judged_bash("cargo test", &mut judge, &mut ui).is_ok());
+        }
+        assert_eq!((judge.asked, ui.asked), (2, 0));
+        assert!(gate.settings.permissions.allow.is_empty());
+        assert!(!Settings::path(&gate.dir).exists(), "nothing was written");
+
+        // Left to the user, their "always" saves the rule as ever — and
+        // the rule then keeps the call from the reviewer.
+        let mut unsure = Judge::new(ASKS);
+        assert!(gate.judged_bash("cargo test", &mut unsure, &mut ui).is_ok());
+        assert_eq!((unsure.asked, ui.asked), (1, 1));
+        assert_eq!(gate.settings.permissions.allow, ["bash(cargo test)"]);
+        assert!(gate.judged_bash("cargo test", &mut unsure, &mut ui).is_ok());
+        assert_eq!((unsure.asked, ui.asked), (1, 1));
+    }
+
+    #[test]
+    fn the_reviewers_deny_is_the_tool_result() {
+        let mut gate = Gate::new("reviewer-deny", reviewing(Always, &[], &[]));
+        let mut judge = Judge::new(DENIES);
+        let mut ui = Scripted::new(|| Approval::Once);
+        let err = gate
+            .judged_bash("cargo clean", &mut judge, &mut ui)
+            .unwrap_err();
+        assert!(
+            err.starts_with("error: the approval reviewer denied this call (high risk)"),
+            "{err}"
+        );
+        assert!(err.contains("wipes the build cache"), "{err}");
+        assert!(err.contains("do not retry the same call in another form"));
+        // The user was not asked to overrule it.
+        assert_eq!((judge.asked, ui.asked), (1, 0));
+        assert_eq!(
+            ui.reviews,
+            ["⚖ reviewer denied bash (high): wipes the build cache"]
+        );
+    }
+
+    /// `when = "unattended"`, the default, leaves an interface with a user
+    /// alone: the prompt is theirs.
+    #[test]
+    fn where_a_user_can_answer_the_reviewer_waits_to_be_told_always() {
+        let mut gate = Gate::new("reviewer-when", reviewing(Unattended, &[], &[]));
+        let mut judge = Judge::new(DENIES);
+        let mut ui = Scripted::new(|| Approval::Once);
+        assert!(gate.judged_bash("make", &mut judge, &mut ui).is_ok());
+        assert_eq!((judge.asked, ui.asked), (0, 1));
+
+        // Switched off, or no way to its model: as without one.
+        let mut off = reviewing(Always, &[], &[]);
+        off.reviewer.as_mut().unwrap().enabled = false;
+        let mut gate = Gate::new("reviewer-off", off);
+        assert!(gate.judged_bash("make", &mut judge, &mut ui).is_ok());
+        let mut gate = Gate::new("reviewer-hostless", reviewing(Always, &[], &[]));
+        assert!(gate.bash("make", &mut ui).is_ok());
+        assert_eq!((judge.asked, ui.asked), (0, 3));
+    }
+
+    /// Anything short of a valid verdict is an "ask": with a user, they are
+    /// asked — once, and the reviewer is not tried again.
+    #[test]
+    fn a_failed_review_asks_the_user_where_there_is_one() {
+        let failures = [
+            Judge::new("Sure, that looks fine."),
+            Judge::new(r#"{"decision":"allow","risk":"critical","reason":"it is fine"}"#),
+            Judge::failing("the request failed: connection refused"),
+            Judge::failing("mock/judge did not answer within 30 s"),
+        ];
+        for mut judge in failures {
+            let mut gate = Gate::new("reviewer-fail-user", reviewing(Always, &[], &[]));
+            let mut yes = Scripted::new(|| Approval::Once);
+            assert!(gate.judged_bash("make", &mut judge, &mut yes).is_ok());
+            let mut no = Scripted::new(|| Approval::Deny);
+            assert_eq!(
+                gate.judged_bash("make", &mut judge, &mut no).unwrap_err(),
+                DENIED
+            );
+            assert_eq!((judge.asked, yes.asked, no.asked), (2, 1, 1));
+            assert_eq!(yes.reviews.len(), 1, "{:?}", yes.reviews);
+        }
+    }
+
+    /// Without a user the same failures refuse the call — and a valid
+    /// "allow" runs what would have been refused for want of an answer.
+    #[test]
+    fn with_nobody_to_ask_the_reviewer_decides_and_fails_closed() {
+        let mut gate = Gate::new("reviewer-nobody", reviewing(Unattended, &[], &[]));
+        let headless = || Scripted {
+            absent: true,
+            ..Scripted::new(|| Approval::Deny)
+        };
+
+        let mut judge = Judge::new(ALLOWS);
+        let mut ui = headless();
+        assert!(gate.judged_bash("cargo test", &mut judge, &mut ui).is_ok());
+        assert_eq!((judge.asked, ui.asked), (1, 0));
+
+        let mut judge = Judge::new(DENIES);
+        let err = gate.judged_bash("make", &mut judge, &mut headless());
+        assert!(err.unwrap_err().contains("the approval reviewer denied"));
+
+        for mut judge in [
+            Judge::new(ASKS),
+            Judge::new("allow"),
+            Judge::new(r#"{"decision":"allow","risk":"critical","reason":"x"}"#),
+            Judge::failing("the request failed: HTTP 500"),
+            Judge::failing("mock/judge did not answer within 30 s"),
+        ] {
+            let mut ui = headless();
+            // The interface's own refusal: there is nobody to overrule it.
+            assert_eq!(
+                gate.judged_bash("make", &mut judge, &mut ui).unwrap_err(),
+                DENIED
+            );
+            assert_eq!(judge.asked, 1, "the request is never retried");
+            assert_eq!(ui.reviews.len(), 1, "{:?}", ui.reviews);
+        }
+    }
+
+    /// A client that is there but does not answer (`serve` past its
+    /// approval timeout): the reviewer gets the call the client left open —
+    /// unless it already had its say.
+    #[test]
+    fn an_unanswered_prompt_goes_to_the_reviewer_once() {
+        let silent = || Scripted {
+            unanswered: true,
+            ..Scripted::new(|| Approval::Deny)
+        };
+        let mut gate = Gate::new("reviewer-silent", reviewing(Unattended, &[], &[]));
+        let mut judge = Judge::new(ALLOWS);
+        let mut ui = silent();
+        assert!(gate.judged_bash("cargo test", &mut judge, &mut ui).is_ok());
+        assert_eq!((judge.asked, ui.asked), (1, 1));
+
+        // A refusal somebody gave stands.
+        let mut ui = Scripted::new(|| Approval::Deny);
+        assert_eq!(
+            gate.judged_bash("cargo test", &mut judge, &mut ui)
+                .unwrap_err(),
+            DENIED
+        );
+        assert_eq!(judge.asked, 1);
+
+        // Asked first (`always`), it said "ask"; the silence that follows
+        // is not put to it again.
+        let mut gate = Gate::new("reviewer-silent-always", reviewing(Always, &[], &[]));
+        let mut unsure = Judge::new(ASKS);
+        let mut ui = silent();
+        assert_eq!(
+            gate.judged_bash("make", &mut unsure, &mut ui).unwrap_err(),
+            DENIED
+        );
+        assert_eq!((unsure.asked, ui.asked), (1, 1));
+    }
+
+    /// A project that is not trusted cannot switch the reviewer on — it
+    /// would be choosing the judge of its own commands — but can switch
+    /// the user's off.
+    #[test]
+    fn an_untrusted_projects_reviewer_does_not_count() {
+        let mut gate = Gate::new("reviewer-untrusted", reviewing(Always, &[], &[]));
+        gate.trust = crate::trust::testing::closed(&gate.dir);
+        let mut judge = Judge::new(ALLOWS);
+        let mut ui = Scripted::new(|| Approval::Deny);
+        assert_eq!(
+            gate.judged_bash("make", &mut judge, &mut ui).unwrap_err(),
+            DENIED
+        );
+        assert_eq!((judge.asked, ui.asked), (0, 1));
+
+        let user = reviewing(Always, &[], &[]);
+        let on = |project: &Permissions| {
+            let project = gate.trust.permissions(project);
+            Policy::new(&project, &user, None).reviewer().is_some()
+        };
+        assert!(on(&Permissions::default()));
+        let mut off = reviewing(Always, &[], &[]);
+        off.reviewer.as_mut().unwrap().enabled = false;
+        assert!(!on(&off));
+        // Trusted, the project's table is the one in force.
+        let trusted = crate::trust::testing::open(&gate.dir);
+        let mut theirs = reviewing(Unattended, &[], &[]);
+        theirs.reviewer.as_mut().unwrap().model = Some("local/judge".to_string());
+        let in_force = Policy::new(&trusted.permissions(&theirs), &user, None);
+        let setup = in_force.reviewer().unwrap();
+        assert_eq!(setup.source, Source::Project);
+        assert!(!setup.always());
+        let listed = in_force.listing(Path::new(ROOT)).join("\n");
+        assert!(
+            listed.contains(
+                "approval reviewer: on (project) — the model local/judge answers where nobody \
+                 can be asked, under the built-in policy"
+            ),
+            "{listed}"
+        );
+        let none = policy(&[], &[], &[]).listing(Path::new(ROOT)).join("\n");
+        assert!(none.contains("approval reviewer: off"), "{none}");
+    }
+
+    /// A background subagent's calls: the rules first, then the reviewer in
+    /// place of the refusal for want of a user — which stays the answer to
+    /// everything the reviewer does not clearly decide.
+    #[test]
+    fn unattended_approval_goes_through_the_reviewer() {
+        const NOBODY: &str = "error: nobody to ask";
+        let policy = Policy::new(
+            &reviewing(Unattended, &["bash(ls *)"], &["bash(rm *)"]),
+            &Permissions::default(),
+            None,
+        );
+        let decide = |command: &str, judge: Option<&mut Judge>| {
+            let arguments = json!({ "command": command }).to_string();
+            let req = Request {
+                tool: "bash",
+                arguments: &arguments,
+                needs_approval: true,
+                hook_allowed: false,
+                hooks: None,
+                mutates: true,
+            };
+            let mut lines = Vec::new();
+            let mut show = |shown: Shown| {
+                if let Shown::Verdict(record) = shown {
+                    lines.push(record.line());
+                }
+            };
+            let root = Path::new(ROOT);
+            let result = match judge {
+                Some(judge) => {
+                    let mut host = reviewer::Host {
+                        call: &mut |_| judge.answer(),
+                        context: &reviewer::Context::default,
+                    };
+                    let host = Some(&mut host);
+                    approve_unattended(&policy, root, Mode::AutoEdit, &req, NOBODY, host, &mut show)
+                }
+                None => {
+                    approve_unattended(&policy, root, Mode::AutoEdit, &req, NOBODY, None, &mut show)
+                }
+            };
+            (result, lines)
+        };
+
+        let mut judge = Judge::new(ALLOWS);
+        assert!(decide("ls -la", Some(&mut judge)).0.is_ok());
+        let (denied, _) = decide("rm -rf x", Some(&mut judge));
+        assert!(denied.unwrap_err().contains("permission rule"));
+        assert_eq!(judge.asked, 0);
+        // Without a way to the model, as before.
+        assert_eq!(decide("cargo test", None).0.unwrap_err(), NOBODY);
+
+        let (allowed, lines) = decide("cargo test", Some(&mut judge));
+        assert!(allowed.is_ok());
+        assert_eq!(lines, ["⚖ reviewer allowed bash (low): runs the tests"]);
+        let (denied, _) = decide("cargo clean", Some(&mut Judge::new(DENIES)));
+        assert!(denied.unwrap_err().contains("the approval reviewer denied"));
+        for mut judge in [
+            Judge::new(ASKS),
+            Judge::new("not json"),
+            Judge::failing("mock/judge did not answer within 30 s"),
+        ] {
+            let (refused, lines) = decide("make", Some(&mut judge));
+            assert_eq!(refused.unwrap_err(), NOBODY);
+            assert_eq!((judge.asked, lines.len()), (1, 1));
+        }
+    }
+
+    /// The reviewer is told why the call asks.
+    #[test]
+    fn the_reviewer_is_told_why_the_call_asks() {
+        let why = |policy: &Policy, mode: Mode, tool: &str, args: Value, needs_approval: bool| {
+            let arguments = args.to_string();
+            let req = Request {
+                tool,
+                arguments: &arguments,
+                needs_approval,
+                hook_allowed: false,
+                hooks: None,
+                mutates: true,
+            };
+            let (ruling, verdict) = judge(policy, mode, &req, &args, Path::new(ROOT));
+            assert_eq!(ruling, Ruling::Ask);
+            why_asked(&req, &verdict, mode)
+        };
+        let rules = policy(&[], &["bash(git push *)"], &[]);
+        let bash = |command: &str| json!({ "command": command });
+        assert_eq!(
+            why(
+                &rules,
+                Mode::AutoEdit,
+                "bash",
+                bash("git push origin"),
+                true
+            ),
+            "the permission rule `bash(git push *)` asks before this runs"
+        );
+        assert_eq!(
+            why(&rules, Mode::AutoEdit, "bash", bash("make"), true),
+            "`bash` asks by default, and no allow rule covers this call"
+        );
+        let write = json!({"path": "a.txt", "content": "x"});
+        assert!(why(&rules, Mode::AskEdits, "write", write, false).contains("ask-edits mode"));
     }
 
     #[test]

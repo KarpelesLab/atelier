@@ -242,8 +242,14 @@ pub fn run_command(args: &[String]) -> Result<u8> {
     for line in trust.startup(&settings, false) {
         eprintln!("{line}");
     }
-    // No model is called; the session wants a configuration all the same.
-    let cfg = Config::from_env(false);
+    // No model is called for the tools themselves; the configuration is
+    // what the approval reviewer, if one is configured, is reached through
+    // (see `permissions::reviewer`).
+    let mut cfg = Config::from_env(false);
+    let user = Settings::load_user().unwrap_or_default();
+    for warning in cfg.apply_settings(&trust.effective(&settings), &user) {
+        eprintln!("warning: {warning}");
+    }
     let mut session = Session::new(cfg, root, tools, Vec::new(), settings, trust);
     session.set_mode(mode);
 
@@ -534,6 +540,16 @@ impl<R: BufRead, W: Write> Ui for Asker<'_, R, W> {
         }
         self.unasked = Some((tool.to_string(), arguments.to_string()));
         Approval::Deny
+    }
+    /// Without elicitation nobody can be asked: the approval reviewer, if
+    /// configured, gets the call before it is refused.
+    fn unattended(&mut self) -> bool {
+        !self.conn.elicits
+    }
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        // For whoever runs the server; the client's model gets the verdict
+        // as the call's result (or the call simply runs).
+        eprintln!("{}", review.line());
     }
     fn notice(&mut self, text: &str) {
         // Hooks' and the rules' troubles: for whoever runs the server.

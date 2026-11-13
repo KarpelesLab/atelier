@@ -284,6 +284,7 @@ One per thing the session reports. Events of a turn carry its id as
 | `event/notice` | `turn`?, `text` | An out-of-band notice: a warning, something that went wrong |
 | `event/activity` | `turn`, `text` | A line of progress from a subagent |
 | `event/review` | `turn`, `text` | A note from the [parallel reviewer](review.md) |
+| `event/approval` | `turn`, `tool`, `arguments`, `decision`, `by`, `reason`, `risk`? | The [approval reviewer](permissions.md#the-approval-reviewer)'s verdict on a call (`"by": "reviewer"`): `decision` is `"allowed"`, `"denied"` or `"escalated"` (left to the client, or — after an `approval/request` went unanswered — refused). With `when = "always"` it precedes the `approval/request`; by default it comes only after one the client answered with an error or let time out |
 | `event/delivered` | `turn`, `text` | A `turn/steer` message just reached the model |
 | `event/idle` | `kind`, … | Output between turns; see below |
 | `turn/ended` | see below | The turn is over |

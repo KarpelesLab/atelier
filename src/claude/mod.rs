@@ -1295,6 +1295,7 @@ mod tests {
                 allow: list(allow),
                 ask: Vec::new(),
                 deny: list(deny),
+                reviewer: None,
             };
             let dir =
                 std::env::temp_dir().join(format!("atelier-bridge-{name}-{}", std::process::id()));
@@ -1339,7 +1340,8 @@ mod tests {
         fn permit(&mut self, req: permissions::Request, ui: &mut dyn Ui) -> Result<(), String> {
             let (policy, dir) = (&self.policy, &self.dir);
             let trust = crate::trust::testing::open(dir);
-            permissions::approve_with(policy, &mut self.settings, dir, self.mode, req, &trust, ui)
+            let settings = &mut self.settings;
+            permissions::approve_with(policy, settings, dir, self.mode, req, &trust, None, ui)
         }
         fn call(
             &mut self,

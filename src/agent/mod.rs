@@ -19,6 +19,7 @@
 //! only read, when several follow one another in a step, run at the same
 //! time — see the `batch` module.
 
+mod approvals;
 mod batch;
 mod compact;
 mod embed;
@@ -122,6 +123,21 @@ pub trait Ui {
     }
     /// Ask the user to approve a side-effecting tool call before it runs.
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval;
+    /// Whether nobody is there to answer an approval prompt. Asked before
+    /// one: `true` where [`ask_approval`](Ui::ask_approval) can only refuse
+    /// (a headless run). Asked after it refused: `true` when that was for
+    /// want of an answer (a client that timed out) rather than somebody's
+    /// no. Either way the approval reviewer, if configured, gets the call
+    /// (see [`crate::permissions::reviewer`]).
+    fn unattended(&mut self) -> bool {
+        false
+    }
+    /// The approval reviewer judged a call that would otherwise have been
+    /// put to the user. One line by default; interfaces that speak events
+    /// send one.
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        self.info(&review.line());
+    }
     /// Put a question from the model (the `ask` tool) to the user and wait
     /// for the answer. `None` means there is no one to ask — the default,
     /// for interfaces with no user at the other end.
@@ -851,6 +867,9 @@ pub struct Session {
     hook_context: Option<String>,
     /// Claude backend: the last turn's final answer, for `turn_end` hooks.
     claude_answer: Option<String>,
+    /// Claude backend: the prompt of the turn in progress, for the approval
+    /// reviewer (the conversation itself is claude's to keep).
+    claude_prompt: String,
     /// Whether the project's `atelier.toml` may run commands and grant
     /// access (see [`trust`]); `settings` holds the file as written, and
     /// whatever acts on its gated parts asks this first.
@@ -919,6 +938,7 @@ impl Session {
             hooks_started: false,
             hook_context: None,
             claude_answer: None,
+            claude_prompt: String::new(),
             cfg,
             root,
             tools,
@@ -2030,6 +2050,7 @@ impl Session {
             self.claude_restart = false;
         }
         self.quit_warned = false;
+        self.claude_prompt = user_input.to_string();
 
         let text = match self.gather_context() {
             Some(ctx) => format!("<atelier-context>\n{ctx}\n</atelier-context>\n\n{user_input}"),
@@ -2089,6 +2110,12 @@ impl Session {
                 trust: &self.trust,
                 parent: self.child.as_ref().map(|c| &c.link),
                 coord: self.coord.as_deref(),
+                reach: Some(approvals::Reach {
+                    cfg: &self.cfg,
+                    chatgpt: &mut self.chatgpt,
+                    history: &self.history,
+                    claude_prompt: &self.claude_prompt,
+                }),
             },
         )
     }
@@ -2341,6 +2368,9 @@ struct ToolRunner<'a> {
     /// The link to the other instances, whose locks an edit is checked
     /// against (see [`coord::locks`]).
     coord: Option<&'a coord::Client>,
+    /// The way to the approval reviewer's model and to the conversation it
+    /// is told about (see [`approvals`]); without it nothing is reviewed.
+    reach: Option<approvals::Reach<'a>>,
 }
 
 impl ToolRunner<'_> {
@@ -2396,7 +2426,19 @@ impl ToolRunner<'_> {
             hook_allowed,
             hooks: Some(self.hooks),
         };
-        crate::permissions::approve(self.settings, self.root, self.mode, req, self.trust, ui)
+        self.decide(req, ui)
+    }
+
+    /// Put `req` to the permission rules, the mode and — where they come
+    /// to a prompt — the approval reviewer and the user.
+    fn decide(&mut self, req: crate::permissions::Request, ui: &mut dyn Ui) -> Result<(), String> {
+        let (settings, root, mode, trust) = (&mut *self.settings, self.root, self.mode, self.trust);
+        match &mut self.reach {
+            Some(reach) => reach.host(|host| {
+                crate::permissions::approve(settings, root, mode, req, trust, Some(host), ui)
+            }),
+            None => crate::permissions::approve(settings, root, mode, req, trust, None, ui),
+        }
     }
 
     /// Execute a call whose arguments are a JSON string (as models send).
@@ -2503,7 +2545,7 @@ impl claude::ToolHost for ToolRunner<'_> {
             hooks: Some(self.hooks),
             ..req
         };
-        crate::permissions::approve(self.settings, self.root, self.mode, req, self.trust, ui)
+        self.decide(req, ui)
     }
 
     fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
@@ -2592,6 +2634,12 @@ impl Ui for PeerUi<'_> {
     }
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.inner.ask_approval(tool, arguments)
+    }
+    fn unattended(&mut self) -> bool {
+        self.inner.unattended()
+    }
+    fn approval_reviewed(&mut self, review: &crate::permissions::reviewer::Record) {
+        self.inner.approval_reviewed(review);
     }
     fn ask_user(&mut self, question: &Question) -> Option<Answer> {
         self.inner.ask_user(question)
@@ -3204,6 +3252,7 @@ mod tests {
             trust: &trust,
             parent: None,
             coord: None,
+            reach: None,
         };
         let mut call = |name: &str, args: Value| {
             let (out, ok) = runner.exec(name, args, &mut StdoutUi::new());
