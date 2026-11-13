@@ -1076,31 +1076,35 @@ impl Session {
             }
             return status;
         }
-        for s in self.settings.mcp.clone() {
-            if !s.options.enabled {
-                status.push(format!("mcp: '{}' is disabled", s.name));
-                continue;
-            }
-            match mcp::connect_stdio(&to_stdio(&s)) {
-                Ok(connection) => {
-                    let n = self.mcp_register(&s.name, connection);
-                    status.push(format!("mcp: connected '{}' ({n} tool(s))", s.name));
-                }
-                Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
+        // Configuration order — stdio servers, then HTTP ones — is the
+        // order tools are registered and so advertised in; it must not
+        // depend on which server answered first (see `mcp::connect_all`).
+        let mut servers = Vec::new();
+        for s in &self.settings.mcp {
+            match s.options.enabled {
+                true => servers.push(mcp::Server::Stdio(to_stdio(s))),
+                false => status.push(format!("mcp: '{}' is disabled", s.name)),
             }
         }
-        for s in self.settings.mcp_http.clone() {
-            if !s.options.enabled {
-                status.push(format!("mcp: '{}' (http) is disabled", s.name));
-                continue;
+        for s in &self.settings.mcp_http {
+            match s.options.enabled {
+                true => servers.push(mcp::Server::Http(to_http(s))),
+                false => status.push(format!("mcp: '{}' (http) is disabled", s.name)),
             }
-            match mcp::connect_http(&to_http(&s)) {
+        }
+        for (server, outcome) in servers.iter().zip(mcp::connect_all(&servers)) {
+            let name = server.name();
+            let kind = match server {
+                mcp::Server::Stdio(_) => "",
+                mcp::Server::Http(_) => "http, ",
+            };
+            status.push(match outcome {
                 Ok(connection) => {
-                    let n = self.mcp_register(&s.name, connection);
-                    status.push(format!("mcp: connected '{}' (http, {n} tool(s))", s.name));
+                    let n = self.mcp_register(name, connection);
+                    format!("mcp: connected '{name}' ({kind}{n} tool(s))")
                 }
-                Err(e) => status.push(format!("mcp: failed to connect '{}': {e:#}", s.name)),
-            }
+                Err(e) => format!("mcp: failed to connect '{name}': {e:#}"),
+            });
         }
         status
     }

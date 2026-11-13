@@ -66,9 +66,15 @@ headers = ["Authorization: Bearer sk-xyz"]
 
 Both `[[mcp]]` (stdio) and `[[mcp_http]]` (HTTP) servers are connected
 automatically at startup (`Session::connect_configured_mcp`), before the
-first prompt. A server that fails to connect is reported (e.g. `mcp: failed
-to connect '<name>': ...`) but doesn't stop the others from connecting or
-abort startup. Names are shared across both kinds — you can't reuse a name
+first prompt — all at once, each on its own thread (`mcp::connect_all`), so
+startup waits for the slowest server rather than for the sum of them. Their
+tools are nevertheless registered in the order of the file (the `[[mcp]]`
+tables, then the `[[mcp_http]]` ones, each server's tools as it listed them),
+whichever server answered first: that order is the order tools are advertised
+to the model in, and it has to be the same on every run for the provider's
+prompt cache to be reused. A server that fails to connect is reported (e.g.
+`mcp: failed to connect '<name>': ...`) but doesn't stop the others from
+connecting or abort startup. Names are shared across both kinds — you can't reuse a name
 already taken by a stdio *or* HTTP server.
 
 ## Per-server options

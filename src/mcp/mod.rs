@@ -47,6 +47,15 @@
 //! (a title, read-only and destructive hints; see `tool.rs`), which the
 //! `/tools` listing shows.
 //!
+//! # Connecting several servers
+//!
+//! [`connect_all`] connects a list of servers at once, each on a thread of
+//! its own, and returns the outcomes *in the order the servers were given*.
+//! Startup then costs as long as the slowest server rather than the sum of
+//! them, while the tools are still registered in configuration order — the
+//! order they are advertised to the model in, which has to be the same from
+//! one run to the next for the provider's prompt cache to be hit.
+//!
 //! # Per-server options
 //!
 //! [`ServerOptions`] carries what the user may set on any server, whichever
@@ -164,6 +173,55 @@ pub struct StdioServer {
     pub args: Vec<String>,
     /// Tool filters and timeouts.
     pub options: ServerOptions,
+}
+
+/// A server to connect, of either transport.
+pub enum Server {
+    Stdio(StdioServer),
+    Http(HttpServer),
+}
+
+impl Server {
+    pub fn name(&self) -> &str {
+        match self {
+            Server::Stdio(s) => &s.name,
+            Server::Http(s) => &s.name,
+        }
+    }
+
+    fn connect(&self) -> Result<Connection> {
+        match self {
+            Server::Stdio(s) => connect_stdio(s),
+            Server::Http(s) => connect_http(s),
+        }
+    }
+}
+
+/// Connect `servers` concurrently; the Nth outcome is the Nth server's (see
+/// the module docs). One server failing, or being slow, costs the others
+/// nothing.
+pub fn connect_all(servers: &[Server]) -> Vec<Result<Connection>> {
+    in_order(servers, Server::connect)
+}
+
+/// `f` applied to every item at once, each on a scoped thread, with the
+/// results in the items' order whichever finished first. A panic in `f`
+/// resurfaces here, as it would have in a plain loop.
+fn in_order<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    // Nothing to gain from a thread for one item (the usual `/mcp add`).
+    if let [only] = items {
+        return vec![f(only)];
+    }
+    thread::scope(|scope| {
+        let running: Vec<_> = items.iter().map(|item| scope.spawn(|| f(item))).collect();
+        running
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
 }
 
 /// Launch an MCP server over stdio and return its tools and instructions.
@@ -602,6 +660,69 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
         let mut rpc = testutil::FakeRpc::new(github);
         let found = discover(&mut rpc, "gh", "2024-11-05").unwrap();
         assemble(Arc::new(Mutex::new(rpc)), "gh", options, found).tools
+    }
+
+    #[test]
+    fn results_keep_the_order_given_whichever_finishes_first() {
+        // The first item is the slowest: run at once, they finish in the
+        // reverse order (one after another, they would finish as listed).
+        let delays = [600u64, 300, 0];
+        let finished = Mutex::new(Vec::new());
+        let results = in_order(&delays, |&ms| {
+            thread::sleep(Duration::from_millis(ms));
+            finished.lock().unwrap().push(ms);
+            ms
+        });
+        assert_eq!(results, delays);
+        assert_eq!(*finished.lock().unwrap(), [0, 300, 600]);
+        assert!(in_order(&[] as &[u64], |&ms| ms).is_empty());
+    }
+
+    #[test]
+    fn servers_connect_concurrently_and_report_in_config_order() {
+        use testutil::{FakeHttp, tools_only};
+        // `slow` is listed first and answers last; `broken` fails in between.
+        let slow = FakeHttp::mcp(|method, params| {
+            if method == "initialize" {
+                thread::sleep(Duration::from_millis(300));
+            }
+            tools_only(json!([{ "name": "a" }]))(method, params)
+        });
+        let fast = FakeHttp::mcp(tools_only(json!([{ "name": "b" }, { "name": "c" }])));
+        let http = |name: &str, url: String| {
+            Server::Http(HttpServer {
+                name: name.into(),
+                url,
+                headers: Vec::new(),
+                options: ServerOptions::default(),
+            })
+        };
+        let servers = [
+            http("slow", slow.url("/mcp")),
+            Server::Stdio(StdioServer {
+                name: "broken".into(),
+                command: "definitely-not-a-real-binary-atelier-mcp-test".into(),
+                args: Vec::new(),
+                options: ServerOptions::default(),
+            }),
+            http("fast", fast.url("/mcp")),
+        ];
+
+        let outcomes = connect_all(&servers);
+        let tools: Vec<Vec<&str>> = outcomes
+            .iter()
+            .map(|o| o.as_ref().map(|c| names(&c.tools)).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                vec!["mcp__slow__a"],
+                vec![],
+                vec!["mcp__fast__b", "mcp__fast__c"],
+            ]
+        );
+        assert!(outcomes[1].is_err());
+        assert_eq!(servers[1].name(), "broken");
     }
 
     #[test]
