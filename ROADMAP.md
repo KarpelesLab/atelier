@@ -5,7 +5,8 @@ OpenAI-compatible model APIs, runs tools in a project directory, speaks MCP,
 and continuously feeds itself context (git status, diagnostics, …) — driven
 from a deliberately minimal terminal interface.
 
-Status: **M0–M14 done** (§3); **M15–M22** (§3b) are next. This document is
+Status: **M0–M14 done** (§3); **M15–M22** (§3b) mostly done — see
+"Progress on M15–M22" there for what is left. This document is
 the plan of record; it changes as we build.
 
 ---
@@ -406,36 +407,52 @@ overlay or a mouse.
 
 ### Where atelier stands
 
-| Capability | Claude Code | opencode | Codex CLI | atelier today | Planned |
-|---|---|---|---|---|---|
-| Instruction files | `CLAUDE.md` hierarchy, `@` imports, path-scoped rules | `AGENTS.md` up the tree, nested ones loaded lazily, globs/URLs, live reload | `AGENTS.md` root→cwd, override files, size cap | first of 4 files at the root, cut at 3000 chars | M15 |
-| Memory across sessions | agent-written memory files with an index | — | background extract → consolidate, off by default | — | M15 |
-| Sessions | many per project, resume by id, fork | SQLite, fork at a message, export/import | named, resume/fork/archive | one per project, `--continue` | no (M16 dropped) |
-| Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | — | no — git does it (M16 dropped) |
-| Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | auto summary only | M22 |
-| Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | per-tool "always", risk signals | M17 |
-| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | — (`node` tool is mediated; `bash` isn't) | M17, on nixvm |
-| Approvals without the user | — | — | reviewer agent with a policy, fails closed | `ATELIER_APPROVE=all` | M17 |
-| Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | — | M17 |
-| Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | reviewer only; peers via coordinator | M18 |
-| Custom commands | Markdown, arguments, shell output | same, plus per-command agent/model | (skills) | — | M19 |
-| Skills | `SKILL.md`, loaded on demand | same, also reads `.claude/skills` | same, `.agents/skills` | — | M19 |
-| Hooks | pre/post tool, prompt, stop, session, compact | plugin events | same set + permission request, hash-pinned trust | — | M19 |
-| Ask the user | structured question tool | `question` tool | `request_user_input` | — | M20 |
-| Web search | yes | yes (several providers) | yes | `web_fetch` only | M20 |
-| Diagnostics after edits | LSP tool, IDE diagnostics | LSP in v1, **dropped in v2** for lint/typecheck commands | — | `cargo check` only | M20 |
-| Parallel tool calls | yes | yes | yes | sequential | M20 |
-| MCP extras | OAuth, resources, prompts as commands, deferred tools, serve as MCP | OAuth, prompts as commands, "code mode" | OAuth, tool filters, deferred tools, serve as MCP | stdio+HTTP, resources, prompts | M20 |
-| Headless / embedding | `-p`, JSON stream in/out, SDK | `run --format json`, HTTP server, ACP | `exec --json`, output schema, app-server | `--print` (text) | M21 |
-| Scheduled / CI work | loops, cron, GitHub action | GitHub action | cloud tasks, GitHub review | — | M21 |
-| Model per role, effort | per subagent, effort levels | per agent/command, variants, small model | per role, effort, review model | one model (+ reviewer's) | M22 |
-| Prompt-cache care | automatic | summary reuses the cache, cache warming | — | fresh context rewrites the system message every turn | M22 |
-| Instances that talk | agent teams | — | message board (in development) | ✅ coordinator (M14) | M18 |
+| Capability | Claude Code | opencode | Codex CLI | atelier now |
+|---|---|---|---|---|
+| Instruction files | `CLAUDE.md` hierarchy, `@` imports, path-scoped rules | `AGENTS.md` up the tree, nested ones loaded lazily, globs/URLs, live reload | `AGENTS.md` root→cwd, override files, size cap | ✅ all files root→cwd, `@` imports, nested on demand, `[instructions] files`, `/init` |
+| Memory across sessions | agent-written memory files with an index | — | background extract → consolidate, off by default | ✅ `memory` tool, index in context, `/memory` |
+| Sessions | many per project, resume by id, fork | SQLite, fork at a message, export/import | named, resume/fork/archive | one per project, `--continue` (M16 dropped) |
+| Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | no — git does it (M16 dropped) |
+| Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | ✅ prune tool output, then a hand-off summary; `/compact`, `/context`; retry on overflow |
+| Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | ✅ allow/ask/deny patterns, command splitting, user-global rules, `permissions check` |
+| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | ⏳ nixvm, opt-in `sandbox` feature; waits on nixvm (docs/sandbox.md) |
+| Approvals without the user | — | — | reviewer agent with a policy, fails closed | ⏳ `yolo`, rules, `permission_request` hooks; no reviewer model yet |
+| Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | ✅ `plan`, `ask-edits`, `auto-edit`, `yolo` |
+| Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | ✅ `task`, agents as files, step cap, parallel, background, worktrees |
+| Custom commands | Markdown, arguments, shell output | same, plus per-command agent/model | (skills) | ✅ files, arguments, shell output, `model:`; MCP prompts as commands |
+| Skills | `SKILL.md`, loaded on demand | same, also reads `.claude/skills` | same, `.agents/skills` | ✅ `SKILL.md`, the `skill` tool |
+| Hooks | pre/post tool, prompt, stop, session, compact | plugin events | same set + permission request, hash-pinned trust | ✅ lifecycle events that observe or decide, under project trust |
+| Ask the user | structured question tool | `question` tool | `request_user_input` | ✅ `ask`, answered on the input line |
+| Web search | yes | yes (several providers) | yes | ✅ `web_search` (SearXNG, Brave, Tavily, DuckDuckGo) |
+| Diagnostics after edits | LSP tool, IDE diagnostics | LSP in v1, **dropped in v2** for lint/typecheck commands | — | ✅ lint/typecheck commands, configured or detected, reporting the change |
+| Parallel tool calls | yes | yes | yes | ✅ read-only calls of a step |
+| MCP extras | OAuth, resources, prompts as commands, deferred tools, serve as MCP | OAuth, prompts as commands, "code mode" | OAuth, tool filters, deferred tools, serve as MCP | ✅ OAuth, filters, timeouts, instructions, deferred tools, code mode, `atelier mcp` |
+| Headless / embedding | `-p`, JSON stream in/out, SDK | `run --format json`, HTTP server, ACP | `exec --json`, output schema, app-server | ✅ JSON in/out, schema, `atelier serve` (JSON-RPC); ⏳ ACP |
+| Scheduled / CI work | loops, cron, GitHub action | GitHub action | cloud tasks, GitHub review | ✅ `/goal`, `atelier review`, GitHub Action (not yet run for real); ⏳ `/loop` |
+| Model per role, effort | per subagent, effort levels | per agent/command, variants, small model | per role, effort, review model | ✅ providers, `[models]` roles, variants, `/effort`, usage stats |
+| Prompt-cache care | automatic | summary reuses the cache, cache warming | — | ✅ constant system message; each request a prefix of the next |
+| Instances that talk | agent teams | — | message board (in development) | ✅ coordinator (M14); ⏳ ask/answer, wake, locks |
 
 Already ahead or equal, and to be kept that way: file-state tracking and
 stale-edit rejection, ambient per-turn context with dedup, the mediated `node`
 tool, mid-turn steering, the subconscious reviewer, three sanctioned backends,
 the coordinator, a libc-free static binary.
+
+### Progress on M15–M22
+
+| | Status | Left |
+|---|---|---|
+| M15 Instructions & memory | ✅ | — |
+| M16 | dropped | — |
+| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins | ⏳ the nixvm sandbox is opt-in and waits on nixvm (libc-free host mounts, `git commit`, `cargo` — docs/sandbox.md); network allowlist; approvals by a reviewer model |
+| M18 Subagents | ✅ `task`, agent files, step cap, parallel, background, worktree isolation | ⏳ on the coordinator: ask/answer, wake, advisory locks |
+| M19 Commands, skills, hooks | ✅ | — |
+| M20 Tools | ✅ `ask`, `web_search`, diagnostics, parallel reads, output to a file, job notices, MCP (OAuth, filters, deferred tools, code mode, `atelier mcp`) | ⏳ an LSP-backed symbols tool |
+| M21 Headless & automation | ✅ JSON/stream-json, schema, `atelier serve`, `/goal`, `review`, `doctor`, `debug prompt`, GitHub Action | ⏳ ACP adapter, `/loop`; the action has not run on a real runner |
+| M22 Models, context, cache | ✅ | ⏳ cache benefit not yet measured; the default compaction threshold (8000) is small next to the tool list |
+
+The milestone texts below are the plan as written; where what was built
+differs, the docs (`docs/`) are the reference.
 
 ### M15 — Instructions & memory
 
