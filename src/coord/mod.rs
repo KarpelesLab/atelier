@@ -124,11 +124,10 @@ fn reachable_socket(dir: &Path) -> Result<(PathBuf, Option<std::fs::File>)> {
     if socket.as_os_str().len() <= MAX {
         return Ok((socket, None));
     }
-    // (fullrust is Linux under another `target_os`; rustc knows the name
-    // only in that toolchain.)
-    #[allow(unexpected_cfgs)]
-    let procfs = cfg!(any(target_os = "linux", target_os = "fullrust"));
-    if procfs && let Ok(handle) = std::fs::File::open(dir) {
+    // (fullrust is Linux under another `target_os`.)
+    if cfg!(any(target_os = "linux", target_os = "fullrust"))
+        && let Ok(handle) = std::fs::File::open(dir)
+    {
         let short = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
             .join(socket.file_name().expect("has a file name"));
         return Ok((short, Some(handle)));

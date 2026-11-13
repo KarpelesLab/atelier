@@ -5,7 +5,8 @@
 //! **everything else — assistant text, reasoning, tool activity — prints to the
 //! terminal scrollback and is never redrawn.** No panes, no mouse, no
 //! alt-screen. Streamed output must interleave above the live input line
-//! without corrupting it. `crossterm` (already a dependency) drives raw mode.
+//! without corrupting it. The terminal itself — raw mode, keys, size — is
+//! [`term`], atelier's own small layer over it.
 //!
 //! # Contract (stable — implementers must not change this signature)
 //!
@@ -62,6 +63,7 @@
 
 mod config;
 mod input;
+mod term;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -71,14 +73,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::{Attribute, Print, SetAttribute};
-use crossterm::terminal::{Clear, ClearType};
-use crossterm::{cursor, event, execute, queue, terminal};
 
 use crate::agent::{self, Session, Ui};
 
 use input::LineEditor;
+use term::{Event, Key};
 
 /// The input prompt and its width in columns (`›` + space, both single-width).
 const PROMPT: &str = "› ";
@@ -185,7 +184,7 @@ pub fn run(mut session: Session) -> Result<()> {
 /// own (claude reporting on background work) is rendered above the prompt.
 fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Option<String>> {
     loop {
-        if !event::poll(IDLE_POLL)? {
+        let Some(event) = term::poll(IDLE_POLL)? else {
             if session.poll_background(&mut TuiUi { r: &mut *r }) {
                 r.status = build_status(session, turn);
                 r.refresh()?;
@@ -199,11 +198,11 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Optio
                 r.refresh()?;
             }
             continue;
-        }
-        match event::read()? {
+        };
+        match event {
             // A resize just needs a repaint; `refresh` re-reads the width.
-            Event::Resize(_, _) => r.refresh()?,
-            Event::Key(k) if k.kind != KeyEventKind::Release => match edit_key(r, k) {
+            Event::Resize => r.refresh()?,
+            Event::Key(k) => match edit_key(r, k) {
                 KeyAction::Exit => return Ok(None),
                 KeyAction::Submit(line) => {
                     r.push_line(format!("{PROMPT}{line}"), false);
@@ -211,7 +210,6 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Optio
                 }
                 KeyAction::Edited => r.refresh()?,
             },
-            _ => {}
         }
     }
 }
@@ -228,20 +226,19 @@ enum KeyAction {
 
 /// Apply one key to the line editor. Shared by the idle prompt and the
 /// working-state pump so editing feels identical in both.
-fn edit_key(r: &mut Renderer, k: KeyEvent) -> KeyAction {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    match k.code {
-        KeyCode::Char('d') if ctrl && r.editor.is_empty() => return KeyAction::Exit,
+fn edit_key(r: &mut Renderer, k: Key) -> KeyAction {
+    match k {
+        Key::Ctrl('d') if r.editor.is_empty() => return KeyAction::Exit,
         // Ctrl-C cancels the current (unsent) input.
-        KeyCode::Char('c') if ctrl => r.editor.clear(),
-        KeyCode::Char(c) if !ctrl => r.editor.insert(c),
-        KeyCode::Backspace => r.editor.backspace(),
-        KeyCode::Delete => r.editor.delete(),
-        KeyCode::Left => r.editor.left(),
-        KeyCode::Right => r.editor.right(),
-        KeyCode::Home => r.editor.home(),
-        KeyCode::End => r.editor.end(),
-        KeyCode::Enter => return KeyAction::Submit(r.editor.take()),
+        Key::Ctrl('c') => r.editor.clear(),
+        Key::Char(c) => r.editor.insert(c),
+        Key::Backspace => r.editor.backspace(),
+        Key::Delete => r.editor.delete(),
+        Key::Left => r.editor.left(),
+        Key::Right => r.editor.right(),
+        Key::Home => r.editor.home(),
+        Key::End => r.editor.end(),
+        Key::Enter => return KeyAction::Submit(r.editor.take()),
         _ => {}
     }
     KeyAction::Edited
@@ -324,22 +321,20 @@ fn pump(
     let mut last_paint = Instant::now();
     loop {
         // Keyboard first; the poll timeout doubles as the loop's sleep.
-        if event::poll(KEY_POLL)? {
-            match event::read()? {
-                Event::Resize(_, _) => r.refresh()?,
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    if r.approval_pending {
-                        if let Some(a) = approval_key(k) {
-                            r.approval_pending = false;
-                            let _ = answers.send(a);
-                        }
-                    } else {
-                        working_key(r, k);
+        match term::poll(KEY_POLL)? {
+            Some(Event::Resize) => r.refresh()?,
+            Some(Event::Key(k)) => {
+                if r.approval_pending {
+                    if let Some(a) = approval_key(k) {
+                        r.approval_pending = false;
+                        let _ = answers.send(a);
                     }
-                    r.refresh()?;
+                } else {
+                    working_key(r, k);
                 }
-                _ => {}
+                r.refresh()?;
             }
+            None => {}
         }
 
         // Then everything the worker produced meanwhile, painted once.
@@ -372,9 +367,8 @@ fn pump(
 /// A keystroke while a turn is running: edit the line as usual, but Enter
 /// queues it rather than sending. Ctrl-C on an empty line drops the queue,
 /// or, with nothing queued, stops the turn.
-fn working_key(r: &mut Renderer, k: KeyEvent) {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    if ctrl && k.code == KeyCode::Char('c') && r.editor.is_empty() {
+fn working_key(r: &mut Renderer, k: Key) {
+    if k == Key::Ctrl('c') && r.editor.is_empty() {
         let dropped = r.clear_queue();
         if dropped > 0 {
             r.push_line(format!("! dropped {dropped} queued message(s)"), true);
@@ -396,13 +390,11 @@ fn working_key(r: &mut Renderer, k: KeyEvent) {
 }
 
 /// Map a key to an approval answer; `None` for keys that don't answer.
-fn approval_key(k: KeyEvent) -> Option<agent::Approval> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    match k.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => Some(agent::Approval::Once),
-        KeyCode::Char('a') | KeyCode::Char('A') => Some(agent::Approval::Always),
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(agent::Approval::Deny),
-        KeyCode::Char('c') if ctrl => Some(agent::Approval::Deny),
+fn approval_key(k: Key) -> Option<agent::Approval> {
+    match k {
+        Key::Char('y' | 'Y') => Some(agent::Approval::Once),
+        Key::Char('a' | 'A') => Some(agent::Approval::Always),
+        Key::Char('n' | 'N') | Key::Esc | Key::Ctrl('c') => Some(agent::Approval::Deny),
         _ => None,
     }
 }
@@ -678,29 +670,24 @@ impl Renderer {
     /// scrollback above it. This is the sole routine that upholds the
     /// append-only invariant; see the module docs.
     fn refresh(&mut self) -> io::Result<()> {
-        let width = terminal::size().map(|(w, _)| w).unwrap_or(80).max(1);
-        let mut out = io::stdout();
+        let width = term::size().map_or(80, |(w, _)| w).max(1);
+        let mut out = io::stdout().lock();
 
-        queue!(out, cursor::Hide)?;
-        // Walk to the top-left of the previously drawn live region.
-        if self.live_height > 1 {
-            queue!(out, cursor::MoveUp(self.live_height - 1))?;
-        }
-        queue!(out, cursor::MoveToColumn(0))?;
-        // Wipe the old live region (nothing above it is ever touched).
-        queue!(out, Clear(ClearType::FromCursorDown))?;
+        // Walk to the top-left of the previously drawn live region and wipe
+        // it (nothing above it is ever touched).
+        write!(
+            out,
+            "{}{}{}{}",
+            term::HIDE_CURSOR,
+            term::move_up(self.live_height.saturating_sub(1)),
+            term::move_to_column(0),
+            term::CLEAR_DOWN
+        )?;
 
         // Flush committed lines — printed once here, then immutable scrollback.
         for line in std::mem::take(&mut self.scroll) {
-            if line.dim {
-                queue!(out, SetAttribute(Attribute::Dim))?;
-            }
-            queue!(
-                out,
-                Print(&line.text),
-                SetAttribute(Attribute::Reset),
-                Print("\r\n")
-            )?;
+            let style = if line.dim { term::DIM } else { "" };
+            write!(out, "{style}{}{}\r\n", line.text, term::RESET)?;
         }
 
         // --- Draw the live region (top to bottom) ---
@@ -709,36 +696,28 @@ impl Renderer {
         // 1. The in-progress output fragment, if any (dim when reasoning).
         if !self.pending.is_empty() {
             let shown = truncate_tail(&self.pending, width as usize);
-            if self.pending_dim {
-                queue!(out, SetAttribute(Attribute::Dim))?;
-            }
-            queue!(
-                out,
-                Print(shown),
-                SetAttribute(Attribute::Reset),
-                Print("\r\n")
-            )?;
+            let style = if self.pending_dim { term::DIM } else { "" };
+            write!(out, "{style}{shown}{}\r\n", term::RESET)?;
             height += 1;
         }
 
         // 2. The status strip: a reverse-video bar padded to full width.
         let bar = pad_to(&self.status_line(), width as usize);
-        queue!(
-            out,
-            SetAttribute(Attribute::Reverse),
-            Print(bar),
-            SetAttribute(Attribute::Reset),
-            Print("\r\n")
-        )?;
+        write!(out, "{}{bar}{}\r\n", term::REVERSE, term::RESET)?;
         height += 1;
 
         // 3. The input line, horizontally scrolled to keep the cursor visible.
         let (shown, col) = self.editor.view(width as usize, PROMPT_COLS);
-        queue!(out, Print(PROMPT), Print(shown))?;
+        write!(out, "{PROMPT}{shown}")?;
         height += 1;
 
         // Park the cursor at the edit position on the input row.
-        queue!(out, cursor::MoveToColumn(col as u16), cursor::Show)?;
+        write!(
+            out,
+            "{}{}",
+            term::move_to_column(col as u16),
+            term::SHOW_CURSOR
+        )?;
         self.live_height = height;
         out.flush()
     }
@@ -789,20 +768,13 @@ impl Ui for TuiUi<'_> {
             .emit_block("   [y] once   [a] always   [n] deny", false);
         let _ = self.r.refresh();
         loop {
-            match event::read() {
-                Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                    match k.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => return agent::Approval::Once,
-                        KeyCode::Char('a') | KeyCode::Char('A') => return agent::Approval::Always,
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            return agent::Approval::Deny;
-                        }
-                        KeyCode::Char('c') if ctrl => return agent::Approval::Deny,
-                        _ => {}
+            match term::read() {
+                Ok(Event::Key(k)) => {
+                    if let Some(answer) = approval_key(k) {
+                        return answer;
                     }
                 }
-                Ok(_) => {}
+                Ok(Event::Resize) => {}
                 Err(_) => return agent::Approval::Deny,
             }
         }
@@ -896,22 +868,25 @@ fn pad_to(s: &str, width: usize) -> String {
 
 /// Enables raw mode and restores the terminal on drop — on the normal path, on a
 /// `?` early return, and while unwinding from a panic.
-struct RawGuard;
+struct RawGuard {
+    _raw: term::RawMode,
+}
 
 impl RawGuard {
     fn enable() -> Result<Self> {
-        terminal::enable_raw_mode()?;
-        Ok(RawGuard)
+        Ok(RawGuard {
+            _raw: term::RawMode::enable()?,
+        })
     }
 }
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        // Still raw here (the modes come back when `_raw` drops, after
+        // this): leave the shell prompt on a fresh line below the last
+        // input row.
         let mut out = io::stdout();
-        let _ = execute!(out, SetAttribute(Attribute::Reset), cursor::Show);
-        let _ = terminal::disable_raw_mode();
-        // Leave the shell prompt on a fresh line below the last input row.
-        let _ = write!(out, "\r\n");
+        let _ = write!(out, "{}{}\r\n", term::RESET, term::SHOW_CURSOR);
         let _ = out.flush();
     }
 }

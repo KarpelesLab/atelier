@@ -14,11 +14,8 @@
 
 use std::io::{self, Write};
 
+use super::term::{self, Event, Key};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::style::{Attribute, Print, SetAttribute};
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{cursor, execute, queue, terminal};
 
 use crate::agent::Session;
 
@@ -141,7 +138,9 @@ struct ScreenGuard;
 
 impl ScreenGuard {
     fn enter() -> io::Result<Self> {
-        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        let mut out = io::stdout();
+        write!(out, "{}{}", term::ENTER_ALT_SCREEN, term::HIDE_CURSOR)?;
+        out.flush()?;
         Ok(ScreenGuard)
     }
 }
@@ -149,11 +148,12 @@ impl ScreenGuard {
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = execute!(
+        let _ = write!(
             out,
-            SetAttribute(Attribute::Reset),
-            cursor::Show,
-            LeaveAlternateScreen
+            "{}{}{}",
+            term::RESET,
+            term::SHOW_CURSOR,
+            term::LEAVE_ALT_SCREEN
         );
         let _ = out.flush();
     }
@@ -171,15 +171,14 @@ pub fn run(session: &mut Session) -> Result<()> {
     draw(&state)?;
 
     loop {
-        match event::read()? {
-            Event::Resize(_, _) => draw(&state)?,
-            Event::Key(k) if k.kind != KeyEventKind::Release => {
+        match term::read()? {
+            Event::Resize => draw(&state)?,
+            Event::Key(k) => {
                 if handle_key(&mut state, k) {
                     break;
                 }
                 draw(&state)?;
             }
-            _ => {}
         }
     }
 
@@ -194,21 +193,21 @@ pub fn run(session: &mut Session) -> Result<()> {
 }
 
 /// Handle one key. Returns `true` when the editor should save & exit.
-fn handle_key(state: &mut State, k: KeyEvent) -> bool {
+fn handle_key(state: &mut State, k: Key) -> bool {
     let row = Row::ALL[state.selected];
 
     // --- Inline edit mode: keys edit the buffer, never the top-level nav. ---
     if let Some(buf) = state.editing.as_mut() {
-        match k.code {
-            KeyCode::Esc => {
+        match k {
+            Key::Esc => {
                 // Cancel the edit; the value is left unchanged.
                 state.editing = None;
             }
-            KeyCode::Enter => state.commit_edit(row),
-            KeyCode::Backspace => {
+            Key::Enter => state.commit_edit(row),
+            Key::Backspace => {
                 buf.pop();
             }
-            KeyCode::Char(c) => {
+            Key::Char(c) => {
                 // The number row only accepts digits.
                 if row == Row::ContextLimit {
                     if c.is_ascii_digit() {
@@ -224,23 +223,23 @@ fn handle_key(state: &mut State, k: KeyEvent) -> bool {
     }
 
     // --- Top-level navigation. ---
-    match k.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+    match k {
+        Key::Up | Key::Char('k') => {
             if state.selected == 0 {
                 state.selected = Row::ALL.len() - 1;
             } else {
                 state.selected -= 1;
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        Key::Down | Key::Char('j') => {
             state.selected = (state.selected + 1) % Row::ALL.len();
         }
-        KeyCode::Char(' ') => {
+        Key::Char(' ') => {
             if row.is_bool() {
                 state.toggle(row);
             }
         }
-        KeyCode::Enter => {
+        Key::Enter => {
             if row.is_bool() {
                 state.toggle(row);
             } else {
@@ -248,7 +247,7 @@ fn handle_key(state: &mut State, k: KeyEvent) -> bool {
             }
         }
         // Esc / q / s at the top level all save & exit.
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => return true,
+        Key::Esc | Key::Char('q' | 's') => return true,
         _ => {}
     }
     false
@@ -271,15 +270,16 @@ const VALUE_COL: usize = 18;
 /// Repaint the whole screen. Robust to tiny terminals (rows that don't fit are
 /// simply not drawn; nothing panics).
 fn draw(state: &State) -> io::Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = term::size().unwrap_or((80, 24));
     let width = cols.max(1) as usize;
     let mut out = io::stdout();
 
-    queue!(
+    write!(
         out,
-        cursor::Hide,
-        Clear(ClearType::All),
-        cursor::MoveTo(0, 0)
+        "{}{}{}",
+        term::HIDE_CURSOR,
+        term::CLEAR_SCREEN,
+        term::move_to(0, 0)
     )?;
 
     // Title bar (reverse video, full width).
@@ -348,11 +348,13 @@ fn put_line(
         *line += 1;
         return Ok(());
     }
-    queue!(out, cursor::MoveTo(0, *line))?;
-    if reverse {
-        queue!(out, SetAttribute(Attribute::Reverse))?;
-    }
-    queue!(out, Print(text), SetAttribute(Attribute::Reset))?;
+    let style = if reverse { term::REVERSE } else { "" };
+    write!(
+        out,
+        "{}{style}{text}{}",
+        term::move_to(0, *line),
+        term::RESET
+    )?;
     *line += 1;
     Ok(())
 }
@@ -378,23 +380,17 @@ fn pad_to(s: &str, width: usize) -> String {
 fn report_save_error(e: &anyhow::Error) {
     let mut out = io::stdout();
     let msg = format!(" ! failed to save settings: {e}  (press any key)");
-    let _ = execute!(
+    let _ = write!(
         out,
-        cursor::MoveTo(0, 0),
-        Clear(ClearType::CurrentLine),
-        SetAttribute(Attribute::Reverse),
-        Print(msg),
-        SetAttribute(Attribute::Reset)
+        "{}{}{}{msg}{}",
+        term::move_to(0, 0),
+        term::CLEAR_LINE,
+        term::REVERSE,
+        term::RESET
     );
     let _ = out.flush();
     // Consume one key so the message is readable; tolerate read failures.
-    loop {
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
+    while let Ok(Event::Resize) = term::read() {}
 }
 
 #[cfg(test)]

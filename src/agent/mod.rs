@@ -602,7 +602,7 @@ impl Session {
     /// Render what claude produced between turns (reports on background
     /// work). Cheap when there's nothing; a no-op for the OpenAI backend.
     /// Returns whether anything arrived.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    #[cfg_attr(not(tui), allow(dead_code))]
     pub fn poll_background(&mut self, ui: &mut dyn Ui) -> bool {
         let (Some(bridge), mut runner) = self.parts() else {
             return false;

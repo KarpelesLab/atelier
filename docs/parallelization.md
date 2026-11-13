@@ -21,7 +21,7 @@ files.
 1. Edit **only** files inside your directory. Do **not** touch `main.rs`,
    `Cargo.toml`, `Cargo.lock`, or another stream's directory.
 2. All dependencies you need are already in `Cargo.toml` (`regex`, `ignore`,
-   `globset`, `crossterm`, `serde_json`, `anyhow`). If you think you need
+   `globset`, `serde_json`, `anyhow`). If you think you need
    another, stop and report it — don't add it.
 3. Program against the **contracts** documented at the top of your module file.
    Their public signatures are frozen; if one is wrong, report it rather than

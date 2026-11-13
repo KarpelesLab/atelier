@@ -19,19 +19,16 @@ tomlproc = { version = "0.1", features = ["serde"] }
 kataan = { version = "0.0.9", default-features = false, features = ["std", "host"] }
 anyhow = "1"
 # Pre-declared for the parallel work streams so module authors need not touch
-# this file: tools (grep/glob/walking), tui, context.
+# this file: tools (grep/glob/walking), context.
 regex = "1"
 ignore = "0.4"
 globset = "0.4"
-# The terminal interface only; its Unix backend needs libc, which rules it
-# out of libc-free (fullrust) builds.
-crossterm = { version = "0.28", optional = true }
 
 [features]
 default = ["tui"]
 # Gates the terminal interface so a headless build (scripted runs, tests,
 # CI) can drop the UI entirely. Nothing in provider/agent/core may depend on it.
-tui = ["dep:crossterm"]
+tui = []
 
 [profile.release]
 opt-level = 3

@@ -8,8 +8,9 @@ Requires a recent Rust toolchain (edition 2024, MSRV 1.95).
 cargo build --release
 ```
 
-The `tui` feature (the inline terminal interface) is on by default. To build a
-headless binary without it (drops the `crossterm` dependency entirely):
+The `tui` feature (the inline terminal interface) is on by default; it is
+available on Linux and macOS, and other platforms get the line REPL. To build
+a headless binary without it:
 
 ```sh
 cargo build --release --no-default-features

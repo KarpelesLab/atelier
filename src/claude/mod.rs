@@ -417,7 +417,7 @@ impl Bridge {
 
     /// Render whatever the child produced while no turn was running — claude
     /// reporting back on background work. Returns whether anything arrived.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    #[cfg_attr(not(tui), allow(dead_code))]
     pub fn pump(&mut self, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Result<bool> {
         let mut any = false;
         loop {

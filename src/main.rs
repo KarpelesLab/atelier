@@ -20,7 +20,7 @@ mod session;
 mod settings;
 mod shlex;
 mod tools;
-#[cfg(feature = "tui")]
+#[cfg(tui)]
 mod tui;
 mod update;
 
@@ -113,9 +113,9 @@ fn main() -> Result<()> {
         return finish(headless::run(session, &prompt));
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(tui)]
     let result = tui::run(session);
-    #[cfg(not(feature = "tui"))]
+    #[cfg(not(tui))]
     let result = agent::repl(session);
     finish(result)
 }

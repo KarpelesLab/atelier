@@ -84,7 +84,7 @@ user input ─▶ context helpers gather ─▶ assemble messages ─▶ provide
 | HTTP            | **`rsurl`** (ours, pure-Rust curl)         | `Request::send_reader()` gives a blocking `Read`+`.status()` — ideal for SSE |
 | Concurrency     | `std::thread` + channels (defer `tokio`)   | rsurl's primary API is blocking; a worker thread streams into the UI. Add an async runtime only if concurrency demands it |
 | JSON            | `serde` / `serde_json`                     | provider + MCP + config |
-| Terminal        | `crossterm`                                | raw mode, inline redraw of input row only |
+| Terminal        | own layer (`src/tui/term.rs`)              | raw mode, keys, size via `ioctl`; no libc needed, so the TUI builds on fullrust |
 | Line editing    | `reedline` (evaluate) or hand-rolled       | history, editing; must coexist with streamed output above it |
 | Errors          | `thiserror` (libs) / `anyhow` (bin)        | |
 | Config          | `toml` + `serde`, `figment`/env overlay    | `atelier.toml` per project + user global |
