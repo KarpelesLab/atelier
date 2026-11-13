@@ -33,7 +33,9 @@ fn run_with(dir: &PathBuf, prompt: &str, approve_all: bool) -> Output {
         .current_dir(dir)
         .env("ATELIER_MODEL", "haiku")
         .env_remove("ATELIER_CLAUDE_BUILTINS")
-        .env_remove("ATELIER_APPROVE");
+        .env_remove("ATELIER_APPROVE")
+        // No coordinator daemon left behind by the test run.
+        .env("ATELIER_NO_COORDINATOR", "1");
     if approve_all {
         cmd.env("ATELIER_APPROVE", "all");
     }

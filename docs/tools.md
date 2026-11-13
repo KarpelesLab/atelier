@@ -21,6 +21,8 @@ model verbatim as the tool result.
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
 | `web_fetch` | **required** | no (network) |
 | `node`      | auto, unless `network: true` (then required) | fs yes; network no |
+| `peers`     | auto     | n/a (lists your atelier instances) |
+| `peer_send` | **required** | no (reaches other instances) |
 
 "Confined" tools resolve every path with `ToolCtx::resolve` /
 `tools::confine`: a relative path is joined against the project root, `.`/`..`
@@ -287,3 +289,24 @@ work across turns (and across compaction).
 
 Renders as `[x] 1. done` / `[ ] 2. pending` with a count summary. Confined and
 auto-approved.
+
+## `peers`, `peer_send`
+
+Present when the instance is connected to the [coordinator](coordinator.md).
+
+`peers` lists the atelier instances running on this machine (name, idle or
+working, model, directory, topics), after applying any subscription changes.
+
+| Param         | Type            | Required | Meaning |
+|---------------|-----------------|----------|---------|
+| `subscribe`   | array of string | no       | Topics to start receiving |
+| `unsubscribe` | array of string | no       | Topics to stop receiving |
+
+`peer_send` sends a message to other instances and reports how many it
+reached. The recipient's agent gets it at its next step; an idle instance
+only reads it with its user's next prompt.
+
+| Param     | Type   | Required | Meaning |
+|-----------|--------|----------|---------|
+| `to`      | string | yes      | An instance name, `*` for every other instance, or `#topic` |
+| `message` | string | yes      | The text to deliver |

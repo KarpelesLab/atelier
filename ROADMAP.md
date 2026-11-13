@@ -366,6 +366,26 @@ servers, and per-turn context.
   rename it over the old one for the next launch; `atelier update` on
   demand, `ATELIER_NO_UPDATE` to opt out. Builds from source never update.
 - ✅ First release (`v0.1.0`): x86_64 and aarch64 static binaries with `SHA256SUMS`.
+
+### M14 — Coordinator: instances connected ✅ (v1)
+
+A daemon that connects every atelier running on the machine
+([docs/coordinator.md](docs/coordinator.md), `src/coord`).
+
+- ✅ **Self-managing daemon**: `atelier coordinator`, launched detached by
+  the first instance up; a held file lock keeps it unique. Instances
+  reconnect on their own — and relaunch it — whenever it ends (crash,
+  kill, idle exit); it steps down when its executable is replaced or a
+  newer atelier connects, so updates take over without intervention.
+- ✅ **Schemes** over one JSON-RPC socket: presence (`list`/`update`),
+  direct and broadcast messages, topics (subscribe/publish), and
+  instance-to-instance `call` (request/response, with deadline).
+- ✅ **Surfaces**: `peers`/`peer_send` tools, `/peers`, `/send`,
+  `/subscribe`; peers' messages are shown and reach the model mid-turn or
+  with the next prompt, marked as another agent's.
+- ⏳ Waking an idle instance on a message (opt-in); `call` handlers that
+  reach the agent (ask a peer and await its answer, hand off a task);
+  shared advisory locks ("I'm editing this file"); non-Unix transport.
 ---
 
 ## 4. Harness ergonomics — designing for the agent's experience

@@ -179,6 +179,8 @@ fn run_print(base_url: &str, cwd: &Path, prompt: &str) -> Output {
         .env("ATELIER_BASE_URL", base_url)
         .env("ATELIER_MODEL", "mock")
         .env("ATELIER_APPROVE", "all")
+        // No coordinator daemon left behind by the test run.
+        .env("ATELIER_NO_COORDINATOR", "1")
         // Keep the run hermetic regardless of the outer environment.
         .env_remove("ATELIER_API_KEY")
         .env_remove("ATELIER_TRACE")

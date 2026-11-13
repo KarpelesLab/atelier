@@ -248,7 +248,7 @@ fn get(url: &str) -> Result<Vec<u8>> {
 }
 
 /// `v1.2.3` / `1.2.3` → (1, 2, 3). Pre-releases (`-rc1` …) aren't offered.
-fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let mut parts = s.strip_prefix('v').unwrap_or(s).split('.');
     let mut next = || parts.next()?.parse::<u64>().ok();
     let v = (next()?, next()?, next()?);

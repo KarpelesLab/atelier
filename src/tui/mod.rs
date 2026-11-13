@@ -190,6 +190,10 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Optio
                 r.status = build_status(session, turn);
                 r.refresh()?;
             }
+            // Messages from other atelier instances (see `coord`).
+            if session.poll_peers(&mut TuiUi { r: &mut *r }) {
+                r.refresh()?;
+            }
             if let Some(notice) = crate::update::take_notice() {
                 r.push_line(format!("! {notice}"), true);
                 r.refresh()?;

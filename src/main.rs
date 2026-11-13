@@ -9,6 +9,7 @@ mod auth;
 mod claude;
 mod config;
 mod context;
+mod coord;
 mod headless;
 mod js;
 mod mcp;
@@ -40,6 +41,11 @@ fn main() -> Result<()> {
     // `atelier update`: install the latest release now (see `update`).
     if args.first().map(String::as_str) == Some("update") {
         return update::run_command();
+    }
+    // `atelier coordinator [status|stop]`: the daemon that connects atelier
+    // instances (they launch it themselves), or a word with it (see `coord`).
+    if args.first().map(String::as_str) == Some("coordinator") {
+        return coord::run_command(&args[1..]);
     }
     #[cfg(unix)]
     if args.first().map(String::as_str) == Some("mcp-serve") {
@@ -76,9 +82,18 @@ fn main() -> Result<()> {
     let resume = args.iter().any(|a| a == "--continue" || a == "-c");
     let print_at = args.iter().position(|a| a == "--print" || a == "-p");
 
-    let tools = tools::builtin_registry();
+    let mut tools = tools::builtin_registry();
+    // Join the other atelier instances on this machine, starting the
+    // coordinator that connects them if this is the first one up.
+    let coordinator = coord::start(&root, &cfg.model);
+    if let Some(c) = &coordinator {
+        coord::tools::register(&mut tools, c);
+    }
     let context = context::default_providers();
     let mut session = agent::Session::new(cfg, root, tools, context, settings);
+    if let Some(c) = coordinator {
+        session.attach_coordinator(c);
+    }
     // Restore a prior Sign-in-with-ChatGPT session, if any (it routes
     // atelier's own loop, which the Claude backend doesn't use).
     if !claude && let Some(tokens) = auth::load() {
