@@ -1087,6 +1087,45 @@ fn custom_command_expands_into_the_prompt() {
     assert!(stdout.contains("unknown command '/nope'"), "{stdout}");
 }
 
+/// `/init` is a prompt, not a generator: it sends the brief for writing
+/// `AGENTS.md` — with what was typed after it as guidance — as an ordinary
+/// turn, and is a built-in a command file cannot replace.
+#[cfg(unix)]
+#[test]
+fn init_sends_the_brief_for_writing_agents_md() {
+    let mock = Mock::start(always("on it"));
+    let dir = unique_dir("init");
+    let commands = dir.join(".atelier/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("init.md"), "shadowing /init").unwrap();
+
+    let out = run_repl(
+        &mock.base_url(),
+        &dir,
+        "/init the web/ app matters most\n/help\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "{stdout}");
+    let prompt = messages_of(&request(&bodies[0]), "user").pop().unwrap();
+    for needle in [
+        "Write an `AGENTS.md` for this repository",
+        "how to run a single test",
+        "Keep it under about 60 lines",
+        "improve it rather than overwrite it",
+        "leave `CLAUDE.md` as it is",
+        "Further guidance from the user:\nthe web/ app matters most",
+    ] {
+        assert!(prompt.contains(needle), "{needle:?} in:\n{prompt}");
+    }
+    assert!(!prompt.contains("shadowing /init"), "{prompt}");
+    assert!(
+        stdout.contains("/init → a brief to write AGENTS.md"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  /init [guidance] "), "{stdout}");
+}
+
 /// Case 6 — skills. A project skill and a user-global one are advertised in
 /// the system message by name and description only. The mock model then
 /// loads the global skill and one of its files with the `skill` tool: both

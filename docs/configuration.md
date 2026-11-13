@@ -513,6 +513,17 @@ change the system message, so the inference server's prompt cache starts over
 from there — see [the shape of a
 request](sessions.md#the-shape-of-a-request).)
 
+**Starting one.** `/init` has the agent write the repository's `AGENTS.md`:
+it reads the README, the manifests, the CI and lint setup and any instruction
+file already there, then writes a short file (about 60 lines at most) holding
+only what it could not cheaply rediscover — the exact build, test and lint
+commands, conventions that differ from the ecosystem's defaults, the
+architecture in a few sentences, and what is easy to get wrong. An existing
+`AGENTS.md` is improved rather than replaced, and the agent says what it
+changed; a `CLAUDE.md` is left alone. Text after the command is passed on as
+guidance: `/init the web/ app matters most`. The file is written with the
+ordinary `write` tool, so the usual approval applies.
+
 ## `[[diagnostics]]`
 
 Each turn atelier runs the project's lint/typecheck commands and tells the

@@ -22,6 +22,7 @@
 mod batch;
 mod compact;
 mod goal;
+mod init;
 mod jobs;
 mod prompt;
 mod window;
@@ -215,6 +216,8 @@ const HELP: &[&str] = &[
     "  /usage                                this session's model requests, tokens and cost",
     "  /goal [condition|clear]               keep the agent working until a condition holds:",
     "                                        set it, show it (no argument), or clear it",
+    "  /init [guidance]                      have the agent write (or improve) this repository's",
+    "                                        AGENTS.md, from a look at the project",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
@@ -269,6 +272,18 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
     {
         session.goal_command(rest.trim(), ui);
         return Dispatch::Handled;
+    }
+    // `/init` is a prompt for the agent (see `init`); what follows it is
+    // guidance in the user's words.
+    if let Some(rest) = trimmed.strip_prefix("/init")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let prompt = init::prompt(rest);
+        ui.info(&format!(
+            "/init → a brief to write AGENTS.md ({} chars)",
+            prompt.chars().count()
+        ));
+        return Dispatch::Expanded(prompt);
     }
     // File-defined commands take their arguments as typed (prose, where an
     // apostrophe is not a quote), so they are looked up before the line is
