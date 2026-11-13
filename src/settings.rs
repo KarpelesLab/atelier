@@ -77,6 +77,28 @@ pub struct Settings {
     /// This instance among the others (see [`crate::coord`]).
     #[serde(default, skip_serializing_if = "CoordinatorSettings::is_unset")]
     pub coordinator: CoordinatorSettings,
+    /// Bounds on `/loop`.
+    #[serde(default, skip_serializing_if = "LoopSettings::is_unset")]
+    pub loops: LoopSettings,
+}
+
+/// `[loops]`: how long a `/loop` may go on (see `agent::loops`).
+///
+/// ```toml
+/// [loops]
+/// max_runs = 20
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoopSettings {
+    /// Times one loop fires before it stops by itself (default 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u32>,
+}
+
+impl LoopSettings {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[coordinator]`: whether other atelier instances may set this one to

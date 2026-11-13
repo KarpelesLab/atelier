@@ -450,6 +450,15 @@ max_rounds = 10      # times a prompt is sent back to work (default 10)
 max_tokens = 50000   # output tokens a prompt may generate (default: no limit)
 ```
 
+## `[loops]`
+
+How long a [`/loop`](loops.md) may go on.
+
+```toml
+[loops]
+max_runs = 50   # runs one loop gets before it stops by itself (default 50)
+```
+
 ## `[coordinator]`
 
 Whether your other atelier instances may set this one to work while it sits

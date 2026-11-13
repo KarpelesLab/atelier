@@ -110,6 +110,7 @@ first conversation, the REPL/TUI fallback).
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |
 | [Skills](docs/skills.md) | `SKILL.md` directories the agent loads on demand: `.atelier/skills/` (also `.claude/skills/`, `.agents/skills/`), the `skill` tool, `/skills` |
+| [Loops](docs/loops.md) | `/loop <interval> <prompt>`: re-send a prompt every 30s, 5m, 1h… while the session is idle; how loops stop; cron + `--print` for real schedules |
 | [Goals](docs/goals.md) | `/goal <condition>` and `--goal`: keep the agent working until a condition holds, checked by a judge at each turn's end; `[goals]` bounds |
 | [Hooks](docs/hooks.md) | Commands run on events (before/after a tool call, on a prompt, at turn end) that can observe or decide: `[[hooks]]`, the stdin/stdout contract, trust, `/hooks`, examples |
 | [Subagents](docs/agents.md) | The `task` tool: `explore` and `general`, your own agents as Markdown files in `.atelier/agents/` (also `.claude/agents/`), the step cap, parallel runs, background agents that report when done, worktree isolation, `/agents` |

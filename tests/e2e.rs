@@ -5736,3 +5736,50 @@ fn a_question_wakes_an_idle_instance_and_its_answer_comes_back() {
     coordinator(&coord, "stop");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `/loop` at a real prompt, with no coordinator: the session, left idle,
+/// sends the prompt by itself and says so; `/loop` lists it and
+/// `/loop stop` ends it.
+#[cfg(unix)]
+#[test]
+fn a_loop_runs_its_prompt_while_the_session_is_idle() {
+    let mock = Mock::start(always("all green"));
+    let dir = unique_dir("loop");
+    let mut child = atelier(&mock.base_url(), &dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn atelier");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    writeln!(stdin, "/loop 10m look at the build").unwrap();
+
+    // Nothing more is typed: the first run is the session's own doing.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while mock.requests() == 0 {
+        assert!(Instant::now() < deadline, "the loop never ran");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let prompt = messages_of(&request(&mock.body(0)), "user").pop().unwrap();
+    assert!(prompt.ends_with("look at the build"), "{prompt}");
+
+    writeln!(stdin, "/loop\n/loop stop 1\n/loop").unwrap();
+    drop(stdin); // end of input: atelier exits
+    let out = child.wait_with_output().expect("atelier's output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "loop 1: every 10m, up to 50 runs",
+        "⏰ loop 1 (run 1 of 50): look at the build",
+        "all green",
+        "loop 1: every 10m, 1 of 50 runs, next in 10m: look at the build",
+        "stopped loop 1",
+        "no loops",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    assert_eq!(mock.requests(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

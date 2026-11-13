@@ -252,6 +252,13 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Idle>
         match event {
             // A resize just needs a repaint; `refresh` re-reads the width.
             Event::Resize => r.refresh()?,
+            // Ctrl-C with nothing typed: there is no line to cancel, so it
+            // is the standing work that is cancelled — the `/loop`s.
+            Event::Key(Key::Ctrl('c')) if r.editor.is_empty() => {
+                if session.stop_loops(&mut TuiUi { r: &mut *r }) {
+                    r.refresh()?;
+                }
+            }
             Event::Key(k) => match edit_key(r, k) {
                 KeyAction::Exit => return Ok(Idle::Exit),
                 KeyAction::Submit(line) => {

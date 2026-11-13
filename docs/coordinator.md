@@ -170,6 +170,10 @@ What keeps this bounded:
 
 `atelier --print` never wakes: it runs its prompt and exits.
 
+A wake and a [`/loop`](loops.md) share the same mechanism — the idle prompt
+asks the session, a few times a second, whether it has a turn of its own to
+start — so they never overlap: one turn at a time, a wake before a loop.
+
 From a shell:
 
 ```sh

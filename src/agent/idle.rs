@@ -1,9 +1,11 @@
 //! Turns the session starts by itself, while it waits at the prompt.
 //!
-//! A session only works when its user prompts it. This module is the one
-//! exception, and it is opt-in: an idle instance may be **woken** by another
-//! instance — start a turn because a peer's question or message arrived,
-//! instead of holding it for the user's next prompt.
+//! A session only works when its user prompts it. This module holds the
+//! two exceptions, both of the user's choosing: an idle instance may be
+//! **woken** by another instance — start a turn because a peer's question
+//! or message arrived, instead of holding it for the user's next prompt —
+//! and a **loop** (`/loop`, see [`super::loops`]) re-sends a prompt at an
+//! interval.
 //!
 //! # The seam
 //!
@@ -15,6 +17,10 @@
 //! permission rules, same approval prompts. Nothing is approved because the
 //! turn started itself: a woken turn that needs an approval waits at the
 //! prompt for the user like any other.
+//!
+//! A tick starts at most one turn: a wake that is due, else the loop that
+//! has been due longest. Nothing starts while the user has text on the
+//! input line.
 //!
 //! # Waking
 //!
@@ -42,8 +48,9 @@
 use std::io::{self, BufRead};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use super::loops::Loops;
 use super::{Session, Ui};
 use crate::coord::{self, Wake};
 use crate::settings::Settings;
@@ -75,6 +82,8 @@ pub(super) struct Idle {
     woken: u32,
     /// A wake decided on, waiting for the prompt to be free.
     due: Option<Due>,
+    /// The `/loop`s.
+    loops: Loops,
 }
 
 /// The message a wake is for.
@@ -95,7 +104,10 @@ impl Idle {
             Ok(v) if !v.is_empty() => Wake::parse(&v).unwrap_or(Wake::Never),
             _ => settings.coordinator.wake.unwrap_or_default(),
         };
-        Self::new(policy, settings.coordinator.wake_max)
+        Self {
+            loops: Loops::new(settings.loops.max_runs),
+            ..Self::new(policy, settings.coordinator.wake_max)
+        }
     }
 
     fn new(policy: Wake, wake_max: Option<u32>) -> Self {
@@ -104,6 +116,7 @@ impl Idle {
             wake_max: wake_max.unwrap_or(DEFAULT_WAKE_MAX),
             woken: 0,
             due: None,
+            loops: Loops::new(None),
         }
     }
 
@@ -148,10 +161,48 @@ impl Session {
     /// itself (see the module docs). `typing` says the user has text on the
     /// input line; nothing starts under their fingers.
     pub fn idle_tick(&mut self, typing: bool, ui: &mut dyn Ui) -> Option<String> {
+        self.idle_tick_at(Instant::now(), typing, ui)
+    }
+
+    /// [`idle_tick`](Self::idle_tick) at the time `now`.
+    fn idle_tick_at(&mut self, now: Instant, typing: bool, ui: &mut dyn Ui) -> Option<String> {
         if typing {
             return None;
         }
-        self.wake(ui)
+        self.wake(ui).or_else(|| self.fire_loop(now, ui))
+    }
+
+    /// Start the turn of the loop that is due, if one is.
+    fn fire_loop(&mut self, now: Instant, ui: &mut dyn Ui) -> Option<String> {
+        let firing = self.idle.loops.due(now)?;
+        // A loop is the user's standing order: what its turn sends counts
+        // as coming from them.
+        if let Some(coord) = &self.coord {
+            coord.set_wake_depth(0);
+        }
+        ui.info(&firing.notice);
+        Some(firing.prompt)
+    }
+
+    /// `/loop …` (see [`super::loops`]).
+    pub(super) fn loop_command(&mut self, rest: &str, ui: &mut dyn Ui) {
+        for line in self.idle.loops.command(rest, Instant::now()) {
+            ui.info(&line);
+        }
+    }
+
+    /// End every loop — Ctrl-C at an empty prompt, which only the TUI sees
+    /// (in the line REPL it ends the process). Returns whether there was
+    /// one to end (and it was said).
+    #[cfg_attr(not(tui), allow(dead_code))]
+    pub fn stop_loops(&mut self, ui: &mut dyn Ui) -> bool {
+        match self.idle.loops.stop_all() {
+            0 => false,
+            n => {
+                ui.info(&format!("⏰ stopped {n} loop(s)"));
+                true
+            }
+        }
     }
 
     /// Start the wake that is due, if one is.
@@ -186,11 +237,14 @@ impl Session {
         }
     }
 
-    /// A turn is over, however it ended.
-    pub(super) fn turn_ended(&mut self, ui: &mut dyn Ui) {
+    /// A turn is over; `ok` unless it ended in an error.
+    pub(super) fn turn_ended(&mut self, ok: bool, ui: &mut dyn Ui) {
         self.close_peer_questions(ui);
         // Whatever arrived before or during the turn was given to it.
         self.idle.due = None;
+        if let Some(stopped) = self.idle.loops.turn_ended(ok) {
+            ui.info(&stopped);
+        }
     }
 }
 
@@ -366,7 +420,7 @@ mod tests {
             }
             // Decided once: nothing starts later for the same message.
             assert!(session.idle_tick(false, &mut ui).is_none());
-            session.turn_ended(&mut ui);
+            session.turn_ended(true, &mut ui);
             session.user_typed();
 
             let asker = {
@@ -416,7 +470,7 @@ mod tests {
             shown(session, ui, body);
             let started = session.idle_tick(false, ui).is_some();
             session.peer_lead(&me);
-            session.turn_ended(ui);
+            session.turn_ended(true, ui);
             started
         };
         assert!(arrives(&mut session, &mut ui, "one"));
@@ -461,11 +515,11 @@ mod tests {
         assert!(wakes(&a_link, &mut b, &b_link, &mut b_ui, "from a's user"));
         // b's woken turn answers a: a wakes, once.
         assert!(wakes(&b_link, &mut a, &a_link, &mut a_ui, "b's reply"));
-        b.turn_ended(&mut b_ui);
+        b.turn_ended(true, &mut b_ui);
         // a's woken turn writes back: b, which already woke, stays idle —
         // and so does a for whatever a woken b might have sent.
         assert!(!wakes(&a_link, &mut b, &b_link, &mut b_ui, "a again"));
-        a.turn_ended(&mut a_ui);
+        a.turn_ended(true, &mut a_ui);
         assert!(!wakes(&a_link, &mut b, &b_link, &mut b_ui, "and again"));
 
         // b's user comes back: b may wake again, once more, and what it then
@@ -479,7 +533,7 @@ mod tests {
             &mut a_ui,
             "b's second reply"
         ));
-        b.turn_ended(&mut b_ui);
+        b.turn_ended(true, &mut b_ui);
         // And a prompt at a starts the count from nothing.
         a.user_typed();
         b.user_typed();
@@ -489,6 +543,71 @@ mod tests {
         }
     }
 
+    /// `/loop` through the session, with no coordinator at all: the idle
+    /// tick hands out the prompt when it is due, announces it, holds it
+    /// back while the user types, and Ctrl-C ends it.
+    #[test]
+    fn a_loop_fires_through_the_idle_tick() {
+        use crate::agent::tests::{Quiet, scratch_session};
+        let (mut session, root) = scratch_session("idle-loop");
+        let mut ui = Quiet::default();
+        let secs = Duration::from_secs;
+        assert!(matches!(
+            crate::agent::dispatch(&mut session, "/loop 30s  run the tests", &mut ui),
+            crate::agent::Dispatch::Handled
+        ));
+        assert_eq!(
+            ui.infos,
+            ["loop 1: every 30s, up to 50 runs — /loop stop 1 ends it"]
+        );
+        // (The loop was created at the real "now"; the clock below starts
+        // a little after it.)
+        let t0 = Instant::now();
+
+        // Not under the user's fingers…
+        assert_eq!(session.idle_tick_at(t0, true, &mut ui), None);
+        // …then at once, announced.
+        let prompt = session.idle_tick_at(t0, false, &mut ui);
+        assert_eq!(prompt.as_deref(), Some("run the tests"));
+        assert_eq!(ui.infos[1], "⏰ loop 1 (run 1 of 50): run the tests");
+        session.turn_ended(true, &mut ui);
+        // Idle, but not due.
+        assert_eq!(session.idle_tick_at(t0 + secs(29), false, &mut ui), None);
+        // Due while a (long) turn runs: nothing asks. Idle again: once.
+        let idle_again = t0 + secs(400);
+        assert!(session.idle_tick_at(idle_again, false, &mut ui).is_some());
+        // That turn fails, and so does the next: the loop is stopped.
+        session.turn_ended(false, &mut ui);
+        assert_eq!(session.idle_tick_at(idle_again, false, &mut ui), None);
+        assert!(
+            session
+                .idle_tick_at(idle_again + secs(30), false, &mut ui)
+                .is_some()
+        );
+        session.turn_ended(false, &mut ui);
+        assert_eq!(
+            ui.infos.last().unwrap(),
+            "⏰ loop 1 stopped: its turn failed 2 times in a row"
+        );
+        assert_eq!(
+            session.idle_tick_at(idle_again + secs(600), false, &mut ui),
+            None
+        );
+
+        // Ctrl-C at an empty prompt ends what is left; with nothing left it
+        // has nothing to say.
+        crate::agent::dispatch(&mut session, "/loop 10s one", &mut ui);
+        crate::agent::dispatch(&mut session, "/loop 1h two", &mut ui);
+        assert!(session.stop_loops(&mut ui));
+        assert_eq!(ui.infos.last().unwrap(), "⏰ stopped 2 loop(s)");
+        assert!(!session.stop_loops(&mut ui));
+        assert_eq!(
+            session.idle_tick_at(idle_again + secs(9000), false, &mut ui),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_policy_is_read_from_settings() {
         let settings: Settings =
@@ -496,9 +615,14 @@ mod tests {
                 .unwrap();
         assert_eq!(settings.coordinator.wake, Some(Wake::Questions));
         assert_eq!(settings.coordinator.wake_max, Some(3));
+        let settings: Settings = tomlproc::serde::from_str("[loops]\nmax_runs = 4\n").unwrap();
+        assert_eq!(settings.loops.max_runs, Some(4));
         // Left out when unset, so rewriting the file does not add the table.
         let text = tomlproc::serde::to_string_pretty(&Settings::default()).unwrap();
-        assert!(!text.contains("coordinator"), "{text}");
+        assert!(
+            !text.contains("coordinator") && !text.contains("loops"),
+            "{text}"
+        );
         assert_eq!(Wake::parse("always"), Some(Wake::Always));
         assert_eq!(Wake::parse("sometimes"), None);
     }

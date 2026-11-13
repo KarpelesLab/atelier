@@ -25,6 +25,7 @@ mod goal;
 mod idle;
 mod init;
 mod jobs;
+mod loops;
 mod prompt;
 mod window;
 
@@ -241,6 +242,8 @@ const HELP: &[&str] = &[
     "                                        set it, show it (no argument), or clear it",
     "  /init [guidance]                      have the agent write (or improve) this repository's",
     "                                        AGENTS.md, from a look at the project",
+    "  /loop [<interval> <prompt>]           re-send a prompt every 30s, 5m, 1h… while idle;",
+    "                                        no argument lists the loops; /loop stop [n|all]",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
@@ -300,6 +303,13 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         && (rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
         session.goal_command(rest.trim(), ui);
+        return Dispatch::Handled;
+    }
+    // And `/loop`'s prompt (see `loops`).
+    if let Some(rest) = trimmed.strip_prefix("/loop")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        session.loop_command(rest.trim(), ui);
         return Dispatch::Handled;
     }
     // `/init` is a prompt for the agent (see `init`); what follows it is
@@ -1588,7 +1598,7 @@ impl Session {
     /// the turn are delivered the way messages typed mid-turn are.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
         let result = self.send_inner(user_input, ui);
-        self.turn_ended(ui);
+        self.turn_ended(result.is_ok(), ui);
         result
     }
 
