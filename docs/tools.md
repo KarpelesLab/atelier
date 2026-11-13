@@ -93,7 +93,9 @@ are deleted when a new one is written (the new one always stays). Searches
 and listings of the project — `grep`, `glob`, `tree`, `fs.glob` in `node`,
 the layout context — leave `.atelier/tool-output/` out, whether or not the
 project git-ignores `.atelier/`, unless the directory or a file in it is
-named as the `path`.
+named as the `path`. The same goes for `.atelier/worktrees/`, where
+[isolated subagents](agents.md#worktree-isolation) work in copies of the
+repository.
 
 `read`, `grep`, `glob` and `web_fetch` page or cap by themselves and are not
 affected.
@@ -545,6 +547,7 @@ their descriptions.
 | `prompt`      | string | yes      | The complete task — goal, known facts and paths, what to report |
 | `description` | string | no       | The task in 3–6 words, shown while it runs (default: the prompt's first line) |
 | `background`  | boolean | no      | Start the agent and return its id at once instead of waiting for its report (default false; `run_in_background` is accepted too) |
+| `isolation`   | string | no       | `"worktree"`: the agent works in a fresh git worktree at HEAD instead of the project directory. Uncommitted changes are not carried over. An agent whose definition says `isolation: worktree` is isolated whatever the call says |
 
 The result is the subagent's final message followed by a footer,
 `[explore: 7 steps · 412 output tokens]`. A subagent that reaches its step
@@ -560,6 +563,14 @@ does. A background agent has no user to ask, so a call the permission rules
 would ask about is denied to it; see [in the
 background](agents.md#in-the-background) for that, `/agents stop`, and the
 limit of 4 running at once.
+
+With `isolation: "worktree"` the agent's project root is its own [git
+worktree](agents.md#worktree-isolation) under `.atelier/worktrees/<id>/`. If
+it changed anything, its report ends with the worktree's path, a `git diff
+--stat` against the base commit and the command that brings the changes over
+(`git -C <worktree> diff --binary <base> | git apply`); nothing is merged
+automatically. An untouched worktree is removed. Outside a git repository,
+or in one without a commit, the call is an error result.
 
 `task` calls that follow one another in one step run at the same time; their
 results come back in call order. Subagents have every limit the caller has —

@@ -36,6 +36,9 @@
 //!   Default: every tool the session has
 //! - `max_steps` — optional; model requests the agent may make before it is
 //!   told to wrap up (default [`DEFAULT_MAX_STEPS`])
+//! - `isolation` — optional; `worktree` has every run of the agent work in
+//!   a git worktree of its own instead of the project directory (see
+//!   [`Isolation`])
 //!
 //! No agent ever gets the `task` tool, whatever `tools` says: subagents do
 //! not start subagents.
@@ -57,6 +60,36 @@ pub const TASK_TOOL: &str = "task";
 
 /// Model requests an agent may make when its definition does not say.
 pub const DEFAULT_MAX_STEPS: u32 = 40;
+
+/// Where the worktrees of isolated agents are kept, relative to the project
+/// root: one directory per run, named by the run's id.
+pub const WORKTREES_DIR: &str = ".atelier/worktrees";
+
+/// Where an agent works.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Isolation {
+    /// In the project directory, with its parent.
+    #[default]
+    Shared,
+    /// In a fresh git worktree of the repository, so that what it changes
+    /// cannot collide with what its parent changes (see
+    /// `agent::subagent`'s `worktree` module).
+    Worktree,
+}
+
+impl Isolation {
+    /// Read the value of an `isolation` key — an agent file's, or a `task`
+    /// call's.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "worktree" => Ok(Isolation::Worktree),
+            "none" => Ok(Isolation::Shared),
+            other => Err(format!(
+                "`isolation` must be \"worktree\" (or \"none\"), not {other:?}"
+            )),
+        }
+    }
+}
 
 /// Longest agent name accepted.
 const MAX_NAME_CHARS: usize = 64;
@@ -124,6 +157,8 @@ pub struct Agent {
     pub tools: Option<Vec<String>>,
     /// Model requests it may make before tools are withdrawn.
     pub max_steps: u32,
+    /// Where it works, unless the call that runs it asks for a worktree.
+    pub isolation: Isolation,
     /// Its system prompt.
     pub prompt: String,
     pub source: Source,
@@ -205,6 +240,7 @@ fn builtins() -> Vec<Agent> {
             model: None,
             tools: Some(EXPLORE_TOOLS.iter().map(|t| t.to_string()).collect()),
             max_steps: DEFAULT_MAX_STEPS,
+            isolation: Isolation::Shared,
             prompt: EXPLORE_PROMPT.to_string(),
             source: Source::Builtin,
         },
@@ -217,6 +253,7 @@ fn builtins() -> Vec<Agent> {
             model: None,
             tools: None,
             max_steps: DEFAULT_MAX_STEPS,
+            isolation: Isolation::Shared,
             prompt: GENERAL_PROMPT.to_string(),
             source: Source::Builtin,
         },
@@ -286,6 +323,10 @@ fn parse(stem: &str, text: &str, claude_compat: bool) -> Result<Agent> {
             .filter(|&n| n > 0)
             .with_context(|| format!("`max_steps` must be a positive number, not {v:?}"))?,
     };
+    let isolation = match field("isolation") {
+        None => Isolation::Shared,
+        Some(value) => Isolation::parse(value).map_err(anyhow::Error::msg)?,
+    };
     // `inherit` is how other harnesses spell "the session's model".
     let model = field("model")
         .filter(|m| !claude_compat && *m != "inherit")
@@ -296,6 +337,7 @@ fn parse(stem: &str, text: &str, claude_compat: bool) -> Result<Agent> {
         model,
         tools: field("tools").map(tool_list),
         max_steps,
+        isolation,
         prompt: prompt.to_string(),
         // Replaced by `scan`, which knows the path.
         source: Source::Builtin,
@@ -339,8 +381,12 @@ pub fn command(root: &Path, global: Option<&Path>) -> Vec<String> {
             .as_ref()
             .map(|m| format!(" · model: {m}"))
             .unwrap_or_default();
+        let isolation = match a.isolation {
+            Isolation::Shared => "",
+            Isolation::Worktree => " · isolation: worktree",
+        };
         out.push(format!(
-            "      {source} · tools: {tools} · max {} steps{model}",
+            "      {source} · tools: {tools} · max {} steps{model}{isolation}",
             a.max_steps
         ));
     }
@@ -350,7 +396,7 @@ pub fn command(root: &Path, global: Option<&Path>) -> Vec<String> {
     }
     out.push(
         "  define one in .atelier/agents/<name>.md (front matter: description, tools, model, \
-         max_steps; the body is its system prompt)"
+         max_steps, isolation; the body is its system prompt)"
             .to_string(),
     );
     out
@@ -406,6 +452,7 @@ mod tests {
         assert_eq!(agent.description, "Reviews a diff");
         assert_eq!(agent.model.as_deref(), Some("big-model"));
         assert_eq!(agent.max_steps, 12);
+        assert_eq!(agent.isolation, Isolation::Shared);
         assert_eq!(agent.prompt, "You review diffs.");
         assert!(agent.allows("read") && agent.allows("mcp__docs__search"));
         assert!(!agent.allows("write") && !agent.allows("mcp__other__search"));
@@ -418,6 +465,32 @@ mod tests {
         // Even when the file asks for it.
         let greedy = parse("g", "---\ndescription: d\ntools: \"*\"\n---\nBody", false).unwrap();
         assert!(greedy.allows("bash") && !greedy.allows("task"));
+    }
+
+    #[test]
+    fn isolation_is_worktree_or_nothing() {
+        let with = |value: &str| {
+            let text = format!("---\ndescription: d\nisolation: {value}\n---\nBody");
+            parse("writer", &text, false)
+        };
+        assert_eq!(with("worktree").unwrap().isolation, Isolation::Worktree);
+        assert_eq!(with("none").unwrap().isolation, Isolation::Shared);
+        // A value that names no isolation must not quietly mean "none".
+        let err = with("sandbox").unwrap_err().to_string();
+        assert!(err.contains("`isolation` must be \"worktree\""), "{err}");
+
+        let (root, global) = dirs("isolation");
+        write(
+            root.join(".atelier/agents/writer.md"),
+            "---\ndescription: d\nisolation: worktree\n---\nBody",
+        );
+        let listing = command(&root, Some(&global)).join("\n");
+        assert!(
+            listing.contains(
+                ".atelier/agents/writer.md · tools: all · max 40 steps · isolation: worktree"
+            ),
+            "{listing}"
+        );
     }
 
     #[test]

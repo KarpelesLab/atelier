@@ -5182,3 +5182,390 @@ fn a_background_agents_call_that_would_ask_is_denied() {
     assert!(last.contains("CHILD-REPORT: I needed bash"), "{last}");
     assert!(of_type(&events, "approval").is_empty(), "{events:?}");
 }
+
+/// Run `git` in `dir` for a test — with an identity for commits, whatever
+/// the machine's own configuration says — and return what it printed.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A project that is a git repository with one commit: `a.txt` and an
+/// `AGENTS.md` saying `COMMITTED-RULES`.
+fn committed_project(name: &str) -> PathBuf {
+    let dir = unique_dir(name);
+    git_out(&dir, &["init", "--quiet"]);
+    std::fs::write(dir.join("a.txt"), "committed\n").unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "COMMITTED-RULES").unwrap();
+    git_out(&dir, &["add", "--all"]);
+    git_out(&dir, &["commit", "--quiet", "-m", "base"]);
+    dir
+}
+
+/// Worktree isolation 1 — a child that writes. With `isolation:
+/// "worktree"` the child's project root is a fresh worktree of the
+/// repository at HEAD: its write lands there and not in the parent's tree,
+/// its `bash` runs there, its instruction files come from there, and what
+/// the parent has not committed is not there. The report ends with where
+/// the worktree is, the diff stat and the command that brings the changes
+/// over — which works. The parent's own searches do not wander into the
+/// copy, and its `git status` does not show it.
+#[cfg(unix)]
+#[test]
+fn an_isolated_subagent_works_in_a_worktree_and_reports_its_changes() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(GENERAL_MARKER) {
+            let call = |name: &str, args: serde_json::Value| json_tool_call("call", name, args);
+            return match results {
+                0 => call(
+                    "write",
+                    serde_json::json!({"path": "made.txt", "content": "WRITTEN-BY-THE-AGENT\n"}),
+                ),
+                1 => call("read", serde_json::json!({"path": "draft.txt"})),
+                2 => call("grep", serde_json::json!({"pattern": "committed"})),
+                3 => call("bash", serde_json::json!({"command": "pwd"})),
+                _ => text_response("CHILD-REPORT"),
+            };
+        }
+        match results {
+            0 => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "CHILD-TASK",
+                    "isolation": "worktree",
+                }),
+            ),
+            1 => json_tool_call(
+                "call_grep",
+                "grep",
+                serde_json::json!({"pattern": "WRITTEN-BY-THE-AGENT"}),
+            ),
+            _ => text_response("parent done"),
+        }
+    }));
+    let dir = committed_project("worktree");
+    // Not committed: an edit of the instructions, and a new file.
+    std::fs::write(dir.join("AGENTS.md"), "UNCOMMITTED-RULES").unwrap();
+    std::fs::write(dir.join("draft.txt"), "a draft\n").unwrap();
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "go"],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    // The write is in the worktree, not in the parent's tree.
+    let worktree = dir.join(".atelier/worktrees/agent-1");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("made.txt")).unwrap(),
+        "WRITTEN-BY-THE-AGENT\n"
+    );
+    assert!(!dir.join("made.txt").exists());
+
+    // The child saw the repository as committed, and worked in its copy.
+    let child = requests_with_system(&mock, GENERAL_MARKER);
+    assert_eq!(child.len(), 5, "stderr: {stderr}");
+    let system = child[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("COMMITTED-RULES"), "{system}");
+    assert!(!system.contains("UNCOMMITTED-RULES"), "{system}");
+    let did = messages_of(&child[4], "tool");
+    assert!(did[0].starts_with("wrote "), "{did:?}");
+    assert!(did[1].starts_with("error:"), "{did:?}");
+    assert_eq!(did[2], "a.txt:1:committed", "{did:?}");
+    assert!(
+        did[3].contains("/.atelier/worktrees/agent-1\n"),
+        "bash ran in {did:?}"
+    );
+
+    // The report: the child's answer, then the worktree and what is in it.
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = messages_of(&parent[1], "tool");
+    let report = &results[0];
+    assert!(
+        report.starts_with("CHILD-REPORT\n\n[general: 5 steps"),
+        "{report}"
+    );
+    assert!(
+        report.contains("\n\n[worktree: .atelier/worktrees/agent-1 — "),
+        "{report}"
+    );
+    assert!(report.contains(" made.txt | 1 +"), "{report}");
+    assert!(
+        report.contains("1 file changed, 1 insertion(+)"),
+        "{report}"
+    );
+    let command = report
+        .lines()
+        .find(|l| l.contains("diff --binary"))
+        .expect("the command to bring the changes over")
+        .trim();
+    assert!(
+        command.starts_with("git -C .atelier/worktrees/agent-1 diff --binary ")
+            && command.ends_with(" | git apply"),
+        "{command}"
+    );
+
+    // The parent's search of the project does not find the copy.
+    let results = messages_of(&parent[2], "tool");
+    assert_eq!(results[1], "no matches found");
+    // Nor does its git: only what the test itself left uncommitted.
+    let status = git_out(&dir, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(status.contains(" M AGENTS.md") && status.contains("?? draft.txt"));
+    assert!(!status.contains("worktrees"), "{status}");
+
+    // What the user is told when it ends.
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert_eq!(
+        info.last().unwrap(),
+        &"⤶ general: done (5 steps) — changes left in .atelier/worktrees/agent-1"
+    );
+
+    // And the command does what the report says.
+    let applied = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(applied.status.success(), "{applied:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("made.txt")).unwrap(),
+        "WRITTEN-BY-THE-AGENT\n"
+    );
+}
+
+/// Worktree isolation 2 — a child that changes nothing. An agent defined
+/// with `isolation: worktree` gets a worktree without the call asking for
+/// one; having only read, it leaves nothing, and the worktree is removed
+/// when it ends.
+#[test]
+fn an_unchanged_worktree_is_removed_when_the_subagent_ends() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains("SCOUT-PROMPT");
+        let answered = !messages_of(&request(body), "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({"agent": "scout", "prompt": "CHILD-TASK"}),
+            ),
+            (true, false) => {
+                json_tool_call("call_read", "read", serde_json::json!({"path": "a.txt"}))
+            }
+            (true, true) => text_response("CHILD-REPORT"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let dir = committed_project("worktree-unchanged");
+    let agents = dir.join(".atelier/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("scout.md"),
+        "---\ndescription: Looks around\ntools: read\nisolation: worktree\n---\n\nSCOUT-PROMPT\n",
+    )
+    .unwrap();
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "go"],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    // It read the committed file, from a worktree that is gone now.
+    let child = requests_with_system(&mock, "SCOUT-PROMPT");
+    assert_eq!(child.len(), 2, "stderr: {stderr}");
+    assert!(messages_of(&child[1], "tool")[0].contains("committed"));
+    assert!(!dir.join(".atelier/worktrees/agent-1").exists());
+    let listed = git_out(&dir, &["worktree", "list"]);
+    assert_eq!(listed.lines().count(), 1, "{listed}");
+
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = messages_of(&parent[1], "tool");
+    assert!(results[0].starts_with("CHILD-REPORT\n\n[scout: 2 steps"));
+    assert!(
+        results[0].ends_with(
+            "\n\n[worktree: the agent changed nothing in its worktree, which was removed]"
+        ),
+        "{results:?}"
+    );
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert_eq!(info.last().unwrap(), &"⤶ scout: done (2 steps)");
+}
+
+/// Worktree isolation 3 — where there is nothing to make a worktree of.
+/// Outside a git repository, and in one without a commit, an isolated task
+/// is an error result that says why; the agent does not run — not in the
+/// shared directory either — in the foreground or in the background.
+#[test]
+fn isolation_without_a_repository_or_a_commit_is_an_error_result() {
+    let run = |name: &str, init: bool, background: bool| {
+        let mock = Mock::by_body(Arc::new(move |body| {
+            match messages_of(&request(body), "tool").len() {
+                0 => json_tool_call(
+                    "call_task",
+                    "task",
+                    serde_json::json!({
+                        "agent": "general",
+                        "prompt": "CHILD-TASK",
+                        "isolation": "worktree",
+                        "background": background,
+                    }),
+                ),
+                _ => text_response("parent done"),
+            }
+        }));
+        let dir = unique_dir(name);
+        if init {
+            git_out(&dir, &["init", "--quiet"]);
+        }
+        let out = run_atelier(
+            &mock.base_url(),
+            &dir,
+            &["-p", "--output-format", "stream-json", "go"],
+            None,
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+        // The parent's two requests, and none of a child.
+        assert_eq!(mock.requests(), 2, "stderr: {stderr}");
+        assert!(requests_with_system(&mock, GENERAL_MARKER).is_empty());
+        assert!(!dir.join(".atelier/worktrees").exists());
+        let events = json_lines(&out);
+        assert_eq!(of_type(&events, "tool_end")[0]["ok"], false);
+        messages_of(&request(&mock.body(1)), "tool")[0].clone()
+    };
+
+    let plain = run("worktree-no-repo", false, false);
+    assert!(
+        plain.starts_with(
+            "error: the agent was not started: isolation \"worktree\" needs a git repository"
+        ),
+        "{plain}"
+    );
+    let empty = run("worktree-no-commit", true, false);
+    assert!(
+        empty.contains("needs a commit to check out, and this repository has none yet"),
+        "{empty}"
+    );
+    let background = run("worktree-no-repo-bg", false, true);
+    assert!(
+        background.starts_with("error: the agent was not started: isolation"),
+        "{background}"
+    );
+}
+
+/// Worktree isolation 4 — in the background, and cleaning up. A background
+/// agent in a worktree reports the same way, the summary of its changes
+/// inside its notice. `/agents clean` keeps a worktree that holds changes
+/// and says how to remove it; naming it removes it.
+#[test]
+fn a_background_agent_in_a_worktree_reports_its_changes_and_clean_removes_it() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(GENERAL_MARKER) {
+            return match results {
+                0 => json_tool_call(
+                    "call_write",
+                    "write",
+                    serde_json::json!({"path": "made.txt", "content": "by the agent\n"}),
+                ),
+                _ => text_response("CHILD-REPORT"),
+            };
+        }
+        let users = messages_of(&req, "user");
+        match results {
+            _ if users.last().unwrap().contains("second prompt") => text_response("seen"),
+            0 => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "CHILD-TASK",
+                    "background": true,
+                    "isolation": "worktree",
+                }),
+            ),
+            _ => text_response("turn over"),
+        }
+    }));
+    let dir = committed_project("worktree-bg");
+    let worktree = dir.join(".atelier/worktrees/agent-1");
+    let mut repl = LiveRepl::start(&mock.base_url(), &dir);
+
+    repl.line("first prompt");
+    repl.wait_for("turn over");
+    repl.type_until(
+        "/agents",
+        "⤶ general agent-1: done (2 steps) — changes left in .atelier/worktrees/agent-1",
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("made.txt")).unwrap(),
+        "by the agent\n"
+    );
+    assert!(!dir.join("made.txt").exists());
+
+    // Unconfirmed, a worktree with changes stays.
+    repl.line("/agents clean");
+    repl.wait_for("agent-1: kept — 1 changed file. /agents clean agent-1 removes it anyway");
+    assert!(worktree.exists());
+
+    repl.line("second prompt");
+    repl.wait_for("seen");
+    repl.line("/agents clean agent-1");
+    repl.wait_for("agent-1: removed, with its changes");
+    let (stdout, stderr) = repl.finish();
+    assert!(!worktree.exists(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(git_out(&dir, &["worktree", "list"]).lines().count(), 1);
+
+    // The notice carried the report and the worktree's summary together.
+    let last = mock.body(mock.requests() - 1);
+    let users = messages_of(&request(&last), "user");
+    let prompt = users.last().unwrap();
+    assert!(
+        prompt.contains(
+            "<subagent id=\"agent-1\" agent=\"general\" status=\"done\" steps=\"2\">\nCHILD-REPORT\n\n\
+             [general agent-1: 2 steps"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("\n\n[worktree: .atelier/worktrees/agent-1 — "),
+        "{prompt}"
+    );
+    assert!(prompt.contains(" made.txt | 1 +"), "{prompt}");
+    assert!(
+        prompt.contains("git -C .atelier/worktrees/agent-1 diff --binary "),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("second prompt"), "{prompt}");
+}

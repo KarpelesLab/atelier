@@ -10,7 +10,8 @@
 //! - **a subset of the parent's tools**: the same tool objects, filtered to
 //!   what the agent's definition allows — never `task`, so the depth is one;
 //! - **copies** of the parent's configuration (endpoint, model unless the
-//!   agent names one, a ChatGPT sign-in) and project root;
+//!   agent names one, a ChatGPT sign-in) and project root — or, isolated,
+//!   a root of its own (see "In a worktree" below);
 //! - **standing context only**: the project's instruction files, not the
 //!   per-turn snapshot (git status, diagnostics) the parent's prompt carries;
 //! - **nothing persisted**: it is never saved as the project's session, and
@@ -52,12 +53,26 @@
 //! rules deciding its calls where a foreground child's are put to the user.
 //! See the `background` module for that and for how its report comes back.
 //!
-//! Not here yet (see ROADMAP.md, M18): worktree isolation, and running a
-//! child as another atelier instance through the coordinator.
+//! # In a worktree
+//!
+//! An agent defined with `isolation: worktree`, or a call that asks for
+//! it, runs with its project root set to a fresh git worktree of the
+//! repository instead of the parent's directory — in the foreground or in
+//! the background alike. Nothing else about the child changes: its root is
+//! what confines its file tools and where its `bash` runs, so a different
+//! root is the whole of the isolation. When it ends, the worktree is
+//! removed if untouched, and otherwise described at the end of the child's
+//! report for the parent to take the changes from. See the `worktree`
+//! module.
+//!
+//! Not here yet (see ROADMAP.md, M18): running a child as another atelier
+//! instance through the coordinator.
 
 mod background;
+mod worktree;
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -66,7 +81,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{Approval, Session, Ui};
-use crate::agents::{self, Agent, TASK_TOOL};
+use crate::agents::{self, Agent, Isolation, TASK_TOOL};
 use crate::context;
 use crate::permissions::DENIED;
 use crate::provider::ToolCall;
@@ -74,6 +89,7 @@ use crate::tools::task::TaskCall;
 
 pub(super) use background::{Background, NOTICE_OPEN, Roster};
 use background::{Rules, Seat};
+use worktree::Worktree;
 
 /// Added to every agent's system prompt: what being a subagent means.
 const SUBAGENT_NOTE: &str = "\
@@ -270,6 +286,8 @@ struct Job {
     prompt: String,
     session: Session,
     link: Link,
+    /// Where it works, when isolated: settled when it ends.
+    worktree: Option<Worktree>,
 }
 
 impl Job {
@@ -300,7 +318,7 @@ impl Job {
         }
         footer.push(']');
         let last = self.session.last_answer();
-        let outcome = match result {
+        let mut outcome = match result {
             // Told to stop, it ended without the report it was asked for.
             Ok(()) if self.link.stopped_in_background() => {
                 let said = match last.trim() {
@@ -347,6 +365,13 @@ impl Job {
                 tokens_out,
             },
         };
+        // However it ended: what it left in a worktree of its own is part
+        // of what it reports.
+        if let Some(worktree) = self.worktree.take() {
+            let settled = worktree.settle();
+            outcome.text.push_str(&settled.report);
+            outcome.line.push_str(&settled.note);
+        }
         self.link.done(outcome);
     }
 }
@@ -390,6 +415,16 @@ impl Session {
                 }
                 Ok(task) => {
                     ui.tool_start(&call.name, &call.arguments);
+                    let id = || self.background.roster().next_id(self.ids_taken());
+                    let worktree = match self.isolate(task.isolation, id) {
+                        Ok(worktree) => worktree,
+                        // Asked for and not to be had: the call fails.
+                        Err(msg) => {
+                            ui.tool_end(&call.name, &msg, false);
+                            slots.push(Slot::Settled(msg));
+                            continue;
+                        }
+                    };
                     let link = Link {
                         stop: Arc::clone(&stop),
                         to: Parent::Waiting {
@@ -397,7 +432,9 @@ impl Session {
                             events: events.clone(),
                         },
                     };
-                    jobs.push((index, self.child(&task.agent, link.clone()), task, link));
+                    let root = worktree.as_ref().map(Worktree::root);
+                    let session = self.child(&task.agent, link.clone(), root);
+                    jobs.push((index, session, task, link, worktree));
                     slots.push(Slot::Running);
                 }
                 Err(msg) => {
@@ -415,7 +452,7 @@ impl Session {
         let jobs: Vec<Job> = jobs
             .into_iter()
             .enumerate()
-            .map(|(n, (index, session, task, link))| {
+            .map(|(n, (index, session, task, link, worktree))| {
                 let label = if several {
                     format!("{}#{}", task.agent.name, n + 1)
                 } else {
@@ -429,6 +466,7 @@ impl Session {
                     prompt: task.prompt,
                     session,
                     link,
+                    worktree,
                 }
             })
             .collect();
@@ -508,9 +546,21 @@ impl Session {
             max.unwrap_or(background::DEFAULT_MAX),
             &task.agent.name,
             &task.description,
+            self.ids_taken(),
         )?;
         let seat = Arc::new(seat);
         let (id, name) = (seat.id(), task.agent.name.clone());
+        let worktree = match self.isolate(task.isolation, || id.clone()) {
+            Ok(worktree) => worktree,
+            Err(msg) => {
+                seat.withdraw();
+                return Err(msg);
+            }
+        };
+        if let Some(worktree) = &worktree {
+            seat.set_worktree(worktree.dir().to_path_buf());
+        }
+        let root = worktree.as_ref().map(Worktree::root);
         // Nobody will be there to ask: its calls are decided by the rules
         // and the mode as they are now (see `background`).
         let rules = Rules {
@@ -519,7 +569,7 @@ impl Session {
             // that runs with nobody to ask.
             permissions: self.trust.permissions(&self.settings.permissions),
             mode: self.mode,
-            root: self.root.clone(),
+            root: root.unwrap_or(&self.root).to_path_buf(),
             tools: self.tools.filtered(|tool| task.agent.allows(tool)),
         };
         let link = Link {
@@ -531,14 +581,17 @@ impl Session {
         };
         let job = Job {
             label: format!("{name} {id}"),
-            session: self.child(&task.agent, link.clone()),
+            session: self.child(&task.agent, link.clone(), root),
             agent: task.agent,
             prompt: task.prompt,
             link,
+            worktree,
         };
         let thread = std::thread::Builder::new().name(id.clone());
         if let Err(e) = thread.spawn(move || job.run()) {
             seat.withdraw();
+            // The worktree made for it went with the job; nobody is in it.
+            worktree::clean(&self.root, &[], Some(&id));
             return Err(format!("error: could not start the agent's thread: {e}"));
         }
         ui.info(&format!(
@@ -553,8 +606,30 @@ impl Session {
         ))
     }
 
+    /// The worktree `isolation` asks for, if it asks for one: a fresh one,
+    /// named by `id`. `Err` is the tool result of the call that cannot have
+    /// it.
+    fn isolate(
+        &self,
+        isolation: Isolation,
+        id: impl FnOnce() -> String,
+    ) -> Result<Option<Worktree>, String> {
+        match isolation {
+            Isolation::Shared => Ok(None),
+            Isolation::Worktree => Worktree::create(&self.root, &id()).map(Some),
+        }
+    }
+
+    /// Which agent ids are in use beyond this session's count: those a
+    /// worktree is left under, from this session or an earlier one.
+    fn ids_taken(&self) -> impl Fn(&str) -> bool + use<> {
+        let project = self.root.clone();
+        move |id| worktree::dir_of(&project, id).exists()
+    }
+
     /// `/agents`: the agents that can be run and the ones running in the
-    /// background; `/agents stop <id>` stops one of those.
+    /// background; `/agents stop <id>` stops one of those, `/agents clean`
+    /// removes worktrees agents left.
     pub(super) fn agents_command(&mut self, args: &[&str], ui: &mut dyn Ui) {
         let roster = self.background.roster();
         match args {
@@ -577,7 +652,13 @@ impl Session {
                 }
             }
             ["stop", id] => ui.info(&roster.stop(id)),
-            _ => ui.info("usage: /agents [stop <id>]"),
+            ["clean", only @ ..] if only.len() <= 1 => {
+                let only = only.first().copied();
+                for line in worktree::clean(&self.root, &roster.worktrees(), only) {
+                    ui.info(&line);
+                }
+            }
+            _ => ui.info("usage: /agents [stop <id> | clean [<id>]]"),
         }
     }
 
@@ -596,13 +677,14 @@ impl Session {
         roster
     }
 
-    /// A session for one run of `agent`, reporting through `link`. See the
-    /// module docs for what it shares with this one.
-    fn child(&self, agent: &Agent, link: Link) -> Session {
+    /// A session for one run of `agent`, reporting through `link`, working
+    /// in `root` — a worktree of its own — or else in this session's
+    /// directory. See the module docs for what it shares with this one.
+    fn child(&self, agent: &Agent, link: Link, root: Option<&Path>) -> Session {
         let tools = self.tools.filtered(|name| agent.allows(name));
         let mut child = Session::new(
             self.cfg.clone(),
-            self.root.clone(),
+            root.unwrap_or(&self.root).to_path_buf(),
             tools,
             context::standing_providers(context::InstructionFiles::with_user(&self.settings)),
             self.settings.clone(),
@@ -804,7 +886,9 @@ mod tests {
         assert!(session.confirm_quit(&mut ui));
 
         let roster = session.background.roster();
-        let seat = roster.start(4, "explore", "find the parser").unwrap();
+        let seat = roster
+            .start(4, "explore", "find the parser", |_| false)
+            .unwrap();
         assert_eq!(session.background_agents(), 1);
 
         // Quitting: a warning first, then it goes ahead.
@@ -841,7 +925,7 @@ mod tests {
             "{:?}",
             ui.0
         );
-        assert_eq!(ui.0[1], "usage: /agents [stop <id>]");
+        assert_eq!(ui.0[1], "usage: /agents [stop <id> | clean [<id>]]");
         assert!(seat.stop_flag().load(Ordering::Relaxed));
 
         // It ends while the session is idle: the user is shown its line at
@@ -878,7 +962,7 @@ mod tests {
         let seat = session
             .background
             .roster()
-            .start(4, "general", "long work")
+            .start(4, "general", "long work", |_| false)
             .unwrap();
         let stop = seat.stop_flag();
         // An agent that ends as soon as it is told to.

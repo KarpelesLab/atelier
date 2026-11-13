@@ -252,6 +252,8 @@ const HELP: &[&str] = &[
     "  /agents                               list the subagents the `task` tool can run, and",
     "                                        the ones running in the background",
     "  /agents stop <id>                     stop a background agent",
+    "  /agents clean [id]                    remove the worktrees agents left: the unchanged",
+    "                                        ones, or the one named whatever it holds",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
     "  /subscribe <topic>                    receive what instances publish to a topic",

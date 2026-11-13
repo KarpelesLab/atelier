@@ -24,6 +24,10 @@
 //! - It is nobody's source: walks of the project (`grep`, `glob`, `tree`, the
 //!   `node` tool's `fs.glob`) leave it out through [`keep_in_walk`] unless
 //!   the walk was pointed at it. Not every project git-ignores `.atelier/`.
+//!
+//! The same predicate keeps those walks out of the other thing under
+//! `.atelier/` that is nobody's source: the worktrees of isolated subagents
+//! ([`crate::agents::WORKTREES_DIR`]), each a copy of the whole repository.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -96,13 +100,17 @@ pub fn fit(root: &Path, text: String, budget: usize) -> String {
 }
 
 /// A `filter_entry` predicate for a walk of the project: everything but
-/// the spill directory. The walk's own starting point is never filtered,
-/// so naming the directory (or a file in it) still searches it.
+/// the spill directory and the subagents' worktrees. The walk's own
+/// starting point is never filtered, so naming one of those directories (or
+/// a file in it) still searches it.
 pub fn keep_in_walk(
     project_root: &Path,
 ) -> impl Fn(&ignore::DirEntry) -> bool + Send + Sync + use<> {
-    let dir = project_root.join(DIR);
-    move |entry| entry.depth() == 0 || entry.path() != dir
+    let left_out = [
+        project_root.join(DIR),
+        project_root.join(crate::agents::WORKTREES_DIR),
+    ];
+    move |entry| entry.depth() == 0 || !left_out.iter().any(|dir| entry.path() == dir)
 }
 
 /// Where the head ends: after the last newline within `max` bytes, or, with
@@ -479,6 +487,41 @@ mod tests {
             .call(&mut ctx, json!({"pattern": "*.txt", "path": DIR}))
             .unwrap();
         assert_eq!(files, file);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Subagents' worktrees are copies of the repository: a walk of the
+    /// project stays out of them, and one pointed at them goes in.
+    #[test]
+    fn walks_of_the_project_stay_out_of_agents_worktrees() {
+        let root = tempdir("walk-worktrees");
+        let copy = root.join(crate::agents::WORKTREES_DIR).join("agent-1");
+        std::fs::create_dir_all(copy.join("src")).unwrap();
+        std::fs::write(root.join("lib.txt"), "needle in the project\n").unwrap();
+        std::fs::write(copy.join("src/lib.txt"), "needle in the copy\n").unwrap();
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: true,
+        };
+
+        let hits = grep::GrepTool
+            .call(&mut ctx, json!({"pattern": "needle"}))
+            .unwrap();
+        assert_eq!(hits, "lib.txt:1:needle in the project");
+        let files = glob::GlobTool
+            .call(&mut ctx, json!({"pattern": "**/*.txt"}))
+            .unwrap();
+        assert_eq!(files, "lib.txt");
+        let listing = tree::TreeTool.call(&mut ctx, json!({"depth": 6})).unwrap();
+        assert!(!listing.contains("agent-1"), "{listing}");
+
+        let inside = ".atelier/worktrees/agent-1";
+        let hits = grep::GrepTool
+            .call(&mut ctx, json!({"pattern": "needle", "path": inside}))
+            .unwrap();
+        assert_eq!(hits, format!("{inside}/src/lib.txt:1:needle in the copy"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

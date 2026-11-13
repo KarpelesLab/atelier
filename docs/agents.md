@@ -71,6 +71,7 @@ lines, not full YAML); the text after it is the agent's **system prompt**.
 | `model` | no | The model that serves this agent's requests — a model of your endpoint (or of your ChatGPT plan when signed in). Default: the session's model. `inherit` means the same |
 | `tools` | no | The tools it may call: names, with `*` as a wildcard (`mcp__docs__*`). A comma list, a bracketed one (`[read, grep]`), or `- item` lines. Default: every tool the session has |
 | `max_steps` | no | Model requests it may make before it is told to wrap up (see below). Default 40 |
+| `isolation` | no | `worktree`: every run of this agent works in a [git worktree of its own](#worktree-isolation) instead of the project directory. Default: none. Any other value makes the file invalid |
 
 Other keys are ignored. A file without a `description` or without a prompt is
 skipped; `/agents` says which and why.
@@ -93,7 +94,7 @@ with no counterpart simply grants nothing. Their `model` (`sonnet`, `opus`,
 | Conversation | Its own, starting at the task's prompt. Nothing of the parent's conversation, and the parent gets nothing of the child's but the final message |
 | System prompt | The agent's, plus the project's instruction files (`AGENTS.md`) — the project's rules apply to it too. Not the per-turn snapshot (git status, diagnostics, layout): what matters of it belongs in the task's prompt |
 | Tools | The parent's, filtered to the agent's `tools`. MCP servers are shared, not reconnected |
-| Files | The same project directory, with its own read tracking: it must read a file before editing it, whatever the parent has read |
+| Files | The same project directory — unless it is [isolated in a worktree](#worktree-isolation) — with its own read tracking: it must read a file before editing it, whatever the parent has read |
 | Model | The agent's `model`, else the session's |
 | Persistence | None. A subagent is never saved or resumed, and the [reviewer](review.md) does not watch it |
 
@@ -142,7 +143,8 @@ subagents are asked one at a time.
 Parallel subagents work in the same directory. Reading in parallel is always
 safe; two subagents editing the same files will trip over each other (the
 stale-edit check catches a file that changed since it was read, it does not
-merge). Give parallel writers disjoint files.
+merge). Give parallel writers disjoint files, or a [worktree
+each](#worktree-isolation).
 
 ## What you see
 
@@ -268,12 +270,105 @@ read it, the main agent's `edit` (and `multiedit`, `apply_patch`,
 it was last read; re-read it before editing"*, and the other way round. It
 catches, it does not merge — and it does not cover everything: `write`
 replaces a whole file whatever is there, and `bash` does what it does. Use
-background agents to read and investigate, or give a background writer
-files nobody else will touch.
+background agents to read and investigate; **a background agent that writes
+belongs in a [worktree](#worktree-isolation)**.
 
 A background agent's output tokens are added to the session's count when
 its end is noticed; `/usage` and the usage log count its requests like any
 others.
+
+## Worktree isolation
+
+An agent that writes while someone else works in the same directory is a
+collision waiting to happen. With isolation, the agent gets a directory of
+its own: a fresh **git worktree** of the repository, checked out (detached)
+at the commit `HEAD` is at, under `.atelier/worktrees/<id>/`. Ask for it in
+the agent's file (`isolation: worktree`, for every run of that agent) or in
+the call (`"isolation": "worktree"`); it works in the foreground and in the
+background.
+
+That directory is the agent's project root: its file tools are confined to
+it, its `bash` runs in it, and its instruction files (`AGENTS.md`) are read
+from it.
+
+**Uncommitted changes are not carried over.** The worktree is what is
+committed. An edit you have not committed, a file you have not added, a
+changed `AGENTS.md` — the agent sees none of it. Commit first what it must
+see.
+
+It needs a git repository with at least one commit. Without one, the `task`
+call is an error result saying so, and the agent does not run — not in the
+shared directory either: isolation that was asked for is not quietly
+dropped.
+
+### When the agent ends
+
+- **It changed nothing** (`git status` is clean and `HEAD` has not moved):
+  the worktree is removed, and the report says so.
+- **It changed something**: the worktree stays, the line you see says where
+  (`⤶ general: done (9 steps) — changes left in .atelier/worktrees/agent-2`),
+  and the agent's report ends with what the main agent needs to take the
+  changes:
+
+  ```
+  [worktree: .atelier/worktrees/agent-2 — the agent worked in a git worktree of its own, created at commit 8e7d16db4fdf. Its changes are there, NOT in your working tree, and nothing is merged automatically.]
+  commits it made:
+    4451d55 parse: accept trailing commas
+  changes against 8e7d16db4fdf (its commits and its uncommitted changes):
+   src/parse.rs       | 14 +++++++++-----
+   tests/parse_test.rs |  9 +++++++++
+   2 files changed, 18 insertions(+), 5 deletions(-)
+  To bring all of it into your working tree, run from the project directory:
+    git -C .atelier/worktrees/agent-2 diff --binary 8e7d16db4fdf | git apply
+  or take its commits as commits (without what it left uncommitted):
+    git cherry-pick 8e7d16db4fdf..4451d55
+  ```
+
+**atelier does not merge.** The main agent decides: apply the patch, pick the
+commits, take part of it, or leave it. New files the agent did not `git add`
+are part of the summary and of the patch. What atelier's own tools write
+under `.atelier/` while it works — spilled tool output, the `todo` list —
+is not counted as a change.
+
+### What is different in a worktree
+
+- State kept in the project directory is the worktree's own: the `todo`
+  list and [memory notes](memory.md) it writes are files in the worktree
+  (memory notes show up as changes), not the project's.
+- Project [hooks](hooks.md) are approved per project path, so they do not
+  run in the worktree; your user-global hooks do.
+- Approvals are as for any subagent: in the foreground the parent decides
+  (and asks you); in the background the rules decide alone.
+- A `bash` background job the agent leaves running keeps its working
+  directory in the worktree.
+
+### Cleaning up
+
+Worktrees that stay are yours to remove — also the ones an earlier session
+left:
+
+```
+› /agents clean
+agent-2: kept — 2 changed files. /agents clean agent-2 removes it anyway
+agent-3: unchanged — removed
+› /agents clean agent-2
+agent-2: removed, with its changes
+```
+
+`/agents clean` removes every worktree that holds nothing that would be
+lost: no uncommitted or untracked change, and a `HEAD` that some branch or
+tag still reaches. `/agents clean <id>` removes that one whatever it holds
+— naming it is the confirmation. Neither touches a worktree an agent is
+working in: one of this session (stop it first), or another atelier's (a
+worktree in use is locked with `git worktree lock`, naming the process; a
+lock whose process is gone does not count). `git worktree remove --force
+<path>` does the same by hand.
+
+`.atelier/worktrees/` git-ignores itself, so the copies never show in your
+`git status`; and the project's own searches and listings (`grep`, `glob`,
+`tree`, the context providers) leave it out the way they leave out
+`.atelier/tool-output/`, unless pointed at it. Agent ids are not reused for
+a directory that exists: a new agent skips to the next free one.
 
 ## With the Claude backend
 
@@ -286,8 +381,6 @@ it. `/agents` still lists what atelier would run.
 
 Planned under the same roadmap item (M18), not in this version:
 
-- **Worktree isolation** — an agent working in its own git worktree, its diff
-  handed back, so parallel writers cannot collide.
 - **Subagents over the coordinator** — a child as another atelier instance
   (a process, or one you opened in another terminal), with messages between
   siblings.

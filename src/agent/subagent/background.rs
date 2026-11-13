@@ -125,6 +125,8 @@ struct Entry {
     /// The last thing it did, as its activity line.
     activity: String,
     stop: Arc<AtomicBool>,
+    /// Where it works, when that is a worktree of its own.
+    worktree: Option<PathBuf>,
     /// How it ended; `None` while it runs.
     ended: Option<Ended>,
 }
@@ -146,9 +148,23 @@ impl Roster {
         self.shared.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The next free id, for an agent that is not kept here (a foreground
+    /// one that needs a name for its worktree). `taken` says which ids are
+    /// in use outside this session.
+    pub(super) fn next_id(&self, taken: impl Fn(&str) -> bool) -> String {
+        id_of(self.lock().claim(taken))
+    }
+
     /// Enter an agent that is about to start, unless `max` are running
-    /// already. `Err` is the tool result of the call that asked.
-    pub(super) fn start(&self, max: usize, agent: &str, description: &str) -> Result<Seat, String> {
+    /// already. `Err` is the tool result of the call that asked. `taken`
+    /// says which ids are in use outside this session.
+    pub(super) fn start(
+        &self,
+        max: usize,
+        agent: &str,
+        description: &str,
+        taken: impl Fn(&str) -> bool,
+    ) -> Result<Seat, String> {
         let mut state = self.lock();
         let running = state.running();
         if running >= max {
@@ -158,8 +174,7 @@ impl Roster {
                  run this task in the foreground."
             ));
         }
-        state.next += 1;
-        let number = state.next;
+        let number = state.claim(taken);
         let stop = Arc::new(AtomicBool::new(false));
         state.agents.insert(
             number,
@@ -169,6 +184,7 @@ impl Roster {
                 started: Instant::now(),
                 activity: "starting".to_string(),
                 stop: Arc::clone(&stop),
+                worktree: None,
                 ended: None,
             },
         );
@@ -182,6 +198,13 @@ impl Roster {
     /// How many are running.
     pub(in crate::agent) fn running(&self) -> usize {
         self.lock().running()
+    }
+
+    /// The worktrees running agents work in.
+    pub(super) fn worktrees(&self) -> Vec<PathBuf> {
+        let state = self.lock();
+        let running = state.agents.values().filter(|e| e.ended.is_none());
+        running.filter_map(|e| e.worktree.clone()).collect()
     }
 
     /// The agents that ended and that `audience` has not been told about,
@@ -292,6 +315,16 @@ impl State {
     fn running(&self) -> usize {
         self.agents.values().filter(|e| e.ended.is_none()).count()
     }
+
+    /// The next number whose id is not `taken`.
+    fn claim(&mut self, taken: impl Fn(&str) -> bool) -> u32 {
+        loop {
+            self.next += 1;
+            if !taken(&id_of(self.next)) {
+                return self.next;
+            }
+        }
+    }
 }
 
 /// A background agent's report as the model is given it: the marked block,
@@ -328,6 +361,13 @@ impl Seat {
     /// The flag that tells this agent to stop.
     pub(super) fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
+    }
+
+    /// Note where the agent works, when that is a worktree of its own.
+    pub(super) fn set_worktree(&self, dir: PathBuf) {
+        if let Some(entry) = self.roster.lock().agents.get_mut(&self.number) {
+            entry.worktree = Some(dir);
+        }
     }
 
     /// Note what the agent is doing, for `/agents`.
@@ -419,7 +459,7 @@ mod tests {
     #[test]
     fn an_agent_is_announced_once_to_the_user_and_once_to_the_model() {
         let roster = Roster::default();
-        let seat = roster.start(4, "explore", "find it").unwrap();
+        let seat = roster.start(4, "explore", "find it", |_| false).unwrap();
         assert_eq!(seat.id(), "agent-1");
         assert_eq!(roster.running(), 1);
         // Nothing to say while it runs.
@@ -462,7 +502,7 @@ mod tests {
         assert!(roster.listing().is_empty());
 
         // Mid-turn, the model's notice comes first and is new to the user.
-        let seat = roster.start(4, "general", "fix it").unwrap();
+        let seat = roster.start(4, "general", "fix it", |_| false).unwrap();
         assert_eq!(seat.id(), "agent-2");
         seat.finish(outcome(Status::Failed, "why"));
         let told = roster.notices(Audience::Model);
@@ -474,23 +514,33 @@ mod tests {
     #[test]
     fn the_limit_counts_the_running_ones() {
         let roster = Roster::default();
-        let first = roster.start(2, "a", "one").unwrap();
-        let _second = roster.start(2, "a", "two").unwrap();
-        let refused = roster.start(2, "a", "three").err().unwrap();
+        let first = roster.start(2, "a", "one", |_| false).unwrap();
+        let _second = roster.start(2, "a", "two", |_| false).unwrap();
+        let refused = roster.start(2, "a", "three", |_| false).err().unwrap();
         assert!(refused.starts_with("error: 2 background agents are running already"));
         assert!(refused.contains("max_background"), "{refused}");
         // One that ended makes room, reported or not.
         first.finish(outcome(Status::Done, "r"));
-        let third = roster.start(2, "a", "three").unwrap();
-        // The refused call used no id.
+        let third = roster.start(2, "a", "three", |_| false).unwrap();
+        // The refused call used no id; ids taken elsewhere are skipped.
         assert_eq!(third.id(), "agent-3");
+        assert_eq!(roster.next_id(|id| id == "agent-4"), "agent-5");
+        let sixth = roster.start(9, "a", "six", |id| id == "agent-6").unwrap();
+        assert_eq!(sixth.id(), "agent-7");
+
+        // Where the running ones work, for those in a worktree.
+        assert!(roster.worktrees().is_empty());
+        third.set_worktree(PathBuf::from("/w/agent-3"));
+        assert_eq!(roster.worktrees(), [PathBuf::from("/w/agent-3")]);
+        third.finish(outcome(Status::Done, "r"));
+        assert!(roster.worktrees().is_empty());
     }
 
     #[test]
     fn stopping_sets_the_agents_own_flag() {
         let roster = Roster::default();
-        let one = roster.start(4, "explore", "one").unwrap();
-        let two = roster.start(4, "explore", "two").unwrap();
+        let one = roster.start(4, "explore", "one", |_| false).unwrap();
+        let two = roster.start(4, "explore", "two", |_| false).unwrap();
         assert!(
             roster
                 .stop("agent-9")
@@ -519,7 +569,7 @@ mod tests {
     fn dropping_the_session_side_stops_the_agents_and_waits_for_them() {
         let background = Background::default();
         let roster = background.roster();
-        let seat = roster.start(4, "general", "long").unwrap();
+        let seat = roster.start(4, "general", "long", |_| false).unwrap();
         let stop = seat.stop_flag();
         let agent = std::thread::spawn(move || {
             // The agent's loop: until told to stop.
@@ -542,7 +592,7 @@ mod tests {
     #[test]
     fn a_seat_dropped_without_a_report_ends_the_agent_as_failed() {
         let roster = Roster::default();
-        let seat = roster.start(4, "general", "doomed").unwrap();
+        let seat = roster.start(4, "general", "doomed", |_| false).unwrap();
         let thread = std::thread::spawn(move || {
             let _seat = seat;
             panic!("the agent's thread dies (expected in this test)");
@@ -560,7 +610,7 @@ mod tests {
         assert_eq!(told[0].line, "⤶ general agent-1: crashed");
 
         // One that could not be started at all leaves nothing.
-        let seat = roster.start(4, "general", "never ran").unwrap();
+        let seat = roster.start(4, "general", "never ran", |_| false).unwrap();
         seat.withdraw();
         drop(seat);
         assert!(roster.notices(Audience::Model).is_empty());

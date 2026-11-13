@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolSpec};
-use crate::agents::{self, Agent, Found, TASK_TOOL};
+use crate::agents::{self, Agent, Found, Isolation, TASK_TOOL};
 
 /// Longest description shown for a subagent when the call gave none and it
 /// is cut from the prompt.
@@ -47,6 +47,9 @@ pub struct TaskCall {
     pub description: String,
     /// Start it and go on, instead of waiting for its report.
     pub background: bool,
+    /// Where it works: what the call asks for, else what the agent's
+    /// definition says.
+    pub isolation: Isolation,
 }
 
 impl TaskCall {
@@ -91,11 +94,19 @@ impl TaskCall {
         let background = ["background", "run_in_background"]
             .iter()
             .any(|k| args.get(*k).and_then(Value::as_bool) == Some(true));
+        // A call may ask for a worktree; it cannot take one away from an
+        // agent defined to work in one.
+        let isolation = match text("isolation").map(Isolation::parse) {
+            None | Some(Ok(Isolation::Shared)) => agent.isolation,
+            Some(Ok(Isolation::Worktree)) => Isolation::Worktree,
+            Some(Err(e)) => return Err(format!("error: {e}")),
+        };
         Ok(Self {
             agent: agent.clone(),
             prompt: prompt.to_string(),
             description,
             background,
+            isolation,
         })
     }
 }
@@ -135,7 +146,15 @@ impl Tool for TaskTool {
             do: you are told when it ends (a <subagent> block carrying its report), so do \
             not wait for it or poll. A background agent has no user to ask: a call that \
             would need the user's approval is refused to it, so use it for work the \
-            permission rules already allow — reading and searching above all.\n\nAgents:"
+            permission rules already allow — reading and searching above all.\n\nWith \
+            `isolation: \"worktree\"` the agent works in a fresh git worktree of the \
+            repository, checked out at HEAD, instead of the project directory — so its edits \
+            cannot collide with yours. Your UNCOMMITTED changes are NOT in that worktree: \
+            commit first what it must see. If it changed anything, its report ends with \
+            where the worktree is, a diff summary and the command to bring the changes \
+            over; nothing is merged for you. It needs a git repository with at least one \
+            commit, and fails without one. Use it for agents that write, above all in the \
+            background.\n\nAgents:"
             .to_string();
         for a in &found.agents {
             description.push_str(&format!("\n- {}: {}", a.name, a.description));
@@ -163,6 +182,11 @@ impl Tool for TaskTool {
                     "background": {
                         "type": "boolean",
                         "description": "Start the agent and return its id immediately; its report arrives later as a notification (default false)."
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["worktree"],
+                        "description": "\"worktree\": run the agent in its own git worktree at HEAD (uncommitted changes are not carried over)."
                     }
                 },
                 "required": ["agent", "prompt"]
@@ -216,6 +240,19 @@ mod tests {
         let call = call.ok().unwrap();
         assert_eq!(call.description, "Fix it.");
         assert!(!call.background);
+        assert_eq!(call.isolation, Isolation::Shared);
+        let isolated = |value: &str| {
+            let args = format!(r#"{{"agent":"explore","prompt":"x","isolation":"{value}"}}"#);
+            TaskCall::parse(&args, &found).map(|call| call.isolation)
+        };
+        assert_eq!(isolated("worktree").ok(), Some(Isolation::Worktree));
+        assert_eq!(isolated("none").ok(), Some(Isolation::Shared));
+        assert!(
+            isolated("vm")
+                .err()
+                .unwrap()
+                .starts_with("error: `isolation` must be")
+        );
         for key in ["background", "run_in_background"] {
             let args = format!(r#"{{"agent":"explore","prompt":"x","{key}":true}}"#);
             assert!(TaskCall::parse(&args, &found).ok().unwrap().background);
