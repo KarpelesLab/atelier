@@ -227,7 +227,11 @@ pub fn install(interp: &mut Interp, root: PathBuf) {
             .compile_matcher();
 
         let mut results = Vec::new();
-        for entry in WalkBuilder::new(&r).hidden(false).build() {
+        let walker = WalkBuilder::new(&r)
+            .hidden(false)
+            .filter_entry(crate::tools::spill::keep_in_walk(&r))
+            .build();
+        for entry in walker {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;

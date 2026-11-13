@@ -90,7 +90,10 @@ before issuing `tools/call`. The tool's description and JSON-Schema
 
 A tool result's `content` array is flattened to a single string (its `text`
 parts, newline-joined); a result with `isError: true` is surfaced to the
-model as a tool error rather than a successful result.
+model as a tool error rather than a successful result. A result over 30,000
+bytes comes back as its start and its end, with all of it saved to a file the
+agent can `read` or `grep` ([spilled output](tools.md#long-output-goes-to-a-file));
+the same goes for `read_resource`.
 
 ## The Streamable HTTP transport in detail
 

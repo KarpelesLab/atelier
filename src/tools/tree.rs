@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, spill};
 
 /// Cap on the number of entries printed, so a huge tree doesn't blow up the
 /// context window.
@@ -77,6 +77,7 @@ impl Tool for TreeTool {
             // Respect a .gitignore file even when the tree isn't rooted in an
             // actual git repository (e.g. under a project subdirectory).
             .require_git(false)
+            .filter_entry(spill::keep_in_walk(ctx.project_root))
             .build();
 
         for entry in walker {

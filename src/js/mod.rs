@@ -26,7 +26,7 @@ use anyhow::{Result, anyhow};
 use kataan::interrupt::Interrupt;
 use serde_json::{Value, json};
 
-use crate::tools::{Tool, ToolCtx, ToolSpec};
+use crate::tools::{Tool, ToolCtx, ToolSpec, spill};
 
 mod console;
 mod encoding;
@@ -41,6 +41,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Hard ceiling on `timeout_ms` so a call cannot pin a worker thread forever by
 /// request (a runaway script past this is abandoned — see [`NodeTool::call`]).
 const MAX_TIMEOUT_MS: u64 = 600_000;
+/// The most output, in bytes, a script's result carries; past it the result
+/// is the head and the tail, with all of it in a file (see [`spill`]).
+const MAX_OUTPUT_BYTES: usize = 10 * 1024;
 /// Worker-thread stack. The tree-walk interpreter recurses on the native stack;
 /// kataan tunes its eval-depth guard for a ~2 MB stack, so a generous stack here
 /// keeps a comfortable margin before the (catchable) `RangeError` fires.
@@ -144,6 +147,7 @@ impl Tool for NodeTool {
             .ok_or_else(|| anyhow!("the `node` tool requires a string `code` argument"))?
             .to_owned();
         let root = ctx.project_root.to_path_buf();
+        let project_root = ctx.project_root;
         let network = args
             .get("network")
             .and_then(Value::as_bool)
@@ -182,7 +186,7 @@ impl Tool for NodeTool {
             Ok(output) => {
                 // Reap the finished worker so it doesn't linger as a zombie.
                 let _ = worker.join();
-                Ok(output)
+                Ok(spill::fit(project_root, output, MAX_OUTPUT_BYTES))
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Trip the interrupt and give the interpreter a moment to unwind,
@@ -378,6 +382,33 @@ mod tests {
             )
             .expect("node tool should not fail at the harness level");
         assert_eq!(output.trim(), "3");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Output past the budget keeps its start and its end; the whole of it
+    /// is in a file under the project.
+    #[test]
+    fn long_output_is_saved_to_a_file() {
+        let root = tmpdir();
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        let code = r#"for (let i = 1; i <= 3000; i++) console.log("row " + i);"#;
+        let output = NodeTool.call(&mut ctx, json!({ "code": code })).unwrap();
+        assert!(
+            output.len() < super::MAX_OUTPUT_BYTES,
+            "{} bytes",
+            output.len()
+        );
+        assert!(output.starts_with("row 1\nrow 2\n"), "{output}");
+        assert!(output.contains("row 3000"), "{output}");
+        let (_, rest) = output.split_once("full output: ").expect("a marker");
+        let full = std::fs::read_to_string(root.join(rest.split_once(' ').unwrap().0)).unwrap();
+        assert!(full.contains("row 1500\n"));
+        assert!(!output.contains("row 1500\n"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

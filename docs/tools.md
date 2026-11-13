@@ -36,6 +36,34 @@ absolute paths outside it. See [Permissions](permissions.md) for the full
 approval model and why confinement is the deciding factor, not "read vs.
 write".
 
+## Long output goes to a file
+
+Tools whose output can be any size — `bash`, `bash_output`, `node`, MCP tools
+and `read_resource` — don't cut it off at a limit the agent can't see past.
+When a result is over the tool's budget (20,000 bytes for `bash` and
+`bash_output`, 10 KiB for `node`, 30,000 bytes for MCP), the whole text is
+saved under `.atelier/tool-output/` in the project and the result is its
+start (about 60% of the budget) and its end (about 25%), cut on line
+boundaries, around one line saying what is missing and where it is:
+
+```
+… 1,842 lines omitted (lines 121-1962) — full output: .atelier/tool-output/ab12cd.txt (use read with offset/limit, or grep) …
+```
+
+The file is in the project, so `read` (`offset`/`limit`) and `grep` reach it
+without approval. Output with no line breaks is cut by bytes instead, and the
+marker counts bytes.
+
+The directory keeps the 50 most recent files and at most 20 MiB; older ones
+are deleted when a new one is written (the new one always stays). Searches
+and listings of the project — `grep`, `glob`, `tree`, `fs.glob` in `node`,
+the layout context — leave `.atelier/tool-output/` out, whether or not the
+project git-ignores `.atelier/`, unless the directory or a file in it is
+named as the `path`.
+
+`read`, `grep`, `glob` and `web_fetch` page or cap by themselves and are not
+affected.
+
 ## `read`
 
 Read a file, returned with 1-based `cat -n`-style line numbers (`"{line}\t{text}\n"`
@@ -140,9 +168,9 @@ stdout/stderr and the exit status.
 | `timeout_ms` | integer | no       | Max run time in ms (default **120000**) |
 
 The child is polled every 20ms and killed if it exceeds the timeout (output
-then reads `[command timed out after Nms and was killed]`). Output is capped
-at 200 lines and 20,000 bytes combined, with `[output truncated]` appended if
-either limit is hit. **`bash` is the one built-in tool that is not confined**
+then reads `[command timed out after Nms and was killed]`). Output over
+20,000 bytes comes back as its start and its end, with all of it saved to a
+file ([below](#long-output-goes-to-a-file)). **`bash` is the one built-in tool that is not confined**
 — it can run anything — so it always requires approval (see
 [Permissions](permissions.md), including the risk-signal warnings shown
 alongside the prompt).
@@ -164,7 +192,8 @@ wait on it.
 | `until`   | string  | no       | …or its new output matches this regex |
 
 Returns `[job-N: running|exit status: … after Ns]` then the new output (its
-last 20,000 bytes if longer). This is how to wait for a build to finish or a
+start and its end if over 20,000 bytes, [the rest in a
+file](#long-output-goes-to-a-file)). This is how to wait for a build to finish or a
 server to print "listening".
 
 ## `bash_kill`

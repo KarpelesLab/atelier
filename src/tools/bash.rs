@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,13 +17,14 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, spill};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Longest `bash_output` will block waiting.
 const MAX_WAIT_MS: u64 = 600_000;
+/// The most output, in bytes, a call returns; the rest goes to a file (see
+/// [`spill`]).
 const MAX_OUTPUT_BYTES: usize = 20_000;
-const MAX_OUTPUT_LINES: usize = 200;
 /// How often the watchdog polls the child for exit while waiting for the
 /// timeout to elapse.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -38,7 +40,8 @@ impl Tool for BashTool {
         ToolSpec {
             name: self.name().to_string(),
             description: "Run a shell command (via `sh -c`) in the project root. Captures \
-                combined stdout/stderr and the exit status. Output is truncated if very large; \
+                combined stdout/stderr and the exit status. Very long output comes back as its start and its end, with all of it saved \
+                to a file you can read or grep; \
                 the command is killed if it exceeds the timeout. With `background: true` it \
                 starts as a job instead and returns its id at once: read its output, or wait \
                 for it to finish or print something, with `bash_output`; stop it with \
@@ -126,12 +129,18 @@ impl Tool for BashTool {
         let stderr_buf = stderr_handle.join().unwrap_or_default();
 
         Ok(format_result(
-            status, timed_out, timeout_ms, stdout_buf, stderr_buf,
+            ctx.project_root,
+            status,
+            timed_out,
+            timeout_ms,
+            stdout_buf,
+            stderr_buf,
         ))
     }
 }
 
 fn format_result(
+    root: &Path,
     status: Option<std::process::ExitStatus>,
     timed_out: bool,
     timeout_ms: u64,
@@ -151,8 +160,6 @@ fn format_result(
         combined.push_str(&stderr);
     }
 
-    let (body, truncated) = truncate_output(combined);
-
     let mut out = String::new();
     if timed_out {
         out.push_str(&format!(
@@ -163,35 +170,9 @@ fn format_result(
     } else {
         out.push_str("[exit status: unknown]\n");
     }
-    out.push_str(&body);
-    if truncated {
-        out.push_str("\n[output truncated]");
-    }
+    // Past the budget, the head and the tail; all of it is in a file.
+    out.push_str(&spill::fit(root, combined, MAX_OUTPUT_BYTES));
     out
-}
-
-/// Cap output to `MAX_OUTPUT_LINES` lines and `MAX_OUTPUT_BYTES` bytes,
-/// reporting whether anything was cut.
-fn truncate_output(s: String) -> (String, bool) {
-    let mut truncated = false;
-    let mut s = if s.lines().count() > MAX_OUTPUT_LINES {
-        truncated = true;
-        s.lines()
-            .take(MAX_OUTPUT_LINES)
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        s
-    };
-    if s.len() > MAX_OUTPUT_BYTES {
-        truncated = true;
-        let mut end = MAX_OUTPUT_BYTES;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-    }
-    (s, truncated)
 }
 
 /// A background job.
@@ -365,7 +346,7 @@ impl Tool for BashOutputTool {
         }
     }
 
-    fn call(&self, _ctx: &mut ToolCtx, args: Value) -> Result<String> {
+    fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
         // Waiting without naming a job means the one just started.
         let waiting = args.get("wait_ms").is_some() || args.get("until").is_some();
         let latest = (waiting && args.get("id").is_none())
@@ -418,8 +399,6 @@ impl Tool for BashOutputTool {
                 }
                 if job.finished() || matched || Instant::now() >= deadline {
                     job.seen += fresh.len();
-                    // A long log: show its end, which is what matters.
-                    let (body, cut) = tail(fresh);
                     let mut out = format!(
                         "[{id}: {} after {}s]\n",
                         job.status(),
@@ -428,28 +407,14 @@ impl Tool for BashOutputTool {
                     if until.is_some() && !matched && !job.finished() {
                         out.push_str("[`until` pattern not seen yet]\n");
                     }
-                    if cut {
-                        out.push_str("[earlier output omitted]\n");
-                    }
-                    out.push_str(&body);
+                    // A long log: its start and its end, the rest in a file.
+                    out.push_str(&spill::fit(ctx.project_root, fresh, MAX_OUTPUT_BYTES));
                     return Ok(out);
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-}
-
-/// The last `MAX_OUTPUT_BYTES` of `s`, and whether anything was cut.
-fn tail(s: String) -> (String, bool) {
-    if s.len() <= MAX_OUTPUT_BYTES {
-        return (s, false);
-    }
-    let mut start = s.len() - MAX_OUTPUT_BYTES;
-    while !s.is_char_boundary(start) {
-        start += 1;
-    }
-    (s[start..].to_string(), true)
 }
 
 /// `bash_kill`: stop a background job (and everything it started).
@@ -665,12 +630,74 @@ mod tests {
         assert!(out.contains("done"), "{out}");
     }
 
+    /// The file a result with omitted output names, read back.
+    fn spilled(root: &std::path::Path, out: &str) -> String {
+        let (_, rest) = out.split_once("full output: ").expect("a marker");
+        std::fs::read_to_string(root.join(rest.split_once(' ').unwrap().0)).unwrap()
+    }
+
     #[test]
-    fn tail_keeps_the_end() {
-        let s = "x".repeat(MAX_OUTPUT_BYTES) + "END";
-        let (t, cut) = tail(s);
-        assert!(cut);
-        assert!(t.ends_with("END"));
-        assert_eq!(t.len(), MAX_OUTPUT_BYTES);
+    fn long_output_comes_back_as_head_and_tail_with_the_rest_in_a_file() {
+        let root = tempdir("bash-spill");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 20000; echo oops >&2"}))
+            .unwrap();
+        assert!(out.len() < MAX_OUTPUT_BYTES, "{} bytes", out.len());
+        assert!(
+            out.starts_with("[exit status: exit status: 0]\n1\n2\n3\n"),
+            "{out}"
+        );
+        // The end is where a command says how it went.
+        assert!(out.ends_with("20000\n[stderr]\noops\n"), "{out}");
+        assert!(out.contains(" lines omitted (lines "), "{out}");
+        assert!(!out.contains("\n9000\n"));
+        // The file holds the output itself, without the status line.
+        let full = spilled(&root, &out);
+        assert!(full.starts_with("1\n2\n") && full.ends_with("[stderr]\noops\n"));
+        assert_eq!(full.lines().count(), 20002);
+
+        // Short output, even of many lines, is returned whole.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 500"}))
+            .unwrap();
+        assert!(out.contains("\n250\n") && !out.contains("omitted"), "{out}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn long_background_output_is_saved_the_same_way() {
+        let root = tempdir("bash-bg-spill");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        let started = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "seq 1 20000", "background": true}),
+            )
+            .unwrap();
+        let id = started
+            .split_whitespace()
+            .find(|w| w.starts_with("job-"))
+            .unwrap()
+            .to_string();
+        let out = BashOutputTool
+            .call(&mut ctx, json!({"id": id, "wait_ms": 10000}))
+            .unwrap();
+        let (status, body) = out.split_once('\n').unwrap();
+        assert!(status.contains("exit status"), "{status}");
+        assert!(body.starts_with("1\n2\n") && body.ends_with("\n20000\n"));
+        assert!(body.contains(" lines omitted (lines "), "{body}");
+        assert_eq!(spilled(&root, &out).lines().count(), 20000);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

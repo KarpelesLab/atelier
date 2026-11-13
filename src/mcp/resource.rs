@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::mcp::jsonrpc::JsonRpc;
-use crate::tools::{Tool, ToolCtx, ToolSpec};
+use crate::tools::{Tool, ToolCtx, ToolSpec, spill};
 
 /// Reads one MCP resource (`resources/read`) by URI, through the shared
 /// connection to its server. `conn` is transport-agnostic (stdio or HTTP) —
@@ -67,7 +67,7 @@ impl Tool for McpResourceTool {
     // `requires_approval` is intentionally left at the `Tool` trait default
     // (`true`): this makes a server call, same as any other MCP tool.
 
-    fn call(&self, _ctx: &mut ToolCtx, args: Value) -> Result<String> {
+    fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
         let Some(uri) = args.get("uri").and_then(Value::as_str) else {
             bail!("missing required `uri` argument");
         };
@@ -90,6 +90,8 @@ impl Tool for McpResourceTool {
             }
         }
 
-        Ok(text)
+        // Resources can be whole documents: past the budget, the head and
+        // the tail, with the rest in a file the agent can page through.
+        Ok(spill::fit(ctx.project_root, text, spill::BUDGET))
     }
 }

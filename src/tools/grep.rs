@@ -6,7 +6,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, spill};
 
 const MAX_MATCHES: usize = 100;
 
@@ -74,7 +74,11 @@ impl Tool for GrepTool {
         let mut matches = Vec::new();
         let mut truncated = false;
 
-        'walk: for entry in WalkBuilder::new(&search_root).hidden(false).build() {
+        let walker = WalkBuilder::new(&search_root)
+            .hidden(false)
+            .filter_entry(spill::keep_in_walk(ctx.project_root))
+            .build();
+        'walk: for entry in walker {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue,

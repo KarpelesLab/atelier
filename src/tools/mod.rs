@@ -41,6 +41,7 @@ mod multiedit;
 mod notebook;
 mod read;
 mod skill;
+pub mod spill;
 mod todo;
 mod tree;
 mod web_fetch;

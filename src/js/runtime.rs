@@ -203,9 +203,6 @@ fetch = function (url, options) {
 };
 "#;
 
-/// Cap on the returned output; longer output is truncated with a note.
-const MAX_OUTPUT: usize = 10 * 1024;
-
 /// Build an interpreter, install the mediated host (`fs` + `console`, plus the
 /// network host when `network` is set), run the bootstrap(s) and the user's
 /// program, and return the captured output as a single [`String`].
@@ -287,7 +284,7 @@ pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt)
         }
     }
 
-    truncate(output)
+    output
 }
 
 /// Render an [`ExecError`] into a human-readable message. A thrown JS value is
@@ -305,17 +302,4 @@ pub fn render_exec_error(interp: &Interp, err: &ExecError) -> String {
 /// Parse `src` into a program, mapping a parse failure to a readable message.
 pub fn parse(src: &str) -> Result<kataan::ast::Program, String> {
     Parser::parse_program(src).map_err(|e| format!("SyntaxError: {e:?}"))
-}
-
-/// Truncate `output` to [`MAX_OUTPUT`] on a char boundary, appending a note.
-pub fn truncate(mut output: String) -> String {
-    if output.len() > MAX_OUTPUT {
-        let mut end = MAX_OUTPUT;
-        while !output.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.truncate(end);
-        output.push_str("\n…[output truncated]");
-    }
-    output
 }

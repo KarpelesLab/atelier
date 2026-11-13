@@ -5,7 +5,7 @@ use globset::Glob;
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec};
+use super::{Tool, ToolCtx, ToolSpec, spill};
 
 const MAX_RESULTS: usize = 200;
 
@@ -62,7 +62,11 @@ impl Tool for GlobTool {
         let mut results = Vec::new();
         let mut truncated = false;
 
-        for entry in WalkBuilder::new(&search_root).hidden(false).build() {
+        let walker = WalkBuilder::new(&search_root)
+            .hidden(false)
+            .filter_entry(spill::keep_in_walk(ctx.project_root))
+            .build();
+        for entry in walker {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;

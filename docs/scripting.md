@@ -17,7 +17,8 @@ Rust-implemented global that checks the project boundary on every call.
 
 The tool result is the script's captured `console` output; if nothing was
 logged, it falls back to the display form of the script's final expression
-value (or is empty for `undefined`). Output is truncated at 10KB. A thrown
+value (or is empty for `undefined`). Output past 10KB comes back as its start and its end, with all of it
+saved to a file ([spilled output](tools.md#long-output-goes-to-a-file)). A thrown
 error is appended as `Uncaught <message>` (a syntax error is reported the
 same way, without running anything).
 
