@@ -58,6 +58,10 @@ And with [rules](#rules):
 - An **ask** rule prompts in every mode but `yolo` — except that in `plan`
   mode a modifying call is refused rather than asked about: nobody is asked
   to approve a change there.
+  A [hook](hooks.md) may answer that prompt in your place (a `pre_tool`
+  hook's `allow`, or a `permission_request` hook), as may the
+  [approval reviewer](#the-approval-reviewer); none of them gets past a
+  deny rule.
 - An **allow** rule runs the call without asking in `ask-edits`,
   `auto-edit` and `yolo`. That is how `ask-edits` is tuned:
   `allow = ["edit(docs/**)", "write(docs/**)"]` lets the documentation be

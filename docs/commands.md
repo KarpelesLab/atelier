@@ -97,6 +97,13 @@ is on (`ATELIER_APPROVE=all`, `[defaults] approve`) or you have answered
 risk signals — before running it. Refusing one cancels the whole command;
 nothing is sent to the model.
 
+Your [`pre_tool` hooks](hooks.md) see each such line first, as the `bash`
+call it is: one that denies it cancels the command, one that allows it
+spares you the prompt. That is the only hook involved — once the line runs
+it runs, and its output is part of your prompt, not a tool result, so no
+`post_tool` hook follows. A hook that rewrites the arguments cancels the
+command too: the line runs as the file has it or not at all.
+
 Arguments are passed to the command as data, never pasted into it. The
 command line is handed to the shell exactly as the template has it — which is
 also what the approval prompt shows — with your arguments as the shell's own

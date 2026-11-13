@@ -6340,3 +6340,52 @@ fn the_built_in_reviewer_policy_can_be_printed() {
         assert!(policy.contains(part), "{part}: {policy}");
     }
 }
+
+/// Hooks × command files — a `` !`command` `` line is a `bash` call to the
+/// `pre_tool` hooks, which see it before it runs: one that denies it cancels
+/// the command (nothing runs, nothing is sent), and one that lets it pass
+/// leaves it to run as usual.
+#[cfg(unix)]
+#[test]
+fn pre_tool_hooks_see_a_command_files_shell_line_before_it_runs() {
+    let mock = Mock::start(Arc::new(|_| text_response("ok")));
+    let dir = unique_dir("hook-command-file");
+    let commands = dir.join(".atelier/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("bad.md"),
+        "Result: !`touch ran-bad; echo bad`\n",
+    )
+    .unwrap();
+    std::fs::write(commands.join("good.md"), "Result: !`echo fine`\n").unwrap();
+    std::fs::write(
+        dir.join("atelier.toml"),
+        r#"
+[[hooks]]
+event = "pre_tool"
+match = "bash"
+command = "cat >> hook-saw.jsonl; echo >> hook-saw.jsonl; if grep -q ran-bad hook-saw.jsonl; then echo 'not that one' >&2; exit 2; fi"
+"#,
+    )
+    .unwrap();
+    let env = [("ATELIER_TRUST_HOOKS", "1")];
+
+    // Allowed through: runs, and its output is in the prompt.
+    let out = run_atelier_env(&mock.base_url(), &dir, &[], Some("/good\n"), &env);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(mock.requests(), 1, "{stdout}");
+    assert!(mock.body(0).contains("Result: fine"), "{}", mock.body(0));
+    let saw = std::fs::read_to_string(dir.join("hook-saw.jsonl")).unwrap();
+    assert!(
+        saw.contains(r#""tool":"bash""#) && saw.contains("echo fine"),
+        "{saw}"
+    );
+
+    // Denied: the line never runs and nothing reaches the model.
+    let out = run_atelier_env(&mock.base_url(), &dir, &[], Some("/bad\n"), &env);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!dir.join("ran-bad").exists(), "{stdout}");
+    assert_eq!(mock.requests(), 1, "{stdout}");
+    assert!(stdout.contains("a pre_tool hook refused"), "{stdout}");
+    assert!(stdout.contains("not that one"), "{stdout}");
+}

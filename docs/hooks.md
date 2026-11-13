@@ -156,6 +156,8 @@ earlier `allow`; a rewrite of the arguments is what the next hook sees.
 
 Notes on the details:
 
+- **A [command file](commands.md)'s `` !`command` `` lines fire `pre_tool`**
+  too, as `bash`, before they run (deny or allow; no `post_tool`).
 - **`pre_tool` runs before the approval prompt**, on what the model sent. If
   it rewrites the arguments, the rewritten ones are what you are asked to
   approve and what runs. `allow` skips the whole approval step for that one

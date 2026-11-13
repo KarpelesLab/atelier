@@ -588,7 +588,32 @@ fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option
         }
         let arguments = arguments.to_string();
         // `approve` passes tools it doesn't know; never run a shell on that.
-        runner.tools.get("bash").is_some() && runner.approve("bash", &arguments, ui).is_ok()
+        if runner.tools.get("bash").is_none() {
+            return false;
+        }
+        // Hooks: `pre_tool` sees the line as the `bash` call it is, before
+        // it runs, and may refuse it or approve it in the user's place.
+        // (Once it runs it runs: there is no `post_tool` for it, its output
+        // being part of the user's prompt rather than a tool result.)
+        let pre = runner
+            .hooks
+            .pre_tool("bash", &arguments, &mut |m| ui.notice(m));
+        if let Some(why) = pre.deny {
+            ui.info(&format!("a pre_tool hook refused `{shell}`: {why}"));
+            return false;
+        }
+        // The line runs as written in the file or not at all: a hook that
+        // would have it run something else is taken as not letting it run.
+        if pre.arguments != arguments {
+            ui.info(&format!(
+                "a pre_tool hook rewrote `{shell}`; a command file's line can't be \
+                 rewritten, so it is not run"
+            ));
+            return false;
+        }
+        runner
+            .approve_hooked("bash", &arguments, pre.allow, ui)
+            .is_ok()
     };
     let expanded = crate::commands::expand(&command, arguments.trim(), &root, &mut approve);
     Some(match expanded {
