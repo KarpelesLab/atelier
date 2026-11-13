@@ -7,6 +7,8 @@ authors = ["Karpelès Lab Inc."]
 description = "A minimal-TUI AI coding harness over OpenAI-compatible APIs."
 license = "MIT"
 repository = "https://github.com/KarpelesLab/atelier"
+# Released as binaries on GitHub (see release-plz.toml), not on crates.io.
+publish = false
 
 [dependencies]
 rsurl = "0.1.12"

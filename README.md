@@ -65,9 +65,11 @@ download against the release's `SHA256SUMS`, and swaps it in for the next launch
 `ATELIER_NO_UPDATE=1` turns the background check off. Builds from source
 never update themselves.
 
-Publishing a release: bump `version` in `Cargo.toml`, then push a matching
-`vX.Y.Z` tag; `.github/workflows/release.yml` builds and publishes the
-binaries and checksums.
+Publishing a release: [release-plz](https://release-plz.dev) keeps a release
+PR open on master (version bump + `CHANGELOG.md`, from the commit messages).
+Merging it tags `vX.Y.Z` and creates the release;
+`.github/workflows/release-binaries.yml` then builds the binaries, attaches
+them with their checksums, and publishes it.
 
 ## Quickstart
 

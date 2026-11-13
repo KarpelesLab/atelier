@@ -1,0 +1,12 @@
+[workspace]
+# atelier isn't published to crates.io (the name there belongs to an
+# unrelated crate): versions come from git tags, and a release is a tag plus
+# a GitHub Release carrying the binaries.
+git_only = true
+git_tag_name = "v{{ version }}"
+# A binary has no API to check.
+semver_check = false
+# The release stays a draft until its binaries are attached
+# (release-binaries.yml publishes it), so the self-updater never sees a
+# release it can't download yet.
+git_release_draft = true

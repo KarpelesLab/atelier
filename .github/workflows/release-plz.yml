@@ -1,0 +1,88 @@
+name: Release-plz
+
+# On every push to master: keep a release PR open (version bump +
+# CHANGELOG.md), and when one has been merged, tag it, create the (draft)
+# GitHub Release, and start release-binaries.yml to build and attach the
+# binaries. Nothing is published to crates.io (see release-plz.toml).
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  # Open/update the release PR and create GitHub Releases.
+  contents: write
+  pull-requests: write
+  # `gh workflow run release-binaries.yml` (workflow_dispatch) needs this even
+  # with GITHUB_TOKEN.
+  actions: write
+
+# Don't run two release-plz jobs in parallel.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # release-plz pushes the tag (and the release PR branch) via git, so
+          # the PAT must be persisted on the checkout — what the default
+          # GITHUB_TOKEN pushes cannot trigger other workflows (CI on the PR).
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      # workflow_dispatch is the single, deterministic way release-binaries
+      # starts; it works with the default GITHUB_TOKEN (given `actions: write`).
+      - name: Trigger release-binaries for each new release
+        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          # release-plz emits `.releases[].tag`; see
+          # https://release-plz.dev/docs/github/output for the schema.
+          echo "$RELEASES" | jq -r '.[].tag' | while read -r tag; do
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              continue
+            fi
+            echo "Dispatching release-binaries for $tag"
+            # On the tag ref itself, so the workflow file and the checkout
+            # both come from the released commit.
+            gh workflow run release-binaries.yml --ref "$tag" -f tag="$tag"
+          done
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

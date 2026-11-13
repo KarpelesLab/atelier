@@ -1,7 +1,11 @@
-name: Release
+name: Release binaries
 
-# Push a tag `vX.Y.Z` (matching Cargo.toml's version) to publish a release.
-# Installed official builds pick it up within a day (see src/update.rs).
+# Builds the binaries for a release and attaches them to it, then publishes
+# the release. release-plz creates the tag and the (draft) GitHub Release and
+# dispatches this workflow (see release-plz.yml); running it by hand retries
+# a failed build against an existing release without re-tagging.
+# Installed official builds pick a published release up within a day (see
+# src/update.rs).
 #
 # Assets are static binaries, gzip-compressed: `atelier-<target>.gz`.
 # - x86_64 is built with fullrust (https://github.com/KarpelesLab/fullrust):
@@ -9,27 +13,41 @@ name: Release
 # - arm64 is built against musl, as fullrust is x86-64 only for now.
 
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload to (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
+  # gh release upload/edit.
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag }}
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Tag matches Cargo.toml version
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - name: The checkout is the release tag, and it matches Cargo.toml
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+          got="$(git describe --tags --exact-match --match "$TAG")"
+          if [ "$got" != "$TAG" ]; then
+            echo "::error::checked out '$got', expected release tag '$TAG'"
             exit 1
           fi
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "Building $TAG at $(git rev-parse HEAD)"
 
   build-x86_64:
     needs: check
@@ -40,7 +58,9 @@ jobs:
     env:
       TARGET: x86_64-unknown-linux-fullrust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
       - name: Build
         env:
           # Marks the build as official: it then updates itself from releases.
@@ -64,7 +84,9 @@ jobs:
     env:
       TARGET: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
@@ -99,11 +121,10 @@ jobs:
           cd dist
           sha256sum atelier-*.gz > SHA256SUMS
           cat SHA256SUMS
-      - name: Publish
+      - name: Attach to the release and publish it
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          # Only now does it become the latest release the updater looks at.
+          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"

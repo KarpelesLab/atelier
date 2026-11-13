@@ -356,11 +356,13 @@ servers, and per-turn context.
 
 ### M13 — Releases & self-update ✅
 
-- ✅ **Release workflow** (`.github/workflows/release.yml`): a `vX.Y.Z` tag
-  (checked against `Cargo.toml`) builds static binaries natively on x86_64
+- ✅ **Release workflow**: release-plz (`release-plz.yml`) keeps a release PR
+  open and, once it is merged, tags `vX.Y.Z` and drafts the GitHub Release;
+  `release-binaries.yml` then builds static binaries natively on x86_64
   (with [fullrust](https://github.com/KarpelesLab/fullrust): libc-free) and
   arm64 (musl, until fullrust targets it) runners, smoke-tests them, and
-  publishes them gzip-compressed (`atelier-<target>.gz`) with `SHA256SUMS`.
+  attaches them gzip-compressed (`atelier-<target>.gz`) with `SHA256SUMS`, and
+  publishes the release.
 - ✅ **Self-update** (`src/update.rs`): official builds (marked by
   `ATELIER_RELEASE_TARGET` at compile time) check the latest release daily
   in the background, verify the checksum, decompress (pure-Rust `compcol`),
