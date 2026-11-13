@@ -29,7 +29,7 @@ use serde_json::Value;
 
 pub use crate::provider::ToolSpec;
 
-mod apply_patch;
+pub mod apply_patch;
 pub mod bash;
 mod edit;
 mod glob;
@@ -307,7 +307,7 @@ fn hash(s: &str) -> u64 {
 }
 
 /// Lexically normalize a path (resolve `.`/`..`) without touching the fs.
-fn normalize(p: &Path) -> PathBuf {
+pub fn normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for c in p.components() {

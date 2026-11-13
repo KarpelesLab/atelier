@@ -6,14 +6,15 @@ atelier has two configuration layers:
   environment at startup. Not persisted.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
   `atelier.toml` at the project root: configured MCP servers, the
-  always-allow permission list, `[defaults]`, `[review]`,
+  permission rules, `[defaults]`, `[review]`,
   `[[diagnostics]]`, and `[search]`. Read at startup
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
   "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
-There is currently no project-vs-user-global precedence: `atelier.toml` is
-read only from the current project root, and `Config`'s environment variables
-have no `atelier.toml` equivalent.
+`atelier.toml` is read from the current project root. The one user-global
+piece is `[permissions]`, also read from
+`$XDG_CONFIG_HOME/atelier/atelier.toml` (see [`[permissions]`](#permissions)).
+`Config`'s environment variables have no `atelier.toml` equivalent.
 
 ## Environment variables
 
@@ -57,7 +58,8 @@ url = "https://mcp.example.com/mcp"
 headers = ["Authorization: Bearer sk-xyz"]
 
 [permissions]
-allow = ["bash"]
+allow = ["bash(cargo *)", "bash(git diff *)"]
+deny = ["bash(rm -rf *)"]
 ```
 
 ### `[[mcp]]` — stdio MCP servers
@@ -91,15 +93,29 @@ remove <name>` — the same subcommands as stdio servers; atelier tells the two
 apart by whether the target looks like a URL. See [MCP](mcp.md) for the
 transport details and its known gaps.
 
-### `[permissions] allow`
+### `[permissions]`
 
 | Field   | Type       | Meaning |
 |---------|------------|---------|
-| `allow` | string[]   | Tool names the user has permanently approved via "always" at an approval prompt |
+| `allow` | string[]   | Rules for calls that run without asking. "Always" at an approval prompt appends here |
+| `ask`   | string[]   | Rules for calls that prompt even when they would otherwise run unasked |
+| `deny`  | string[]   | Rules for calls that are refused |
 
-Populated automatically — you don't hand-author this list, though you may
-pre-seed it. See [Permissions](permissions.md) for how entries land here and
-how they're used.
+A rule is `tool` or `tool(pattern)`; deny wins, then ask, then allow, then
+the tool's default:
+
+```toml
+[permissions]
+allow = ["bash(git diff *)", "bash(cargo *)", "mcp__github__*"]
+ask   = ["read(.env*)"]
+deny  = ["read(~/.ssh/**)", "bash(rm -rf *)"]
+```
+
+The same table in `$XDG_CONFIG_HOME/atelier/atelier.toml` (else
+`~/.config/atelier/atelier.toml`) holds user-global rules, merged with the
+project's — that file's other tables are not read. `atelier permissions
+check -- <command>` explains a decision. See [Permissions](permissions.md)
+for the pattern syntax per tool and how compound shell commands are judged.
 
 - `ATELIER_TRACE` — file path to append a JSONL trace (one line per model request: messages, tool calls, usage) for debugging.
 

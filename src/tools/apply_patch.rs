@@ -141,6 +141,19 @@ fn parse_hunk_header(line: &str) -> Result<(usize, usize, usize)> {
     Ok((old_start, old_len, new_len))
 }
 
+/// Every path the `apply_patch` call `args` would create, change or delete —
+/// what the permission rules match (see [`crate::permissions`]). Empty when
+/// the patch does not parse; the call then fails on its own.
+pub fn target_paths(args: &Value) -> Vec<String> {
+    let patch = args.get("patch").and_then(Value::as_str).unwrap_or("");
+    parse_patch(patch)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|f| [f.old_path, f.new_path])
+        .flatten()
+        .collect()
+}
+
 /// Parse a whole unified diff into its per-file sections.
 fn parse_patch(patch: &str) -> Result<Vec<FilePatch>> {
     let lines: Vec<&str> = patch.lines().collect();

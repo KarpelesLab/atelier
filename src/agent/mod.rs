@@ -9,7 +9,7 @@
 //! terminal interface (the `tui` module supplies one; [`repl`] uses a plain
 //! stdout one). Nothing here may depend on `tui`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -120,7 +120,8 @@ impl std::error::Error for StepLimit {}
 pub enum Approval {
     /// Run this once.
     Once,
-    /// Run this and remember the tool as always-allowed (persisted).
+    /// Run this and remember a rule that allows it (persisted — see
+    /// [`crate::permissions`]).
     Always,
     /// Refuse; the model is told the user denied it.
     Deny,
@@ -153,6 +154,7 @@ const HELP: &[&str] = &[
     "  /mcp add <name> <command> [args...]   add a stdio MCP server",
     "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
     "  /mcp remove <name>                    remove an MCP server",
+    "  /permissions                          list the permission rules in force, by source",
     "  /new [force]                          start a fresh conversation (clear saved session);",
     "                                        force: even if claude has background tasks running",
     "  /image <path>                         attach an image to your next message (vision)",
@@ -222,6 +224,12 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             Err(e) => ui.info(&format!("error: {e:#}")),
         },
         "/mcp" => dispatch_mcp(session, &args, ui),
+        "/permissions" => {
+            let policy = crate::permissions::Policy::load(&session.settings.permissions);
+            for line in policy.listing(&session.root) {
+                ui.info(&line);
+            }
+        }
         "/model" => match args.first() {
             None => ui.info(&format!("model: {}", session.backend_label())),
             Some(name) => {
@@ -420,9 +428,6 @@ pub struct Session {
     tools: ToolRegistry,
     context: Vec<Box<dyn ContextProvider>>,
     settings: Settings,
-    /// Tools approved for the rest of this session (seeded from settings, grown
-    /// by "always allow").
-    allow: HashSet<String>,
     /// Skip approval prompts entirely (e.g. `ATELIER_APPROVE=all` for headless
     /// runs).
     auto_approve: bool,
@@ -475,7 +480,6 @@ impl Session {
         context: Vec<Box<dyn ContextProvider>>,
         settings: Settings,
     ) -> Self {
-        let allow: HashSet<String> = settings.permissions.allow.iter().cloned().collect();
         // env wins; else the project's [defaults]; else the built-in default.
         let auto_approve = match std::env::var("ATELIER_APPROVE") {
             Ok(v) => matches!(v.as_str(), "all" | "yes" | "1"),
@@ -497,7 +501,6 @@ impl Session {
             tools,
             context,
             settings,
-            allow,
             auto_approve,
             usage_ctx: 0,
             usage_out: 0,
@@ -1070,8 +1073,7 @@ impl Session {
                         .push(Message::tool_result(call.id.clone(), msg));
                     continue;
                 }
-                if !self.runner().approve(&call.name, &call.arguments, ui) {
-                    let msg = DENIED.to_string();
+                if let Err(msg) = self.runner().approve(&call.name, &call.arguments, ui) {
                     ui.tool_end(&call.name, &msg, false);
                     self.history
                         .push(Message::tool_result(call.id.clone(), msg));
@@ -1273,7 +1275,6 @@ impl Session {
                 tools: &self.tools,
                 root: &self.root,
                 fstate: &mut self.fstate,
-                allow: &mut self.allow,
                 settings: &mut self.settings,
                 auto_approve: self.auto_approve,
             },
@@ -1356,9 +1357,6 @@ impl Session {
     }
 }
 
-/// The tool result for a call the user refused.
-const DENIED: &str = "error: the user denied permission to run this tool.";
-
 /// Runs tool calls against the session: approval policy (prompting through
 /// the caller's [`Ui`]), then execution confined to the project root. Used by
 /// atelier's own loop, and — as the [`ToolHost`](claude::ToolHost) — for
@@ -1367,43 +1365,27 @@ struct ToolRunner<'a> {
     tools: &'a ToolRegistry,
     root: &'a std::path::Path,
     fstate: &'a mut FileState,
-    allow: &'a mut HashSet<String>,
     settings: &'a mut Settings,
     auto_approve: bool,
 }
 
 impl ToolRunner<'_> {
-    /// Whether the call may run, asking the user when its tool requires
-    /// approval (unconfined — `bash`, MCP tools) and it isn't already
-    /// allowed. "Always" is remembered and persisted. Tools confined to the
-    /// project directory (all file tools) never prompt.
-    fn approve(&mut self, name: &str, arguments: &str, ui: &mut dyn Ui) -> bool {
-        if self.auto_approve || self.allow.contains(name) {
-            return true;
-        }
+    /// Whether the call may run under the permission rules, asking the user
+    /// when they — or, failing a rule, the tool's own default (unconfined
+    /// tools ask: `bash`, MCP tools) — say so. `Err` is the tool result for a
+    /// refused call. See [`crate::permissions`].
+    fn approve(&mut self, name: &str, arguments: &str, ui: &mut dyn Ui) -> Result<(), String> {
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-        let needs = self
+        let needs_approval = self
             .tools
             .get(name)
             .is_some_and(|t| t.requires_approval_in(&args, self.root));
-        if !needs {
-            return true;
-        }
-        for signal in crate::risk::signals(name, arguments) {
-            ui.info(&format!("⚠ {signal}"));
-        }
-        match ui.ask_approval(name, arguments) {
-            Approval::Once => true,
-            Approval::Always => {
-                self.allow.insert(name.to_string());
-                if !self.settings.permissions.allow.iter().any(|n| n == name) {
-                    self.settings.permissions.allow.push(name.to_string());
-                    let _ = self.settings.save(self.root);
-                }
-                true
-            }
-            Approval::Deny => false,
-        }
+        let req = crate::permissions::Request {
+            tool: name,
+            arguments,
+            needs_approval,
+        };
+        crate::permissions::approve(self.settings, self.root, self.auto_approve, req, ui)
     }
 
     /// Execute a call whose arguments are a JSON string (as models send).
@@ -1458,8 +1440,8 @@ impl claude::ToolHost for ToolRunner<'_> {
     }
 
     fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
-        if !self.approve(name, &arguments.to_string(), ui) {
-            return (ToolOutput::text(DENIED.to_string()), false);
+        if let Err(msg) = self.approve(name, &arguments.to_string(), ui) {
+            return (ToolOutput::text(msg), false);
         }
         self.exec(name, arguments)
     }
@@ -1988,13 +1970,11 @@ mod tests {
 
         let tools = crate::tools::builtin_registry();
         let mut fstate = FileState::new();
-        let mut allow = HashSet::new();
         let mut settings = Settings::default();
         let mut runner = ToolRunner {
             tools: &tools,
             root: &root,
             fstate: &mut fstate,
-            allow: &mut allow,
             settings: &mut settings,
             auto_approve: true,
         };

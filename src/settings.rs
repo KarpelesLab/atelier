@@ -114,12 +114,21 @@ pub struct Defaults {
     pub context_limit: Option<u32>,
 }
 
-/// Persisted tool-approval state.
+/// Tool-approval rules: `tool` or `tool(pattern)` strings, in three lists.
+/// Deny wins, then ask, then allow — see [`crate::permissions`] for the
+/// syntax and how each is matched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Permissions {
-    /// Tool names the user has approved for all future runs ("always allow").
+    /// Calls that run without asking. "Always" at an approval prompt adds
+    /// here.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Calls that prompt even when they would otherwise run unasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask: Vec<String>,
+    /// Calls that are refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// One stdio MCP server the user has configured.
@@ -145,6 +154,17 @@ impl Settings {
     /// The settings file path for a given project root.
     pub fn path(root: &Path) -> PathBuf {
         root.join(FILE_NAME)
+    }
+
+    /// The directory of the user-global settings file:
+    /// `$XDG_CONFIG_HOME/atelier`, else `~/.config/atelier`. Only its
+    /// `[permissions]` are used today (merged under the project's).
+    pub fn user_dir() -> Option<PathBuf> {
+        let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+        var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|base| base.join("atelier"))
     }
 
     /// Load settings from `<root>/atelier.toml`, or defaults if absent.

@@ -15,6 +15,7 @@ mod headless;
 mod js;
 mod mcp;
 mod memory;
+mod permissions;
 mod provider;
 mod review;
 mod risk;
@@ -66,6 +67,11 @@ fn run() -> Result<u8> {
     // instances (they launch it themselves), or a word with it (see `coord`).
     if args.first().map(String::as_str) == Some("coordinator") {
         return coord::run_command(&args[1..]).map(|()| 0);
+    }
+    // `atelier permissions check …`: what the permission rules decide for a
+    // call, and which rule decided (see `permissions`).
+    if args.first().map(String::as_str) == Some("permissions") {
+        return permissions::run_command(&args[1..]).map(|()| 0);
     }
     // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
     // claude launch — a relay back to the atelier process that owns the
