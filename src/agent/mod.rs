@@ -46,6 +46,7 @@ use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpOptions, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
+use crate::trust::{self, Trust};
 
 mod standalone;
 mod subagent;
@@ -219,7 +220,12 @@ const HELP: &[&str] = &[
     "  /memory forget <name>                 delete one memory",
     "  /skills                               list the skills the agent can load, and where they are",
     "  /hooks                                list configured hooks and whether they run",
-    "  /hooks trust                          approve this project's hooks as they are now",
+    "  /hooks trust                          the same as /trust",
+    "  /trust                                accept what this project's atelier.toml runs and",
+    "                                        grants (MCP servers, checkers, providers, allow",
+    "                                        rules, hooks), as it is now",
+    "  /trust show                           list those settings and whether they are in effect",
+    "  /trust revoke                         stop trusting this project",
     "  /agents                               list the subagents the `task` tool can run",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
@@ -335,9 +341,13 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         },
         "/mcp" => dispatch_mcp(session, &args, ui),
         "/permissions" => {
-            let policy = crate::permissions::Policy::load(&session.settings.permissions);
+            let rules = session.trust.permissions(&session.settings.permissions);
+            let policy = crate::permissions::Policy::load(&rules);
             for line in policy.listing(&session.root) {
                 ui.info(&line);
+            }
+            if !session.trust.active() && !session.settings.permissions.allow.is_empty() {
+                ui.info("  this project's own allow rules are not in effect: /trust");
             }
         }
         "/mode" => match args.first().map(|name| Mode::parse(name)) {
@@ -456,6 +466,7 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             }
         }
         "/hooks" => session.hooks_command(&args, ui),
+        "/trust" => session.trust_command(&args, ui),
         "/context" => {
             for l in session.context_report() {
                 ui.info(&l);
@@ -587,6 +598,7 @@ fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
                 let extra: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
                 session.mcp_add(name, target, extra)
             };
+            let added = result.is_ok();
             match result {
                 Ok(_) if session.is_claude() => ui.info(&format!(
                     "added MCP server '{name}' — claude picks it up from the next message \
@@ -599,6 +611,16 @@ fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
                     "added MCP server '{name}' — it requires sign-in: run /mcp login {name}"
                 )),
                 Err(e) => ui.info(&format!("error: {e:#}")),
+            }
+            // Adding one server does not vouch for the rest of the file.
+            if added && !session.trust.active() {
+                ui.info(if session.is_claude() {
+                    "this project is not trusted, so the server is saved but not handed to \
+                     claude: /trust first"
+                } else {
+                    "this project is not trusted, so the server is yours for this session \
+                     only: /trust to have it start with every session"
+                });
             }
         }
         Some("login") => {
@@ -719,6 +741,10 @@ pub struct Session {
     hook_context: Option<String>,
     /// Claude backend: the last turn's final answer, for `turn_end` hooks.
     claude_answer: Option<String>,
+    /// Whether the project's `atelier.toml` may run commands and grant
+    /// access (see [`trust`]); `settings` holds the file as written, and
+    /// whatever acts on its gated parts asks this first.
+    trust: Trust,
     /// Set when this session is a subagent's (see [`subagent`]): its system
     /// prompt and its line to the parent. Such a session is never persisted,
     /// and wraps up at its step cap instead of failing.
@@ -740,6 +766,7 @@ impl Session {
         tools: ToolRegistry,
         mut context: Vec<Box<dyn ContextProvider>>,
         settings: Settings,
+        trust: Trust,
     ) -> Self {
         // Servers connect later (startup, `/mcp add`); what they have to
         // tell the model reaches this provider through the catalog.
@@ -747,8 +774,9 @@ impl Session {
         context.push(Box::new(crate::context::McpProvider::new(
             mcp_catalog.clone(),
         )));
-        // env wins; else the project's [defaults]; else the built-in default.
-        let mode = Mode::configured(&settings.defaults);
+        // env wins; else the project's [defaults] — which get to choose
+        // `yolo` only in a trusted project; else the built-in default.
+        let mode = Mode::configured(&trust.effective(&settings).defaults);
         let compact_threshold = std::env::var("ATELIER_CONTEXT_LIMIT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -759,8 +787,14 @@ impl Session {
             Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
             Err(_) => settings.review.enabled,
         };
-        let hooks = Hooks::load(&root, &settings.hooks, hooks::Paths::from_env());
+        let hooks = Hooks::load(
+            &root,
+            &settings.hooks,
+            hooks::user_config().as_deref(),
+            trust.hooks_state(),
+        );
         Self {
+            trust,
             hooks,
             hooks_started: false,
             hook_context: None,
@@ -890,9 +924,10 @@ impl Session {
         self.cfg.model = name.to_string();
         self.settings.defaults.model = Some(name.to_string());
     }
-    /// Persist current settings to `atelier.toml`.
+    /// Persist current settings to `atelier.toml` (the user's own edit:
+    /// see [`Trust::save`]).
     pub fn save_settings(&self) -> Result<()> {
-        self.settings.save(&self.root)
+        self.trust.save(&self.settings)
     }
 
     /// Whether turns go to the Claude Code CLI rather than atelier's own loop.
@@ -1136,6 +1171,12 @@ impl Session {
     /// Returns human-readable status lines (one per server) for the caller to
     /// display; a failed server is reported but does not abort the others.
     pub fn connect_configured_mcp(&mut self) -> Vec<String> {
+        // A server is a command, or an address, of the project's choosing:
+        // none is started or contacted in a project the user has not
+        // trusted (the startup notice lists them; `/trust` comes back here).
+        if !self.trust.active() {
+            return Vec::new();
+        }
         let mut status = Vec::new();
         // With the Claude backend the servers are handed to claude itself
         // (`--mcp-config`); connecting them here too would run them twice.
@@ -1259,7 +1300,7 @@ impl Session {
         let n = self.mcp_register(name, connection);
         self.mcp_defer();
         self.settings.mcp.push(cfg);
-        self.settings.save(&self.root)?;
+        self.trust.save(&self.settings)?;
         Ok(n)
     }
 
@@ -1294,7 +1335,7 @@ impl Session {
         let n = self.mcp_register(name, connection);
         self.mcp_defer();
         self.settings.mcp_http.push(cfg);
-        self.settings.save(&self.root)?;
+        self.trust.save(&self.settings)?;
         Ok(n)
     }
 
@@ -1312,7 +1353,7 @@ impl Session {
         }
         self.mcp_disconnect(name);
         self.mcp_defer();
-        self.settings.save(&self.root)?;
+        self.trust.save(&self.settings)?;
         Ok(true)
     }
 
@@ -1368,7 +1409,7 @@ impl Session {
     /// `--mcp-config`.
     fn claude_mcp_changed(&mut self) -> Result<()> {
         self.claude_restart = true;
-        self.settings.save(&self.root)
+        self.trust.save(&self.settings)
     }
 
     /// Run one user turn to completion, executing tool calls until the model
@@ -1791,7 +1832,9 @@ impl Session {
             self.claude = Some(Bridge::spawn(
                 &launch,
                 &self.root,
-                &self.settings,
+                // claude launches the MCP servers it is handed: only a
+                // trusted project's.
+                &self.trust.effective(&self.settings),
                 self.tools.specs(),
             )?);
             self.claude_restart = false;
@@ -1853,6 +1896,7 @@ impl Session {
                 settings: &mut self.settings,
                 mode: self.mode,
                 hooks: &self.hooks,
+                trust: &self.trust,
                 parent: self.child.as_ref().map(|c| &c.link),
             },
         )
@@ -1894,11 +1938,14 @@ impl Session {
 /// call: startup, the prompt, the final answer, `/hooks`.
 impl Session {
     /// Called once the session is set up, before the first prompt: returns
-    /// what to tell the user about the configured hooks (problems, project
-    /// hooks awaiting approval), and runs `session_start`.
+    /// what to tell the user — the project settings that wait to be trusted
+    /// (listed for an `interactive` session, which can accept them; one
+    /// line otherwise), problems with the configured hooks — and runs
+    /// `session_start`.
     pub fn start_hooks(&mut self, interactive: bool) -> Vec<String> {
         self.describe_to_hooks();
-        let mut lines = self.hooks.startup(interactive);
+        let mut lines = self.trust.startup(&self.settings, interactive);
+        lines.extend(self.hooks.problems().iter().cloned());
         self.hook_context = self.hooks.session_start(&mut |m| lines.push(m.to_string()));
         self.hooks_started = true;
         lines
@@ -1944,24 +1991,122 @@ impl Session {
         last.map(|m| m.content.clone()).unwrap_or_default()
     }
 
-    /// `/hooks` (list) and `/hooks trust` (approve the project's set).
+    /// `/hooks` (list) and `/hooks trust` — which is `/trust`: hooks are
+    /// trusted with the rest of what the project's file asks for.
     fn hooks_command(&mut self, args: &[&str], ui: &mut dyn Ui) {
-        if !matches!(args, [] | ["trust"]) {
-            ui.info("usage: /hooks [trust]");
-            return;
+        match args {
+            [] => {
+                for l in self.hooks.list() {
+                    ui.info(&l);
+                }
+            }
+            ["trust"] => self.accept_trust(ui),
+            _ => ui.info("usage: /hooks [trust]"),
         }
-        // Approving shows the list first: it is what is being approved.
-        for l in self.hooks.list() {
+    }
+}
+
+/// The session's side of project trust (see [`trust`]): `/trust`, and
+/// putting a decision made mid-session into effect.
+impl Session {
+    /// `/trust` (accept), `/trust show`, `/trust revoke`.
+    fn trust_command(&mut self, args: &[&str], ui: &mut dyn Ui) {
+        match args {
+            [] | ["accept"] => self.accept_trust(ui),
+            ["show"] => {
+                for l in self.trust.describe(&self.settings) {
+                    ui.info(&l);
+                }
+            }
+            ["revoke"] => self.revoke_trust(ui),
+            _ => ui.info("usage: /trust [show|revoke]"),
+        }
+    }
+
+    /// Accept the project's gated settings as this session loaded them,
+    /// and put them into effect where that can be done without a restart.
+    fn accept_trust(&mut self, ui: &mut dyn Ui) {
+        let was_active = self.trust.active();
+        // Shown first: it is what is being accepted.
+        for l in self.trust.describe(&self.settings) {
             ui.info(&l);
         }
-        if args == ["trust"] {
-            match self.hooks.trust() {
-                Ok(()) => ui.info(
-                    "approved: this project's hooks run from now on, until they change \
-                     (session_start hooks: from the next session)",
-                ),
-                Err(e) => ui.info(&format!("error: {e:#}")),
+        match self.trust.accept(&self.settings) {
+            Err(e) => ui.info(&format!("error: {e:#}")),
+            Ok(trust::State::NotNeeded) => {}
+            Ok(_) if was_active => {
+                ui.info("trusted: on record for this project, until one of these changes");
             }
+            Ok(_) => {
+                self.hooks.set_trust(self.trust.hooks_state());
+                let servers = !self.settings.mcp.is_empty() || !self.settings.mcp_http.is_empty();
+                if self.is_claude() {
+                    // claude is handed the servers when it is launched.
+                    self.claude_restart |= servers;
+                } else {
+                    // The providers, and the models addressed on them.
+                    let user = Settings::load_user().unwrap_or_default();
+                    let before = self.cfg.model.clone();
+                    for warning in self.cfg.apply_settings(&self.settings, &user) {
+                        ui.info(&format!("warning: {warning}"));
+                    }
+                    if self.cfg.model != before {
+                        ui.info(&format!("model: {} (this project's)", self.cfg.model));
+                    }
+                    // A server added by hand this session is connected
+                    // already; start over rather than run it twice.
+                    self.drop_mcp_tools();
+                    for line in self.connect_configured_mcp() {
+                        ui.info(&line);
+                    }
+                }
+                ui.info("trusted: in effect from now on, and on record until one of these changes");
+                // What only a new session picks up.
+                if Mode::configured(&self.settings.defaults) == Mode::Yolo
+                    && self.mode != Mode::Yolo
+                {
+                    ui.info("  the yolo default applies from the next session (/mode yolo: now)");
+                }
+                if !self.settings.hooks.is_empty() {
+                    ui.info("  session_start hooks run from the next session");
+                }
+            }
+        }
+    }
+
+    /// Stop trusting the project, and withdraw what can be withdrawn from
+    /// a running session.
+    fn revoke_trust(&mut self, ui: &mut dyn Ui) {
+        let state = match self.trust.revoke(&self.settings) {
+            Ok(state) => state,
+            Err(e) => return ui.info(&format!("error: {e:#}")),
+        };
+        self.hooks.set_trust(self.trust.hooks_state());
+        match state {
+            trust::State::NotNeeded => {
+                ui.info("nothing to revoke: nothing in this project needs your approval");
+            }
+            state if state.active() => ui.info(&format!(
+                "revoked on record — but {}=1 still accepts this project for this run",
+                trust::ENV_TRUST
+            )),
+            _ => {
+                self.drop_mcp_tools();
+                self.claude_restart |= self.is_claude();
+                ui.info(
+                    "revoked: this project's checkers, allow rules and hooks are off and its \
+                     MCP tools withdrawn. Restart atelier to be rid of the rest: a server \
+                     already started, a provider or a mode it configured",
+                );
+            }
+        }
+    }
+
+    /// Unregister the tools of every configured MCP server.
+    fn drop_mcp_tools(&mut self) {
+        let stdio = self.settings.mcp.iter().map(|m| &m.name);
+        for name in stdio.chain(self.settings.mcp_http.iter().map(|m| &m.name)) {
+            self.tools.remove_prefix(&format!("mcp__{name}__"));
         }
     }
 }
@@ -1989,6 +2134,8 @@ struct ToolRunner<'a> {
     settings: &'a mut Settings,
     mode: Mode,
     hooks: &'a Hooks,
+    /// Whether the project's own allow rules count (see [`trust`]).
+    trust: &'a Trust,
     /// In a subagent's session: the parent, which decides its calls.
     parent: Option<&'a subagent::Link>,
 }
@@ -2046,7 +2193,7 @@ impl ToolRunner<'_> {
             hook_allowed,
             hooks: Some(self.hooks),
         };
-        crate::permissions::approve(self.settings, self.root, self.mode, req, ui)
+        crate::permissions::approve(self.settings, self.root, self.mode, req, self.trust, ui)
     }
 
     /// Execute a call whose arguments are a JSON string (as models send).
@@ -2131,7 +2278,7 @@ impl claude::ToolHost for ToolRunner<'_> {
             hooks: Some(self.hooks),
             ..req
         };
-        crate::permissions::approve(self.settings, self.root, self.mode, req, ui)
+        crate::permissions::approve(self.settings, self.root, self.mode, req, self.trust, ui)
     }
 
     fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
@@ -2638,7 +2785,8 @@ mod tests {
         let tools = crate::tools::builtin_registry();
         let mut fstate = FileState::new();
         let mut settings = Settings::default();
-        let hooks = Hooks::load(&root, &[], hooks::Paths::default());
+        let hooks = Hooks::load(&root, &[], None, trust::State::NotNeeded);
+        let trust = trust::testing::open(&root);
         let mut runner = ToolRunner {
             tools: &tools,
             root: &root,
@@ -2646,6 +2794,7 @@ mod tests {
             settings: &mut settings,
             mode: Mode::Yolo,
             hooks: &hooks,
+            trust: &trust,
             parent: None,
         };
         let mut call = |name: &str, args: Value| {
@@ -2708,6 +2857,7 @@ mod tests {
             crate::tools::builtin_registry(),
             Vec::new(),
             Settings::default(),
+            trust::testing::open(&root),
         );
         (session, root)
     }
@@ -2835,8 +2985,14 @@ mod tests {
             crate::provider::Provider::from_env("http://127.0.0.1:9/v1".into(), None),
             "none".into(),
         );
-        let mut session =
-            Session::new(cfg, root.clone(), ToolRegistry::new(), Vec::new(), settings);
+        let mut session = Session::new(
+            cfg,
+            root.clone(),
+            ToolRegistry::new(),
+            Vec::new(),
+            settings,
+            trust::testing::open(&root),
+        );
         session.mcp_tokens = temp_store("session");
 
         assert_eq!(

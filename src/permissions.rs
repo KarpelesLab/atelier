@@ -20,6 +20,13 @@
 //! the lists are unions, so a deny from either file wins over an allow from
 //! either.
 //!
+//! The project's `allow` list counts only in a project the user has trusted
+//! (see [`crate::trust`]): a cloned repository must not be able to approve
+//! its own commands. Its `deny` and `ask` lists always count — they only
+//! restrict. In an untrusted project, the allow rules in force are the
+//! user-global ones and those the user saves with "always" during the
+//! session.
+//!
 //! [`Tool::requires_approval_in`]: crate::tools::Tool::requires_approval_in
 //!
 //! # What a pattern is matched against
@@ -114,6 +121,7 @@ use serde_json::{Value, json};
 use crate::agent::{Approval, Ui};
 use crate::settings::{Defaults, Permissions, Settings};
 use crate::tools;
+use crate::trust::Trust;
 
 /// The tool result for a call the user refused at the prompt.
 pub const DENIED: &str = "error: the user denied permission to run this tool.";
@@ -1074,14 +1082,16 @@ fn deny_refusal(verdict: &Verdict, root: &Path) -> String {
 /// through `ui` when they (or the tool's default) say to ask. `Err` carries
 /// the tool result for the model — which rule refused, that plan mode did, or
 /// that the user did. "Always" saves a rule to the project's `atelier.toml`.
+/// `trust` says whether the project's own allow rules count.
 pub fn approve(
     settings: &mut Settings,
     root: &Path,
     mode: Mode,
     req: Request,
+    trust: &Trust,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
-    let policy = Policy::load(&settings.permissions);
+    let policy = Policy::load(&trust.permissions(&settings.permissions));
     // Trouble with the rule files is said once, not at every call.
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !policy.problems.is_empty() && !WARNED.swap(true, Ordering::Relaxed) {
@@ -1089,7 +1099,7 @@ pub fn approve(
             ui.info(&format!("⚠ {problem}"));
         }
     }
-    approve_with(&policy, settings, root, mode, req, ui)
+    approve_with(&policy, settings, root, mode, req, trust, ui)
 }
 
 /// [`approve`] under a given policy.
@@ -1099,6 +1109,7 @@ pub(crate) fn approve_with(
     root: &Path,
     mode: Mode,
     req: Request,
+    trust: &Trust,
     ui: &mut dyn Ui,
 ) -> Result<(), String> {
     let args: Value = serde_json::from_str(req.arguments).unwrap_or(Value::Null);
@@ -1134,7 +1145,7 @@ pub(crate) fn approve_with(
         Approval::Once => Ok(()),
         Approval::Deny => Err(DENIED.to_string()),
         Approval::Always => {
-            remember(policy, settings, root, &verdict, req.tool, &args, ui);
+            remember(policy, settings, root, trust, &verdict, req.tool, &args, ui);
             Ok(())
         }
     }
@@ -1142,10 +1153,12 @@ pub(crate) fn approve_with(
 
 /// "Always": save the rules that let this call through, and say which — or
 /// say that none fits and the call ran once.
+#[allow(clippy::too_many_arguments)]
 fn remember(
     policy: &Policy,
     settings: &mut Settings,
     root: &Path,
+    trust: &Trust,
     verdict: &Verdict,
     tool: &str,
     args: &Value,
@@ -1160,7 +1173,10 @@ fn remember(
         return;
     }
     let mut rules = policy.propose(tool, args, root);
-    rules.retain(|r| !settings.permissions.allow.contains(r));
+    // Against the rules in force: in an untrusted project the file may
+    // already hold the rule, and holding it there counts for nothing.
+    let in_force = trust.permissions(&settings.permissions).allow;
+    rules.retain(|r| !in_force.contains(r));
     // Only save what demonstrably lets this very call through next time.
     let works = policy
         .with_allow(&rules)
@@ -1172,9 +1188,19 @@ fn remember(
         );
         return;
     }
-    settings.permissions.allow.extend(rules.iter().cloned());
-    let saved = match settings.save(root) {
-        Ok(()) => "saved to atelier.toml".to_string(),
+    for rule in &rules {
+        if !settings.permissions.allow.contains(rule) {
+            settings.permissions.allow.push(rule.clone());
+        }
+    }
+    // The user's own rule: in force now whatever the project's standing,
+    // and — in a project that was trusted — part of what is trusted.
+    trust.allowed_by_user(&rules);
+    let saved = match trust.save(settings) {
+        Ok(()) if trust.active() => "saved to atelier.toml".to_string(),
+        Ok(()) => "saved to atelier.toml; in force for this session — the project is not \
+                   trusted, /trust to keep it"
+            .to_string(),
         Err(e) => format!("kept for this session only — {e:#}"),
     };
     for rule in &rules {
@@ -1225,7 +1251,11 @@ pub fn run_command(args: &[String]) -> Result<()> {
         }
     };
     let root = std::env::current_dir()?;
+    // As a session started here would see them: without the gated parts
+    // if the project is not trusted.
     let settings = Settings::load(&root)?;
+    let trust = Trust::load(&root, &settings, crate::trust::Store::from_env());
+    let settings = trust.effective(&settings);
     let policy = Policy::load(&settings.permissions);
     let mode = match chosen {
         Some(mode) => mode,
@@ -1248,6 +1278,12 @@ pub fn run_command(args: &[String]) -> Result<()> {
     };
     for line in explain(&policy, mode, &req, &call_args, &root) {
         println!("{line}");
+    }
+    if !trust.active() {
+        println!(
+            "note: this project is not trusted, so its allow rules and mode default are not \
+             counted (atelier trust status)"
+        );
     }
     Ok(())
 }
@@ -2112,6 +2148,8 @@ mod tests {
         dir: PathBuf,
         settings: Settings,
         mode: Mode,
+        /// The project's standing; trusted unless a test says otherwise.
+        trust: Trust,
     }
 
     impl Gate {
@@ -2120,6 +2158,7 @@ mod tests {
                 std::env::temp_dir().join(format!("atelier-perm-{name}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             Self {
+                trust: crate::trust::testing::open(&dir),
                 dir,
                 settings: Settings {
                     permissions,
@@ -2136,8 +2175,9 @@ mod tests {
             needs_approval: bool,
             ui: &mut Scripted,
         ) -> Result<(), String> {
+            // As `approve` builds it: the project's rules as they apply.
             let policy = Policy::new(
-                &self.settings.permissions,
+                &self.trust.permissions(&self.settings.permissions),
                 &Permissions::default(),
                 Some(PathBuf::from(HOME)),
             );
@@ -2150,7 +2190,8 @@ mod tests {
                 hooks: None,
                 mutates: modifies(tool, &args),
             };
-            approve_with(&policy, &mut self.settings, &self.dir, self.mode, req, ui)
+            let (dir, trust) = (&self.dir, &self.trust);
+            approve_with(&policy, &mut self.settings, dir, self.mode, req, trust, ui)
         }
 
         fn bash(&mut self, command: &str, ui: &mut Scripted) -> Result<(), String> {
@@ -2212,6 +2253,55 @@ mod tests {
         assert!(gate.settings.permissions.allow.is_empty());
         assert!(gate.bash("git push", &mut ui).is_ok());
         assert_eq!(ui.asked, 2);
+    }
+
+    /// An untrusted project's allow rules approve nothing; its deny and ask
+    /// rules still bind; and "always" works for the session without
+    /// vouching for the rest of the file.
+    #[test]
+    fn an_untrusted_projects_allow_rules_do_not_count() {
+        let rules = perms(&["bash"], &["bash(git push *)"], &["bash(rm *)"]);
+        let mut gate = Gate::new("untrusted", rules);
+        gate.trust = crate::trust::testing::closed(&gate.dir);
+        let mut ui = Scripted::new(|| Approval::Deny);
+        // `allow = ["bash"]` would have run this unasked.
+        assert_eq!(gate.bash("make", &mut ui).unwrap_err(), DENIED);
+        assert_eq!(ui.asked, 1);
+        assert!(
+            gate.bash("rm -rf x", &mut ui)
+                .unwrap_err()
+                .contains("`bash(rm *)`")
+        );
+        assert_eq!(gate.bash("git push origin", &mut ui).unwrap_err(), DENIED);
+        assert_eq!(ui.asked, 2);
+
+        let mut ui = Scripted::new(|| Approval::Always);
+        assert!(gate.bash("cargo test --lib", &mut ui).is_ok());
+        assert!(
+            ui.infos.iter().any(|i| i.contains("not trusted")),
+            "{:?}",
+            ui.infos
+        );
+        // Saved next to what was there, in force now, and the project is
+        // no more trusted than before.
+        assert_eq!(
+            gate.settings.permissions.allow,
+            ["bash", "bash(cargo test *)"]
+        );
+        assert!(gate.bash("cargo test other", &mut ui).is_ok());
+        assert_eq!(ui.asked, 1);
+        assert!(!gate.trust.active());
+        let mut ui = Scripted::new(|| Approval::Deny);
+        assert_eq!(gate.bash("make", &mut ui).unwrap_err(), DENIED);
+
+        // A rule the file already holds is still the user's to give.
+        let mut gate = Gate::new("untrusted-held", perms(&["bash(cargo test *)"], &[], &[]));
+        gate.trust = crate::trust::testing::closed(&gate.dir);
+        let mut ui = Scripted::new(|| Approval::Always);
+        assert!(gate.bash("cargo test --lib", &mut ui).is_ok());
+        assert!(gate.bash("cargo test again", &mut ui).is_ok());
+        assert_eq!(ui.asked, 1);
+        assert_eq!(gate.settings.permissions.allow, ["bash(cargo test *)"]);
     }
 
     #[test]
@@ -2304,6 +2394,7 @@ mod tests {
                 &gate.dir,
                 Mode::AutoEdit,
                 req,
+                &gate.trust,
                 ui,
             )
         };
@@ -2334,8 +2425,8 @@ mod tests {
             mutates: true,
         };
         let policy = policy(&["bash(ls *)"], &[], &[]);
-        let mode = Mode::AutoEdit;
-        assert!(approve_with(&policy, &mut gate.settings, &gate.dir, mode, req, &mut ui).is_err());
+        let (dir, mode, trust) = (&gate.dir, Mode::AutoEdit, &gate.trust);
+        assert!(approve_with(&policy, &mut gate.settings, dir, mode, req, trust, &mut ui).is_err());
         assert_eq!(ui.asked, 2);
     }
 

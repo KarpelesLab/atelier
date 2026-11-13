@@ -111,6 +111,7 @@ first conversation, the REPL/TUI fallback).
 | [Goals](docs/goals.md) | `/goal <condition>` and `--goal`: keep the agent working until a condition holds, checked by a judge at each turn's end; `[goals]` bounds |
 | [Hooks](docs/hooks.md) | Commands run on events (before/after a tool call, on a prompt, at turn end) that can observe or decide: `[[hooks]]`, the stdin/stdout contract, trust, `/hooks`, examples |
 | [Subagents](docs/agents.md) | The `task` tool: `explore` and `general`, your own agents as Markdown files in `.atelier/agents/` (also `.claude/agents/`), the step cap, parallel runs, `/agents` |
+| [Project trust](docs/trust.md) | What a project's `atelier.toml` may not do until you accept it (start MCP servers, run checkers and hooks, add providers, allow commands): `/trust`, `atelier trust`, `ATELIER_TRUST_PROJECT`, what is gated and why |
 | [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
 | [Sandboxed `bash`](docs/sandbox.md) | Experimental (`--features sandbox`): commands in a nixvm guest that sees only the project — setup, what works there, measurements, what is missing |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
@@ -140,6 +141,7 @@ src/
 ├─ context/       per-turn context helpers
 ├─ risk.rs        risk-signal detection for bash approval prompts
 ├─ sandbox.rs     bash commands in a nixvm guest                [feature = "sandbox", off]
+├─ trust.rs       project trust: which atelier.toml settings wait for /trust
 └─ tui/           minimal inline interface, mid-turn steering  [feature = "tui", default on]
 ```
 

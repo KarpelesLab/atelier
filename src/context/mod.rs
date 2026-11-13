@@ -41,10 +41,14 @@ mod todos;
 pub use budget::{estimate_tokens, render_budgeted};
 #[allow(unused_imports)]
 pub use dedup::{Delta, dedup_items};
-pub use instructions::{instruction_files, nested_instructions, review_section};
+pub use diagnostics::detectable as detectable_checkers;
+pub use instructions::{
+    instruction_files, nested_instructions, pick as instruction_file, review_section,
+};
 pub use mcp::McpProvider;
 
 use crate::settings::DiagnosticCheck;
+use crate::trust::Trust;
 use std::path::Path;
 
 /// A single piece of injected context.
@@ -103,12 +107,20 @@ pub fn standing_providers() -> Vec<Box<dyn ContextProvider>> {
 ///
 /// `checkers` are the `[[diagnostics]]` entries of `atelier.toml`; when
 /// empty, the diagnostics provider picks checkers from the project's files.
-pub fn default_providers(checkers: Vec<DiagnosticCheck>) -> Vec<Box<dyn ContextProvider>> {
+/// Either way they are commands of the project's choosing, which run only
+/// while `trust` says the project is trusted.
+pub fn default_providers(
+    checkers: Vec<DiagnosticCheck>,
+    trust: &Trust,
+) -> Vec<Box<dyn ContextProvider>> {
     vec![
         Box::new(instructions::InstructionsProvider::new()),
         Box::new(memory::MemoryProvider::new(crate::memory::global_dir())),
         Box::new(skills::SkillsProvider::new(crate::skills::global_dirs())),
-        Box::new(diagnostics::DiagnosticsProvider::new(checkers)),
+        Box::new(diagnostics::DiagnosticsProvider::new(
+            checkers,
+            trust.clone(),
+        )),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),
         Box::new(commits::RecentCommitsProvider),

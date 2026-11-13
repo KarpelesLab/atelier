@@ -125,7 +125,12 @@ impl Tool for WebSearchTool {
         // A broken atelier.toml was already reported at startup; here it
         // just means "no [search] table".
         let settings = Settings::load(ctx.project_root).unwrap_or_default();
-        let backend = resolve(&|name| std::env::var(name).ok(), &settings.search)?;
+        // `key_env` names a variable to send to an endpoint the same file
+        // chooses: honored only in a project the user has trusted.
+        let store = crate::trust::Store::from_env();
+        let trust = crate::trust::Trust::load(ctx.project_root, &settings, store);
+        let search = trust.effective(&settings).search;
+        let backend = resolve(&|name| std::env::var(name).ok(), &search)?;
         let hits = backend.search(query, max, &domains)?;
         Ok(render(query, &hits))
     }

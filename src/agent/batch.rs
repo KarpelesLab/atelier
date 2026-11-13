@@ -505,6 +505,7 @@ mod tests {
             tools,
             Vec::new(),
             Settings::default(),
+            crate::trust::testing::open(&root),
         );
         session.set_mode(Mode::AutoEdit);
         (session, root)

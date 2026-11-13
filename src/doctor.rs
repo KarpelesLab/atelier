@@ -35,8 +35,9 @@ use serde_json::{Value, json};
 
 use crate::agent::{to_http, to_stdio};
 use crate::config::{self, Backend, Config};
-use crate::hooks::{self, Hooks, Trust};
+use crate::hooks::Hooks;
 use crate::settings::{self, Settings};
+use crate::trust::{State, Trust};
 use crate::{agents, auth, commands, context, coord, headless, mcp, memory, provider, skills};
 
 const USAGE: &str = "\
@@ -590,20 +591,32 @@ fn check_extensions(report: &mut Report, root: &Path, settings: &Settings) {
     let found = agents::discover(root, agents::global_dir().as_deref());
     counted(report, "agents", found.agents.len(), &found.invalid);
 
-    let hooks = Hooks::load(root, &settings.hooks, hooks::Paths::from_env());
+    // Whether the project's hooks run is part of whether the project is
+    // trusted (see `trust`).
+    let trust = Trust::load(root, settings, crate::trust::Store::from_env());
+    let user_config = Settings::user_dir().map(|d| d.join(crate::settings::FILE_NAME));
+    let hooks = Hooks::load(
+        root,
+        &settings.hooks,
+        user_config.as_deref(),
+        trust.hooks_state(),
+    );
     let (user, project) = hooks.counts();
     let (status, trust) = match hooks.trust_state() {
         _ if project == 0 => (Status::Ok, String::new()),
-        Trust::Trusted => (Status::Ok, " (approved)".to_string()),
-        Trust::Env => (Status::Ok, format!(" (run because {}=1)", hooks::ENV_TRUST)),
-        Trust::Untrusted => (
-            Status::Warn,
-            " — NOT approved, so they do not run: review them and /hooks trust".to_string(),
+        State::NotNeeded | State::Trusted => (Status::Ok, " (trusted)".to_string()),
+        State::Env => (
+            Status::Ok,
+            " (run because the environment says to trust them)".to_string(),
         ),
-        Trust::Changed => (
+        State::Untrusted => (
             Status::Warn,
-            " — changed since they were approved, so they do not run: review them and \
-             /hooks trust"
+            " — the project is NOT trusted, so they do not run: review them and /trust".to_string(),
+        ),
+        State::Changed => (
+            Status::Warn,
+            " — changed since the project was trusted, so they do not run: review them and \
+             /trust"
                 .to_string(),
         ),
     };

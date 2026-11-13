@@ -107,6 +107,10 @@ In order of precedence:
    auto-approve switch sets).
 7. Otherwise `auto-edit`.
 
+A project's file gets to choose `yolo` (5 or 6) only in a project you have
+[trusted](trust.md); in an untrusted one that default is ignored. The more
+careful modes need no trust.
+
 A name that is no mode is an error, not a fallback: `--mode pln` and
 `ATELIER_MODE=pln` stop atelier before it runs anything.
 
@@ -145,6 +149,13 @@ always has.
 `~/.config/atelier/atelier.toml`), same `[permissions]` table. The lists are
 unions of both files, so the order above holds across them: a deny from
 either file beats an allow from either.
+
+**The project's `allow` list counts only in a project you have
+[trusted](trust.md)** — a cloned repository must not be able to approve its
+own commands. Its `deny` and `ask` lists always count: they only restrict.
+In an untrusted project the allow rules in force are your user-global ones
+and those you save with "always" during the session; `/permissions` and
+`permissions check` say when the project's are left out.
 
 A rule that does not parse is ignored and reported (once per session, in
 `/permissions`, and by `permissions check`) — check after editing by hand.
@@ -389,5 +400,5 @@ signals at once (each category is reported at most once per call).
 - MCP tools have no risk-signal analysis.
 - In `plan` mode, `bash` commands covered by a pattern allow rule run
   unexamined: atelier does not check that they only read.
-- A sandbox for `bash`, an approving reviewer and project trust are the
-  rest of roadmap M17.
+- A sandbox for `bash` and an approving reviewer are the rest of roadmap
+  M17. ([Project trust](trust.md) is in.)

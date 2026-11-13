@@ -9,7 +9,7 @@
 //! misspells `--max-turns` should find out, not run unbounded.
 //!
 //! Subcommands that are programs of their own (`update`, `coordinator`, `doctor`,
-//! `mcp-serve`) are picked off in `main` before this runs. Those that are
+//! `trust`, `mcp-serve`) are picked off in `main` before this runs. Those that are
 //! runs on a session (`review`, `debug prompt`) are recognized by [`subcommand`]; their
 //! arguments are their own, parsed by the module that implements them.
 
@@ -30,6 +30,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
+       atelier trust [status|accept|revoke] [path]
 
   -c, --continue             resume the saved session for this directory
   -p, --print                run one prompt non-interactively and exit

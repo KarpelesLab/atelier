@@ -241,6 +241,9 @@ fn run_repl(model: &Server, cwd: &Path, input: &str) -> Output {
 fn run_repl_env(model: &Server, cwd: &Path, input: &str, env: &[(&str, &str)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_atelier"))
         .env_remove("ATELIER_TRUST_HOOKS")
+        // These tests are about what a project's MCP servers and rules do
+        // once the project is trusted (trust itself is covered in e2e.rs).
+        .env("ATELIER_TRUST_PROJECT", "1")
         .envs(env.iter().copied())
         .env("ATELIER_BASE_URL", model.url("/v1"))
         .env("ATELIER_MODEL", "mock")

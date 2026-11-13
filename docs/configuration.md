@@ -46,7 +46,8 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
 | `ATELIER_PARALLEL_TOOLS`  | *(unset)*                        | `agent::batch` | `0`, `off`, `no` or `false` runs the read-only tool calls of one model step one after the other instead of [at the same time](tools.md#read-only-calls-run-in-parallel); any other value turns that on. Overrides `[defaults] parallel_tools` |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
-| `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `hooks::Paths::from_env` | `1` runs the project's [hooks](hooks.md) without your stored approval — for headless runs (`--print`), which never ask and otherwise skip unapproved project hooks. Only for checkouts you control |
+| `ATELIER_TRUST_PROJECT`   | *(unset)*                        | `trust::Store::from_env` | `1` accepts the [gated settings](trust.md) of the project's `atelier.toml` (MCP servers, checkers, providers, allow rules, a `yolo` default, hooks) for this run without recording anything — for headless runs (`--print`), which never ask and otherwise skip them. Only for checkouts you control |
+| `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `trust::Store::from_env` | `1` does the same for the project's [hooks](hooks.md) alone |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000), and any provider's `timeout_secs`. Non-numeric or `<= 0` values are ignored |
 | `ATELIER_NO_UPDATE`       | *(unset)*                        | `update::spawn_background_check` | Any non-empty value other than `0` turns off release builds' daily background update check (`atelier update` still works) |
 | `ATELIER_UPDATE_API`      | `https://api.github.com`         | `update` | GitHub API base the update check queries (for a mirror, or testing) |
@@ -66,6 +67,14 @@ Lives at the project root (`Settings::path`, i.e. `<root>/atelier.toml`).
 Missing entirely is fine — atelier falls back to empty settings. A file that
 fails to parse also falls back to empty settings, with a warning printed to
 stderr.
+
+**Not all of it applies at once.** The file comes with the repository, so
+the tables that run commands or grant access — `[[mcp]]`, `[[mcp_http]]`,
+`[[diagnostics]]` (and auto-detected checkers), `[[provider]]`,
+`[permissions] allow`, a `yolo` default, `[[hooks]]`, `[search] key_env` —
+take effect only once you have accepted them for the project with `/trust`
+(or `atelier trust accept`; `ATELIER_TRUST_PROJECT=1` for one run). See
+[Project trust](trust.md). Your user-global file is never gated.
 
 ```toml
 [[mcp]]
@@ -129,6 +138,9 @@ tokens go to `mcp-auth.json` in the user config directory
 (`$XDG_CONFIG_HOME/atelier/`, else `~/.config/atelier/`), mode 0600 — not
 into this file. See [MCP → Signing in](mcp.md#signing-in-to-a-remote-server-oauth).
 
+Servers of either kind are started or contacted only in a
+[trusted project](trust.md).
+
 ### `[permissions]`
 
 | Field   | Type       | Meaning |
@@ -153,6 +165,9 @@ project's — that file's other tables are not read. `atelier permissions
 check -- <command>` explains a decision. See [Permissions](permissions.md)
 for the pattern syntax per tool and how compound shell commands are judged.
 
+The project's `allow` list counts only in a [trusted project](trust.md);
+its `ask` and `deny` lists always do.
+
 - `ATELIER_TRACE` — file path to append a JSONL trace (one line per model request: messages, tool calls, usage) for debugging.
 
 ## `[defaults]`
@@ -176,7 +191,8 @@ parallel_tools = true       # overridden by ATELIER_PARALLEL_TOOLS
 `approve = true` is the older spelling of `mode = "yolo"`; `mode` wins when
 both are set. On the command line, `--mode <name>` (or `--mode=<name>`)
 selects the mode for one run, interactive or `--print`; `/mode <name>`
-switches it during a session.
+switches it during a session. `mode = "yolo"` and `approve = true` are
+honored only in a [trusted project](trust.md).
 
 `mcp_tool_budget` is how many bytes of MCP tool specs (names, descriptions,
 schemas) are advertised to the model before the tools are
@@ -229,8 +245,12 @@ nowhere else: it is not printed by `/providers`, `ATELIER_DEBUG` or
 `ATELIER_TRACE`, and if a server quotes it back in an error, it is blanked
 out of the message.
 
-`api_key_command` runs a shell command named by a file in the repository.
-Put it in your user-global `atelier.toml` when the project isn't yours.
+A project's `[[provider]]` tables — all of them, with or without a key
+source — are used only in a [trusted project](trust.md): a provider is where
+the conversation is sent, `api_key_env` names a variable to send there, and
+`api_key_command` is a shell command. Until then model choices that point at
+one fall back to your own default. Providers in your user-global
+`atelier.toml` are always in use.
 
 Providers are read from the user-global file and from the project's; a
 project entry replaces a global one of the same name. A table with a mistake
@@ -448,9 +468,9 @@ timeout_secs = 30              # optional, default 60
 `[[hooks]]` is read from two files: the project's `atelier.toml`, and your
 own `$XDG_CONFIG_HOME/atelier/atelier.toml` (`~/.config/atelier/atelier.toml`
 when that variable is unset), of which only this table is read. Your own
-hooks always run. A project's run only after you approve them with `/hooks
-trust`, and need approving again whenever they change; approvals are kept in
-`$XDG_STATE_HOME/atelier/trust.json` (`~/.local/state/atelier/trust.json`).
+hooks always run. A project's run only in a [trusted project](trust.md)
+(`/trust`), and need accepting again whenever they change; decisions are kept
+in `$XDG_STATE_HOME/atelier/trust.json` (`~/.local/state/atelier/trust.json`).
 `/hooks` lists what is configured and whether it runs.
 
 ## Instruction files
@@ -524,6 +544,9 @@ error. If a command fails without printing any such line, the first lines of
 its output are reported as they are. At most 15 lines are shown per turn,
 errors first, shared between the checkers.
 
+Checkers — configured or auto-detected — run only in a
+[trusted project](trust.md): until you `/trust` it there are no diagnostics.
+
 Use commands that only read the tree: they run unprompted, every time a
 matching file changes. A command that can't be started is reported once and
 skipped for the rest of the session; one that times out is reported once,
@@ -562,7 +585,7 @@ key_env = "BRAVE_API_KEY"            # the variable holding the key; ATELIER_SEA
 |------------|--------|---------|
 | `provider` | string | `searxng`, `brave`, `tavily` or `duckduckgo`. Unset: `searxng` if a URL is set, else `duckduckgo` |
 | `url`      | string | The SearXNG instance's base URL. For the other providers it replaces the endpoint (a proxy) |
-| `key_env`  | string | **Name** of the environment variable that holds the API key — the key itself never goes in `atelier.toml` |
+| `key_env`  | string | **Name** of the environment variable that holds the API key — the key itself never goes in `atelier.toml`. Honored only in a [trusted project](trust.md) (`ATELIER_SEARCH_KEY` always works) |
 
 | Provider     | Needs | Request |
 |--------------|-------|---------|

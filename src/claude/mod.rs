@@ -1338,7 +1338,8 @@ mod tests {
     impl ToolHost for RuleHost {
         fn permit(&mut self, req: permissions::Request, ui: &mut dyn Ui) -> Result<(), String> {
             let (policy, dir) = (&self.policy, &self.dir);
-            permissions::approve_with(policy, &mut self.settings, dir, self.mode, req, ui)
+            let trust = crate::trust::testing::open(dir);
+            permissions::approve_with(policy, &mut self.settings, dir, self.mode, req, &trust, ui)
         }
         fn call(
             &mut self,

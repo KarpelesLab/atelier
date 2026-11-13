@@ -745,12 +745,15 @@ mod tests {
             crate::provider::Provider::from_env("http://127.0.0.1:9/v1".into(), None),
             "m".into(),
         );
+        let root = std::env::temp_dir().join("atl-compact-unused");
+        let trust = crate::trust::testing::open(&root);
         let mut session = Session::new(
             cfg,
-            std::env::temp_dir().join("atl-compact-unused"),
+            root,
             crate::tools::ToolRegistry::new(),
             Vec::new(),
             crate::settings::Settings::default(),
+            trust,
         );
         session.compact_threshold = threshold;
         session

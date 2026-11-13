@@ -25,9 +25,14 @@
 //!   dropped for the session; one that times out is reported once and tried
 //!   again after the next change — a cold build cache is the usual cause —
 //!   then dropped if it times out a second time running.
+//! - **Trust.** A checker is a command the project chose — or, detected,
+//!   the project's own build (`cargo check` runs build scripts) — so none
+//!   runs, and nothing is probed, until the project is trusted (see
+//!   [`crate::trust`]).
 
 use super::{ContextItem, ContextProvider};
 use crate::settings::DiagnosticCheck;
+use crate::trust::Trust;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -67,11 +72,14 @@ pub struct DiagnosticsProvider {
     /// The Python that can `import pyflakes`, probed once: it costs a
     /// process, unlike the other presence checks.
     pyflakes: OnceLock<Option<&'static str>>,
+    /// Whether the project's commands may run at all.
+    trust: Trust,
 }
 
 impl DiagnosticsProvider {
-    pub fn new(configured: Vec<DiagnosticCheck>) -> Self {
+    pub fn new(configured: Vec<DiagnosticCheck>, trust: Trust) -> Self {
         Self {
+            trust,
             configured,
             state: Mutex::new(HashMap::new()),
             pyflakes: OnceLock::new(),
@@ -103,6 +111,10 @@ impl ContextProvider for DiagnosticsProvider {
     }
 
     fn gather(&self, root: &Path) -> Option<ContextItem> {
+        // Asked every turn: `/trust` switches the checkers on mid-session.
+        if !self.trust.active() {
+            return None;
+        }
         let checkers = self.checkers(root);
         if checkers.is_empty() {
             return None;
@@ -212,6 +224,14 @@ fn detect(
         }
     }
     found
+}
+
+/// The commands detection could pick for `root`, going by its marker files
+/// alone: nothing is run and what is installed is not looked at, so the
+/// answer is the same on every machine. For the trust summary.
+pub fn detectable(root: &Path) -> Vec<String> {
+    let found = detect(root, &|_| true, &|| None);
+    found.into_iter().map(|c| c.command).collect()
 }
 
 /// Whether `program` is an existing file in some `PATH` directory.
@@ -644,6 +664,11 @@ mod tests {
         dir
     }
 
+    /// A provider in a trusted project.
+    fn provider(dir: &Path, configured: Vec<DiagnosticCheck>) -> DiagnosticsProvider {
+        DiagnosticsProvider::new(configured, crate::trust::testing::open(dir))
+    }
+
     fn diags(output: &str) -> Vec<Diagnostic> {
         parse(output, false)
     }
@@ -652,7 +677,7 @@ mod tests {
     fn no_marker_files_means_no_checkers() {
         let dir = temp_dir("nomarkers");
         assert!(detect(&dir, &|_| true, &|| Some("python3")).is_empty());
-        assert!(DiagnosticsProvider::new(Vec::new()).gather(&dir).is_none());
+        assert!(provider(&dir, Vec::new()).gather(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -876,13 +901,55 @@ Found 2 errors.
     }
 
     #[cfg(unixlike)]
-    fn configured(command: &str, when: &[&str]) -> DiagnosticsProvider {
-        DiagnosticsProvider::new(vec![DiagnosticCheck {
+    fn lint(command: &str, when: &[&str]) -> DiagnosticCheck {
+        DiagnosticCheck {
             name: "lint".to_string(),
             command: command.to_string(),
             when: when.iter().map(|s| s.to_string()).collect(),
             timeout_secs: 30,
-        }])
+        }
+    }
+
+    /// In an untrusted project nothing runs — not a configured checker, not
+    /// a detected one — until the project is accepted, mid-session.
+    #[cfg(unixlike)]
+    #[test]
+    fn nothing_runs_until_the_project_is_trusted() {
+        let dir = temp_dir("untrusted");
+        let state = temp_dir("untrusted-state");
+        let command = "sh -c 'touch ran; echo a.rs:1:1: error: x; exit 1'";
+        let settings = crate::settings::Settings {
+            diagnostics: vec![lint(command, &[])],
+            ..Default::default()
+        };
+        let store = crate::trust::Store {
+            file: Some(state.join("trust.json")),
+            ..Default::default()
+        };
+        let trust = Trust::load(&dir, &settings, store);
+        let provider = DiagnosticsProvider::new(settings.diagnostics.clone(), trust.clone());
+        assert!(provider.gather(&dir).is_none());
+        assert!(!dir.join("ran").exists(), "the checker ran untrusted");
+
+        trust.accept(&settings).unwrap();
+        assert!(provider.gather(&dir).is_some());
+        assert!(dir.join("ran").exists());
+
+        // Detected checkers wait the same way.
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert_eq!(detectable(&dir), ["cargo check --message-format short"]);
+        let closed = crate::trust::testing::closed(&dir);
+        let detected = DiagnosticsProvider::new(Vec::new(), closed);
+        assert!(detected.gather(&dir).is_none());
+        assert!(!dir.join("target").exists(), "cargo ran untrusted");
+        for d in [dir, state] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[cfg(unixlike)]
+    fn configured(command: &str, when: &[&str]) -> DiagnosticsProvider {
+        provider(Path::new("."), vec![lint(command, when)])
     }
 
     /// The whole loop with a stand-in checker: it prints `diag.txt` and
@@ -946,12 +1013,13 @@ Found 2 errors.
     #[test]
     fn a_checker_that_cannot_start_is_reported_once() {
         let dir = temp_dir("nostart");
-        let provider = DiagnosticsProvider::new(vec![DiagnosticCheck {
+        let check = DiagnosticCheck {
             name: "lint".to_string(),
             command: "atelier-no-such-checker --flag".to_string(),
             when: Vec::new(),
             timeout_secs: 5,
-        }]);
+        };
+        let provider = provider(&dir, vec![check]);
         let body = provider.gather(&dir).unwrap().body;
         assert!(body.starts_with("lint: could not run `atelier-no-such-checker --flag`"));
         assert_eq!(body.lines().count(), 1);

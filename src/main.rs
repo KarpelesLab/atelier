@@ -31,6 +31,7 @@ mod settings;
 mod shlex;
 mod skills;
 mod tools;
+mod trust;
 #[cfg(tui)]
 mod tui;
 mod update;
@@ -101,6 +102,11 @@ fn run() -> Result<u8> {
     if args.first().map(String::as_str) == Some("stats") {
         return usage::run_command(&args[1..]).map(|()| 0);
     }
+    // `atelier trust [status|accept|revoke] [path]`: whether a project's
+    // `atelier.toml` may run commands and grant access (see `trust`).
+    if args.first().map(String::as_str) == Some("trust") {
+        return trust::run_command(&args[1..]);
+    }
     // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
     // claude launch — a relay back to the atelier process that owns the
     // session (see `claude::relay`). Nothing else runs in that mode.
@@ -169,9 +175,13 @@ fn run() -> Result<u8> {
     // describe endpoints atelier calls, so none applies to the Claude
     // backend (where claude picks unless ATELIER_MODEL says). A user file
     // that can't be read is reported with the permission rules it also
-    // holds.
+    // holds. The project's file gets a say in where requests go, what runs
+    // and what is allowed only once the user has trusted the project (see
+    // `trust`); until then its gated parts are left out here and wherever
+    // else they would be acted on.
+    let trust = trust::Trust::load(&root, &settings, trust::Store::from_env());
     let user_settings = Settings::load_user().unwrap_or_default();
-    for warning in cfg.apply_settings(&settings, &user_settings) {
+    for warning in cfg.apply_settings(&trust.effective(&settings), &user_settings) {
         eprintln!("warning: {warning}");
     }
 
@@ -190,8 +200,8 @@ fn run() -> Result<u8> {
             agents::global_dir(),
         )));
     }
-    let context = context::default_providers(settings.diagnostics.clone());
-    let mut session = agent::Session::new(cfg, root, tools, context, settings);
+    let context = context::default_providers(settings.diagnostics.clone(), &trust);
+    let mut session = agent::Session::new(cfg, root, tools, context, settings, trust);
     if let Some(mode) = mode {
         session.set_mode(mode);
     }
@@ -206,8 +216,9 @@ fn run() -> Result<u8> {
     if cli.resume {
         eprintln!("{}", session.resume());
     }
-    // Hooks: say which of the project's are waiting for approval (a headless
-    // run can't ask, so it skips them), then run `session_start`.
+    // Say which of the project's settings are waiting to be trusted (a
+    // headless run can't ask, so it skips them), then run the
+    // `session_start` hooks.
     for line in session.start_hooks(cli.print.is_none() && sub.is_none()) {
         eprintln!("{line}");
     }

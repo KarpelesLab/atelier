@@ -32,7 +32,7 @@ Two files are read:
 
 | File | Hooks in it |
 |------|-------------|
-| `<project>/atelier.toml` | the project's: run only once [you have approved them](#trust) |
+| `<project>/atelier.toml` | the project's: run only once [you have trusted the project](#trust) |
 | `$XDG_CONFIG_HOME/atelier/atelier.toml`, else `~/.config/atelier/atelier.toml` | yours, for every project: always run. Only `[[hooks]]` is read from this file |
 
 Several hooks on one event run in order, yours first, then the project's in
@@ -46,29 +46,38 @@ regex — is skipped with a warning at startup; the others still load.
 
 Hooks are arbitrary commands, and a project's `atelier.toml` can arrive with
 a repository you just cloned. So **project hooks do not run until you have
-approved that exact set**:
+trusted the project** — one decision that covers its hooks together with
+everything else in the file that runs commands or grants access (MCP
+servers, checkers, providers, allow rules). [Project trust](trust.md) has
+the whole of it; for hooks it means:
 
-- When an interactive session starts in a project whose hooks you haven't
-  approved — or whose hooks changed since you did — atelier prints them and
-  runs none of them. Read them, then type `/hooks trust`.
-- The approval is a SHA-256 of the project's hooks (event, `match`, command
-  and timeout of each, in order), stored per project path in
+- When an interactive session starts in a project you haven't trusted — or
+  whose gated settings changed since you did — atelier lists them, hooks
+  included, and runs none of the project's hooks. Read them, then type
+  `/trust`.
+- The decision is a SHA-256 over those settings (for a hook: event, `match`,
+  command and timeout, in order), stored per project path in
   `$XDG_STATE_HOME/atelier/trust.json` (else `~/.local/state/atelier/`) —
   outside the project, so neither the repository nor the agent (whose file
   tools are confined to the project) can approve anything.
 - Any change to the set — a `git pull` that edits a command, the agent
-  editing `atelier.toml` — makes it unapproved again at the next start.
-- A headless run (`--print`) never asks. Unapproved project hooks are
-  skipped, with one notice on stderr, unless `ATELIER_TRUST_HOOKS=1` is set
-  — which runs them whatever they are, so set it only where you control the
-  checkout (CI on your own repository).
+  editing `atelier.toml` — makes the project untrusted again at the next
+  start.
+- A headless run (`--print`) never asks. In an untrusted project the hooks
+  are skipped, with one notice on stderr, unless `ATELIER_TRUST_PROJECT=1`
+  (the project's settings, all of them) or `ATELIER_TRUST_HOOKS=1` (its hooks
+  alone) is set — either runs them whatever they are, so set it only where
+  you control the checkout (CI on your own repository).
+- Hooks you approved with `/hooks trust` before the rest was gated keep
+  running as long as they are unchanged; if the project configures other
+  gated settings, those wait for `/trust`.
 
 Hooks in your user-global file are yours and need no approval.
 
 | Command | Does |
 |---------|------|
 | `/hooks` | lists every hook, where it comes from (`user`, `project`), and whether the project's are trusted |
-| `/hooks trust` | lists them, then approves the project's hooks as they are now. They run from then on (`session_start` hooks: from the next session) |
+| `/hooks trust` | the same as `/trust`: shows what the project's file asks for and accepts it as it is now. Hooks run from then on (`session_start` hooks: from the next session) |
 
 ## What a hook receives
 

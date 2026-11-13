@@ -363,6 +363,8 @@ impl Session {
             tools,
             context::standing_providers(),
             self.settings.clone(),
+            // The same decision as its parent's, not another reading of it.
+            self.trust.clone(),
         );
         child.chatgpt = self.chatgpt.clone();
         // The agent's own `model:` wins; else `[models] subagent`, if set;

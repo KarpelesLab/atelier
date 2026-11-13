@@ -6,6 +6,12 @@ calls them exactly like any other tool. All MCP tools flow through the same
 [permission model](permissions.md) as `bash` — every MCP tool call requires
 approval, regardless of server, transport, or tool.
 
+A server configured in a project's `atelier.toml` is started (or contacted)
+only in a project you have [trusted](trust.md): a stdio server is a command
+of the file's choosing. In an untrusted project the startup notice lists the
+servers and `/trust` starts them. Servers you add yourself with `/mcp add`
+are connected at once either way.
+
 ## Configuring a stdio server
 
 ### `/mcp add`
@@ -199,6 +205,12 @@ endpoint (sign in again). With the [Claude backend](claude.md) `claude`
 signs in to MCP servers itself.
 
 ## Managing servers
+
+`/mcp add` and `/mcp remove` rewrite `atelier.toml`. In a project that is
+trusted, or that had nothing needing trust, the change is recorded as
+trusted — you are not asked about your own action. In an untrusted project
+the server works for the session and is listed with the rest of the file's
+gated settings until you `/trust`.
 
 - `/mcp` (no arguments) — list every configured server, stdio and HTTP alike
   (HTTP entries are marked `(http)`).

@@ -227,7 +227,7 @@ fn chain(root: &Path) -> Vec<PathBuf> {
 }
 
 /// The instruction file of `dir`: the first of [`CANDIDATES`] present.
-fn pick(dir: &Path) -> Option<PathBuf> {
+pub fn pick(dir: &Path) -> Option<PathBuf> {
     CANDIDATES
         .iter()
         .map(|name| dir.join(name))
