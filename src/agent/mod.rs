@@ -51,6 +51,7 @@ use crate::trust::{self, Trust};
 
 mod standalone;
 mod subagent;
+mod turn_model;
 
 const SYSTEM_PROMPT: &str = "\
 You are atelier, an AI coding assistant operating inside a project directory. \
@@ -176,9 +177,10 @@ pub enum Approval {
 pub enum Dispatch {
     /// Not a command — send it to the model as a prompt.
     Prompt,
-    /// A file-defined command (see [`crate::commands`]): send this text, the
-    /// expanded template, as the prompt instead of the line typed.
-    Expanded(String),
+    /// A command that stands for a prompt — a command file (see
+    /// [`crate::commands`]), an MCP prompt, `/init`: send what it expanded
+    /// into instead of the line typed (with [`Session::send_expansion`]).
+    Expanded(Expansion),
     /// A command that was handled in place.
     Handled,
     /// The user asked to quit.
@@ -186,6 +188,24 @@ pub enum Dispatch {
     /// Open the full-screen configuration editor (TUI only; the REPL prints a
     /// text summary instead).
     Config,
+}
+
+/// What a command expanded into: the prompt to send, and how.
+pub struct Expansion {
+    pub prompt: String,
+    /// The model the command asks for, for this one turn (a command file's
+    /// `model:` — see `turn_model`). `None` is the session's.
+    pub model: Option<String>,
+}
+
+impl From<String> for Expansion {
+    /// A prompt to send as any other, on the session's model.
+    fn from(prompt: String) -> Self {
+        Self {
+            prompt,
+            model: None,
+        }
+    }
 }
 
 const HELP: &[&str] = &[
@@ -283,7 +303,7 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             "/init → a brief to write AGENTS.md ({} chars)",
             prompt.chars().count()
         ));
-        return Dispatch::Expanded(prompt);
+        return Dispatch::Expanded(prompt.into());
     }
     // File-defined commands take their arguments as typed (prose, where an
     // apostrophe is not a quote), so they are looked up before the line is
@@ -541,7 +561,10 @@ fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option
                 command.path.display(),
                 prompt.chars().count()
             ));
-            Dispatch::Expanded(prompt)
+            Dispatch::Expanded(Expansion {
+                prompt,
+                model: command.model,
+            })
         }
         Err(e) => {
             ui.info(&format!("{name}: {e}"));
@@ -577,7 +600,7 @@ fn dispatch_mcp_prompt(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Op
                 prompt.name,
                 text.chars().count()
             ));
-            Dispatch::Expanded(text)
+            Dispatch::Expanded(text.into())
         }
         Err(e) => {
             ui.info(&format!("{name}: {e:#}"));
@@ -2708,12 +2731,13 @@ pub fn repl(mut session: Session) -> Result<()> {
                 ui.info("(edit atelier.toml or use /model, /review; the TUI has a full editor)");
             }
             outcome @ (Dispatch::Prompt | Dispatch::Expanded(_)) => {
-                // A file-defined command sends its expanded template.
-                let prompt = match &outcome {
-                    Dispatch::Expanded(text) => text,
-                    _ => line,
+                // A command that stands for a prompt sends what it expanded
+                // into, on its own model if it names one.
+                let sent = match &outcome {
+                    Dispatch::Expanded(expansion) => session.send_expansion(expansion, &mut ui),
+                    _ => session.send(line, &mut ui),
                 };
-                if let Err(e) = session.send(prompt, &mut ui) {
+                if let Err(e) = sent {
                     eprintln!("error: {e:#}");
                 } else if let Some(s) = session.usage_summary() {
                     eprintln!("{DIM}[{s}]{RESET}");

@@ -1152,6 +1152,61 @@ fn custom_command_expands_into_the_prompt() {
     assert!(stdout.contains("unknown command '/nope'"), "{stdout}");
 }
 
+/// `model:` in a command file's front matter is the model for the turn that
+/// command starts, variant included — and only that turn: the next prompt is
+/// on the session's model again, also after a turn that failed.
+#[cfg(unix)]
+#[test]
+fn a_commands_model_applies_to_its_turn_only() {
+    let mock = Mock::start(Arc::new(|n| match n {
+        // The command's first turn fails at the provider.
+        0 => error_response(400, r#"{"error":{"message":"no such model"}}"#),
+        _ => answer_response("done"),
+    }));
+    let dir = unique_dir("command-model");
+    let commands = dir.join(".atelier/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("deep.md"),
+        "---\ndescription: think hard\nmodel: big-model#high\n---\nThink hard about $ARGUMENTS\n",
+    )
+    .unwrap();
+
+    let out = run_repl(
+        &mock.base_url(),
+        &dir,
+        "/deep the parser\nplain one\n/deep the lexer\nplain two\n/model\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(mock.requests(), 4, "{stdout}\n{stderr}");
+    let sent: Vec<serde_json::Value> = (0..4).map(|n| request_json(&mock, n)).collect();
+    let models: Vec<&str> = sent.iter().map(|r| r["model"].as_str().unwrap()).collect();
+    assert_eq!(models, ["big-model", "mock", "big-model", "mock"]);
+    let efforts: Vec<Option<&str>> = sent
+        .iter()
+        .map(|r| r["reasoning_effort"].as_str())
+        .collect();
+    assert_eq!(efforts, [Some("high"), None, Some("high"), None]);
+    assert!(
+        messages_of(&sent[2], "user")
+            .last()
+            .unwrap()
+            .contains("Think hard about the lexer")
+    );
+
+    assert!(stderr.contains("no such model"), "{stderr}");
+    assert_eq!(
+        stdout
+            .matches("model: big-model#high for this turn")
+            .count(),
+        2,
+        "{stdout}"
+    );
+    // Afterwards the session is where it was.
+    assert!(stdout.contains("model: mock\n"), "{stdout}");
+}
+
 /// `/init` is a prompt, not a generator: it sends the brief for writing
 /// `AGENTS.md` — with what was typed after it as guidance — as an ordinary
 /// turn, and is a built-in a command file cannot replace.

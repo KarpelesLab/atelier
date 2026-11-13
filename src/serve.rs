@@ -823,7 +823,14 @@ impl Server {
             Dispatch::Quit => json!({ "handled": false, "kind": "quit" }),
             Dispatch::Prompt => json!({ "handled": false, "kind": "prompt", "text": line.trim() }),
             Dispatch::Expanded(text) => {
-                json!({ "handled": false, "kind": "expanded", "text": text })
+                // The expansion's `model:` is passed along; the client decides
+                // whether to start a turn with it.
+                json!({
+                    "handled": false,
+                    "kind": "expanded",
+                    "text": text.prompt,
+                    "model": text.model,
+                })
             }
             // The settings screen is the terminal interface's.
             Dispatch::Config => json!({ "handled": false, "kind": "config" }),

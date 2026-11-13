@@ -183,14 +183,20 @@ pub fn run(mut session: Session) -> Result<()> {
                 r.refresh()?;
             }
             outcome @ (agent::Dispatch::Prompt | agent::Dispatch::Expanded(_)) => {
-                // A file-defined command sends its expanded template.
-                let prompt = match &outcome {
-                    agent::Dispatch::Expanded(text) => text,
-                    _ => &trimmed,
+                // A command that stands for a prompt sends what it expanded
+                // into — on its own model, if it names one, for this turn:
+                // the strip shows that model while the turn runs, and the
+                // session's again once it is put back.
+                let (prompt, model) = match &outcome {
+                    agent::Dispatch::Expanded(e) => (e.prompt.as_str(), e.model.as_deref()),
+                    _ => (trimmed.as_str(), None),
                 };
+                let entered = session.enter_turn_model(model, &mut TuiUi { r: &mut r });
                 turn += 1;
                 r.status = build_status(&session, turn);
-                run_turn(&mut session, &mut r, prompt)?;
+                let result = run_turn(&mut session, &mut r, prompt);
+                session.leave_turn_model(entered);
+                result?;
                 // Usage counters moved; recompute the strip now that we can
                 // borrow the session again.
                 r.status = build_status(&session, turn);

@@ -17,8 +17,9 @@
 //! # Format
 //!
 //! Optional front matter between `---` lines (`key: value`, parsed by hand —
-//! see [`front_matter`]) with `description` and `argument-hint`; other keys
-//! are ignored. The rest is the template.
+//! see [`front_matter`]) with `description`, `argument-hint` and `model` (the
+//! model for the turn the command starts — see `agent::turn_model`); other
+//! keys are ignored. The rest is the template.
 //!
 //! # Expansion, and why it is ordered the way it is
 //!
@@ -71,6 +72,9 @@ pub struct Command {
     pub description: String,
     /// Shown after the name in `/help`, e.g. `<branch> [remote]`.
     pub argument_hint: Option<String>,
+    /// The model to run the command's turn on, as `/model` takes it
+    /// (`provider/model#variant`); the session's when unset.
+    pub model: Option<String>,
     /// The prompt template.
     pub body: String,
     /// The file it was read from.
@@ -192,6 +196,7 @@ fn parse(name: String, text: &str, path: PathBuf) -> Command {
         name,
         description,
         argument_hint: field("argument-hint"),
+        model: field("model"),
         body: body.trim().to_string(),
         path,
     }
@@ -586,6 +591,7 @@ mod tests {
         assert_eq!(commands[1].body, "A");
         assert_eq!(commands[2].description, "What happened");
         assert_eq!(commands[2].argument_hint.as_deref(), Some("[day]"));
+        assert_eq!(commands[2].model, None);
 
         assert_eq!(
             find(&root, None, "git:sync").unwrap().path,
@@ -593,6 +599,16 @@ mod tests {
         );
         assert!(find(&root, None, "standup").is_none());
         assert!(find(&root, Some(&global), "../review").is_none());
+    }
+
+    #[test]
+    fn a_command_may_name_its_model() {
+        let named = command("---\nmodel: \"second/big#high\"\n---\nReview it.");
+        assert_eq!(named.model.as_deref(), Some("second/big#high"));
+        assert_eq!(named.body, "Review it.");
+        // An empty value is no choice.
+        assert_eq!(command("---\nmodel:\n---\nx").model, None);
+        assert_eq!(command("Just a template").model, None);
     }
 
     #[test]

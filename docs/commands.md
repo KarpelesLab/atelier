@@ -50,10 +50,20 @@ It is `key: value` lines, not full YAML:
 |-----|---------|
 | `description` | shown in `/help`. Without it, the template's first line is used |
 | `argument-hint` | shown after the name in `/help` |
+| `model` | the model for the turn this command starts, written as for [`/model`](configuration.md): `provider/model#variant`, or a bare model name on the default provider |
 
-Other keys are ignored. That includes `model`, `agent` and `allowed-tools`
-from other tools' command files: a command runs with the session's current
-model and permissions. (Per-command model is not supported yet.)
+**`model`.** The command's prompt is sent on that model, and so is everything
+the turn goes on to do — tool calls and the requests after them. When the turn
+is over the session is back on its own model, also if the turn failed or you
+interrupted it; atelier prints `model: … for this turn` when it switches, and
+the TUI's status strip shows the temporary model while the turn runs. Only the
+main model changes: the model roles (`[models]` — summary, subagent, …) keep
+their own. With the [Claude backend](claude.md) a model change means
+relaunching claude, which is not done for a single turn: the key is ignored
+there, and one line says so.
+
+Other keys are ignored. That includes `agent` and `allowed-tools` from other
+tools' command files: a command runs with the session's current permissions.
 
 ## Placeholders
 
