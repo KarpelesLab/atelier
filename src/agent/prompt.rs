@@ -39,11 +39,15 @@
 use super::{CONTEXT_TOKEN_BUDGET, SYSTEM_PROMPT, Session};
 use crate::context::{self, ContextItem};
 
-/// The session's one system message: the prompt, then the standing context
+/// The session's one system message: `prompt`, then the standing context
 /// (whole — its providers budget it themselves), then the summary of
 /// compacted turns if there is one.
-pub(super) fn system_message(standing: &[ContextItem], summary: Option<&str>) -> String {
-    let mut system = SYSTEM_PROMPT.to_string();
+pub(super) fn system_message(
+    prompt: &str,
+    standing: &[ContextItem],
+    summary: Option<&str>,
+) -> String {
+    let mut system = prompt.to_string();
     if !standing.is_empty() {
         system.push_str("\n\nStanding project context:\n");
         for item in standing {
@@ -101,7 +105,12 @@ impl Session {
 
     /// The system message for the next request (see [`system_message`]).
     pub(super) fn system_message(&self) -> String {
-        system_message(&self.standing, self.summary.as_deref())
+        // A subagent's session speaks from its agent's prompt.
+        let prompt = match &self.child {
+            Some(child) => child.system.as_str(),
+            None => SYSTEM_PROMPT,
+        };
+        system_message(prompt, &self.standing, self.summary.as_deref())
     }
 }
 
@@ -128,11 +137,11 @@ mod tests {
             ContextItem::new("project instructions", "RULES", 250).standing(),
             ContextItem::new("memory", "INDEX", 240).standing(),
         ];
-        let bare = system_message(&[], None);
+        let bare = system_message(SYSTEM_PROMPT, &[], None);
         assert_eq!(bare, SYSTEM_PROMPT);
 
-        let full = system_message(&standing, Some("SUMMARY"));
-        let without_summary = system_message(&standing, None);
+        let full = system_message(SYSTEM_PROMPT, &standing, Some("SUMMARY"));
+        let without_summary = system_message(SYSTEM_PROMPT, &standing, None);
         // A compaction changes only the end: what precedes stays cached.
         assert!(full.starts_with(&without_summary));
         assert!(without_summary.starts_with(SYSTEM_PROMPT));

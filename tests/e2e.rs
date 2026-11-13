@@ -32,6 +32,14 @@ use std::time::{Duration, Instant, SystemTime};
 /// Builds the full HTTP response bytes for the Nth chat request (0-based).
 type Responder = Arc<dyn Fn(usize) -> Vec<u8> + Send + Sync>;
 
+/// Builds the response from the request's body instead of its index: for
+/// exchanges whose requests arrive in no fixed order (subagents running at
+/// the same time), where only what a request says tells which one it is.
+type BodyResponder = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
+/// What the mock runs per request: handed both the index and the body.
+type AnyResponder = Arc<dyn Fn(usize, &str) -> Vec<u8> + Send + Sync>;
+
 /// A background mock OpenAI-compatible server. Accepts connections until
 /// dropped; each connection is answered by the `Responder`, which is handed a
 /// monotonically increasing request index so one mock can script a multi-step
@@ -47,6 +55,15 @@ struct Mock {
 
 impl Mock {
     fn start(responder: Responder) -> Mock {
+        Mock::start_by_body(Arc::new(move |n, _body| responder(n)))
+    }
+
+    /// A mock that answers each request by what it contains.
+    fn by_body(responder: BodyResponder) -> Mock {
+        Mock::start_by_body(Arc::new(move |_n, body| responder(body)))
+    }
+
+    fn start_by_body(responder: AnyResponder) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let port = listener.local_addr().expect("local addr").port();
         // Non-blocking accept so the loop can poll the stop flag and shut down
@@ -116,7 +133,7 @@ impl Drop for Mock {
 fn handle_conn(
     stream: TcpStream,
     n: usize,
-    responder: &Responder,
+    responder: &AnyResponder,
     bodies: &Mutex<Vec<String>>,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
@@ -146,12 +163,10 @@ fn handle_conn(
     // keep it for tests that assert on what was sent.
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
-    bodies
-        .lock()
-        .unwrap()
-        .push(String::from_utf8_lossy(&body).into_owned());
+    let body = String::from_utf8_lossy(&body).into_owned();
+    bodies.lock().unwrap().push(body.clone());
 
-    let response = responder(n);
+    let response = responder(n, &body);
     writer.write_all(&response)?;
     writer.flush()?;
     // Close-delimited body: the provider reads the SSE stream until EOF.
@@ -1858,4 +1873,455 @@ fn context_command_shows_where_the_window_goes() {
         .find(|l| l.starts_with("  total "))
         .expect("a total row");
     assert!(total.trim_end().ends_with('%'), "{total}");
+}
+
+/// An SSE response carrying one tool call.
+fn json_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> Vec<u8> {
+    tool_calls_response(&[(id, name, arguments)])
+}
+
+/// An SSE response carrying several tool calls in one assistant message.
+fn tool_calls_response(calls: &[(&str, &str, serde_json::Value)]) -> Vec<u8> {
+    let calls: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            serde_json::json!({
+                "index": index,
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments.to_string() },
+            })
+        })
+        .collect();
+    let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":calls}}]});
+    sse_response(&[&chunk.to_string()])
+}
+
+/// An SSE response carrying `text` as the answer.
+fn text_response(text: &str) -> Vec<u8> {
+    let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"content":text}}]});
+    sse_response(&[&chunk.to_string()])
+}
+
+/// A captured request, parsed.
+fn request(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).expect("request body is JSON")
+}
+
+/// The text of every message with `role` in a request.
+fn messages_of(request: &serde_json::Value, role: &str) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["role"] == role)
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The names of the tools a request offers, sorted (empty when it offers
+/// none).
+fn tool_names(request: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The requests the mock received whose system message contains `marker`.
+fn requests_with_system(mock: &Mock, marker: &str) -> Vec<serde_json::Value> {
+    (0..mock.requests())
+        .map(|n| mock.body(n))
+        .filter(|b| system_message(b).contains(marker))
+        .map(|b| request(&b))
+        .collect()
+}
+
+/// What opens the built-in `explore` agent's system prompt.
+const EXPLORE_MARKER: &str = "read-only exploration agent";
+/// What opens atelier's own system prompt (the parent's).
+const PARENT_MARKER: &str = "You are atelier";
+
+/// Subagents — the `task` tool end to end. The parent model calls `task`
+/// with the built-in `explore` agent; the child is a separate conversation
+/// (the agent's system prompt, only read-only tools, nothing of the parent's
+/// conversation) that reads a file and answers; that answer is the parent's
+/// tool result, and the parent then answers the user. The transcript shows
+/// the child as a start line, its tool call, and an end line.
+#[test]
+fn task_runs_a_subagent_and_returns_its_report() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains(EXPLORE_MARKER);
+        let answered = !messages_of(&request(body), "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "explore",
+                    "prompt": "CHILD-TASK: say what notes.txt holds",
+                    "description": "inspect the notes",
+                }),
+            ),
+            (true, false) => json_tool_call(
+                "call_read",
+                "read",
+                serde_json::json!({"path": "notes.txt"}),
+            ),
+            (true, true) => text_response("CHILD-REPORT: notes.txt:1 holds the marker"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let dir = unique_dir("task");
+    std::fs::write(dir.join("notes.txt"), "MARKER-IN-FILE\n").unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "PROJECT-RULES apply to everyone").unwrap();
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--output-format",
+            "stream-json",
+            "PARENT-PROMPT: look into the notes",
+        ],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(mock.requests(), 4, "stderr: {stderr}");
+
+    // The parent is offered `task`, described with the agents it can run.
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    assert_eq!(parent.len(), 2);
+    let task_spec = parent[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "task")
+        .expect("the parent has the task tool");
+    let description = task_spec["function"]["description"].as_str().unwrap();
+    assert!(description.contains("- explore: ") && description.contains("- general: "));
+
+    // The child: its own system prompt (with the project's standing
+    // instructions), the read-only tools and no `task`, and a conversation
+    // that starts at the prompt it was given.
+    let child = requests_with_system(&mock, EXPLORE_MARKER);
+    assert_eq!(child.len(), 2);
+    let system = child[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(!system.contains(PARENT_MARKER), "{system}");
+    assert!(system.contains("PROJECT-RULES"), "{system}");
+    assert_eq!(
+        tool_names(&child[0]),
+        [
+            "glob",
+            "grep",
+            "ls",
+            "read",
+            "tree",
+            "web_fetch",
+            "web_search"
+        ]
+    );
+    assert_eq!(
+        messages_of(&child[0], "user"),
+        ["CHILD-TASK: say what notes.txt holds"]
+    );
+    assert!(!child[0].to_string().contains("PARENT-PROMPT"));
+    // It read the file.
+    let read = messages_of(&child[1], "tool");
+    assert!(read[0].contains("MARKER-IN-FILE"), "{read:?}");
+
+    // Its answer is the parent's tool result, with the footer; the child's
+    // own reading is not.
+    let results = messages_of(&parent[1], "tool");
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].starts_with("CHILD-REPORT: notes.txt:1 holds the marker\n\n[explore: 2 steps"),
+        "{results:?}"
+    );
+    assert!(!parent[1].to_string().contains("MARKER-IN-FILE"));
+
+    // What the user sees: one tool call (the task), the child's lines as
+    // info events, and the parent's answer — never the child's text.
+    let events = json_lines(&out);
+    let starts = of_type(&events, "tool_start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["name"], "task");
+    let ends = of_type(&events, "tool_end");
+    assert_eq!((ends.len(), &ends[0]["ok"]), (1, &serde_json::json!(true)));
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        info,
+        [
+            "⤷ explore: inspect the notes",
+            "  ⤷ read notes.txt",
+            "⤶ explore: done (2 steps)"
+        ]
+    );
+    let texts: Vec<&str> = of_type(&events, "text")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["parent done"]);
+    let result = events.last().unwrap();
+    assert_eq!(result["result"], "parent done");
+    // The parent's own steps; the child's are in its footer.
+    assert_eq!(result["num_steps"], 2);
+}
+
+/// Subagents — agents as files, and the step cap. A project file named
+/// `explore` replaces the built-in agent (its prompt, its tools, its cap).
+/// With `max_steps: 1` the child gets one request with tools; the next is
+/// sent without any and ends with the instruction to report, and what the
+/// model answers to that is the result — a report, not an error.
+#[test]
+fn a_project_agent_overrides_the_builtin_and_wraps_up_at_its_step_cap() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let req = request(body);
+        let child = system_message(body).contains("CUSTOM-EXPLORE-PROMPT");
+        let answered = !messages_of(&req, "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({"agent": "explore", "prompt": "count the files"}),
+            ),
+            // The child keeps asking for tools as long as it is offered any.
+            (true, _) if !tool_names(&req).is_empty() => {
+                json_tool_call("call_read", "read", serde_json::json!({"path": "a.txt"}))
+            }
+            (true, _) => text_response("WRAP-UP: read a.txt; b.txt is left"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let dir = unique_dir("task-cap");
+    std::fs::write(dir.join("a.txt"), "file a\n").unwrap();
+    let agents = dir.join(".atelier").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("explore.md"),
+        "---\ndescription: The project's own explorer\ntools:\n  - read\n  - task\nmax_steps: 1\n---\n\nCUSTOM-EXPLORE-PROMPT: look, don't touch.\n",
+    )
+    .unwrap();
+
+    let out = run_print(&mock.base_url(), &dir, "how many files?");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("parent done"),
+        "stderr: {stderr}"
+    );
+
+    // The parent is told about the file's agent, not the built-in.
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    assert!(
+        parent[0]
+            .to_string()
+            .contains("- explore: The project's own explorer")
+    );
+    assert_eq!(requests_with_system(&mock, EXPLORE_MARKER).len(), 0);
+
+    // The child: the file's prompt and tools — without `task`, though the
+    // file lists it.
+    let child = requests_with_system(&mock, "CUSTOM-EXPLORE-PROMPT");
+    assert_eq!(child.len(), 2, "stderr: {stderr}");
+    assert_eq!(tool_names(&child[0]), ["read"]);
+
+    // The request past the cap: no tools, and the last word is the
+    // instruction to stop and report.
+    assert!(child[1].get("tools").is_none(), "{}", child[1]);
+    let users = messages_of(&child[1], "user");
+    assert_eq!(users[0], "count the files");
+    assert!(users.last().unwrap().contains("step limit"), "{users:?}");
+    assert!(users.last().unwrap().contains("final report"));
+
+    let results = messages_of(&parent[1], "tool");
+    assert!(
+        results[0].starts_with("WRAP-UP: read a.txt; b.txt is left"),
+        "{results:?}"
+    );
+    assert!(results[0].contains("stopped at its cap of 1 steps"));
+    assert!(stderr.contains("wrapped up at its step cap"), "{stderr}");
+}
+
+/// Subagents — several `task` calls in one step. Both children run (at the
+/// same time: the mock answers by what a request says, not by its order),
+/// each result goes to its own call, in call order; and a child that asks
+/// for `task` — which it is never offered — cannot start a subagent of its
+/// own.
+#[test]
+fn task_calls_in_one_step_run_together_and_children_cannot_nest() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let req = request(body);
+        let child = system_message(body).contains("general-purpose agent");
+        let users = messages_of(&req, "user").join("\n");
+        let answered = !messages_of(&req, "tool").is_empty();
+        match (child, answered) {
+            (false, false) => tool_calls_response(&[
+                (
+                    "call_a",
+                    "task",
+                    serde_json::json!({"agent": "general", "prompt": "TASK-ALPHA"}),
+                ),
+                (
+                    "call_b",
+                    "task",
+                    serde_json::json!({"agent": "general", "prompt": "TASK-BETA"}),
+                ),
+            ]),
+            // Alpha tries to delegate in turn.
+            (true, false) if users.contains("TASK-ALPHA") => json_tool_call(
+                "call_nested",
+                "task",
+                serde_json::json!({"agent": "general", "prompt": "TASK-NESTED"}),
+            ),
+            (true, true) if users.contains("TASK-ALPHA") => text_response("report-alpha"),
+            (true, _) => text_response("report-beta"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let dir = unique_dir("task-parallel");
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "do both"],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    // `general` has every tool the parent has, except `task`.
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let child = requests_with_system(&mock, "general-purpose agent");
+    let mut expected = tool_names(&parent[0]);
+    assert!(expected.contains(&"task".to_string()) && expected.contains(&"bash".to_string()));
+    expected.retain(|t| t != "task");
+    for request in &child {
+        assert_eq!(tool_names(request), expected);
+    }
+    // Nothing ever ran the nested task: the call failed as an unknown tool.
+    assert!((0..mock.requests()).all(|n| {
+        !messages_of(&request(&mock.body(n)), "user").contains(&"TASK-NESTED".to_string())
+    }));
+    let alpha_second = child
+        .iter()
+        .find(|r| !messages_of(r, "tool").is_empty())
+        .expect("alpha went on after its refused call");
+    assert!(messages_of(alpha_second, "tool")[0].contains("unknown tool 'task'"));
+
+    // Results in call order, each under its own call id.
+    let results: Vec<(&str, &str)> = parent[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| {
+            (
+                m["tool_call_id"].as_str().unwrap(),
+                m["content"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "call_a");
+    assert!(
+        results[0]
+            .1
+            .starts_with("report-alpha\n\n[general#1: 2 steps")
+    );
+    assert_eq!(results[1].0, "call_b");
+    assert!(
+        results[1]
+            .1
+            .starts_with("report-beta\n\n[general#2: 1 step")
+    );
+
+    // Each child has its lines, named apart.
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    for line in [
+        "⤷ general#1: TASK-ALPHA",
+        "⤷ general#2: TASK-BETA",
+        "  ⤷ general#1 · task",
+        "⤶ general#1: done (2 steps)",
+        "⤶ general#2: done (1 step)",
+    ] {
+        assert!(info.contains(&line), "missing {line:?} in {info:?}");
+    }
+    assert_eq!(of_type(&events, "tool_start").len(), 2);
+    assert_eq!(of_type(&events, "tool_end").len(), 2);
+    assert_eq!(events.last().unwrap()["result"], "parent done");
+}
+
+/// Subagents — approvals. Without auto-approve, a child's unconfined call
+/// (`bash`) is put to the parent's user like the parent's own, after a line
+/// naming the agent that asks; a refusal is the child's tool result. And
+/// `/agents` lists what can be run.
+#[cfg(unix)]
+#[test]
+fn a_subagents_call_asks_the_user_and_names_the_agent() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains("general-purpose agent");
+        let results = messages_of(&request(body), "tool").len();
+        let bash = |id: &str, command: &str| {
+            json_tool_call(id, "bash", serde_json::json!({"command": command}))
+        };
+        match (child, results) {
+            (false, 0) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({"agent": "general", "prompt": "make the files"}),
+            ),
+            (true, 0) => bash("call_1", "echo one > first.txt"),
+            (true, 1) => bash("call_2", "echo two > second.txt"),
+            (true, _) => text_response("child report"),
+            (false, _) => text_response("parent done"),
+        }
+    }));
+    let dir = unique_dir("task-approval");
+
+    // The prompt, then the answers to the two approval prompts.
+    let out = run_repl(&mock.base_url(), &dir, "go\ny\nn\n/agents\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        stdout
+            .matches("⤷ the subagent general asks to run:")
+            .count(),
+        2,
+        "stdout: {stdout}\n stderr: {stderr}"
+    );
+    assert_eq!(stdout.matches("allow tool 'bash'").count(), 2, "{stdout}");
+    // Approved once, refused once.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("first.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(!dir.join("second.txt").exists());
+    let child = requests_with_system(&mock, "general-purpose agent");
+    assert_eq!(child.len(), 3, "stdout: {stdout}\n stderr: {stderr}");
+    let results = messages_of(&child[2], "tool");
+    assert!(results[1].contains("denied permission"), "{results:?}");
+    assert!(stdout.contains("parent done"));
+
+    // `/agents`.
+    assert!(stdout.contains("2 agent(s):"), "{stdout}");
+    assert!(stdout.contains("  explore — Read-only search"));
+    assert!(stdout.contains("built-in · tools: read, grep, glob, ls, tree, web_fetch, web_search"));
 }

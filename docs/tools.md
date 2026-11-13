@@ -19,6 +19,7 @@ model verbatim as the tool result.
 | `ask`       | auto (it only talks to you) | n/a |
 | `memory`    | auto     | to the memory directories (the project's `.atelier/memory/` and the user-global one) |
 | `skill`     | auto     | to the skill directories (read-only; a skill's files only from inside that skill's directory) |
+| `task`      | auto to start; each call the subagent makes is approved like the agent's own | as the tools the subagent uses |
 | `notebook_edit` | auto | yes |
 | `bash`      | **required** | no (arbitrary shell) |
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
@@ -459,6 +460,33 @@ symlink leading out of the skill is an error. That confinement is what lets
 the tool be auto-approved even though a user-global skill is outside the
 project, where `read` would ask. An unknown name is an error that lists the
 available ones.
+
+## `task`
+
+Run a [subagent](agents.md) on a task and return its final report. The
+subagent is a fresh conversation: it sees nothing of the caller's, only
+`prompt`, so the prompt must be complete in itself. The description the
+model is given lists the agents available (built-in and file-defined) with
+their descriptions.
+
+| Param         | Type   | Required | Meaning |
+|---------------|--------|----------|---------|
+| `agent`       | string | yes      | Which agent runs it: `explore`, `general`, or one defined in `.atelier/agents/` |
+| `prompt`      | string | yes      | The complete task — goal, known facts and paths, what to report |
+| `description` | string | no       | The task in 3–6 words, shown while it runs (default: the prompt's first line) |
+
+The result is the subagent's final message followed by a footer,
+`[explore: 7 steps · 412 output tokens]`. A subagent that reaches its step
+cap is made to wrap up without tools, and its report says so. An unknown
+agent is an error that lists the available ones; a subagent that fails (the
+endpoint errored) is an error result with the cause.
+
+`task` calls that follow one another in one step run at the same time; their
+results come back in call order. Subagents have every limit the caller has —
+the same project root, the same permission rules, the same approval prompts
+— and never `task` itself. The tool is run by the agent loop rather than by
+`Tool::call`, and is not offered to the [Claude backend](claude.md), which
+has subagents of its own.
 
 ## `peers`, `peer_send`
 

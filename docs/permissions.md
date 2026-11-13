@@ -193,6 +193,15 @@ tool was denied and can try to proceed without it. Allow rules are how a
 `--print` run gets exactly the unconfined calls it needs;
 `ATELIER_APPROVE=all` gives it all of them.
 
+## Subagents
+
+A [subagent](agents.md) has no rules of its own. Every call it makes is
+decided by the session that started it — the same rules, the same defaults,
+the same prompt (after a line naming the agent that asks), the same
+"always". So a subagent can never do what the main agent could not. `task`
+itself is a tool like any other in rules: `deny = ["task"]` switches
+subagents off.
+
 ## The Claude backend
 
 Atelier's own tools reach claude as `mcp__atelier__<tool>` and run through

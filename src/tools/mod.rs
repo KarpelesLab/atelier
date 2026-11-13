@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -42,6 +43,7 @@ mod notebook;
 mod read;
 mod skill;
 pub mod spill;
+pub mod task;
 mod todo;
 mod tree;
 mod web_fetch;
@@ -182,9 +184,14 @@ pub trait Tool: Send + Sync {
 }
 
 /// The set of tools available to a session.
+///
+/// Tools are shared (`Arc`) rather than owned so a subagent's session can be
+/// given a subset of its parent's ([`ToolRegistry::filtered`]) — the same
+/// tool objects, so an MCP server's connection is used by both, not opened
+/// twice.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -192,7 +199,19 @@ impl ToolRegistry {
         Self::default()
     }
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        self.tools.push(Arc::from(tool));
+    }
+    /// A registry of the tools whose name `keep` accepts, sharing them with
+    /// this one.
+    pub fn filtered(&self, keep: impl Fn(&str) -> bool) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| keep(t.name()))
+                .cloned()
+                .collect(),
+        }
     }
     /// Specs for every registered tool, to advertise to the provider.
     ///

@@ -83,6 +83,9 @@ them; the system prompt tells claude which is which:
 | `TodoWrite` | `todo` |
 | `AskUserQuestion` | `ask` (printed as numbered lines, answered on the input line) |
 
+atelier's own [`task` tool](agents.md) is not offered: claude runs the loop
+and brings its own subagents.
+
 Everything without an atelier counterpart stays: subagents (`Agent`/`Task`),
 `WebSearch`, `LSP`, plan mode, skills, worktrees, cron, …
 Subagents get the same set (atelier's tools included). atelier's tools are

@@ -715,7 +715,7 @@ fn propose_bash(words: &[String]) -> Option<String> {
 
 /// `*`-wildcard match of the whole of `text`: `*` is any run of characters
 /// (none included), everything else is literal.
-fn wild(pattern: &str, text: &str) -> bool {
+pub(crate) fn wild(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0, 0);

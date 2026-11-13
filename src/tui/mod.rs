@@ -276,6 +276,8 @@ enum UiEvent {
     },
     TurnEnd,
     Info(String),
+    /// A subagent's progress line.
+    Activity(String),
     Notice(String),
     /// A note from the parallel reviewer ("subconscious").
     Subconscious(String),
@@ -468,6 +470,7 @@ fn apply_event(r: &mut Renderer, ev: UiEvent) {
             r.push_line(String::new(), false);
         }
         UiEvent::Info(t) => r.emit_block(&t, false),
+        UiEvent::Activity(t) => r.emit_block(&t, true),
         UiEvent::Notice(t) => r.emit_block(&format!("! {t}"), false),
         UiEvent::Subconscious(t) => r.emit_block(&format!("💭 {t}"), true),
         UiEvent::Delivered(t) => {
@@ -527,6 +530,9 @@ impl Ui for ChanUi {
     }
     fn info(&mut self, text: &str) {
         self.send(UiEvent::Info(text.to_string()));
+    }
+    fn activity(&mut self, text: &str) {
+        self.send(UiEvent::Activity(text.to_string()));
     }
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> agent::Approval {
         self.send(UiEvent::AskApproval {
@@ -846,6 +852,10 @@ impl Ui for TuiUi<'_> {
     }
     fn info(&mut self, text: &str) {
         self.r.emit_block(text, false);
+        let _ = self.r.refresh();
+    }
+    fn activity(&mut self, text: &str) {
+        self.r.emit_block(text, true);
         let _ = self.r.refresh();
     }
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> agent::Approval {

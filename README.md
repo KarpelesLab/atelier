@@ -108,6 +108,7 @@ first conversation, the REPL/TUI fallback).
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |
 | [Skills](docs/skills.md) | `SKILL.md` directories the agent loads on demand: `.atelier/skills/` (also `.claude/skills/`, `.agents/skills/`), the `skill` tool, `/skills` |
 | [Hooks](docs/hooks.md) | Commands run on events (before/after a tool call, on a prompt, at turn end) that can observe or decide: `[[hooks]]`, the stdin/stdout contract, trust, `/hooks`, examples |
+| [Subagents](docs/agents.md) | The `task` tool: `explore` and `general`, your own agents as Markdown files in `.atelier/agents/` (also `.claude/agents/`), the step cap, parallel runs, `/agents` |
 | [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |

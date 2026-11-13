@@ -202,8 +202,11 @@ fn parse(name: String, text: &str, path: PathBuf) -> Command {
 /// Front matter is a first line of exactly `---`, then `key: value` lines, up
 /// to the next `---` line. This is not YAML: values are single-line strings,
 /// optionally wrapped in one pair of quotes; lines without a colon and `#`
-/// comments are skipped. A file that does not open with `---`, or never
-/// closes it, has no front matter and is all body.
+/// comments are skipped. The one multi-line form understood is a list:
+/// `- item` lines under a key that has no value of its own become that key's
+/// value, joined with `, ` (so an agent file may write `tools:` either way).
+/// A file that does not open with `---`, or never closes it, has no front
+/// matter and is all body.
 pub fn front_matter(text: &str) -> (Vec<(&str, String)>, &str) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(rest) = text
@@ -212,8 +215,10 @@ pub fn front_matter(text: &str) -> (Vec<(&str, String)>, &str) {
     else {
         return (Vec::new(), text);
     };
-    let mut fields = Vec::new();
+    let mut fields: Vec<(&str, String)> = Vec::new();
     let mut offset = 0;
+    // The last key had no value on its own line: `- item` lines are its list.
+    let mut list_open = false;
     for line in rest.split_inclusive('\n') {
         offset += line.len();
         let line = line.trim();
@@ -223,8 +228,20 @@ pub fn front_matter(text: &str) -> (Vec<(&str, String)>, &str) {
         if line.starts_with('#') {
             continue;
         }
+        if list_open
+            && let Some(item) = line.strip_prefix("- ")
+            && let Some((_, value)) = fields.last_mut()
+        {
+            if !value.is_empty() {
+                value.push_str(", ");
+            }
+            value.push_str(unquote(item.trim()));
+            continue;
+        }
         if let Some((key, value)) = line.split_once(':') {
-            fields.push((key.trim(), unquote(value.trim()).to_string()));
+            let value = unquote(value.trim());
+            list_open = value.is_empty();
+            fields.push((key.trim(), value.to_string()));
         }
     }
     (Vec::new(), text)
@@ -528,6 +545,17 @@ mod tests {
         // A rule further down is not front matter.
         let rule = "Intro\n---\nmore\n";
         assert_eq!(front_matter(rule), (Vec::new(), rule));
+
+        // `- item` lines are the list of a key without a value — and only that.
+        let (fields, _) =
+            front_matter("---\ntools:\n  - read\n  - \"mcp__x__*\"\nname: a\n- stray\n---\n");
+        assert_eq!(
+            fields,
+            vec![
+                ("tools", "read, mcp__x__*".to_string()),
+                ("name", "a".to_string()),
+            ]
+        );
     }
 
     #[test]

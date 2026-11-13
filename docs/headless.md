@@ -63,7 +63,7 @@ don't know: the set will grow.
 | `tool_end` | `name`, `ok`, `output`, `truncated`? | A tool finished; `ok` is false for an error result. `output` is cut to 16 KiB, with `"truncated": true` when it was |
 | `question` | `id`, `question`, `options`, `multi_select`, `allow_other` | The model asked the user something (the [`ask` tool](tools.md#ask)) and the run is waiting for an `answer` line on stdin. Only with `--input-format stream-json`; see [Questions](#questions) |
 | `approval` | `tool`, `arguments`, `decision` | A tool call needed approval. `decision` is always `"denied"` today (headless runs have nobody to ask); `"allowed"` is reserved. A `tool_end` with `ok: false` follows, without a `tool_start` |
-| `info` | `text` | Informational output, e.g. the risk signals of a call that needs approval |
+| `info` | `text` | Informational output, e.g. the risk signals of a call that needs approval, or the progress lines of a [subagent](agents.md) (`⤷ explore: …`, its tool calls, `⤶ explore: done (7 steps)`) between the `task` call's `tool_start` and `tool_end`. A subagent's own text, reasoning and tool results are not streamed |
 | `notice` | `text` | Out-of-band status, e.g. the schema retry, or an error from background work |
 | `review` | `text` | A note from the [subconscious reviewer](review.md), when it is on |
 | `result` | see below | A prompt ended |

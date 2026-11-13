@@ -12,12 +12,16 @@
 //! How a request is laid out so a server's prompt cache survives from one
 //! to the next is in [`prompt`]; how a conversation that outgrew the context
 //! window is made to fit again is in [`compact`].
+//!
+//! One tool is not run through the registry: `task`. A subagent is another
+//! [`Session`] on this same loop, which a tool has no way to build, so the
+//! loop runs those calls itself — see the `subagent` module.
 
 mod compact;
 mod prompt;
 mod window;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -37,12 +41,22 @@ use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 
+mod subagent;
+
 const SYSTEM_PROMPT: &str = "\
 You are atelier, an AI coding assistant operating inside a project directory. \
 You have tools to read and modify files and run commands; use them to inspect \
 the project and make changes rather than guessing. Keep responses concise. \
 When you have completed the request, stop calling tools and give a short final \
 answer.";
+
+/// What a subagent is told when it has used up its steps: sent as a user
+/// message with a request that offers no tools, so the answer is its report
+/// (opencode's idea — a report on half the work beats an error).
+const WRAP_UP: &str = "\
+You have reached your step limit: no more tool calls are possible. Stop here \
+and write your final report now — what you did and found, what is not done, \
+and how to continue from here.";
 
 /// Token budget for per-turn injected context (git status, diff, layout,
 /// diagnostics), prioritized and truncated to fit.
@@ -60,6 +74,7 @@ const DEFAULT_CHATGPT_MODEL: &str = "gpt-5";
 
 /// The ChatGPT-plan backend: OAuth tokens + the model to request via the
 /// Responses API. Present only while signed in (see `/login`).
+#[derive(Clone)]
 pub struct ChatgptBackend {
     pub tokens: auth::Tokens,
     pub model: String,
@@ -80,6 +95,12 @@ pub trait Ui {
     /// Informational output from a command (e.g. `/models`, `/mcp`): printed to
     /// the scrollback, not part of a model turn.
     fn info(&mut self, text: &str);
+    /// A line of progress from a subagent (one of its tool calls): like
+    /// [`info`](Ui::info), but meant to stay in the background — dim, where
+    /// the interface can.
+    fn activity(&mut self, text: &str) {
+        self.info(text);
+    }
     /// Ask the user to approve a side-effecting tool call before it runs.
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval;
     /// Put a question from the model (the `ask` tool) to the user and wait
@@ -180,6 +201,7 @@ const HELP: &[&str] = &[
     "  /skills                               list the skills the agent can load, and where they are",
     "  /hooks                                list configured hooks and whether they run",
     "  /hooks trust                          approve this project's hooks as they are now",
+    "  /agents                               list the subagents the `task` tool can run",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
     "  /subscribe <topic>                    receive what instances publish to a topic",
@@ -355,6 +377,15 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         }
         "/skills" => {
             for l in crate::skills::command(&session.root, &crate::skills::global_dirs()) {
+                ui.info(&l);
+            }
+        }
+        "/agents" => {
+            if session.is_claude() {
+                ui.info("Claude backend: claude runs subagents of its own; these are not offered to it.");
+            }
+            let global = crate::agents::global_dir();
+            for l in crate::agents::command(&session.root, global.as_deref()) {
                 ui.info(&l);
             }
         }
@@ -580,6 +611,10 @@ pub struct Session {
     hook_context: Option<String>,
     /// Claude backend: the last turn's final answer, for `turn_end` hooks.
     claude_answer: Option<String>,
+    /// Set when this session is a subagent's (see [`subagent`]): its system
+    /// prompt and its line to the parent. Such a session is never persisted,
+    /// and wraps up at its step cap instead of failing.
+    child: Option<subagent::Child>,
 }
 
 impl Session {
@@ -637,6 +672,7 @@ impl Session {
             quit_warned: false,
             coord: None,
             peer_pending: Vec::new(),
+            child: None,
         }
     }
 
@@ -824,7 +860,8 @@ impl Session {
     /// Cap the model requests a single prompt may make (`--max-turns`). A
     /// prompt that would need more ends with a [`StepLimit`] error, its
     /// history intact. With the Claude backend the cap is claude's own
-    /// `--max-turns`, applied when it is launched.
+    /// `--max-turns`, applied when it is launched. (A subagent's cap comes
+    /// from its definition and ends differently: see `run_turn`.)
     pub fn set_max_steps(&mut self, max: Option<u32>) {
         self.max_steps = max;
     }
@@ -897,6 +934,10 @@ impl Session {
 
     /// Persist the current conversation (summary + history) to disk (best-effort).
     fn persist(&self) {
+        // A subagent's conversation is not the project's saved session.
+        if self.child.is_some() {
+            return;
+        }
         let _ = crate::session::save(&self.root, self.summary.as_deref(), &self.history);
     }
 
@@ -1048,6 +1089,11 @@ impl Session {
     /// the turn are delivered the way messages typed mid-turn are.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
         // Hooks: `user_prompt` may block the prompt or add context to it.
+        // A subagent's task is not the user's prompt: the `user_prompt` and
+        // `turn_end` hooks are about the conversation the user is having.
+        if self.child.is_some() {
+            return self.run_turn(user_input, ui);
+        }
         let user_input = &self.hook_prompt(user_input, ui)?;
         let Some(coord) = self.coord.clone() else {
             return self.run_turn(user_input, ui);
@@ -1082,6 +1128,9 @@ impl Session {
             self.run_once(&input, ui)?;
             // A turn the user stopped is not one to send back to work.
             if ui.interrupted() {
+                return Ok(());
+            }
+            if self.child.is_some() {
                 return Ok(());
             }
             let answer = self.last_answer();
@@ -1122,14 +1171,23 @@ impl Session {
         // turn, so a conversation that can't be made to fit fails the turn
         // rather than looping.
         let mut overflow_retried = false;
+        // A subagent past its step cap: this request is its last (see below).
+        let mut wrapping_up = false;
 
         loop {
             // The step budget is checked here, where the history is
             // well-formed (a user message or a full batch of tool results),
             // so the conversation can be continued afterwards.
             if self.max_steps.is_some_and(|max| self.steps >= max) {
-                self.end_turn(ui)?;
-                return Err(StepLimit.into());
+                if self.child.is_none() {
+                    self.end_turn(ui)?;
+                    return Err(StepLimit.into());
+                }
+                // Nobody can continue a subagent's conversation, so it gets
+                // one more request instead of an error: without tools, and
+                // told to report where it stands.
+                wrapping_up = true;
+                self.history.push(Message::user(WRAP_UP));
             }
             self.steps += 1;
             // Mid-turn steering: anything the user typed while we were busy is
@@ -1150,7 +1208,11 @@ impl Session {
             messages.push(Message::system(self.system_message()));
             messages.extend(self.history.iter().cloned());
 
-            let specs = self.tools.specs();
+            let specs = if wrapping_up {
+                Vec::new()
+            } else {
+                self.tools.specs()
+            };
             // Stream into the UI, stopping early if the user asks (Ctrl-C).
             let mut on_event = |ev: StreamEvent| {
                 match ev {
@@ -1163,7 +1225,7 @@ impl Session {
                     ControlFlow::Continue(())
                 }
             };
-            let completion = match self.request(&messages, &specs, &mut on_event) {
+            let mut completion = match self.request(&messages, &specs, &mut on_event) {
                 Err(e) if !overflow_retried && provider::is_context_overflow(&e) => {
                     overflow_retried = true;
                     ui.notice(&format!("{e:#} — compacting and retrying"));
@@ -1178,6 +1240,11 @@ impl Session {
             if let Some(u) = &completion.usage {
                 self.usage_ctx = u.total_tokens;
                 self.usage_out += u64::from(u.completion_tokens);
+            }
+            if wrapping_up {
+                // No tools were offered; a call made anyway is not run, so
+                // this request is the last whatever the model sent.
+                completion.tool_calls.clear();
             }
 
             if completion.interrupted {
@@ -1206,10 +1273,23 @@ impl Session {
             // completions tool results are text, so they follow as a user
             // message once every call has its result.
             let mut images: Vec<String> = Vec::new();
-            for call in &completion.tool_calls {
+            // Results of `task` calls that ran together with an earlier one.
+            let mut ahead: VecDeque<String> = VecDeque::new();
+            for (i, call) in completion.tool_calls.iter().enumerate() {
                 // Once stopped, the remaining calls still need a result each
                 // to keep the history well-formed; they just don't run.
                 stopped = stopped || ui.interrupted();
+                // `task` calls are run here, not by the tool: each is a
+                // subagent, and the ones that follow one another run at the
+                // same time (see `subagent`).
+                if !stopped && ahead.is_empty() && self.runs_task(call) {
+                    ahead = self.run_tasks(&completion.tool_calls[i..], ui);
+                }
+                if let Some(text) = ahead.pop_front() {
+                    self.history
+                        .push(Message::tool_result(call.id.clone(), text));
+                    continue;
+                }
                 if stopped {
                     let msg = "error: not run — the user stopped the turn.".to_string();
                     self.history
@@ -1469,6 +1549,7 @@ impl Session {
                 settings: &mut self.settings,
                 auto_approve: self.auto_approve,
                 hooks: &self.hooks,
+                parent: self.child.as_ref().map(|c| &c.link),
             },
         )
     }
@@ -1593,6 +1674,8 @@ struct ToolRunner<'a> {
     settings: &'a mut Settings,
     auto_approve: bool,
     hooks: &'a Hooks,
+    /// In a subagent's session: the parent, which decides its calls.
+    parent: Option<&'a subagent::Link>,
 }
 
 impl ToolRunner<'_> {
@@ -1614,6 +1697,15 @@ impl ToolRunner<'_> {
         hook_allowed: bool,
         ui: &mut dyn Ui,
     ) -> Result<(), String> {
+        // A subagent's calls are decided by its parent — its rules, its
+        // user (see `subagent`). A tool the child was not given needs no
+        // decision: running it fails as unknown.
+        if let Some(parent) = self.parent {
+            return match self.tools.get(name) {
+                Some(_) => parent.approve(name, arguments),
+                None => Ok(()),
+            };
+        }
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         let needs_approval = self
             .tools
@@ -1777,6 +1869,9 @@ impl Ui for PeerUi<'_> {
     fn info(&mut self, text: &str) {
         self.inner.info(text);
     }
+    fn activity(&mut self, text: &str) {
+        self.inner.activity(text);
+    }
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.inner.ask_approval(tool, arguments)
     }
@@ -1916,6 +2011,10 @@ impl Ui for StdoutUi {
     fn info(&mut self, text: &str) {
         self.end_reasoning();
         println!("{text}");
+    }
+    fn activity(&mut self, text: &str) {
+        self.end_reasoning();
+        println!("{DIM}{text}{RESET}");
     }
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.end_reasoning();
@@ -2192,6 +2291,7 @@ mod tests {
             settings: &mut settings,
             auto_approve: true,
             hooks: &hooks,
+            parent: None,
         };
         let mut call = |name: &str, args: Value| {
             let (out, ok) = runner.exec(name, args, &mut StdoutUi::new());

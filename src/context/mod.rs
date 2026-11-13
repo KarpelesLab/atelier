@@ -86,6 +86,14 @@ pub trait ContextProvider: Send + Sync {
     fn gather(&self, root: &Path) -> Option<ContextItem>;
 }
 
+/// The providers of *standing* context only — the project's instruction
+/// files. What a subagent gets: the rules of the project apply to it too,
+/// but the snapshot of the moment (git status, diagnostics, layout) is its
+/// parent's to pass on in the task, and gathering it per child is not free.
+pub fn standing_providers() -> Vec<Box<dyn ContextProvider>> {
+    vec![Box::new(instructions::InstructionsProvider::new())]
+}
+
 /// The default set of context providers: project instructions, the memory
 /// index, the available skills, lint/typecheck diagnostics, git status,
 /// recent diff, recent commits, project layout, open TODOs, and environment

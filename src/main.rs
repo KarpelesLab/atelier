@@ -5,6 +5,7 @@
 //! `src/tui`) takes over.
 
 mod agent;
+mod agents;
 mod auth;
 mod claude;
 mod cli;
@@ -128,6 +129,14 @@ fn run() -> Result<u8> {
     let coordinator = coord::start(&root, &cfg.model);
     if let Some(c) = &coordinator {
         coord::tools::register(&mut tools, c);
+    }
+    // Subagents run on atelier's own loop; claude has its own (see
+    // `tools::task`).
+    if !claude {
+        tools.register(Box::new(tools::task::TaskTool::new(
+            root.clone(),
+            agents::global_dir(),
+        )));
     }
     let context = context::default_providers(settings.diagnostics.clone());
     let mut session = agent::Session::new(cfg, root, tools, context, settings);
