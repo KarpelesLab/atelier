@@ -38,13 +38,19 @@ separate program atelier fetches and runs for you. The default model is
 
 After that, `atelier --local` starts at once.
 
-## Speed, honestly
+## Speed, and why not a smaller model
 
-A 27B model on a CPU answers at a few tokens per second, and an agent's
-requests are long (the tools alone are several thousand tokens). It works;
-it is not quick. A GPU with enough memory changes that, and so does a
-smaller model. `atelier local status` shows oxinfer's estimate for the
-model you have chosen.
+How fast it answers depends on where the model fits. On Apple silicon,
+whose memory is shared with the GPU, and on a GPU with 20 GB or more, the
+27B model runs well. On a CPU alone it answers at a few tokens per second,
+and an agent's requests are long (the tools alone are several thousand
+tokens): it works, it is not quick. `atelier local status` shows oxinfer's
+estimate for your machine.
+
+A smaller model is faster and is not the answer: in our use, anything below
+Qwen 3.8 does poorly at this work — it loses the thread of a task and gets
+tool calls wrong — and the 27B is the smallest Qwen 3.8 there is. That is
+why it is the default despite its size.
 
 ## Choosing another model
 
@@ -52,14 +58,14 @@ Any chat model oxinfer runs, written the way `oxinfer serve --model` takes
 it — a Hugging Face repository, a folder or a file, then oxinfer's options:
 
 ```sh
-ATELIER_LOCAL_MODEL="google/gemma-4-E4B-it,quant=q8" atelier --local
+ATELIER_LOCAL_MODEL="Qwen/Qwen3.8-27B,quant=q8" atelier --local
 ```
 
 or, to keep it, in your user-global `~/.config/atelier/atelier.toml`:
 
 ```toml
 [local]
-model = "Qwen/Qwen3.5-9B,quant=q8"
+model = "Qwen/Qwen3.8-27B,quant=q8"
 ```
 
 `oxinfer --models` lists what your machine can run, with estimated speeds.

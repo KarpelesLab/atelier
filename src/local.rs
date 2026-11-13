@@ -135,8 +135,8 @@ impl Plan {
             out.push(format!("it takes about {need:.0} GB of memory{speed}"));
             if self.memory_available_gb.is_some_and(|have| have < need) {
                 out.push(format!(
-                    "  only {:.0} GB are available: expect it to be very slow, or to fail — \
-                     {ENV_MODEL} names a smaller model",
+                    "  only {:.0} GB are available: expect it to be very slow, or to fail \
+                     ({ENV_MODEL} names another model, but smaller ones do poorly as agents)",
                     self.memory_available_gb.unwrap_or_default()
                 ));
             }
