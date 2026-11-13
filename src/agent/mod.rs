@@ -2842,6 +2842,15 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out");
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
+        // First, until `me` has read the coordinator's answer to its own
+        // hello. The coordinator lists an instance — and delivers to it —
+        // as soon as it has seen the hello, before its answer is written;
+        // a message sent in between overtakes the answer, is read in its
+        // place and never reaches the inbox. So wait on what the client
+        // knows, not on what the coordinator does.
+        while !me.link_status().starts_with("connected") {
+            wait();
+        }
         while !matches!(other.send("me", "build is red"), Ok(1)) {
             wait();
         }

@@ -3537,20 +3537,24 @@ fn a_background_job_that_ends_mid_turn_is_announced_to_the_model_once() {
 /// user's next prompt, and that prompt carries the notice in front of it.
 /// (The job is held until the first turn is over, then released and waited
 /// for by the second prompt's own `` !`command` ``.) A job the model has
-/// read to its end with `bash_output` announces nothing.
+/// read to its end with `bash_output` announces nothing. (That job is held
+/// too, until the request that asks for its output has been made: free to
+/// end at once, it could end before that request, and a job that ends
+/// mid-turn is announced before the model's next step — rightly.)
 #[cfg(unix)]
 #[test]
 fn a_background_job_that_ends_between_turns_leads_the_next_prompt() {
-    let mock = Mock::start(Arc::new(|n| match n {
+    let dir = unique_dir("job-notice-idle");
+    let asked = dir.join("asked");
+    let mock = Mock::start(Arc::new(move |n| match n {
         0 => tool_calls_response(&[
             (
                 "call_read",
                 "bash",
-                // It must still be running when the model's `bash_output`
-                // (the next step) starts waiting on it: a job that ended
-                // before anyone looked would rightly be announced, which is
-                // not the case this test is about.
-                serde_json::json!({"command": "sleep 2; echo read-to-the-end", "background": true}),
+                serde_json::json!({
+                    "command": "while [ ! -e asked ]; do sleep 0.02; done; echo read-to-the-end",
+                    "background": true,
+                }),
             ),
             (
                 "call_held",
@@ -3561,15 +3565,17 @@ fn a_background_job_that_ends_between_turns_leads_the_next_prompt() {
                 }),
             ),
         ]),
-        1 => json_tool_call(
-            "call_output",
-            "bash_output",
-            serde_json::json!({"id": "job-1", "wait_ms": 10000}),
-        ),
+        1 => {
+            std::fs::write(&asked, "").unwrap();
+            json_tool_call(
+                "call_output",
+                "bash_output",
+                serde_json::json!({"id": "job-1", "wait_ms": 10000}),
+            )
+        }
         2 => text_response("started"),
         _ => text_response("seen"),
     }));
-    let dir = unique_dir("job-notice-idle");
     let commands = dir.join(".atelier/commands");
     std::fs::create_dir_all(&commands).unwrap();
     std::fs::write(commands.join("wait.md"), "What happened? !`sh wait.sh`\n").unwrap();
