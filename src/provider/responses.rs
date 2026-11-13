@@ -157,11 +157,13 @@ fn build_body(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
                 input.push(json!({ "role": "system", "content": msg.content }));
             }
             "user" => {
+                // `wire_text`: the turn's context block rides in front of
+                // what the user typed, as in the chat completions form.
                 if msg.images.is_empty() {
-                    input.push(json!({ "role": "user", "content": msg.content }));
+                    input.push(json!({ "role": "user", "content": msg.wire_text() }));
                 } else {
                     let mut parts = Vec::with_capacity(1 + msg.images.len());
-                    parts.push(json!({ "type": "input_text", "text": msg.content }));
+                    parts.push(json!({ "type": "input_text", "text": msg.wire_text() }));
                     for img in &msg.images {
                         parts.push(json!({ "type": "input_image", "image_url": img }));
                     }

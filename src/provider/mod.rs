@@ -15,6 +15,7 @@
 
 pub mod responses;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::ops::ControlFlow;
@@ -79,6 +80,15 @@ pub struct Message {
     /// still deserialize.
     #[serde(default)]
     pub images: Vec<String>,
+    /// Project context gathered for this user turn (git status, diagnostics,
+    /// … — see `agent::prompt`), sent in front of `content` inside a
+    /// `<context>` block. It is kept apart from what the user typed so the
+    /// transcript stays readable, and it is never rewritten once sent: a
+    /// server's prompt cache covers a request up to the first byte that
+    /// differs from the previous one. Absent from session files written
+    /// before it existed, and from every other kind of message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl Message {
@@ -99,6 +109,22 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            context: None,
+        }
+    }
+    /// Attaches the context gathered for this user turn (see
+    /// [`Message::context`]).
+    pub fn with_context(mut self, context: Option<String>) -> Self {
+        self.context = context;
+        self
+    }
+    /// The text of the message as the model gets it: the turn's context
+    /// block, if any, then the content. Both wire forms (chat completions
+    /// and Responses) send user text through this, so the two agree.
+    pub fn wire_text(&self) -> Cow<'_, str> {
+        match &self.context {
+            Some(ctx) => Cow::Owned(format!("<context>\n{ctx}\n</context>\n\n{}", self.content)),
+            None => Cow::Borrowed(&self.content),
         }
     }
     /// An assistant turn that requested one or more tool calls.
@@ -109,6 +135,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             images: Vec::new(),
+            context: None,
         }
     }
     /// The result of executing a tool call, fed back to the model.
@@ -119,6 +146,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             images: Vec::new(),
+            context: None,
         }
     }
     /// A user turn with one or more images attached alongside text (OpenAI
@@ -132,6 +160,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images,
+            context: None,
         }
     }
 
@@ -153,15 +182,16 @@ impl Message {
         }
         if !self.images.is_empty() {
             let mut parts = Vec::with_capacity(1 + self.images.len());
-            if !self.content.is_empty() {
-                parts.push(json!({ "type": "text", "text": self.content }));
+            let text = self.wire_text();
+            if !text.is_empty() {
+                parts.push(json!({ "type": "text", "text": text }));
             }
             for img in &self.images {
                 parts.push(json!({ "type": "image_url", "image_url": { "url": img } }));
             }
             return json!({ "role": self.role, "content": parts });
         }
-        json!({ "role": self.role, "content": self.content })
+        json!({ "role": self.role, "content": self.wire_text() })
     }
 }
 
@@ -834,6 +864,33 @@ mod tests {
     /// A message built with `user_with_images` must serialize `content` as an
     /// array: text part first, then one `image_url` part per image, with the
     /// url passed through exactly.
+    /// A turn's context goes out in front of what the user typed, in the
+    /// same user message (no second system message, no extra turn), and is
+    /// left out of the stored form when there is none.
+    #[test]
+    fn to_wire_puts_the_turn_context_before_the_user_text() {
+        let msg = Message::user("fix it").with_context(Some("## git status\nM a.rs".into()));
+        let wire = msg.to_wire();
+        assert_eq!(wire["role"], "user");
+        assert_eq!(
+            wire["content"],
+            "<context>\n## git status\nM a.rs\n</context>\n\nfix it"
+        );
+
+        let with_image = Message::user_with_images("look", vec!["data:x".into()])
+            .with_context(Some("ctx".into()));
+        assert_eq!(
+            with_image.to_wire()["content"][0]["text"],
+            "<context>\nctx\n</context>\n\nlook"
+        );
+
+        let stored = serde_json::to_value(Message::user("plain")).unwrap();
+        assert!(stored.get("context").is_none(), "{stored}");
+        let stored = serde_json::to_value(&msg).unwrap();
+        assert_eq!(stored["context"], "## git status\nM a.rs");
+        assert_eq!(stored["content"], "fix it");
+    }
+
     #[test]
     fn to_wire_user_with_images_has_array_content() {
         let data_url = "data:image/png;base64,AAAA";

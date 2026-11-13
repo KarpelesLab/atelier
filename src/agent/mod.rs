@@ -8,6 +8,11 @@
 //! Rendering goes through the [`Ui`] trait so the loop stays independent of the
 //! terminal interface (the `tui` module supplies one; [`repl`] uses a plain
 //! stdout one). Nothing here may depend on `tui`.
+//!
+//! How a request is laid out so a server's prompt cache survives from one
+//! to the next is in [`prompt`].
+
+mod prompt;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -523,6 +528,9 @@ pub struct Session {
     pending_images: Vec<String>,
     /// Last turn's context items (`title -> body`), for cross-turn dedup.
     last_ctx: HashMap<String, String>,
+    /// The standing context (instructions, memory index) as of the last
+    /// turn's start: part of the system message (see [`prompt`]).
+    standing: Vec<ContextItem>,
     /// Rolling summary of older turns that have been compacted out of `history`.
     summary: Option<String>,
     /// Compact when the last request's total tokens exceed this.
@@ -601,6 +609,7 @@ impl Session {
             max_steps: None,
             pending_images: Vec::new(),
             last_ctx: HashMap::new(),
+            standing: Vec::new(),
             summary: None,
             compact_threshold,
             review_enabled,
@@ -1085,14 +1094,16 @@ impl Session {
         if self.is_claude() {
             return self.send_claude(user_input, ui);
         }
-        if self.pending_images.is_empty() {
-            self.history.push(Message::user(user_input));
+        // What changed in the project since the last turn rides with this
+        // turn's user message, and stays there: see `prompt`.
+        let context = self.gather_turn_context();
+        let images = std::mem::take(&mut self.pending_images);
+        let user = if images.is_empty() {
+            Message::user(user_input)
         } else {
-            let images = std::mem::take(&mut self.pending_images);
-            self.history
-                .push(Message::user_with_images(user_input, images));
-        }
-        let context_msg = self.gather_context();
+            Message::user_with_images(user_input, images)
+        };
+        self.history.push(user.with_context(context));
 
         loop {
             // The step budget is checked here, where the history is
@@ -1113,23 +1124,12 @@ impl Session {
             // Surface any finished background reviews (non-blocking).
             self.drain_reviews(ui);
 
-            // Assemble the request: a single leading system message (prompt +
-            // fresh context — some servers reject a second system message), then
-            // the conversation history.
+            // Assemble the request: a single leading system message (some
+            // servers reject a second), constant for the session, then the
+            // conversation history — so each request is a prefix of the
+            // next and the server's prompt cache carries over (see `prompt`).
             let mut messages = Vec::with_capacity(self.history.len() + 1);
-            // One leading system message (some servers reject a second): the
-            // prompt, then the rolling summary of compacted turns, then fresh
-            // per-turn context.
-            let mut system = SYSTEM_PROMPT.to_string();
-            if let Some(s) = &self.summary {
-                system.push_str("\n\nSummary of earlier conversation:\n");
-                system.push_str(s);
-            }
-            if let Some(ctx) = &context_msg {
-                system.push_str("\n\n");
-                system.push_str(ctx);
-            }
-            messages.push(Message::system(system));
+            messages.push(Message::system(self.system_message()));
             messages.extend(self.history.iter().cloned());
 
             let specs = self.tools.specs();
@@ -1462,6 +1462,9 @@ impl Session {
                 // Nested instruction files arrived in tool results that may
                 // just have been summarized away: deliver them again.
                 self.fstate.forget_dirs();
+                // So did the context blocks of the summarized turns: the
+                // next turn sends every item afresh.
+                self.last_ctx.clear();
                 // Avoid re-compacting immediately; the next real turn recomputes.
                 self.usage_ctx = 0;
                 ui.info(&format!(
@@ -1499,7 +1502,8 @@ impl Session {
         Ok(s)
     }
 
-    /// Gather per-turn context into a single injected block, or `None`.
+    /// Gather per-turn context into a single injected block, or `None`, for
+    /// the Claude backend (atelier's own loop uses `gather_turn_context`).
     ///
     /// Providers are prioritized and truncated to a token budget so a large diff
     /// or layout can't crowd out the conversation.
@@ -1511,13 +1515,11 @@ impl Session {
             .collect();
         // Drop items unchanged since last turn so we don't re-send identical
         // context every turn; remember the full snapshot for next time.
-        // Claude keeps context in its transcript; our own loop rebuilds the
-        // system message per request, so standing items (the instruction
-        // files) must be restated there or they'd be gone after one turn.
-        let (kept, snapshot) =
-            crate::context::dedup_items(&self.last_ctx, items, !self.is_claude());
-        self.last_ctx = snapshot;
-        crate::context::render_budgeted(kept, CONTEXT_TOKEN_BUDGET)
+        // Claude keeps the context in its transcript, standing items (the
+        // instruction files) included, so nothing needs restating.
+        let delta = crate::context::dedup_items(&self.last_ctx, items);
+        self.last_ctx = delta.snapshot;
+        crate::context::render_budgeted(delta.changed, CONTEXT_TOKEN_BUDGET)
     }
 }
 

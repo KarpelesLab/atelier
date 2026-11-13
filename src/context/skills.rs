@@ -75,7 +75,10 @@ impl ContextProvider for SkillsProvider {
         }
         // Below the project instructions (250) and the memory index (240),
         // above everything that describes the repository's current state.
-        Some(ContextItem::new("skills", body, 230))
+        // Standing: the list changes only when a skill is added or removed,
+        // so it belongs in the constant system message, where it is always
+        // present and doesn't disturb the prompt cache.
+        Some(ContextItem::new("skills", body, 230).standing())
     }
 }
 

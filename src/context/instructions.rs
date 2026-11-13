@@ -626,16 +626,19 @@ mod tests {
         let provider = provider();
         let gather = || vec![provider.gather(&dir).unwrap()];
 
-        let (sent, seen) = dedup_items(&HashMap::new(), gather(), false);
-        assert_eq!(sent.len(), 1);
-        let (sent, seen) = dedup_items(&seen, gather(), false);
-        assert!(sent.is_empty(), "unchanged instructions are not repeated");
+        let first = dedup_items(&HashMap::new(), gather());
+        assert_eq!(first.changed.len(), 1);
+        let second = dedup_items(&first.snapshot, gather());
+        assert!(
+            second.changed.is_empty(),
+            "unchanged instructions are not repeated"
+        );
 
         // Even a change in an imported file counts.
         write(&dir.join("rule.md"), "new rule");
-        let (sent, _) = dedup_items(&seen, gather(), false);
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].body.contains("new rule"));
+        let third = dedup_items(&second.snapshot, gather());
+        assert_eq!(third.changed.len(), 1);
+        assert!(third.changed[0].body.contains("new rule"));
 
         let _ = fs::remove_dir_all(&dir);
     }

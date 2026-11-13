@@ -161,4 +161,34 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// A file from before turns carried their context (no `context` key on
+    /// its messages) still loads, and a turn's context survives a save.
+    #[test]
+    fn reads_messages_without_context_and_keeps_it_when_present() {
+        let root = tmpdir();
+        let old = r#"{"summary":"s","messages":[
+            {"role":"user","content":"hi","tool_calls":[],"tool_call_id":null,"images":[]},
+            {"role":"assistant","content":"yo","tool_calls":[],"tool_call_id":null}]}"#;
+        std::fs::create_dir_all(path(&root).parent().unwrap()).unwrap();
+        std::fs::write(path(&root), old).unwrap();
+
+        let mut data = load(&root);
+        assert_eq!(data.summary.as_deref(), Some("s"));
+        assert_eq!(data.messages.len(), 2);
+        assert!(data.messages[0].context.is_none());
+
+        data.messages
+            .push(Message::user("next").with_context(Some("## git status\nclean".into())));
+        save(&root, data.summary.as_deref(), &data.messages).unwrap();
+        let again = load(&root);
+        assert_eq!(
+            again.messages[2].context.as_deref(),
+            Some("## git status\nclean")
+        );
+        assert_eq!(again.messages[2].content, "next");
+        assert!(again.messages[0].context.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

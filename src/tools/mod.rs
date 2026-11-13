@@ -195,6 +195,12 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
     /// Specs for every registered tool, to advertise to the provider.
+    ///
+    /// In registration order, and the same from one call to the next: the
+    /// tool list is part of every request, in front of the conversation on
+    /// many servers, so a list that reordered itself would throw away the
+    /// server's prompt cache (see `agent::prompt`). It changes only when a
+    /// tool is registered or removed (an MCP server added mid-session).
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|t| t.spec()).collect()
     }
@@ -332,6 +338,24 @@ pub fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The advertised tool list is byte-stable: same order, same schemas,
+    /// whichever registry instance or call produced it.
+    #[test]
+    fn specs_are_identical_from_one_call_to_the_next() {
+        let render = |registry: &ToolRegistry| -> Vec<String> {
+            registry
+                .specs()
+                .iter()
+                .map(|s| format!("{} | {} | {}", s.name, s.description, s.parameters))
+                .collect()
+        };
+        let registry = builtin_registry();
+        let first = render(&registry);
+        assert!(!first.is_empty());
+        assert_eq!(first, render(&registry));
+        assert_eq!(first, render(&builtin_registry()));
+    }
 
     #[test]
     fn each_directory_is_reported_once() {

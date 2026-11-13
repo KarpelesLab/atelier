@@ -41,8 +41,8 @@ pub fn estimate_tokens(text: &str) -> usize {
     chars.div_ceil(CHARS_PER_TOKEN)
 }
 
-/// Renders `items` into a single system-message-ready block, packing as many
-/// as fit under `max_tokens` (by [`estimate_tokens`]).
+/// Renders `items` into a single block to put in front of the model, packing
+/// as many as fit under `max_tokens` (by [`estimate_tokens`]).
 ///
 /// Items are sorted by `priority` descending (ties keep their relative
 /// order) and rendered as titled sections (`## <title>\n<body>`), matching
@@ -57,7 +57,9 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// [Standing](ContextItem::standing) items are the exception: they come
 /// first, whole, and don't count against `max_tokens`. They are the
 /// instruction files, which carry a byte budget of their own and are no use
-/// to the model cut down to what a per-turn snapshot may cost.
+/// to the model cut down to what a per-turn snapshot may cost. (Only the
+/// Claude backend passes them here; atelier's own loop keeps them in the
+/// system message.)
 ///
 /// Returns `None` if `items` is empty, or if nothing at all could be made to
 /// fit (e.g. `max_tokens` is too small even for the header).

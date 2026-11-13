@@ -47,14 +47,14 @@ first line becomes the description, its type `project`).
 
 ## How the agent uses it
 
-- **Recall.** Every turn, the index of both scopes (names, types,
-  descriptions — not the bodies) is part of the injected project context,
-  under `## memory`, with a line telling the model to read the notes that
-  look relevant. Like all context items it is sent when it changes rather
-  than repeated verbatim, and it is capped (about 400 tokens) so a large
-  store can't crowd out the rest; past the cap the agent is told how many
-  notes were left out. With the [Claude backend](claude.md) it arrives the
-  same way, in the `<atelier-context>` block.
+- **Recall.** The index of both scopes (names, types, descriptions — not
+  the bodies) is standing context: it is part of the system message of every
+  request, under `## memory`, with a line telling the model to read the notes
+  that look relevant (see [the shape of a
+  request](sessions.md#the-shape-of-a-request)). It is capped (about 400
+  tokens) so a large store can't crowd out the rest; past the cap the agent
+  is told how many notes were left out. With the [Claude backend](claude.md)
+  it arrives in the `<atelier-context>` block instead, when it changes.
 - **Reading and writing.** The agent uses the [`memory` tool](tools.md#memory)
   to `read` a note in full, `save` one, `list` them, or `delete` one. The
   tool's description is the policy: save corrections, preferences, project

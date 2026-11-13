@@ -224,7 +224,10 @@ the more specific ones, since they come last. Instructions are sent with
 every request, so they count against the model's context window each time;
 keep them short.
 
-**Edits take effect on your next message**; no restart is needed.
+**Edits take effect on your next message**; no restart is needed. (They
+change the system message, so the inference server's prompt cache starts over
+from there — see [the shape of a
+request](sessions.md#the-shape-of-a-request).)
 
 ## `[[diagnostics]]`
 

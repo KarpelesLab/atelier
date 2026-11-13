@@ -193,6 +193,35 @@ fn unique_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// The `atelier` binary, set up to talk to the mock at `base_url` from `cwd`
+/// with nothing of the outer environment or the real home leaking in.
+fn atelier(base_url: &str, cwd: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_atelier"));
+    // Hook approvals (see the hooks cases) are neither read from nor
+    // written to the real home.
+    cmd.env("XDG_STATE_HOME", cwd.with_extension("state"))
+        .env_remove("ATELIER_TRUST_HOOKS")
+        .env("ATELIER_BASE_URL", base_url)
+        .env("ATELIER_MODEL", "mock")
+        .env("ATELIER_APPROVE", "all")
+        // No coordinator daemon left behind by the test run.
+        .env("ATELIER_NO_COORDINATOR", "1")
+        // No user config (global instructions, a saved login), and global
+        // memory next to the temp project.
+        .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
+        .env("XDG_DATA_HOME", cwd.with_extension("data"))
+        // Likewise the user's skills under ~/.claude and ~/.agents.
+        .env("HOME", cwd.with_extension("home"))
+        .env_remove("ATELIER_API_KEY")
+        .env_remove("ATELIER_TRACE")
+        .env_remove("ATELIER_DEBUG")
+        .env_remove("ATELIER_BACKEND")
+        .env_remove("ATELIER_CONTEXT_LIMIT")
+        .env_remove("ATELIER_REVIEW")
+        .current_dir(cwd);
+    cmd
+}
+
 /// Spawn `atelier --print <prompt>` against `base_url` with `cwd` and return
 /// its captured output.
 fn run_print(base_url: &str, cwd: &Path, prompt: &str) -> Output {
@@ -215,30 +244,9 @@ fn run_atelier_env(
     stdin: Option<&str>,
     env: &[(&str, &str)],
 ) -> Output {
-    let bin = env!("CARGO_BIN_EXE_atelier");
-    let mut child = Command::new(bin)
+    let mut child = atelier(base_url, cwd)
         .args(args)
-        // Hook approvals (see the hooks cases) are neither read from nor
-        // written to the real home.
-        .env("XDG_STATE_HOME", cwd.with_extension("state"))
-        .env_remove("ATELIER_TRUST_HOOKS")
         .envs(env.iter().copied())
-        .env("ATELIER_BASE_URL", base_url)
-        .env("ATELIER_MODEL", "mock")
-        .env("ATELIER_APPROVE", "all")
-        // No coordinator daemon left behind by the test run.
-        .env("ATELIER_NO_COORDINATOR", "1")
-        // Keep the run hermetic regardless of the outer environment: no API
-        // key, no user config (global instructions, a saved login), and
-        // global memory next to the temp project, never the real home.
-        .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
-        .env("XDG_DATA_HOME", cwd.with_extension("data"))
-        // Likewise the user's skills under ~/.claude and ~/.agents.
-        .env("HOME", cwd.with_extension("home"))
-        .env_remove("ATELIER_API_KEY")
-        .env_remove("ATELIER_TRACE")
-        .env_remove("ATELIER_DEBUG")
-        .current_dir(cwd)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -1330,4 +1338,205 @@ fn ask_is_answered_on_the_repl_input() {
         "{}",
         mock.body(1)
     );
+}
+
+/// An interactive `atelier` (the line REPL, since stdin is a pipe) whose
+/// prompts the test types one at a time, waiting on the mock in between.
+struct Repl {
+    child: std::process::Child,
+}
+
+impl Repl {
+    fn start(base_url: &str, cwd: &Path, env: &[(&str, &str)]) -> Repl {
+        let child = atelier(base_url, cwd)
+            .envs(env.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn atelier binary");
+        Repl { child }
+    }
+
+    /// Type one line at the prompt.
+    fn line(&mut self, text: &str) {
+        writeln!(self.child.stdin.as_mut().expect("stdin open"), "{text}").expect("write a line");
+    }
+
+    /// End the input and collect everything printed (stdout, stderr). The
+    /// output is small, so reading it only now cannot fill a pipe.
+    fn finish(mut self) -> (String, String) {
+        drop(self.child.stdin.take());
+        let out = self.child.wait_with_output().expect("collect child output");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+/// Block until the mock has received `n` requests, and return their bodies.
+fn wait_requests(mock: &Mock, n: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let bodies = mock.bodies.lock().unwrap().clone();
+        if bodies.len() >= n {
+            return bodies;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for request {n}; got {}",
+            bodies.len()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The `messages` array of a chat request body, exactly as it was sent.
+/// (`messages` is the body's first key and `model` its second.)
+fn raw_messages(body: &str) -> &str {
+    let start = body.find(r#""messages":["#).expect("a messages array") + r#""messages":"#.len();
+    let end = body.rfind(r#","model":"#).expect("model follows messages");
+    &body[start..end]
+}
+
+/// The parsed `messages` of a chat request body.
+fn messages(body: &str) -> Vec<serde_json::Value> {
+    let request: serde_json::Value = serde_json::from_str(body).expect("request body is JSON");
+    request["messages"].as_array().expect("messages").clone()
+}
+
+/// A streamed call of `tool` with the given JSON arguments.
+fn tool_call_response(id: &str, tool: &str, arguments: &str) -> Vec<u8> {
+    let chunk = serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": 0, "id": id, "type": "function",
+        "function": {"name": tool, "arguments": arguments},
+    }]}}]});
+    sse_response(&[&chunk.to_string()])
+}
+
+/// A streamed plain answer.
+fn answer_response(text: &str) -> Vec<u8> {
+    let chunk = serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    sse_response(&[&chunk.to_string()])
+}
+
+/// Case 6 — the prompt cache survives. Over three turns (two of them with a
+/// tool step) in a working tree that changes in between — a file the model
+/// writes, a file the user adds — every request must be the previous one plus
+/// new messages at the end: the system message and the tool list
+/// byte-identical throughout, and no earlier message rewritten. That is the
+/// condition for a server's prompt cache (llama.cpp's KV cache, a hosted
+/// provider's) to be reused from one request to the next; the fresh project
+/// context therefore travels with the user turn it was gathered for.
+#[test]
+fn each_request_is_a_prefix_of_the_next() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => tool_call_response("call_1", "write", r#"{"path":"a.txt","content":"alpha"}"#),
+        1 => answer_response("one"),
+        2 => tool_call_response("call_2", "read", r#"{"path":"a.txt"}"#),
+        3 => answer_response("two"),
+        _ => answer_response("three"),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("prefix");
+    std::fs::write(dir.join("AGENTS.md"), "STANDING-RULE-5c1e").unwrap();
+    // A repository makes `git status` one of the things that change; without
+    // git on the machine the layout still does.
+    let _ = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .output();
+
+    let mut repl = Repl::start(&mock.base_url(), &dir, &[]);
+    repl.line("first prompt");
+    wait_requests(&mock, 2);
+    // Between turns the tree changes under atelier (as does `a.txt`, written
+    // by the model in the first turn).
+    std::fs::write(dir.join("made-by-test.txt"), "beta").unwrap();
+    repl.line("second prompt");
+    wait_requests(&mock, 4);
+    // Nothing changes before the third turn.
+    repl.line("third prompt");
+    let bodies = wait_requests(&mock, 5);
+    let (stdout, stderr) = repl.finish();
+    assert_eq!(bodies.len(), 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("three"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let system = system_message(&bodies[0]);
+    assert!(system.contains("STANDING-RULE-5c1e"), "{system}");
+    assert!(
+        !system.contains("## layout") && !system.contains("## environment"),
+        "only standing context is in the system message: {system}"
+    );
+    let tools = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["tools"].clone()
+    };
+
+    for (n, pair) in bodies.windows(2).enumerate() {
+        let (before, after) = (messages(&pair[0]), messages(&pair[1]));
+        assert!(
+            before.len() < after.len(),
+            "request {} adds messages",
+            n + 1
+        );
+        for (i, message) in before.iter().enumerate() {
+            assert_eq!(
+                message,
+                &after[i],
+                "message {i} of request {n} was rewritten in request {}",
+                n + 1
+            );
+        }
+        assert_eq!(
+            system,
+            system_message(&pair[1]),
+            "system message, request {}",
+            n + 1
+        );
+        assert_eq!(
+            tools(&pair[0]),
+            tools(&pair[1]),
+            "tool list, request {}",
+            n + 1
+        );
+        // And on the wire, byte for byte: all of request n's array but its
+        // closing bracket opens request n+1's.
+        let (raw_before, raw_after) = (raw_messages(&pair[0]), raw_messages(&pair[1]));
+        assert!(
+            raw_after.starts_with(&raw_before[..raw_before.len() - 1]),
+            "request {} does not start with the bytes of request {n}:\n{raw_before}\n{raw_after}",
+            n + 1
+        );
+    }
+
+    // The context is in the user turn it was gathered for: everything with
+    // the first prompt, only what changed with the second, nothing with the
+    // third.
+    let last = messages(&bodies[4]);
+    let user_turn = |prompt: &str| -> String {
+        last.iter()
+            .filter_map(|m| m["content"].as_str())
+            .find(|c| c.ends_with(prompt))
+            .unwrap_or_else(|| panic!("no user message for {prompt:?}"))
+            .to_string()
+    };
+    let first = user_turn("first prompt");
+    assert!(first.starts_with("<context>\n"), "{first}");
+    assert!(first.contains("## environment"), "{first}");
+    assert!(first.contains("</context>\n\nfirst prompt"), "{first}");
+    let second = user_turn("second prompt");
+    assert!(second.starts_with("<context>\n"), "{second}");
+    assert!(
+        second.contains("made-by-test.txt") && second.contains("a.txt"),
+        "the changed tree is described: {second}"
+    );
+    assert!(
+        !second.contains("## environment") && second.contains("(unchanged since last shown: "),
+        "unchanged items are named, not repeated: {second}"
+    );
+    assert_eq!(user_turn("third prompt"), "third prompt");
 }

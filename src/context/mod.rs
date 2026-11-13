@@ -39,7 +39,7 @@ mod todos;
 #[allow(unused_imports)]
 pub use budget::{estimate_tokens, render_budgeted};
 #[allow(unused_imports)]
-pub use dedup::dedup_items;
+pub use dedup::{Delta, dedup_items};
 pub use instructions::nested_instructions;
 
 use crate::settings::DiagnosticCheck;
@@ -53,9 +53,11 @@ pub struct ContextItem {
     pub body: String,
     /// Higher priority survives truncation when the context budget is tight.
     pub priority: u8,
-    /// Standing context (the instruction files) rather than a snapshot of the
-    /// moment: the model must have it on every request, and it is rendered
-    /// whole — its provider keeps it within a budget of its own.
+    /// Standing context (the instruction files, the memory index) rather
+    /// than a snapshot of the moment: constant for most of a session, so
+    /// atelier's own loop keeps it in the system message instead of a turn's
+    /// context block (see `agent::prompt`), and it is rendered whole — its
+    /// provider keeps it within a budget of its own.
     pub standing: bool,
 }
 
