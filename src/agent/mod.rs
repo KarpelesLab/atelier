@@ -990,22 +990,26 @@ impl Session {
         Ok(model)
     }
 
-    /// Names of all registered tools, sorted.
+    /// Names of the tools advertised to the model, sorted.
     pub fn tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.tools.specs().into_iter().map(|s| s.name).collect();
         names.sort();
         names
     }
 
-    /// [`tool_names`](Self::tool_names) as `/tools` shows them: each name,
-    /// then what an MCP server said about that tool (`[read-only]`,
-    /// `[destructive]`, a title).
+    /// The tools as `/tools` shows them: each advertised name, then the
+    /// deferred MCP tools marked as such — both followed by what an MCP
+    /// server said about the tool (`[read-only]`, `[destructive]`, a title).
     pub fn tool_listing(&self) -> Vec<String> {
-        let line = |name: String| match self.mcp_catalog.describe(&name) {
-            Some(said) => format!("{name} {said}"),
-            None => name,
+        let line = |name: String, deferred: &str| match self.mcp_catalog.describe(&name) {
+            Some(said) => format!("{name}{deferred} {said}"),
+            None => format!("{name}{deferred}"),
         };
-        self.tool_names().into_iter().map(line).collect()
+        let advertised = self.tool_names().into_iter().map(|n| line(n, ""));
+        let mut hidden = self.tools.hidden_names();
+        hidden.sort();
+        let deferred = hidden.into_iter().map(|n| line(n, " (deferred)"));
+        advertised.chain(deferred).collect()
     }
 
     /// Load a previously-saved conversation for this project (for `--continue`).
@@ -1106,7 +1110,22 @@ impl Session {
                 Err(e) => format!("mcp: failed to connect '{name}': {e:#}"),
             });
         }
+        if let Some(d) = self.mcp_defer() {
+            status.push(format!(
+                "mcp: {} tools ({} bytes of schemas) are deferred — the model finds them \
+                 with mcp_search and runs them with mcp_call",
+                d.tools, d.bytes
+            ));
+        }
         status
+    }
+
+    /// Re-decide whether the MCP tools are advertised one by one or
+    /// deferred, now that the set of them changed (see `mcp::deferred`).
+    fn mcp_defer(&mut self) -> Option<mcp::deferred::Deferral> {
+        let budget = self.settings.defaults.mcp_tool_budget;
+        let budget = budget.unwrap_or(mcp::deferred::DEFAULT_TOOL_BUDGET);
+        mcp::deferred::apply(&mut self.tools, &self.mcp_catalog, budget)
     }
 
     /// Take in a server that just connected: its tools join the registry,
@@ -1162,6 +1181,7 @@ impl Session {
         }
         let connection = mcp::connect_stdio(&to_stdio(&cfg))?;
         let n = self.mcp_register(name, connection);
+        self.mcp_defer();
         self.settings.mcp.push(cfg);
         self.settings.save(&self.root)?;
         Ok(n)
@@ -1185,6 +1205,7 @@ impl Session {
         }
         let connection = mcp::connect_http(&to_http(&cfg))?;
         let n = self.mcp_register(name, connection);
+        self.mcp_defer();
         self.settings.mcp_http.push(cfg);
         self.settings.save(&self.root)?;
         Ok(n)
@@ -1204,6 +1225,7 @@ impl Session {
         }
         self.tools.remove_prefix(&format!("mcp__{name}__"));
         self.mcp_catalog.remove(name);
+        self.mcp_defer();
         self.settings.save(&self.root)?;
         Ok(true)
     }
@@ -1431,6 +1453,10 @@ impl Session {
                         .push(Message::tool_result(call.id.clone(), msg));
                     continue;
                 }
+                // An `mcp_call` of a deferred MCP tool is a call of that tool
+                // from here on: hooks, rules, approval and the UI all see
+                // its real name and arguments (see `mcp::deferred`).
+                let call = &self.runner().resolved(call);
                 // Hooks: `pre_tool` may refuse the call, rewrite its
                 // arguments, or approve it in the user's place (never past
                 // a deny rule).
@@ -1839,6 +1865,20 @@ struct ToolRunner<'a> {
 }
 
 impl ToolRunner<'_> {
+    /// `call` as it is to be judged and run: itself, unless it is an
+    /// `mcp_call` of a deferred MCP tool, which stands for a call of that
+    /// tool. Must come before hooks and approval, which go by tool name.
+    fn resolved(&self, call: &provider::ToolCall) -> provider::ToolCall {
+        match mcp::deferred::resolve(self.tools, &call.name, &call.arguments) {
+            Some((name, arguments)) => provider::ToolCall {
+                name,
+                arguments,
+                ..call.clone()
+            },
+            None => call.clone(),
+        }
+    }
+
     /// Whether the call may run under the permission rules, asking the user
     /// when they — or, failing a rule, the tool's own default (unconfined
     /// tools ask: `bash`, MCP tools) — say so. `Err` is the tool result for a

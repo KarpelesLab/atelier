@@ -153,6 +153,61 @@ bytes comes back as its start and its end, with all of it saved to a file the
 agent can `read` or `grep` ([spilled output](tools.md#long-output-goes-to-a-file));
 the same goes for `read_resource`.
 
+## Deferred tools
+
+Every advertised tool costs its name, description and JSON Schema on every
+request, and a few MCP servers can bring hundreds. When the specs of all
+connected MCP tools together exceed a budget, atelier stops advertising them
+one by one and gives the model two tools instead:
+
+- `mcp_search {"query": "create issue", "limit": 5}` — the best-matching
+  tools, each with its description and full input schema. The query is split
+  into words; a tool matches if any word occurs in its name or description
+  (case-insensitive). A word found in the name counts for more than one found
+  only in the description, more matching words rank higher, and ties keep
+  registration order. The server's name is part of a tool's name, so it finds
+  that server's tools. `limit` defaults to 5 and is capped at 20.
+- `mcp_call {"tool": "mcp__github__create_issue", "arguments": {…}}` — runs
+  one of them.
+
+The model is told, in the standing `MCP servers` context, which servers are
+deferred and how many tools each has (`github (31 tools), db (12 tools)`), so
+it knows to search. `/tools` lists the deferred tools after the advertised
+ones, marked `(deferred)`; the startup line `mcp: N tools (… bytes of schemas)
+are deferred` says when it happened.
+
+The budget is `[defaults] mcp_tool_budget` in `atelier.toml`, in bytes of
+name + description + schema summed over all MCP tools; the default is 8192
+(about 2k tokens) and `0` never defers. Deferral is all or nothing across
+servers, and is re-decided whenever the set of tools changes (`/mcp add`,
+`/mcp remove`).
+
+### Approval, permission rules and hooks see the real tool
+
+`mcp_call` is not a tool that runs other tools. Before anything looks at a
+call, the agent loop resolves `mcp_call {tool: T, arguments: A}` into the call
+`T(A)` (`mcp::deferred::resolve`, applied in `ToolRunner::resolved`); from
+there on it is a call to `T` in every respect:
+
+- `pre_tool` and `post_tool` [hooks](hooks.md) match on and receive `T` and
+  `A` — a hook with `match = "mcp__db__.*"` fires, one with `match =
+  "mcp_call"` does not;
+- [permission rules](permissions.md) are matched against `T` and `A`, so
+  `deny = ["mcp__github__delete_*"]` and `allow = ["mcp__db__query(…)"]` mean
+  what they mean without deferral, and a rule naming `mcp_call` matches
+  nothing;
+- the approval prompt names `T` and shows `A`, and "always" saves a rule for
+  `T`.
+
+Only a currently deferred tool is resolved. An `mcp_call` naming anything else
+(an unknown tool, a built-in, `mcp_call` itself) is not rewritten and returns
+an error telling the model to use the name `mcp_search` gave. `mcp_search`
+reads an in-memory index and needs no approval.
+
+Deferral applies to atelier's own loop. With the [Claude backend](claude.md)
+the servers are connected by `claude`, which has its own handling of large
+tool sets.
+
 ## Tool annotations
 
 A server may annotate a tool in `tools/list`. atelier keeps the title and the

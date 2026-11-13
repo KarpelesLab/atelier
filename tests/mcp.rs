@@ -155,6 +155,30 @@ fn say(text: &str) -> Value {
     json!({ "content": text })
 }
 
+/// A model step that calls `tool` with `arguments`.
+fn call(tool: &str, arguments: Value) -> Value {
+    json!({ "tool_calls": [{
+        "index": 0,
+        "id": "call_1",
+        "type": "function",
+        "function": { "name": tool, "arguments": arguments.to_string() },
+    }] })
+}
+
+/// The `tools/call` requests an MCP server received, as `(name, arguments)`.
+fn tool_calls(server: &Server) -> Vec<(String, Value)> {
+    server
+        .bodies()
+        .iter()
+        .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|msg| msg["method"] == "tools/call")
+        .map(|msg| {
+            let name = msg["params"]["name"].as_str().unwrap_or("").to_string();
+            (name, msg["params"]["arguments"].clone())
+        })
+        .collect()
+}
+
 /// An MCP server over Streamable HTTP with the given `initialize` result
 /// and `tools/list` entries. A tool call answers `ran <name> <arguments>`.
 fn mcp_server(initialize: Value, tools: Value) -> Server {
@@ -203,7 +227,14 @@ fn project(name: &str, settings: &str) -> PathBuf {
 /// Run the line REPL in `cwd` with `input` as everything typed (approval
 /// answers included: nothing is auto-approved), until end of input.
 fn run_repl(model: &Server, cwd: &Path, input: &str) -> Output {
+    run_repl_env(model, cwd, input, &[])
+}
+
+/// [`run_repl`] with extra environment variables for atelier.
+fn run_repl_env(model: &Server, cwd: &Path, input: &str, env: &[(&str, &str)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_atelier"))
+        .env_remove("ATELIER_TRUST_HOOKS")
+        .envs(env.iter().copied())
         .env("ATELIER_BASE_URL", model.url("/v1"))
         .env("ATELIER_MODEL", "mock")
         .env("ATELIER_NO_COORDINATOR", "1")
@@ -315,4 +346,154 @@ fn server_instructions_and_tool_filters_reach_the_model() {
             "{tools:?}"
         );
     }
+}
+
+/// A tracker whose two tools cost more to advertise than the budget the
+/// deferral tests set, and that project's settings up to `[defaults]`.
+fn deferred_tracker() -> (Server, String) {
+    let tracker = mcp_server(
+        json!({ "capabilities": {} }),
+        json!([
+            {
+                "name": "create_issue",
+                "description": "Open a new issue in the tracker",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "title": { "type": "string", "description": "SCHEMA-MARK" } },
+                },
+            },
+            { "name": "delete_issue", "description": "Delete an issue for good" },
+        ]),
+    );
+    let settings = format!(
+        "[[mcp_http]]\nname = \"tracker\"\nurl = \"{}\"\n\n[defaults]\nmcp_tool_budget = 50\n",
+        tracker.url("/mcp")
+    );
+    (tracker, settings)
+}
+
+/// Past the budget, the MCP tools are not advertised: the model is told
+/// they exist, finds one with `mcp_search` (which returns its schema) and
+/// runs it with `mcp_call` — and the user is asked about the *real* tool.
+#[test]
+fn deferred_tools_are_searched_then_called_and_approved_by_their_real_name() {
+    let (tracker, settings) = deferred_tracker();
+    let create = json!({ "tool": "mcp__tracker__create_issue", "arguments": { "title": "x" } });
+    let model = model(vec![
+        call("mcp_search", json!({ "query": "create issue" })),
+        call("mcp_call", create),
+        say("done"),
+    ]);
+    let dir = project("deferred", &settings);
+
+    // `y` answers the one approval prompt.
+    let out = run_repl(&model, &dir, "go\ny\n/tools\n");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(stderr.contains("mcp: 2 tools ("), "{stderr}");
+    assert!(stderr.contains("are deferred"), "{stderr}");
+
+    let bodies = model.bodies();
+    assert_eq!(bodies.len(), 3, "stdout: {stdout}\nstderr: {stderr}");
+    let (system, tools) = system_and_tools(&bodies[0]);
+    assert!(tools.contains(&"mcp_search".to_string()), "{tools:?}");
+    assert!(tools.contains(&"mcp_call".to_string()), "{tools:?}");
+    assert!(!tools.iter().any(|t| t.starts_with("mcp__")), "{tools:?}");
+    assert!(
+        !bodies[0].contains("SCHEMA-MARK"),
+        "schemas are not sent up front"
+    );
+    assert!(system.contains("tracker (2 tools)"), "{system}");
+    assert!(system.contains("`mcp_search`"), "{system}");
+
+    // The search result: best match first, with its schema.
+    assert!(
+        bodies[1].contains("### mcp__tracker__create_issue"),
+        "{}",
+        bodies[1]
+    );
+    assert!(bodies[1].contains("SCHEMA-MARK"), "{}", bodies[1]);
+
+    // Asked about, shown as, and run as the real tool with its own arguments.
+    assert!(
+        stdout.contains(r#"allow tool 'mcp__tracker__create_issue' {"title":"x"}?"#),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("allow tool 'mcp_call'"), "{stdout}");
+    assert_eq!(
+        tool_calls(&tracker),
+        [("create_issue".to_string(), json!({ "title": "x" }))]
+    );
+    assert!(
+        bodies[2].contains(r#"ran create_issue {\"title\":\"x\"}"#),
+        "{}",
+        bodies[2]
+    );
+    assert!(
+        stdout.contains("  mcp__tracker__delete_issue (deferred)\n"),
+        "{stdout}"
+    );
+}
+
+/// Permission rules and `pre_tool` hooks written for an MCP tool's name
+/// apply when it is reached through `mcp_call`: a denied tool does not run,
+/// an allowed one runs unasked, and hooks are handed the real name.
+#[test]
+fn rules_and_hooks_see_the_real_tool_behind_mcp_call() {
+    let (tracker, mut settings) = deferred_tracker();
+    settings.push_str(
+        r#"
+[permissions]
+allow = ["mcp__tracker__create_issue"]
+deny = ["mcp__tracker__delete_*"]
+
+[[hooks]]
+event = "pre_tool"
+match = "mcp__tracker__.*"
+command = 'echo "$ATELIER_TOOL" >> real.log'
+
+[[hooks]]
+event = "pre_tool"
+match = "mcp_call"
+command = "echo fired >> wrapper.log"
+"#,
+    );
+    let delete = json!({ "tool": "mcp__tracker__delete_issue", "arguments": { "id": 7 } });
+    let create = json!({ "tool": "mcp__tracker__create_issue", "arguments": { "title": "y" } });
+    let model = model(vec![
+        call("mcp_call", delete),
+        call("mcp_call", create),
+        say("done"),
+    ]);
+    let dir = project("deferred-rules", &settings);
+
+    // No approval answers are typed: a prompt would be refused at end of
+    // input, and would show.
+    let out = run_repl_env(&model, &dir, "go\n", &[("ATELIER_TRUST_HOOKS", "1")]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(
+        model.bodies().len(),
+        3,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stdout.contains("allow tool"), "{stdout}");
+
+    // The deny rule stopped the delete; the allow rule let the create run.
+    assert_eq!(
+        tool_calls(&tracker),
+        [("create_issue".to_string(), json!({ "title": "y" }))]
+    );
+    let after_delete = &model.bodies()[1];
+    assert!(
+        after_delete.contains("mcp__tracker__delete_"),
+        "{after_delete}"
+    );
+    assert!(!after_delete.contains("ran delete_issue"), "{after_delete}");
+
+    // Hooks matched on, and were told, the real names — never `mcp_call`.
+    let real = std::fs::read_to_string(dir.join("real.log")).unwrap_or_default();
+    assert_eq!(
+        real,
+        "mcp__tracker__delete_issue\nmcp__tracker__create_issue\n"
+    );
+    assert!(!dir.join("wrapper.log").exists());
 }

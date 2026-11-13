@@ -204,6 +204,9 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    /// Registered tools that are not advertised (see
+    /// [`set_hidden`](Self::set_hidden)).
+    hidden: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -223,9 +226,12 @@ impl ToolRegistry {
                 .filter(|t| keep(t.name()))
                 .cloned()
                 .collect(),
+            // Deferred tools stay deferred in a subagent's view.
+            hidden: self.hidden.clone(),
         }
     }
-    /// Specs for every registered tool, to advertise to the provider.
+    /// Specs for every registered tool that isn't hidden, to advertise to
+    /// the provider.
     ///
     /// In registration order, and the same from one call to the next: the
     /// tool list is part of every request, in front of the conversation on
@@ -233,7 +239,24 @@ impl ToolRegistry {
     /// server's prompt cache (see `agent::prompt`). It changes only when a
     /// tool is registered or removed (an MCP server added mid-session).
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
+        let advertised = self.tools.iter().filter(|t| !self.is_hidden(t.name()));
+        advertised.map(|t| t.spec()).collect()
+    }
+    /// Make exactly the tools named in `names` *hidden*: still registered,
+    /// so [`get`](Self::get) finds them and they can run, but left out of
+    /// [`specs`](Self::specs). This is how deferred MCP tools are kept (see
+    /// [`crate::mcp::deferred`]).
+    pub fn set_hidden(&mut self, names: HashSet<String>) {
+        self.hidden = names;
+    }
+    /// Whether `name` is a registered tool that is not advertised.
+    pub fn is_hidden(&self, name: &str) -> bool {
+        self.hidden.contains(name) && self.get(name).is_some()
+    }
+    /// The names of the hidden tools, in registration order.
+    pub fn hidden_names(&self) -> Vec<String> {
+        let hidden = self.tools.iter().filter(|t| self.hidden.contains(t.name()));
+        hidden.map(|t| t.name().to_string()).collect()
     }
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

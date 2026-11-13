@@ -157,6 +157,7 @@ provider = "local"          # the provider a bare model name is on (default: env
 approve = false             # overridden by ATELIER_APPROVE
 mode = "auto-edit"          # overridden by ATELIER_MODE and --mode
 context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
+mcp_tool_budget = 8192      # no environment variable
 ```
 
 `mode` is the permission [mode](permissions.md#modes) sessions start in:
@@ -165,6 +166,11 @@ context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
 both are set. On the command line, `--mode <name>` (or `--mode=<name>`)
 selects the mode for one run, interactive or `--print`; `/mode <name>`
 switches it during a session.
+
+`mcp_tool_budget` is how many bytes of MCP tool specs (names, descriptions,
+schemas) are advertised to the model before the tools are
+[deferred](mcp.md#deferred-tools) behind `mcp_search` and `mcp_call`. The
+default is 8192; `0` never defers.
 
 ## `[[provider]]` — named endpoints
 

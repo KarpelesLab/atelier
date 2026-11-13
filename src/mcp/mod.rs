@@ -56,6 +56,13 @@
 //! order they are advertised to the model in, which has to be the same from
 //! one run to the next for the provider's prompt cache to be hit.
 //!
+//! # Deferred tools
+//!
+//! When the connected servers' tools would cost too much to advertise one by
+//! one, they are hidden behind two tools, `mcp_search` and `mcp_call` — see
+//! `deferred.rs`, which also explains how such a call is still approved and
+//! judged as the tool it runs.
+//!
 //! # Per-server options
 //!
 //! [`ServerOptions`] carries what the user may set on any server, whichever
@@ -73,6 +80,7 @@
 
 mod catalog;
 mod conn;
+pub mod deferred;
 mod http;
 mod jsonrpc;
 mod prompt;

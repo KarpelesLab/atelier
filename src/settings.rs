@@ -251,6 +251,11 @@ pub struct Defaults {
     pub mode: Option<crate::permissions::Mode>,
     #[serde(default)]
     pub context_limit: Option<u32>,
+    /// Bytes of MCP tool specs advertised before the tools are deferred
+    /// behind `mcp_search` / `mcp_call` (see [`crate::mcp::deferred`]);
+    /// `0` never defers. Unset means the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_budget: Option<usize>,
 }
 
 /// Tool-approval rules: `tool` or `tool(pattern)` strings, in three lists.
