@@ -5,8 +5,8 @@ OpenAI-compatible model APIs, runs tools in a project directory, speaks MCP,
 and continuously feeds itself context (git status, diagnostics, …) — driven
 from a deliberately minimal terminal interface.
 
-Status: **M0–M14 done** (§3); **M15–M22** (§3b) mostly done — see
-"Progress on M15–M22" there for what is left. This document is
+Status: **M0–M14 done** (§3); **M15–M22** (§3b) done but for the sandbox,
+which waits on nixvm — see "Progress on M15–M22" there. This document is
 the plan of record; it changes as we build.
 
 ---
@@ -416,7 +416,7 @@ overlay or a mouse.
 | Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | ✅ prune tool output, then a hand-off summary; `/compact`, `/context`; retry on overflow |
 | Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | ✅ allow/ask/deny patterns, command splitting, user-global rules, `permissions check` |
 | OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | ⏳ nixvm, opt-in `sandbox` feature; waits on nixvm (docs/sandbox.md) |
-| Approvals without the user | — | — | reviewer agent with a policy, fails closed | ⏳ `yolo`, rules, `permission_request` hooks; no reviewer model yet |
+| Approvals without the user | — | — | reviewer agent with a policy, fails closed | ✅ a reviewer model with a policy, failing closed; `permission_request` hooks |
 | Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | ✅ `plan`, `ask-edits`, `auto-edit`, `yolo` |
 | Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | ✅ `task`, agents as files, step cap, parallel, background, worktrees |
 | Custom commands | Markdown, arguments, shell output | same, plus per-command agent/model | (skills) | ✅ files, arguments, shell output, `model:`; MCP prompts as commands |
@@ -424,14 +424,14 @@ overlay or a mouse.
 | Hooks | pre/post tool, prompt, stop, session, compact | plugin events | same set + permission request, hash-pinned trust | ✅ lifecycle events that observe or decide, under project trust |
 | Ask the user | structured question tool | `question` tool | `request_user_input` | ✅ `ask`, answered on the input line |
 | Web search | yes | yes (several providers) | yes | ✅ `web_search` (SearXNG, Brave, Tavily, DuckDuckGo) |
-| Diagnostics after edits | LSP tool, IDE diagnostics | LSP in v1, **dropped in v2** for lint/typecheck commands | — | ✅ lint/typecheck commands, configured or detected, reporting the change |
+| Diagnostics after edits | LSP tool, IDE diagnostics | LSP in v1, **dropped in v2** for lint/typecheck commands | — | ✅ lint/typecheck commands, reporting the change; `symbols` for navigation |
 | Parallel tool calls | yes | yes | yes | ✅ read-only calls of a step |
 | MCP extras | OAuth, resources, prompts as commands, deferred tools, serve as MCP | OAuth, prompts as commands, "code mode" | OAuth, tool filters, deferred tools, serve as MCP | ✅ OAuth, filters, timeouts, instructions, deferred tools, code mode, `atelier mcp` |
-| Headless / embedding | `-p`, JSON stream in/out, SDK | `run --format json`, HTTP server, ACP | `exec --json`, output schema, app-server | ✅ JSON in/out, schema, `atelier serve` (JSON-RPC); ⏳ ACP |
-| Scheduled / CI work | loops, cron, GitHub action | GitHub action | cloud tasks, GitHub review | ✅ `/goal`, `atelier review`, GitHub Action (not yet run for real); ⏳ `/loop` |
+| Headless / embedding | `-p`, JSON stream in/out, SDK | `run --format json`, HTTP server, ACP | `exec --json`, output schema, app-server | ✅ JSON in/out, schema, `atelier serve` (JSON-RPC), `atelier acp` |
+| Scheduled / CI work | loops, cron, GitHub action | GitHub action | cloud tasks, GitHub review | ✅ `/goal`, `/loop`, `atelier review`, GitHub Action (not yet run for real) |
 | Model per role, effort | per subagent, effort levels | per agent/command, variants, small model | per role, effort, review model | ✅ providers, `[models]` roles, variants, `/effort`, usage stats |
 | Prompt-cache care | automatic | summary reuses the cache, cache warming | — | ✅ constant system message; each request a prefix of the next |
-| Instances that talk | agent teams | — | message board (in development) | ✅ coordinator (M14); ⏳ ask/answer, wake, locks |
+| Instances that talk | agent teams | — | message board (in development) | ✅ coordinator: messages, topics, ask/answer, opt-in wake, advisory locks |
 
 Already ahead or equal, and to be kept that way: file-state tracking and
 stale-edit rejection, ambient per-turn context with dedup, the mediated `node`
@@ -444,12 +444,17 @@ the coordinator, a libc-free static binary.
 |---|---|---|
 | M15 Instructions & memory | ✅ | — |
 | M16 | dropped | — |
-| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins | ⏳ the nixvm sandbox is opt-in and waits on nixvm (libc-free host mounts, `git commit`, `cargo` — docs/sandbox.md); network allowlist; approvals by a reviewer model |
-| M18 Subagents | ✅ `task`, agent files, step cap, parallel, background, worktree isolation | ⏳ on the coordinator: ask/answer, wake, advisory locks |
+| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins, the approval reviewer | ⏳ the nixvm sandbox is opt-in (`--features sandbox`) and waits on nixvm: libc-free host mounts, `git commit`, `cargo`, egress by name (docs/sandbox.md) |
+| M18 Subagents | ✅ `task`, agent files, step cap, parallel, background, worktree isolation; on the coordinator: ask/answer, opt-in wake, advisory locks | subagents as coordinator instances (a child in another process or terminal) |
 | M19 Commands, skills, hooks | ✅ | — |
-| M20 Tools | ✅ `ask`, `web_search`, diagnostics, parallel reads, output to a file, job notices, MCP (OAuth, filters, deferred tools, code mode, `atelier mcp`) | ⏳ an LSP-backed symbols tool |
-| M21 Headless & automation | ✅ JSON/stream-json, schema, `atelier serve`, `/goal`, `review`, `doctor`, `debug prompt`, GitHub Action | ⏳ ACP adapter, `/loop`; the action has not run on a real runner |
-| M22 Models, context, cache | ✅ | ⏳ cache benefit not yet measured; the default compaction threshold (8000) is small next to the tool list |
+| M20 Tools | ✅ `ask`, `web_search`, diagnostics, parallel reads, output to a file, job notices, `symbols`, MCP (OAuth, filters, deferred tools, code mode, `atelier mcp`) | — |
+| M21 Headless & automation | ✅ JSON/stream-json, schema, `atelier serve`, `atelier acp`, `/goal`, `/loop`, `review`, `doctor`, `debug prompt`, GitHub Action | to be tried for real: the action on a runner, ACP in an editor; runs when no atelier is open are cron + `--print` |
+| M22 Models, context, cache | ✅ | cache benefit not yet measured; the default compaction threshold (8000) is small next to the tool list |
+
+Not exercised against the real thing, and worth doing before relying on
+them: the Claude-backend paths of most of the above (its live tests are
+opt-in), OAuth against a real authorization server, language servers other
+than rust-analyzer, search providers other than DuckDuckGo.
 
 The milestone texts below are the plan as written; where what was built
 differs, the docs (`docs/`) are the reference.
