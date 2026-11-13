@@ -34,6 +34,12 @@
 //! `call` method, `ask`, carries a question to another instance's *agent*
 //! and its answer back — the `peer_ask` and `peer_answer` tools ([`ask`]).
 //!
+//! An idle instance holds what it receives for its user's next prompt,
+//! unless it is set to wake ([`Wake`]; the rules are in `agent::idle`). For
+//! that, every `send`, `publish` and `ask` carries a `wake_depth` — how many
+//! self-started turns lie between it and a prompt some user typed — which
+//! the coordinator passes on untouched.
+//!
 //! Unix only (`cfg(unixlike)`, see `build.rs`): elsewhere [`start`] returns
 //! `None` and atelier runs alone.
 
@@ -53,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 pub use client::Client;
 
@@ -75,6 +82,31 @@ pub const ERR_TIMEOUT: i64 = -32003;
 /// JSON-RPC error: the target of a `call` disconnected before answering.
 pub const ERR_GONE: i64 = -32004;
 
+/// `[coordinator] wake`: whether a peer may set this instance to work
+/// while it is idle (see `agent::idle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Wake {
+    /// Whatever arrives waits for the user's next prompt.
+    #[default]
+    Never,
+    /// A question (`peer_ask`) starts a turn; other messages wait.
+    Questions,
+    /// Any message from a peer starts a turn.
+    Always,
+}
+
+impl Wake {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "never" => Some(Wake::Never),
+            "questions" => Some(Wake::Questions),
+            "always" => Some(Wake::Always),
+            _ => None,
+        }
+    }
+}
+
 /// A message from another instance.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Message {
@@ -90,6 +122,9 @@ pub struct Message {
     /// Set when the sender is waiting for this instance's agent to answer
     /// (see [`ask`]): the id the answer must name.
     pub question: Option<String>,
+    /// How many self-started turns led to it: 0 when it comes from a turn
+    /// a user prompted (see `agent::idle`).
+    pub wake_depth: u32,
 }
 
 impl Message {

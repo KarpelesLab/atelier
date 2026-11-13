@@ -53,6 +53,7 @@ impl Client {
     pub fn answer_question(&self, _: &str, _: &str) -> Result<String> {
         bail!(UNSUPPORTED)
     }
+    pub fn set_wake_depth(&self, _: u32) {}
     pub fn question_open(&self, _: &str) -> bool {
         false
     }

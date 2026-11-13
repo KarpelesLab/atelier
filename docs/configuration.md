@@ -48,6 +48,7 @@ other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
 | `ATELIER_UPDATE_API`      | `https://api.github.com`         | `update` | GitHub API base the update check queries (for a mirror, or testing) |
 | `ATELIER_NO_COORDINATOR`  | *(unset)*                        | `coord::start` | Any non-empty value other than `0`: don't join (or start) the [coordinator](coordinator.md) that connects atelier instances |
 | `ATELIER_COORDINATOR_DIR` | `$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier` | `coord::runtime_dir` | Directory of the coordinator's socket, lock and log |
+| `ATELIER_COORDINATOR_WAKE` | *(unset)*                       | `agent::idle` | `never`, `questions` or `always`: whether a peer's question or message starts a turn in this instance while it is idle — see [waking](coordinator.md#waking-an-idle-instance). Overrides `[coordinator] wake`; any other value means `never` |
 | `ATELIER_SEARCH_PROVIDER` | `duckduckgo` (`searxng` if a URL is set) | `web_search` tool | Search provider: `searxng`, `brave`, `tavily` or `duckduckgo`. Overrides `[search] provider` — see [`[search]`](#search) |
 | `ATELIER_SEARCH_URL`      | *(unset)*                        | `web_search` tool | Base URL of the SearXNG instance (required for `searxng`); for the other providers, replaces their endpoint. Overrides `[search] url` |
 | `ATELIER_SEARCH_KEY`      | *(unset)*                        | `web_search` tool | API key for `brave` or `tavily`. Overrides the variable named by `[search] key_env` |
@@ -448,6 +449,27 @@ prompt may go before the turn ends with the goal unmet.
 max_rounds = 10      # times a prompt is sent back to work (default 10)
 max_tokens = 50000   # output tokens a prompt may generate (default: no limit)
 ```
+
+## `[coordinator]`
+
+Whether your other atelier instances may set this one to work while it sits
+idle at its prompt — see [Waking an idle
+instance](coordinator.md#waking-an-idle-instance) for what that does and
+what bounds it.
+
+```toml
+[coordinator]
+wake = "never"   # never | questions | always (overridden by ATELIER_COORDINATOR_WAKE)
+wake_max = 5     # turns it may start by itself before you type again
+```
+
+| Field      | Type    | Meaning |
+|------------|---------|---------|
+| `wake`     | string  | `never` (default): what peers send waits for your next prompt. `questions`: a `peer_ask` starts a turn. `always`: any peer message does |
+| `wake_max` | integer | The most turns the instance starts by itself between two inputs of yours (default 5) |
+
+The table is read from the project's `atelier.toml` only; to make it your
+choice for every project, export `ATELIER_COORDINATOR_WAKE` instead.
 
 ## `[[hooks]]`
 

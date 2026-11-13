@@ -476,7 +476,13 @@ impl Daemon {
                 };
                 let line = notification(
                     "message",
-                    json!({ "from": from, "body": body, "broadcast": broadcast, "at": now() }),
+                    json!({
+                        "from": from,
+                        "body": body,
+                        "broadcast": broadcast,
+                        "wake_depth": p["wake_depth"],
+                        "at": now(),
+                    }),
                 );
                 let delivered = targets
                     .into_iter()
@@ -506,6 +512,7 @@ impl Daemon {
                         "from": st.peers[&conn].from(),
                         "topic": topic,
                         "body": body,
+                        "wake_depth": p["wake_depth"],
                         "at": now(),
                     }),
                 );

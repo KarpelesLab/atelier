@@ -123,8 +123,9 @@ impl Tool for PeerSend {
                           instance name (see peers), '*' for every other instance, or '#topic' \
                           for the instances subscribed to a topic. The message is shown to the \
                           recipient's user and given to its agent at its next step; an idle \
-                          instance only reads it when its user next prompts it, so do not wait \
-                          for a reply. Replies arrive as messages from the peer."
+                          instance only reads it when its user next prompts it (unless that \
+                          instance is set to wake for messages), so do not wait for a reply. \
+                          Replies arrive as messages from the peer."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -172,8 +173,9 @@ impl Tool for PeerAsk {
                  need what the other agent knows before you can continue; use peer_send for \
                  anything that needs no answer. The call blocks until the answer arrives or \
                  the timeout runs out (default {}s, at most {}s). A working instance answers at \
-                 its next step; an idle one only once its user prompts it, so a question to \
-                 an idle instance may come back unanswered — the result then says so and why.",
+                 its next step; an idle one only once its user prompts it (unless it is set \
+                 to wake for questions), so a question to an idle instance may come back \
+                 unanswered — the result then says so and why.",
                 ask::DEFAULT_TIMEOUT.as_secs(),
                 ask::MAX_TIMEOUT.as_secs()
             ),

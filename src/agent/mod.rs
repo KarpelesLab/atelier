@@ -22,6 +22,7 @@
 mod batch;
 mod compact;
 mod goal;
+mod idle;
 mod init;
 mod jobs;
 mod prompt;
@@ -269,6 +270,8 @@ const HELP: &[&str] = &[
 /// send. Shared by the REPL and the TUI so commands behave identically in both.
 pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch {
     let trimmed = line.trim();
+    // Whatever it is, the user typed it (see `idle`).
+    session.user_typed();
     if !trimmed.starts_with('/') {
         return Dispatch::Prompt;
     }
@@ -824,6 +827,8 @@ pub struct Session {
     /// Messages from other instances that arrived (and were shown) while
     /// idle; the model gets them with the next prompt.
     peer_pending: Vec<coord::Message>,
+    /// What may make the session start a turn by itself (see [`idle`]).
+    idle: idle::Idle,
     /// The configured hooks (see [`hooks`]); `hooks_started` once
     /// `session_start` has run, so `session_end` pairs with it.
     hooks: Hooks,
@@ -887,6 +892,13 @@ impl Session {
             hooks::user_config().as_deref(),
             trust.hooks_state(),
         );
+        // Whether peers may wake this instance is the user's to say: a
+        // project's `[coordinator]` counts only once the project is trusted.
+        let idle = if trust.active() {
+            idle::Idle::configured(&settings)
+        } else {
+            idle::Idle::configured(&Settings::default())
+        };
         Self {
             trust,
             hooks,
@@ -921,6 +933,7 @@ impl Session {
             quit_warned: false,
             coord: None,
             peer_pending: Vec::new(),
+            idle,
             child: None,
             standalone: None,
             goal: None,
@@ -948,6 +961,7 @@ impl Session {
             ui.info(&peer_display(m));
         }
         let any = !fresh.is_empty();
+        self.idle.judge(&fresh);
         self.peer_pending.extend(fresh);
         any || ended
     }
@@ -1571,7 +1585,7 @@ impl Session {
     /// the turn are delivered the way messages typed mid-turn are.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
         let result = self.send_inner(user_input, ui);
-        self.close_peer_questions(ui);
+        self.turn_ended(ui);
         result
     }
 
@@ -2718,10 +2732,9 @@ impl Ui for StdoutUi {
         let args: String = arguments.chars().take(200).collect();
         print!("allow tool '{tool}' {args}? [y]once / [a]lways / [n]o: ");
         io::stdout().flush().ok();
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line).is_err() {
+        let Some(line) = idle::read_line() else {
             return Approval::Deny;
-        }
+        };
         match line.trim().chars().next() {
             Some('y') | Some('Y') => Approval::Once,
             Some('a') | Some('A') => Approval::Always,
@@ -2736,12 +2749,10 @@ impl Ui for StdoutUi {
         loop {
             print!("? ");
             io::stdout().flush().ok();
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                // End of input: whoever was there is gone.
-                Ok(0) | Err(_) => return Some(Answer::Declined),
-                Ok(_) => {}
-            }
+            // End of input: whoever was there is gone.
+            let Some(line) = idle::read_line() else {
+                return Some(Answer::Declined);
+            };
             match question.parse(&line) {
                 Ok(answer) => return Some(answer),
                 Err(why) => println!("  {why}\n{}", question.hint()),
@@ -2777,6 +2788,10 @@ fn config_summary(session: &Session) -> Vec<String> {
     out
 }
 
+/// How long the REPL waits for a line before looking at what else there is
+/// to do (see [`Session::idle_tick`]).
+const REPL_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// A minimal stdin REPL driving a [`Session`] with [`StdoutUi`].
 ///
 /// Used for headless runs and until the inline TUI (M2) lands.
@@ -2795,29 +2810,46 @@ pub fn repl(mut session: Session) -> Result<()> {
         eprintln!("{line}");
     }
 
-    let stdin = io::stdin();
     loop {
         if let Some(notice) = crate::update::take_notice() {
             eprintln!("{notice}");
         }
-        // Messages from other atelier instances (see `coord`).
-        session.poll_peers(&mut StdoutUi::new());
         print!("› ");
         io::stdout().flush().ok();
-        let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
+        // Wait for a line, looking now and then at what other atelier
+        // instances sent (see `coord`) and at whether the session has a
+        // turn of its own to start (see `idle`).
+        let next = loop {
+            let ui = &mut StdoutUi::new();
+            session.poll_peers(ui);
+            if let Some(prompt) = session.idle_tick(false, ui) {
+                break Some((prompt, true));
+            }
+            match idle::wait_line(REPL_POLL) {
+                idle::Line::Typed(line) => break Some((line, false)),
+                idle::Line::Closed => break None,
+                idle::Line::Pending => {}
+            }
+        };
+        let Some((input, own)) = next else {
             // EOF (Ctrl-D, or the end of piped input). Exiting would end
             // claude's background work, and there's no one left to confirm
             // that, so let it finish first.
             session.wait_background(&mut StdoutUi::new())?;
             break;
-        }
+        };
         let line = input.trim();
         if line.is_empty() {
             continue;
         }
         let mut ui = StdoutUi::new();
-        match dispatch(&mut session, line, &mut ui) {
+        // A prompt of the session's own is sent as it is, not interpreted.
+        let outcome = if own {
+            Dispatch::Expanded(line.to_string().into())
+        } else {
+            dispatch(&mut session, line, &mut ui)
+        };
+        match outcome {
             Dispatch::Quit => break,
             Dispatch::Handled => {}
             Dispatch::Config => {
@@ -2917,11 +2949,11 @@ mod tests {
 
     /// A coordinator of the test's own, in a temp dir, ended on drop.
     #[cfg(unixlike)]
-    struct Peers(PathBuf);
+    pub(super) struct Peers(PathBuf);
 
     #[cfg(unixlike)]
     impl Peers {
-        fn start(name: &str) -> Self {
+        pub(super) fn start(name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("atl-agent-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let cfg = coord::daemon::Config {
@@ -2934,7 +2966,7 @@ mod tests {
         }
 
         /// An instance, once it is connected and knows its name.
-        fn join(&self, name: &str) -> std::sync::Arc<coord::Client> {
+        pub(super) fn join(&self, name: &str) -> std::sync::Arc<coord::Client> {
             let client = coord::Client::start(coord::client::Options {
                 dir: self.0.clone(),
                 exe: None,
@@ -2957,7 +2989,7 @@ mod tests {
 
     /// Poll `ready` until it holds; fail, rather than hang, if it never does.
     #[cfg(unixlike)]
-    fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    pub(super) fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !ready() {
             assert!(
@@ -3130,8 +3162,8 @@ mod tests {
 
     /// A [`Ui`] that refuses every prompt and keeps what it was told.
     #[derive(Default)]
-    struct Quiet {
-        infos: Vec<String>,
+    pub(super) struct Quiet {
+        pub(super) infos: Vec<String>,
         asked: usize,
     }
 
@@ -3151,7 +3183,7 @@ mod tests {
     }
 
     /// A session on the built-in tools in a scratch directory.
-    fn scratch_session(name: &str) -> (Session, PathBuf) {
+    pub(super) fn scratch_session(name: &str) -> (Session, PathBuf) {
         let root = std::env::temp_dir().join(format!("atl-agent-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

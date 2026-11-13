@@ -22,7 +22,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -174,6 +174,8 @@ struct Shared {
     desk: Mutex<Desk>,
     /// The instances this one is waiting on an answer from.
     asking: Mutex<Vec<String>>,
+    /// What goes out as `wake_depth` (see [`Client::set_wake_depth`]).
+    wake_depth: AtomicU32,
     stop: AtomicBool,
 }
 
@@ -210,6 +212,7 @@ impl Client {
             handlers: Mutex::new(HashMap::new()),
             desk: Mutex::new(Desk::default()),
             asking: Mutex::new(Vec::new()),
+            wake_depth: AtomicU32::new(0),
             stop: AtomicBool::new(false),
         });
         let client = Arc::new(Self {
@@ -274,13 +277,18 @@ impl Client {
     /// instance, or `#topic` for the topic's subscribers. Returns how many
     /// instances it reached.
     pub fn send(&self, to: &str, body: &str) -> Result<u64> {
+        let wake_depth = self.sh.wake_depth.load(Ordering::Relaxed);
         let r = match to.strip_prefix('#') {
             Some(topic) => self.request(
                 "publish",
-                json!({ "topic": topic, "body": body }),
+                json!({ "topic": topic, "body": body, "wake_depth": wake_depth }),
                 REQUEST_TIMEOUT,
             )?,
-            None => self.request("send", json!({ "to": to, "body": body }), REQUEST_TIMEOUT)?,
+            None => self.request(
+                "send",
+                json!({ "to": to, "body": body, "wake_depth": wake_depth }),
+                REQUEST_TIMEOUT,
+            )?,
         };
         Ok(r["delivered"].as_u64().unwrap_or(0))
     }
@@ -326,7 +334,11 @@ impl Client {
     /// that could not be asked at all.
     pub fn ask(&self, to: &str, question: &str, timeout: Duration) -> Result<Outcome> {
         let timeout = timeout.min(ask::MAX_TIMEOUT);
-        let params = json!({ "question": question, "timeout_ms": timeout.as_millis() as u64 });
+        let params = json!({
+            "question": question,
+            "timeout_ms": timeout.as_millis() as u64,
+            "wake_depth": self.sh.wake_depth.load(Ordering::Relaxed),
+        });
         lock(&self.sh.asking).push(to.to_string());
         let answer = self.call(to, ask::METHOD, params, timeout);
         {
@@ -347,6 +359,14 @@ impl Client {
                 _ => Err(e),
             },
         }
+    }
+
+    /// Say how far what this instance sends from now on is from a prompt a
+    /// user typed: 0 in a turn the user started, one more than the depth of
+    /// the message that woke it in a turn the instance started by itself
+    /// (see `agent::idle`). It rides on every `send` and `ask`.
+    pub fn set_wake_depth(&self, depth: u32) {
+        self.sh.wake_depth.store(depth, Ordering::Relaxed);
     }
 
     /// Answer the question `id` another instance asked this one; returns
@@ -430,6 +450,11 @@ impl Client {
 /// A JSON string, or nothing.
 fn text(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
+}
+
+/// A `wake_depth` as received; one that is missing is a user's own.
+fn depth(v: &Value) -> u32 {
+    v.as_u64().map_or(0, |d| d.min(u64::from(u32::MAX)) as u32)
 }
 
 /// How a connection attempt ended.
@@ -627,6 +652,7 @@ impl Shared {
                 broadcast: false,
                 body: text(&params["question"]),
                 question: Some(id),
+                wake_depth: depth(&params["wake_depth"]),
             },
         );
     }
@@ -659,6 +685,7 @@ impl Shared {
                         broadcast: params["broadcast"].as_bool().unwrap_or(false),
                         body: text(&params["body"]),
                         question: None,
+                        wake_depth: depth(&params["wake_depth"]),
                     },
                 );
             }

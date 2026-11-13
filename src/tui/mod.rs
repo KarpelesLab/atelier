@@ -139,16 +139,19 @@ pub fn run(mut session: Session) -> Result<()> {
     loop {
         // Whatever was queued during the last turn is served first, in order,
         // exactly as if it had just been typed (echoed, then dispatched).
-        let input = match r.pop_queued() {
+        // `own`: a prompt the session starts by itself (see `agent::idle`),
+        // sent as it is rather than interpreted as a line the user typed.
+        let (input, own) = match r.pop_queued() {
             Some(line) => {
                 r.push_line(format!("{PROMPT}{line}"), false);
-                line
+                (line, false)
             }
             None => match read_line(&mut r, &mut session, turn)? {
-                Some(line) => line,
+                Idle::Line(line) => (line, false),
+                Idle::Start(prompt) => (prompt, true),
                 // Ctrl-D: exits, unless that would stop claude's background
                 // work and this is the first attempt.
-                None => {
+                Idle::Exit => {
                     if session.confirm_quit(&mut TuiUi { r: &mut r }) {
                         break;
                     }
@@ -166,7 +169,9 @@ pub fn run(mut session: Session) -> Result<()> {
 
         // Commands and prompts share one dispatcher. Scope the TuiUi borrow so
         // `r` is free again in the match arms.
-        let outcome = {
+        let outcome = if own {
+            agent::Dispatch::Expanded(trimmed.clone().into())
+        } else {
             let mut ui = TuiUi { r: &mut r };
             agent::dispatch(&mut session, &trimmed, &mut ui)
         };
@@ -207,11 +212,22 @@ pub fn run(mut session: Session) -> Result<()> {
     Ok(())
 }
 
-/// Block at the idle prompt until the user submits a line (`Some`) or asks to
-/// exit with Ctrl-D on an empty input (`None`). The submitted line is echoed
-/// into the scrollback record. Meanwhile, output the session produces on its
-/// own (claude reporting on background work) is rendered above the prompt.
-fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Option<String>> {
+/// How a wait at the idle prompt ended.
+enum Idle {
+    /// The user submitted a line.
+    Line(String),
+    /// Ctrl-D on an empty input.
+    Exit,
+    /// The session has a turn of its own to start, with this prompt.
+    Start(String),
+}
+
+/// Block at the idle prompt until the user submits a line or asks to exit
+/// with Ctrl-D on an empty input, or the session starts a turn by itself.
+/// The submitted line is echoed into the scrollback record. Meanwhile,
+/// output the session produces on its own (claude reporting on background
+/// work) is rendered above the prompt.
+fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Idle> {
     loop {
         let Some(event) = term::poll(IDLE_POLL)? else {
             if session.poll_background(&mut TuiUi { r: &mut *r }) {
@@ -226,16 +242,21 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Optio
                 r.push_line(format!("! {notice}"), true);
                 r.refresh()?;
             }
+            // Never under the user's fingers: not while a line is being typed.
+            let typing = !r.editor.is_empty();
+            if let Some(prompt) = session.idle_tick(typing, &mut TuiUi { r: &mut *r }) {
+                return Ok(Idle::Start(prompt));
+            }
             continue;
         };
         match event {
             // A resize just needs a repaint; `refresh` re-reads the width.
             Event::Resize => r.refresh()?,
             Event::Key(k) => match edit_key(r, k) {
-                KeyAction::Exit => return Ok(None),
+                KeyAction::Exit => return Ok(Idle::Exit),
                 KeyAction::Submit(line) => {
                     r.push_line(format!("{PROMPT}{line}"), false);
-                    return Ok(Some(line));
+                    return Ok(Idle::Line(line));
                 }
                 KeyAction::Edited => r.refresh()?,
             },

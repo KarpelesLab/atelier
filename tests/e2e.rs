@@ -5628,3 +5628,111 @@ fn a_background_agent_in_a_worktree_reports_its_changes_and_clean_removes_it() {
     );
     assert!(prompt.ends_with("second prompt"), "{prompt}");
 }
+
+/// `atelier coordinator <cmd>` for the coordinator in `coord`.
+#[cfg(unix)]
+fn coordinator(coord: &Path, cmd: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_atelier"))
+        .args(["coordinator", cmd])
+        .env("ATELIER_COORDINATOR_DIR", coord)
+        .output()
+        .expect("run atelier coordinator");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Two instances and their agents — `peer_ask` end to end. `beta` sits idle
+/// at its prompt, set to wake for questions. `alpha`'s model asks it one:
+/// beta starts a turn by itself, its model is shown the question and answers
+/// with `peer_answer`, and that answer is `alpha`'s tool result.
+#[cfg(unix)]
+#[test]
+fn a_question_wakes_an_idle_instance_and_its_answer_comes_back() {
+    let dir = unique_dir("ask");
+    let coord = dir.join("run");
+    let (alpha_dir, beta_dir) = (dir.join("alpha"), dir.join("beta"));
+    std::fs::create_dir_all(&alpha_dir).unwrap();
+    std::fs::create_dir_all(&beta_dir).unwrap();
+    let joined = |mut cmd: Command| {
+        cmd.env("ATELIER_COORDINATOR_DIR", &coord)
+            .env_remove("ATELIER_NO_COORDINATOR");
+        cmd
+    };
+
+    // beta's model: answers the question it is shown, then says so.
+    let beta_mock = Mock::by_body(Arc::new(|body| {
+        let request = request(body);
+        let asked = messages_of(&request, "user")
+            .iter()
+            .any(|m| m.contains("<peer-question id=\"q1\""));
+        match (asked, messages_of(&request, "tool").is_empty()) {
+            (true, true) => json_tool_call(
+                "call_answer",
+                "peer_answer",
+                serde_json::json!({"id": "q1", "answer": "it listens on 8080"}),
+            ),
+            (true, false) => text_response("answered alpha"),
+            (false, _) => text_response("nothing to do"),
+        }
+    }));
+    let mut beta = joined(atelier(&beta_mock.base_url(), &beta_dir))
+        .env("ATELIER_COORDINATOR_WAKE", "questions")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn beta");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !coordinator(&coord, "status").contains("beta — idle") {
+        assert!(
+            Instant::now() < deadline,
+            "beta never joined the coordinator"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // alpha's model: asks beta, then reports what it was told.
+    let alpha_mock = Mock::start(Arc::new(|n| {
+        if n == 0 {
+            json_tool_call(
+                "call_ask",
+                "peer_ask",
+                serde_json::json!({"to": "beta", "question": "which port?", "timeout_secs": 15}),
+            )
+        } else {
+            text_response("beta says 8080")
+        }
+    }));
+    let mut alpha = joined(atelier(&alpha_mock.base_url(), &alpha_dir));
+    alpha.args(["--print", "find out the port"]);
+    let out = finish(alpha, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("beta says 8080"), "{stdout}");
+    // The answer came back as the tool's result.
+    let results = messages_of(&request(&alpha_mock.body(1)), "tool");
+    assert_eq!(results, ["it listens on 8080"]);
+
+    // beta was not prompted by anyone: it woke, with the question leading
+    // the prompt, and said so in its transcript.
+    let woken = request(&beta_mock.body(0));
+    let prompt = messages_of(&woken, "user").pop().unwrap();
+    assert!(
+        prompt.contains("<peer-question id=\"q1\" from=\"alpha\""),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("which port?") && prompt.contains("[woken]"),
+        "{prompt}"
+    );
+    drop(beta.stdin.take()); // end of input: beta exits
+    let transcript = beta.wait_with_output().expect("beta's output");
+    let transcript = String::from_utf8_lossy(&transcript.stdout);
+    assert!(
+        transcript.contains("⏰ woken by alpha (1 of 5 without you): which port?"),
+        "{transcript}"
+    );
+    assert!(transcript.contains("answered alpha"), "{transcript}");
+
+    coordinator(&coord, "stop");
+    let _ = std::fs::remove_dir_all(&dir);
+}

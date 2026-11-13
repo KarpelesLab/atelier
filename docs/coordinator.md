@@ -37,7 +37,8 @@ An instance is named after its project directory (`atelier`, and
 A message that arrives is shown in the receiving instance (`✉ name: …`)
 and handed to its agent: at the agent's next step if it is working, or
 together with your next prompt if it is idle. **An idle instance does not
-start working because a message arrived** — it waits for you.
+start working because a message arrived** — it waits for you, unless you
+have told it to [wake](#waking-an-idle-instance).
 
 The agent sees a peer's message marked as coming from another agent, not
 from you, and is told to treat it as information.
@@ -81,8 +82,60 @@ waiting any more, but what was asked may still matter.
 
 The asking turn cannot be interrupted while it waits (no tool call can), so
 an agent should give `timeout_secs` when a short wait is all the question is
-worth. An idle instance does not answer by itself: the question waits for
-its user's next prompt, like any message.
+worth. An idle instance does not answer by itself — the question waits for
+its user's next prompt, like any message — unless it is set to
+[wake](#waking-an-idle-instance) for questions.
+
+## Waking an idle instance
+
+By default an instance at its prompt does nothing until you type. You can
+let your other instances set it to work:
+
+```toml
+[coordinator]
+wake = "questions"   # never (default) | questions | always
+wake_max = 5         # self-started turns before you must type again (default 5)
+```
+
+or `ATELIER_COORDINATOR_WAKE=questions` for one run. With `questions`, a
+`peer_ask` that arrives while the instance is idle starts a turn in it, with
+the question as the prompt, so the asking agent gets its answer without you;
+ordinary messages still wait. With `always`, any message from a peer starts
+a turn.
+
+The turn is an ordinary one. It is announced in the transcript (`⏰ woken by
+<peer> (2 of 5 without you): …`), and it runs under the session's mode and
+permission rules: **nothing is approved because the instance woke**. A woken
+turn that wants to run something you have not allowed stops at the approval
+prompt and waits for you, like any turn — set the instance's
+[mode](permissions.md#modes) and rules for what you want done unattended
+(`plan` for an instance that should only answer questions about the code).
+
+What keeps this bounded:
+
+- **Only your own instances can wake one.** The coordinator's socket is in
+  a directory only your user can enter, so every message comes from a
+  process of yours. Nothing arriving from the network or from another user
+  can start a turn.
+- **A cap.** An instance starts at most `wake_max` turns by itself. Typing
+  anything in it — a prompt, a command — resets the count; until then,
+  further messages are shown and wait for your prompt as usual.
+- **Never under your fingers.** While there is text on the input line, the
+  wake waits; it starts when the line is empty again. (The line REPL — what
+  atelier is when its input is not a terminal — cannot see a half-typed
+  line, and does not wait.)
+- **No ping-pong.** Every message carries a `wake_depth`: 0 when it is sent
+  from a turn somebody typed the prompt of, and one more than the message
+  that woke it when it is sent from a woken turn. An instance that has
+  already woken since you last typed in it does not wake for a message of
+  depth 2 or more. So if you prompt A, A may wake B, and B's reply may wake
+  A once — but what A's woken turn sends back wakes nobody. Two instances
+  set to `always` cannot keep each other busy.
+- **Decided on arrival.** Whether a message wakes is settled when it
+  arrives. One that did not (the cap was reached, the chain was too deep)
+  does not start a turn later; it leads your next prompt.
+
+`atelier --print` never wakes: it runs its prompt and exits.
 
 From a shell:
 
@@ -96,6 +149,7 @@ atelier coordinator stop     # end it (instances will start another)
 | Variable | |
 |---|---|
 | `ATELIER_NO_COORDINATOR` | Any non-empty value other than `0`: this atelier runs alone — it neither joins nor starts a coordinator, and has none of the `peer*` tools |
+| `ATELIER_COORDINATOR_WAKE` | `never`, `questions` or `always`: what [wakes](#waking-an-idle-instance) this instance when idle, overriding `[coordinator] wake`. Any other value means `never` |
 | `ATELIER_COORDINATOR_DIR` | Directory for the coordinator's socket, lock and log. Default: `$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier`. Instances only meet if they use the same directory |
 
 The coordinator is available on Unix systems. Its log is
@@ -119,14 +173,15 @@ the name it gets. After that:
 |---|---|
 | `list` | The connected instances |
 | `update {status, model}` | Change what `list` says about the caller |
-| `send {to, body}` | Deliver `body` to the instance named `to` (or with that id), or to all others with `to: "*"` |
+| `send {to, body, wake_depth?}` | Deliver `body` to the instance named `to` (or with that id), or to all others with `to: "*"` |
 | `subscribe {topic}`, `unsubscribe {topic}` | Topic membership |
-| `publish {topic, body}` | Deliver `body` to the topic's subscribers |
+| `publish {topic, body, wake_depth?}` | Deliver `body` to the topic's subscribers |
 | `call {to, method, params, timeout_ms}` | Ask another instance to run `method` and return its answer |
 | `status`, `shutdown` | About the coordinator itself; allowed without `hello` |
 
-Deliveries arrive as a `message` notification (`from`, `body`, and `topic`
-or `broadcast`). A `call` arrives at its target as a `call` request, whose
+Deliveries arrive as a `message` notification (`from`, `body`, `topic` or
+`broadcast`, and the sender's `wake_depth`, which the coordinator passes on
+untouched — see [waking](#waking-an-idle-instance)). A `call` arrives at its target as a `call` request, whose
 answer the coordinator passes back to the caller; it fails if the target
 disconnects (error `-32004`) or takes longer than `timeout_ms` (error
 `-32003`; 30 s by default, 30 minutes at most). Instances answer `ping`,
@@ -142,7 +197,7 @@ connection the call arrived on (a new coordinator numbers its calls afresh),
 and one dropped without an answer fails the call at once.
 
 `ask` is built on that: `call {to, method: "ask", params: {question,
-timeout_ms}}`. The target's handler files the question under an id (`q1`,
+timeout_ms, wake_depth}}`. The target's handler files the question under an id (`q1`,
 `q2`, …) with its responder and puts it in the inbox; `peer_answer` looks
 the id up and answers `{answered: true, answer}`. A question closed without
 an answer is answered `{answered: false, reason}`. The target forgets a

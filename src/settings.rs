@@ -74,6 +74,36 @@ pub struct Settings {
     /// Limits on subagents (see `agent::subagent`).
     #[serde(default, skip_serializing_if = "AgentSettings::is_empty")]
     pub agents: AgentSettings,
+    /// This instance among the others (see [`crate::coord`]).
+    #[serde(default, skip_serializing_if = "CoordinatorSettings::is_unset")]
+    pub coordinator: CoordinatorSettings,
+}
+
+/// `[coordinator]`: whether other atelier instances may set this one to
+/// work while it is idle (see `agent::idle` and `docs/coordinator.md`).
+/// `ATELIER_COORDINATOR_WAKE` overrides `wake`.
+///
+/// ```toml
+/// [coordinator]
+/// wake = "questions"
+/// wake_max = 5
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CoordinatorSettings {
+    /// What starts a turn in an idle instance: `never` (default),
+    /// `questions` or `always`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<crate::coord::Wake>,
+    /// Turns the instance may start by itself before its user types again
+    /// (default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_max: Option<u32>,
+}
+
+impl CoordinatorSettings {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[sandbox]`: run the `bash` tool's commands inside nixvm (see
