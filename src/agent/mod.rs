@@ -2215,6 +2215,9 @@ impl Session {
             )),
             _ => {
                 self.drop_mcp_tools();
+                // With them goes the deferral they may have been under
+                // (`mcp_search` / `mcp_call`).
+                self.mcp_defer();
                 self.claude_restart |= self.is_claude();
                 ui.info(
                     "revoked: this project's checkers, allow rules and hooks are off and its \
@@ -2225,11 +2228,17 @@ impl Session {
         }
     }
 
-    /// Unregister the tools of every configured MCP server.
+    /// Unregister the tools of every configured MCP server, and forget
+    /// what else the servers brought (their instructions, standing in the
+    /// system message; their prompts, typed as `/mcp:<server>:<prompt>`).
     fn drop_mcp_tools(&mut self) {
         let stdio = self.settings.mcp.iter().map(|m| &m.name);
-        for name in stdio.chain(self.settings.mcp_http.iter().map(|m| &m.name)) {
-            self.tools.remove_prefix(&format!("mcp__{name}__"));
+        let names: Vec<String> = stdio
+            .chain(self.settings.mcp_http.iter().map(|m| &m.name))
+            .cloned()
+            .collect();
+        for name in names {
+            self.mcp_disconnect(&name);
         }
     }
 }
@@ -3142,6 +3151,74 @@ mod tests {
         let after = session.gather_turn_context().unwrap_or_default();
         assert!(!after.contains("Plan mode is off"), "{after}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/trust revoke` withdraws an untrusted project's MCP servers from
+    /// the session: not only their tools, but what else they brought —
+    /// instructions standing in the system message, the deferral
+    /// (`mcp_search` / `mcp_call`) their tools were under.
+    #[test]
+    fn revoking_trust_withdraws_all_that_an_mcp_server_brought() {
+        use crate::mcp::testutil::{FakeRpc, tools_only};
+        use crate::mcp::{ServerOptions, assemble, discover};
+        use std::sync::{Arc, Mutex};
+
+        let root = trust::testing::dir("revoke-mcp");
+        let state = trust::testing::dir("revoke-mcp-state");
+        let mut settings = Settings::default();
+        settings.mcp.push(McpServerConfig {
+            name: "gh".into(),
+            command: "gh-mcp".into(),
+            args: Vec::new(),
+            options: McpOptions::default(),
+        });
+        // Any tool at all is over this budget: they are deferred.
+        settings.defaults.mcp_tool_budget = Some(1);
+        let store = trust::Store {
+            file: Some(state.join("trust.json")),
+            ..trust::Store::default()
+        };
+        let trust = Trust::load(&root, &settings, store);
+        trust.accept(&settings).unwrap();
+        let mut session = Session::new(
+            Config::from_env(false),
+            root.clone(),
+            crate::tools::builtin_registry(),
+            Vec::new(),
+            settings,
+            trust,
+        );
+        // The server, as connected at startup.
+        let tools = serde_json::json!([{ "name": "a" }, { "name": "b" }]);
+        let mut rpc = FakeRpc::new(tools_only(tools));
+        let found = discover(&mut rpc, "gh", "2024-11-05").unwrap();
+        let options = ServerOptions::default();
+        let mut connection = assemble(Arc::new(Mutex::new(rpc)), "gh", &options, found);
+        connection.instructions = Some("Search before creating.".into());
+        assert_eq!(session.mcp_register("gh", connection), 2);
+        assert!(session.mcp_defer().is_some());
+        session.gather_turn_context();
+        let told = |s: &Session| s.standing.iter().any(|i| i.title == "MCP servers");
+        assert!(told(&session));
+        assert!(session.tools.get("mcp_call").is_some());
+
+        let mut ui = Quiet::default();
+        session.revoke_trust(&mut ui);
+        assert!(
+            ui.infos.iter().any(|l| l.starts_with("revoked:")),
+            "{:?}",
+            ui.infos
+        );
+        assert!(session.tools.get("mcp__gh__a").is_none());
+        for gone in ["mcp_search", "mcp_call"] {
+            assert!(session.tools.get(gone).is_none(), "{gone}");
+        }
+        assert!(session.mcp_catalog.instructions().is_empty());
+        session.gather_turn_context();
+        assert!(!told(&session), "{:?}", session.standing.len());
+        for dir in [root, state] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// The OAuth path as the session drives it: a server that wants a
