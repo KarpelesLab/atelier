@@ -25,7 +25,7 @@ model verbatim as the tool result.
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
 | `web_fetch` | **required** | no (network) |
 | `web_search` | **required** | no (network) |
-| `node`      | auto, unless `network: true` (then required) | fs yes; network no |
+| `node`      | auto, unless `network: true` (then required); with `tools: true`, each tool the script calls is approved as that tool | fs yes; network no |
 | `peers`     | auto     | n/a (lists your atelier instances) |
 | `peer_send` | **required** | no (reaches other instances) |
 
@@ -315,9 +315,13 @@ doesn't exist or isn't a directory. Returns `"(empty directory)"` if empty.
 ## `node`
 
 Runs a JavaScript snippet on an embedded interpreter with a mediated,
-project-confined `fs` and an optional network capability. See
-[Scripting](scripting.md) for the full reference — it's substantial enough to
-warrant its own page.
+project-confined `fs` and an optional network capability. With `tools: true`
+the script can also call the other tools (`tools.call("read", {path})`) and
+work on their results, so that only what it prints reaches the model — "code
+mode", for many calls whose intermediate results the model need not read.
+Each such call goes through the hooks, permission rules and approval of the
+tool it names. See [Scripting](scripting.md) for the full reference — it's
+substantial enough to warrant its own page.
 
 ## `tree`
 

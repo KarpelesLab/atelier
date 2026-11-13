@@ -241,6 +241,7 @@ fn run_repl(model: &Server, cwd: &Path, input: &str) -> Output {
 fn run_repl_env(model: &Server, cwd: &Path, input: &str, env: &[(&str, &str)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_atelier"))
         .env_remove("ATELIER_TRUST_HOOKS")
+        .env_remove("ATELIER_MODE")
         // These tests are about what a project's MCP servers and rules do
         // once the project is trusted (trust itself is covered in e2e.rs).
         .env("ATELIER_TRUST_PROJECT", "1")
@@ -731,4 +732,300 @@ fn an_oauth_server_is_reported_at_startup_and_connects_with_a_stored_grant() {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&auth_file).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
+}
+
+// ---- Code mode: `node` scripts calling tools (`tools: true`) ----
+
+/// A tracker for the code-mode tests: `search` answers JSON (the files two
+/// issues are about), `delete_issue` answers text. Small enough to be
+/// advertised, unlike [`deferred_tracker`]'s.
+fn scripted_tracker() -> (Server, String) {
+    let tracker = Server::start(|request, _| {
+        let msg: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+        let Some(id) = msg.get("id") else {
+            return Reply {
+                status: 202,
+                headers: Vec::new(),
+                body: String::new(),
+            };
+        };
+        let result = match msg["method"].as_str().unwrap_or("") {
+            "initialize" => json!({ "capabilities": {} }),
+            "tools/list" => json!({ "tools": [
+                { "name": "search", "description": "Find issues" },
+                { "name": "delete_issue", "description": "Delete an issue for good" },
+            ] }),
+            "tools/call" if msg["params"]["name"] == "search" => {
+                let found = json!({
+                    "note": "SEARCH-MARK",
+                    "items": [{ "file": "a.txt" }, { "file": "b.txt" }],
+                });
+                json!({ "content": [{ "type": "text", "text": found.to_string() }] })
+            }
+            _ => json!({ "content": [{ "type": "text", "text": "deleted" }] }),
+        };
+        Reply::json(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    });
+    let settings = format!(
+        "[[mcp_http]]\nname = \"tracker\"\nurl = \"{}\"\n",
+        tracker.url("/mcp")
+    );
+    (tracker, settings)
+}
+
+/// A model step that runs `code` as a `node` script with the `tools` object.
+fn script(code: &str) -> Value {
+    call("node", json!({ "code": code, "tools": true }))
+}
+
+/// The result of the first tool call, as the model's next request holds it.
+fn tool_result(body: &str) -> String {
+    let request: Value = serde_json::from_str(body).expect("the request body is JSON");
+    let messages = request["messages"].as_array().expect("messages");
+    let result = messages.iter().find(|m| m["role"] == "tool");
+    result.expect("a tool result")["content"]
+        .as_str()
+        .expect("text")
+        .to_string()
+}
+
+/// A script calls an MCP tool and `read`, twice, and prints a count: the
+/// model's next request holds that line and none of what the tools said.
+#[test]
+fn a_script_combines_tool_results_the_model_never_sees() {
+    let (tracker, mut settings) = scripted_tracker();
+    settings.push_str("\n[permissions]\nallow = [\"mcp__tracker__search\"]\n");
+    let model = model(vec![
+        script(
+            r#"
+            var issues = tools.call("mcp__tracker__search", { query: "label:bug" });
+            var files = issues.json.items.map(function (i) {
+                return tools.call("read", { path: i.file }).text;
+            });
+            console.log("todo-files=" + files.filter(function (f) {
+                return f.includes("TODO");
+            }).length);
+            "#,
+        ),
+        say("done"),
+    ]);
+    let dir = project("script", &settings);
+    std::fs::write(dir.join("a.txt"), "INNER-MARK one TODO\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "INNER-MARK nothing\n").unwrap();
+
+    let out = run_repl(&model, &dir, "go\n");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    let bodies = model.bodies();
+    assert_eq!(bodies.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(tool_result(&bodies[1]), "todo-files=1\n");
+    assert!(!bodies[1].contains("INNER-MARK"), "{}", bodies[1]);
+    assert!(!bodies[1].contains("SEARCH-MARK"), "{}", bodies[1]);
+    assert_eq!(
+        tool_calls(&tracker),
+        [("search".to_string(), json!({ "query": "label:bug" }))]
+    );
+    // Nothing here asks: the rule allows the search, reads are confined.
+    assert!(!stdout.contains("allow tool"), "{stdout}");
+    // The inner calls are shown as they run.
+    assert!(stdout.contains("⤷ read a.txt"), "{stdout}");
+}
+
+/// An inner call that needs approval is put to the user under the real
+/// tool's name, as coming from a script; "no" reaches the script as a
+/// failed call, and the script goes on.
+#[test]
+fn an_inner_call_is_approved_under_its_own_name_and_a_denial_reaches_the_script() {
+    let code = r#"
+        var r = tools.call("mcp__tracker__search", { query: "x" });
+        console.log("ok=" + r.ok, r.text);
+        console.log("script went on");
+    "#;
+    for (answer, expect_ran) in [("n", false), ("y", true)] {
+        let (tracker, settings) = scripted_tracker();
+        let model = model(vec![script(code), say("done")]);
+        let dir = project("script-ask", &settings);
+
+        let out = run_repl(&model, &dir, &format!("go\n{answer}\n"));
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        let bodies = model.bodies();
+        assert_eq!(bodies.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("⤷ a node script asks to run:"), "{stdout}");
+        assert!(
+            stdout.contains(r#"allow tool 'mcp__tracker__search' {"query":"x"}?"#),
+            "{stdout}"
+        );
+        // One prompt, and not for `node`.
+        assert_eq!(stdout.matches("allow tool").count(), 1, "{stdout}");
+        let result = tool_result(&bodies[1]);
+        assert!(result.ends_with("script went on\n"), "{result}");
+        assert_eq!(tool_calls(&tracker).len(), usize::from(expect_ran));
+        if expect_ran {
+            assert!(result.starts_with("ok=true "), "{result}");
+        } else {
+            assert!(
+                result.starts_with("ok=false error: the user denied permission"),
+                "{result}"
+            );
+        }
+    }
+}
+
+/// A deny rule on a tool holds when a script calls it, `pre_tool` hooks are
+/// matched on and told the inner tool's real name, and the write a script
+/// asks for in a session that allows writes does happen.
+#[test]
+fn rules_and_hooks_see_the_tools_a_script_calls() {
+    let (tracker, mut settings) = scripted_tracker();
+    settings.push_str(
+        r#"
+[permissions]
+deny = ["mcp__tracker__delete_*"]
+
+[[hooks]]
+event = "pre_tool"
+match = "mcp__tracker__.*|write"
+command = 'echo "$ATELIER_TOOL" >> real.log'
+
+[[hooks]]
+event = "pre_tool"
+match = "read"
+command = "echo 'no reading today' >&2; exit 2"
+"#,
+    );
+    let model = model(vec![
+        script(
+            r#"
+            var d = tools.call("mcp__tracker__delete_issue", { id: 7 });
+            console.log("delete ok=" + d.ok, d.text);
+            console.log("write ok=" + tools.call("write", { path: "out.txt", content: "w" }).ok);
+            console.log("read:", tools.call("read", { path: "out.txt" }).text);
+            "#,
+        ),
+        say("done"),
+    ]);
+    let dir = project("script-rules", &settings);
+
+    let out = run_repl_env(&model, &dir, "go\n", &[("ATELIER_TRUST_HOOKS", "1")]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    let bodies = model.bodies();
+    assert_eq!(bodies.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+    let result = tool_result(&bodies[1]);
+    assert!(
+        result.contains(
+            "delete ok=false error: refused by the permission rule `mcp__tracker__delete_*`"
+        ),
+        "{result}"
+    );
+    assert!(result.contains("write ok=true"), "{result}");
+    assert!(
+        result.contains("read: error: blocked by a pre_tool hook: no reading today"),
+        "{result}"
+    );
+    assert!(
+        tool_calls(&tracker).is_empty(),
+        "the denied tool did not run"
+    );
+    assert!(!stdout.contains("allow tool"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "w");
+    let real = std::fs::read_to_string(dir.join("real.log")).unwrap_or_default();
+    assert_eq!(real, "mcp__tracker__delete_issue\nwrite\n");
+}
+
+/// Plan mode: a script cannot write, with `fs` or through `tools`. (`node`
+/// as a whole is refused there, since its own `fs` writes; that an inner
+/// `write` is refused on its own account is tested with the runner, in
+/// `src/agent/script.rs`.)
+#[test]
+fn plan_mode_keeps_a_script_from_writing() {
+    let (_tracker, settings) = scripted_tracker();
+    let model = model(vec![
+        script(r#"console.log(tools.call("write", { path: "out.txt", content: "w" }).ok);"#),
+        say("done"),
+    ]);
+    let dir = project("script-plan", &settings);
+
+    let out = run_repl_env(&model, &dir, "go\n", &[("ATELIER_MODE", "plan")]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    let bodies = model.bodies();
+    assert_eq!(bodies.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        tool_result(&bodies[1]).contains("plan mode: node is not available"),
+        "{}",
+        bodies[1]
+    );
+    assert!(!dir.join("out.txt").exists());
+}
+
+/// A script gets 50 tool calls; the ones past that are not run and say so.
+#[test]
+fn a_script_is_capped_at_fifty_tool_calls() {
+    let (_tracker, settings) = scripted_tracker();
+    let model = model(vec![
+        script(
+            r#"
+            var ok = 0, last;
+            for (var i = 0; i < 60; i++) {
+                last = tools.call("write", { path: "n" + i + ".txt", content: "x" });
+                if (last.ok) ok++;
+            }
+            console.log("ran=" + ok, last.text);
+            "#,
+        ),
+        say("done"),
+    ]);
+    let dir = project("script-cap", &settings);
+
+    let out = run_repl(&model, &dir, "go\n");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    let bodies = model.bodies();
+    assert_eq!(bodies.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+    let result = tool_result(&bodies[1]);
+    assert!(
+        result.starts_with("ran=50 error: this script has made its 50 tool calls"),
+        "{result}"
+    );
+    assert!(dir.join("n49.txt").exists());
+    assert!(!dir.join("n50.txt").exists());
+}
+
+/// Deferred MCP tools are not advertised, and a script reaches them by
+/// their real names without `mcp_search`/`mcp_call` — asked about, like a
+/// direct call, under that name.
+#[test]
+fn a_script_calls_a_deferred_tool_by_its_real_name() {
+    let (tracker, settings) = deferred_tracker();
+    let model = model(vec![
+        script(
+            r#"
+            var names = tools.list().map(function (t) { return t.name; });
+            console.log(names.includes("mcp__tracker__create_issue"), names.includes("mcp_call"));
+            console.log(tools.schema("mcp__tracker__create_issue").properties.title.type);
+            console.log(tools.call("mcp__tracker__create_issue", { title: "x" }).text);
+            console.log(tools.call("mcp_call", { tool: "mcp__tracker__delete_issue" }).ok);
+            "#,
+        ),
+        say("done"),
+    ]);
+    let dir = project("script-deferred", &settings);
+
+    let out = run_repl(&model, &dir, "go\ny\n");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(stderr.contains("are deferred"), "{stderr}");
+    let bodies = model.bodies();
+    assert_eq!(bodies.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
+    let (_, tools) = system_and_tools(&bodies[0]);
+    assert!(!tools.iter().any(|t| t.starts_with("mcp__")), "{tools:?}");
+    assert_eq!(
+        tool_result(&bodies[1]),
+        "true false\nstring\nran create_issue {\"title\":\"x\"}\nfalse\n"
+    );
+    assert!(
+        stdout.contains(r#"allow tool 'mcp__tracker__create_issue' {"title":"x"}?"#),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("allow tool").count(), 1, "{stdout}");
+    assert_eq!(
+        tool_calls(&tracker),
+        [("create_issue".to_string(), json!({ "title": "x" }))]
+    );
 }

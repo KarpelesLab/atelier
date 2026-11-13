@@ -242,6 +242,10 @@ impl ToolRegistry {
         let advertised = self.tools.iter().filter(|t| !self.is_hidden(t.name()));
         advertised.map(|t| t.spec()).collect()
     }
+    /// Every registered tool, hidden ones included, in registration order.
+    pub fn all(&self) -> impl Iterator<Item = &dyn Tool> {
+        self.tools.iter().map(|t| t.as_ref())
+    }
     /// Make exactly the tools named in `names` *hidden*: still registered,
     /// so [`get`](Self::get) finds them and they can run, but left out of
     /// [`specs`](Self::specs). This is how deferred MCP tools are kept (see

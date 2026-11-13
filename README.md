@@ -116,7 +116,7 @@ first conversation, the REPL/TUI fallback).
 | [Project trust](docs/trust.md) | What a project's `atelier.toml` may not do until you accept it (start MCP servers, run checkers and hooks, add providers, allow commands): `/trust`, `atelier trust`, `ATELIER_TRUST_PROJECT`, what is gated and why |
 | [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
 | [Sandboxed `bash`](docs/sandbox.md) | Experimental (`--features sandbox`): commands in a nixvm guest that sees only the project — setup, what works there, measurements, what is missing |
-| [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
+| [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network, calling other tools from a script (code mode) |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` — and how it differs from `atelier review` |
 | [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |

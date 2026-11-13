@@ -291,6 +291,39 @@ Deferral applies to atelier's own loop. With the [Claude backend](claude.md)
 the servers are connected by `claude`, which has its own handling of large
 tool sets.
 
+## Code mode: MCP tools from a script
+
+The other way to keep MCP results out of the conversation is not to pass
+them through the model at all. A [`node`](scripting.md#tools--calling-other-tools-code-mode)
+script run with `tools: true` calls tools itself and prints what matters:
+
+```js
+var open = tools.call("mcp__tracker__search", { query: "is:open label:bug" }).json.items;
+var stale = open.filter(function (i) { return i.updated < "2025-01-01"; });
+console.log(stale.map(function (i) { return i.id + " " + i.title; }).join("\n"));
+```
+
+MCP tools are called by their real names (`mcp__<server>__<tool>`), whether
+or not they are deferred; `tools.list()` and `tools.schema(name)` give a
+script what `mcp_search` gives the model. A result that is a JSON object or
+array comes parsed, as `json`. Every call is decided as a direct call of
+that tool would be — the same permission rules, hooks and approval prompt,
+under the tool's real name — so a script is not a way around a `deny` rule
+or a prompt.
+
+Which to use:
+
+| | Deferred tools (`mcp_search` / `mcp_call`) | Code mode (`node`, `tools: true`) |
+|---|---|---|
+| Saves | the *schemas* of tools that are never called | the *results* the model does not need to read |
+| Each call | one model step; the whole result enters the context | no model step; the script keeps the result |
+| Good for | one or two calls whose result the model must read and reason about | many calls, loops over items, filtering/joining/counting large results |
+| Costs | a search step before the first call of a tool | the model has to write a correct script without having seen a result's shape |
+
+They combine: with deferral on, the model can look a tool up with
+`mcp_search` (to learn its name and schema), try it once with `mcp_call` to
+see what it returns, and then do the bulk of the work in a script.
+
 ## Tool annotations
 
 A server may annotate a tool in `tools/list`. atelier keeps the title and the

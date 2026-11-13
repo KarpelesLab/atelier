@@ -49,6 +49,7 @@ use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 use crate::trust::{self, Trust};
 
+mod script;
 mod standalone;
 mod subagent;
 mod turn_model;
@@ -2327,6 +2328,22 @@ impl ToolRunner<'_> {
     /// Execute a call that has passed [`approve`](Self::approve), returning
     /// its output and whether it succeeded.
     fn exec(&mut self, name: &str, args: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
+        let (mut out, ok) = self.exec_only(name, args, ui);
+        if ok {
+            // A subdirectory's own instruction file comes with the first
+            // result from under it: in time for the model's next step,
+            // and kept in the transcript of either backend.
+            let entered = self.fstate.take_new_dirs();
+            if let Some(note) = crate::context::nested_instructions(self.root, &entered) {
+                out.text.push_str(&note);
+            }
+        }
+        (out, ok)
+    }
+
+    /// [`exec`](Self::exec) without the instruction files of directories
+    /// the call entered, which stay to be handed over with a later result.
+    fn exec_only(&mut self, name: &str, args: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
         // `ask` is the one tool that needs the interface, which a tool's
         // `call` has no way to reach: answer it here, through `ui`.
         if name == ask::NAME {
@@ -2341,22 +2358,18 @@ impl ToolRunner<'_> {
                 false,
             );
         };
+        // A `node` script that calls tools needs them served from here,
+        // each call decided like one of the model's (see `script`).
+        if script::wants_tools(name, &args) {
+            return self.run_script(args, ui);
+        }
         let mut ctx = ToolCtx {
             project_root: self.root,
             fstate: self.fstate,
             approved: true,
         };
         match tool.call_output(&mut ctx, args) {
-            Ok(mut out) => {
-                // A subdirectory's own instruction file comes with the first
-                // result from under it: in time for the model's next step,
-                // and kept in the transcript of either backend.
-                let entered = self.fstate.take_new_dirs();
-                if let Some(note) = crate::context::nested_instructions(self.root, &entered) {
-                    out.text.push_str(&note);
-                }
-                (out, true)
-            }
+            Ok(out) => (out, true),
             Err(e) => (ToolOutput::text(format!("error: {e:#}")), false),
         }
     }

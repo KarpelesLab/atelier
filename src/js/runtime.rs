@@ -204,14 +204,21 @@ fetch = function (url, options) {
 "#;
 
 /// Build an interpreter, install the mediated host (`fs` + `console`, plus the
-/// network host when `network` is set), run the bootstrap(s) and the user's
-/// program, and return the captured output as a single [`String`].
+/// network host when `network` is set and the `tools` object when the call
+/// came with a [`Port`](super::tools::Port) to the session's tools), run the
+/// bootstrap(s) and the user's program, and return the captured output as a single [`String`].
 ///
 /// Takes fully **owned** data so it can run on a dedicated worker thread: the
 /// `Interp` and every `NanBox` are created and dropped here, never crossing the
 /// thread boundary — only the returned `String` (which is `Send`) does. See
 /// [`super::NodeTool::call`], which drives this under a wall-clock timeout.
-pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt) -> String {
+pub fn execute(
+    code: String,
+    root: PathBuf,
+    network: bool,
+    tools: Option<super::tools::Port>,
+    interrupt: Interrupt,
+) -> String {
     // Parse every program up front so each outlives `interp` (the interpreter
     // borrows a program for its own lifetime). A user syntax error is reported
     // as a normal result, not a failure. Declared before `interp` so drop order
@@ -224,6 +231,14 @@ pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt)
         match parse(NET_BOOTSTRAP) {
             Ok(p) => Some(p),
             Err(e) => return format!("internal network bootstrap parse error: {e}"),
+        }
+    } else {
+        None
+    };
+    let tools_bootstrap = if tools.is_some() {
+        match parse(super::tools::BOOTSTRAP) {
+            Ok(p) => Some(p),
+            Err(e) => return format!("internal tools bootstrap parse error: {e}"),
         }
     } else {
         None
@@ -246,6 +261,9 @@ pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt)
     if network {
         super::net::install(&mut interp);
     }
+    if let Some(port) = tools {
+        super::tools::install(&mut interp, port);
+    }
 
     if let Err(e) = interp.run(&bootstrap) {
         return format!(
@@ -258,6 +276,14 @@ pub fn execute(code: String, root: PathBuf, network: bool, interrupt: Interrupt)
     {
         return format!(
             "internal error assembling network host: {}",
+            render_exec_error(&interp, &e)
+        );
+    }
+    if let Some(tb) = tools_bootstrap.as_ref()
+        && let Err(e) = interp.run(tb)
+    {
+        return format!(
+            "internal error assembling the tools host: {}",
             render_exec_error(&interp, &e)
         );
     }

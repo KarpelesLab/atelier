@@ -13,6 +13,7 @@ Rust-implemented global that checks the project boundary on every call.
 |--------------|---------|----------|---------|
 | `code`       | string  | yes      | JavaScript source to run |
 | `network`    | boolean | no       | Install `fetch`/`httpGet`/`httpRequest` (default false). Setting this `true` makes the call require approval |
+| `tools`      | boolean | no       | Install the [`tools`](#tools--calling-other-tools-code-mode) object, to call other tools from the script (default false) |
 | `timeout_ms` | integer | no       | Wall-clock budget in ms (default **5000**, clamped to at most 600000) |
 
 The tool result is the script's captured `console` output; if nothing was
@@ -107,6 +108,88 @@ Pure, always-available (not gated by `network`):
 console.log(encoding.base64Encode("hi"), hash.sha256("abc"));
 ```
 
+## `tools` — calling other tools (code mode)
+
+With `tools: true` a script can call the session's other tools and work on
+what they return. Only what the script prints goes back to the model, so the
+intermediate results never enter the conversation:
+
+```js
+const issues = tools.call("mcp__tracker__search", { query: "label:bug" });
+const files = issues.json.items.map(i => tools.call("read", { path: i.file }).text);
+console.log(files.filter(f => f.includes("TODO")).length);
+```
+
+That is one tool result of one line, where the same work done call by call
+would have put the search result and every file into the context. It is the
+thing to reach for when a task takes many calls whose results only feed the
+next step, or when a large result is to be filtered, joined or counted.
+
+| Function | Signature | Behavior |
+|----------|-----------|----------|
+| `tools.call` | `(name[, args]) -> {ok, text, json?}` | Runs the tool and returns its result. `text` is the result the model would have been given. `json` is present when that text is a JSON object or array (what MCP tools commonly return), parsed. `args` defaults to `{}` |
+| `tools.list` | `() -> [{name, description}]` | The tools a script can call |
+| `tools.schema` | `(name) -> object` | A tool's input schema (JSON Schema); throws for a name `tools.list()` does not have |
+
+All three are synchronous, like `fs`.
+
+### Every call is checked as if the model had made it
+
+`tools.call` does not run anything itself. The script's thread sends the
+name and the arguments to the session, which treats them as a call of that
+tool by the model and takes it through the same steps, in the same order:
+`pre_tool` [hooks](hooks.md) (matched on and told the real tool name),
+the [permission rules](permissions.md) and the mode, the approval prompt
+when one is due, the tool, `post_tool` hooks. So:
+
+- a `deny` rule on a tool refuses it from a script too, and an `allow` rule
+  lets it run unasked;
+- a tool that asks (`bash`, `web_fetch`, an MCP tool) asks — the prompt names
+  the real tool and its arguments, after a line saying a script is asking,
+  and "always" saves the usual rule for that tool;
+- plan mode refuses the calls that change something, `ask-edits` asks
+  before a `write`; (`node` itself is not available in plan mode, as its own
+  `fs` can write);
+- the tool's own limits apply: `read` pages a long file, `bash` output past
+  its cap is [spilled](tools.md#long-output-goes-to-a-file), and files a
+  script reads are tracked for `edit` like any other read.
+
+`node` with `tools: true` is approved exactly as `node` without it — it
+gives a script nothing a call would not have had.
+
+A call that is refused — by a rule, a hook, the mode or the user — or that
+fails **does not throw**: it returns `{ok: false, text: "<why>"}`, and the
+script goes on. Check `ok` where it matters.
+
+```js
+var r = tools.call("bash", { command: "cargo metadata --format-version 1" });
+if (!r.ok) { console.log("could not run cargo:", r.text); }
+else { console.log(r.json.packages.map(function (p) { return p.name; }).join("\n")); }
+```
+
+### What can be called
+
+Every tool the session has, by its real name — MCP tools as
+`mcp__<server>__<tool>`, including [deferred](mcp.md#deferred-tools) ones,
+which need no `mcp_search`/`mcp_call` from a script. Not callable: `node`
+(no scripts starting scripts), `ask` and `task` (they need the interface and
+the agent loop), and `mcp_search`/`mcp_call`. In a subagent, a script can
+call the tools that agent was given.
+
+### Limits
+
+- **50 tool calls per script.** The calls past that are not run and return
+  `{ok: false}` with a message saying so.
+- **Results are text.** An image a tool returns (`read` on a picture) is
+  left out, with a note in `text`.
+- **The timeout covers the script, not the tools** — see below.
+- Each inner call is shown as a dim line under the `node` call
+  (`⤷ read src/x.rs`); its result is not.
+
+With the [Claude backend](claude.md), `tools: true` works the same way for
+the tools atelier offers `claude` (the MCP servers there are connected by
+`claude` itself, so their tools are not among them).
+
 ## Timeouts and interruption
 
 A script gets `timeout_ms` (default 5000ms, hard ceiling 600000ms) of
@@ -117,6 +200,15 @@ worker thread is reaped. A pathological script with no loop back-edge to
 observe the flag is abandoned after a short grace period rather than
 blocking the harness. The tool result for a timeout is a plain notice:
 `node: script exceeded the <N>ms time limit and was aborted`.
+
+With `tools: true` the budget is the script's own running time: the clock
+runs while atelier waits for the script — to make its next tool call or to
+finish — and is stopped while a call is being served, which is when the
+user may be reading an approval prompt and the tool runs (under its own
+timeout, if it has one). A script that makes one slow `bash` call is not
+timed out by it; a script that spins between calls still is. Stopping the
+turn (Ctrl-C) also stops such a script: no further call is run and the
+result is `node: the script was stopped by the user`.
 
 ## Network (opt-in, requires approval)
 

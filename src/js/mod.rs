@@ -17,12 +17,20 @@
 //! result string. Add `src/js/fs.rs`, `src/js/console.rs`, `src/js/runtime.rs`
 //! as you see fit. Do not edit files outside `src/js/`. Keep `NodeTool`'s public
 //! shape (name, spec, requires_approval) so the registration keeps working.
+//!
+//! # Code mode
+//!
+//! A call with `tools: true` also gets a `tools` object, to call the
+//! session's other tools from the script. That needs the session — its
+//! rules, its hooks, its user — so such a call is not run by
+//! [`NodeTool::call`] but by the agent's tool runner through [`tools::run`],
+//! which serves the script's tool calls on the turn's thread. See [`tools`].
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use kataan::interrupt::Interrupt;
 use serde_json::{Value, json};
 
@@ -35,6 +43,7 @@ mod hash;
 mod net;
 mod os;
 mod runtime;
+pub mod tools;
 
 /// Default wall-clock budget for a script when the call omits `timeout_ms`.
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -57,6 +66,46 @@ const INTERRUPT_GRACE_MS: u64 = 1_000;
 
 /// The `node` tool: run JavaScript with a mediated, project-confined host.
 pub struct NodeTool;
+
+/// What a `node` call asks for, apart from `tools`.
+struct Params {
+    code: String,
+    /// Install the network host.
+    network: bool,
+    /// The script's time budget, within `1..=MAX_TIMEOUT_MS`.
+    timeout_ms: u64,
+}
+
+impl Params {
+    fn parse(args: &Value) -> Result<Self> {
+        let code = args
+            .get("code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("the `node` tool requires a string `code` argument"))?
+            .to_owned();
+        let network = args
+            .get("network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1, MAX_TIMEOUT_MS);
+        Ok(Self {
+            code,
+            network,
+            timeout_ms,
+        })
+    }
+}
+
+/// Whether a `node` call asks for the `tools` object (code mode). Such a
+/// call is run by the session's tool runner, which can serve the script's
+/// tool calls (see [`tools`]); [`NodeTool::call`] alone cannot.
+pub fn wants_tools(args: &Value) -> bool {
+    args.get("tools").and_then(Value::as_bool).unwrap_or(false)
+}
 
 impl Tool for NodeTool {
     fn name(&self) -> &str {
@@ -112,7 +161,19 @@ impl Tool for NodeTool {
                 fetch(url[, {method, headers, body}]) -> {status, ok, body, headers}; \
                 httpRequest({method, url, headers, body}) -> {status, ok, body, headers}; \
                 httpGet(url) -> string (the body). Without `network: true` those globals are \
-                undefined (typeof fetch === 'undefined')."
+                undefined (typeof fetch === 'undefined'). Set `tools: true` to call your other \
+                tools from the script through a SYNCHRONOUS `tools` global: \
+                tools.call(name, args) -> {ok, text, json} runs the tool and returns its \
+                result to the script as data (`text` is what the tool would have answered \
+                you; `json` is set when that text is a JSON object or array; a refused or \
+                failed call has ok === false and the reason in `text` — it does not throw); \
+                tools.list() -> [{name, description}] and tools.schema(name) -> the tool's \
+                input schema. Prefer such a script to calling the tools one by one when you \
+                need many calls whose intermediate results you do not have to read \
+                yourself, or when you would filter, join or count over large results: only \
+                what the script prints comes back to you. Each call is checked exactly as \
+                if you had made it (permission rules, approval). At most 50 tool calls per \
+                script; MCP tools are called by their full name (mcp__server__tool)."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -125,11 +186,18 @@ impl Tool for NodeTool {
                             user approval.",
                         "default": false
                     },
+                    "tools": {
+                        "type": "boolean",
+                        "description": "Provide the `tools` global, to call other tools \
+                            from the script and work on their results there. Default false.",
+                        "default": false
+                    },
                     "timeout_ms": {
                         "type": "integer",
                         "description": "Wall-clock execution budget in milliseconds. Default \
                             5000. A script that runs longer is aborted and the tool returns a \
-                            timeout notice.",
+                            timeout notice. With `tools`, time spent inside a tool call does \
+                            not count.",
                         "default": DEFAULT_TIMEOUT_MS
                     }
                 },
@@ -139,24 +207,25 @@ impl Tool for NodeTool {
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
+        // The `tools` object needs someone to run the script's tool calls and
+        // to decide each of them — the session, which a tool cannot reach.
+        // The tool runner takes such a call before it gets here; should one
+        // arrive anyway it is refused, never run with tools nobody checks.
+        if wants_tools(&args) {
+            bail!(
+                "`tools: true` is not available here: the script's tool calls need the \
+                 session to approve and run them"
+            );
+        }
         // Owned inputs for the worker thread: the script source, the `fs`
         // confinement root, and whether to install the network host.
-        let code = args
-            .get("code")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("the `node` tool requires a string `code` argument"))?
-            .to_owned();
+        let Params {
+            code,
+            network,
+            timeout_ms,
+        } = Params::parse(&args)?;
         let root = ctx.project_root.to_path_buf();
         let project_root = ctx.project_root;
-        let network = args
-            .get("network")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let timeout_ms = args
-            .get("timeout_ms")
-            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .clamp(1, MAX_TIMEOUT_MS);
 
         // Run the interpreter on a dedicated worker thread and wait for its
         // result with a wall-clock deadline. The `Interp`/`NanBox` values live
@@ -175,7 +244,7 @@ impl Tool for NodeTool {
             .name("node-script".into())
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
-                let out = runtime::execute(code, root, network, worker_interrupt);
+                let out = runtime::execute(code, root, network, None, worker_interrupt);
                 // Ignore a send error: it only means we already timed out and
                 // the receiver is gone.
                 let _ = tx.send(out);
