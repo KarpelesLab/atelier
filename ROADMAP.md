@@ -410,11 +410,11 @@ overlay or a mouse.
 |---|---|---|---|---|---|
 | Instruction files | `CLAUDE.md` hierarchy, `@` imports, path-scoped rules | `AGENTS.md` up the tree, nested ones loaded lazily, globs/URLs, live reload | `AGENTS.md` root→cwd, override files, size cap | first of 4 files at the root, cut at 3000 chars | M15 |
 | Memory across sessions | agent-written memory files with an index | — | background extract → consolidate, off by default | — | M15 |
-| Sessions | many per project, resume by id, fork | SQLite, fork at a message, export/import | named, resume/fork/archive | one per project, `--continue` | M16 |
-| Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | — | M16 |
-| Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | auto summary only | M16 |
+| Sessions | many per project, resume by id, fork | SQLite, fork at a message, export/import | named, resume/fork/archive | one per project, `--continue` | no (M16 dropped) |
+| Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | — | no — git does it (M16 dropped) |
+| Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | auto summary only | M22 |
 | Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | per-tool "always", risk signals | M17 |
-| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | — (`node` tool is mediated; `bash` isn't) | M17 |
+| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | — (`node` tool is mediated; `bash` isn't) | M17, on nixvm |
 | Approvals without the user | — | — | reviewer agent with a policy, fails closed | `ATELIER_APPROVE=all` | M17 |
 | Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | — | M17 |
 | Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | reviewer only; peers via coordinator | M18 |
@@ -467,31 +467,13 @@ What the agent knows before the first prompt, and what it keeps afterwards.
 **Exit:** a correction given in one session changes behaviour in the next
 without being repeated; a subdirectory's rules apply only when working there.
 
-### M16 — Sessions, undo, and compaction that loses less
+### M16 — dropped
 
-- **Many sessions per project**, stored under `.atelier/sessions/` with an
-  index (id, title from a cheap model, time, turn count). `--continue` resumes
-  the latest; `--resume [id]` and `/sessions` list them as printed lines to
-  pick by number — no picker screen. `/fork` branches the conversation;
-  `/export` writes a transcript.
-- **Checkpoints and undo.** Before each model step that edits, snapshot the
-  touched files in a private git object store beside the repository (opencode:
-  no commits, the user's index untouched; fall back to plain copies outside
-  git). `/undo` and `/redo` restore only the paths that step changed and put
-  the prompt back in the input line; `/rewind` goes to any earlier turn.
-  Commands run through `bash` are outside what can be undone, and the
-  interface says so when one ran in the step being reverted.
-- **Compaction in stages.** First drop the bodies of old tool results (keep
-  one line saying what they were); only then summarize. The summary is a
-  structured hand-off (goal, decisions, state of the work, files touched, next
-  steps), the recent tail stays verbatim by token count, and `/compact
-  [instructions]` does it on demand. The agent's todo list and memory live
-  outside the history, so they survive untouched.
-- **`/context`** prints where the window goes (system, instructions, context
-  items, tools, history) so both user and agent can see what to trim.
-
-**Exit:** a bad edit is undone with one command; a long session resumes after
-compaction still knowing what it was doing and why.
+Was: many sessions per project with fork, and checkpoints with
+`/undo`/`/rewind` of file edits. Dropped: nearly every project already has
+git, which does this job better, and private snapshot and session stores
+grow without restraint. One saved session per project (`--continue`) stays.
+What the milestone said about compaction and `/context` moved to M22.
 
 ### M17 — Permission rules and a real sandbox
 
@@ -508,16 +490,24 @@ Today's model is one bit per tool. Codex shows how far the other end goes.
   edits are refused with a reason it can act on), `default`, `auto-edit`
   (today's behaviour), `yolo` (today's `ATELIER_APPROVE=all`). `/mode`, and
   the status strip shows the current one.
-- **Sandboxed `bash`.** On Linux, run commands in new user/mount/network
-  namespaces with the project writable, the rest read-only, `.git/hooks` and
-  `atelier.toml` protected, and no network unless allowed — set up by
-  atelier's own code through the kernel interfaces (no `bwrap` dependency, so
-  it works in the libc-free build); Seatbelt on macOS. A command that fails
-  *because of* the sandbox is reported as such, and the agent may ask to rerun
-  it outside with a stated reason — that request is what the user approves.
-  With a sandbox, most commands stop needing approval at all.
-- **Network by allowlist.** Sandboxed commands reach the network only through
-  a local proxy that admits listed domains.
+- **Sandboxed `bash`, on nixvm.** Commands run inside
+  [nixvm](https://github.com/KarpelesLab/nixvm), our own sandbox: a real
+  Linux userland whose syscalls are served by nixvm's kernel, written in
+  Rust, instead of the host's. The guest sees the project directory
+  (writable, with `.git/hooks` and `atelier.toml` protected) and a userland
+  image, and nothing else of the host. Being a library with no OS
+  dependencies, it is the same sandbox on every platform and in the
+  libc-free build — no `bwrap`, namespaces or Seatbelt to depend on. A
+  command that fails *because of* the sandbox is reported as such, and the
+  agent may ask to rerun it on the host with a stated reason — that request
+  is what the user approves. With a sandbox, most commands stop needing
+  approval at all.
+- **Network by allowlist.** The guest's network is nixvm's in-VM stack, so
+  which domains it may reach is decided in atelier, not by a proxy.
+- **What this depends on:** nixvm running the toolchains projects actually
+  use (compilers, package managers, test runners) at a usable speed, and the
+  userland image carrying or reaching the project's tools. Until a command
+  is known to work there, it falls back to asking as today.
 - **Approvals by a reviewer.** Optionally, would-be prompts go to a reviewer
   model with a written policy (`[permissions] reviewer`), which allows, denies
   or escalates to the user, and fails closed. This is what makes unattended
@@ -616,11 +606,11 @@ a `/release` routine) live in its repository and apply to whoever opens it.
 - **`--print` grows up**: `--output-format json|stream-json` (events for
   text, reasoning, tool calls, approvals, usage, final result),
   `--input-format stream-json` for multi-turn driving, `--output-schema` for
-  a validated structured answer, `--max-turns`, `--resume`, and exit codes
+  a validated structured answer, `--max-turns`, `--continue`, and exit codes
   that distinguish failure, refusal and limits.
 - **A protocol to embed atelier**: the same events as JSON-RPC over stdio
   (and over the coordinator's socket, which is already there) — start, steer
-  and interrupt turns, answer approvals, fork, compact. With ACP on top,
+  and interrupt turns, answer approvals, compact. With ACP on top,
   editors get atelier without atelier growing a UI. This is also how any
   other front end stays out of this repository.
 - **Goals and loops**: `/goal` keeps the agent going until a stated,
@@ -633,7 +623,7 @@ a `/release` routine) live in its repository and apply to whoever opens it.
   exists.
 - `atelier doctor`, and a way to print the exact prompt a turn would send.
 
-### M22 — Models, effort and the cache
+### M22 — Models, context and the cache
 
 - **A model per role**: main, subagents, reviewer, a small one for titles,
   summaries and memory upkeep; `/model` variants carrying reasoning effort
@@ -648,6 +638,14 @@ a `/release` routine) live in its repository and apply to whoever opens it.
   for the life of a session, and deliver fresh context as late messages
   that replace their predecessors. On a local 30B model this is the largest
   latency win available.
+- **Compaction in stages.** First drop the bodies of old tool results (keep
+  one line saying what they were); only then summarize. The summary is a
+  structured hand-off (goal, decisions, state of the work, files touched, next
+  steps), the recent tail stays verbatim by token count, and `/compact
+  [instructions]` does it on demand. The agent's todo list and memory live
+  outside the history, so they survive untouched.
+- **`/context`** prints where the window goes (system, instructions, context
+  items, tools, history) so both user and agent can see what to trim.
 - **Cost and usage** per session and per day (`atelier stats`), with prices
   for providers that have them, and budgets that warn before they stop.
 - **Telemetry** stays local: a trace file per session that replays (§5).
@@ -659,6 +657,8 @@ a `/release` routine) live in its repository and apply to whoever opens it.
 - **An in-process plugin API or marketplace.** Files (commands, skills,
   agents), hooks, and MCP cover it without loading other people's code into
   the harness.
+- **Multiple sessions, fork, and undo of file edits** (the dropped M16):
+  git already does it, and such stores only grow.
 - **LSP for diagnostics** — see M20; opencode's reversal is the evidence.
 - **Remote instruction URLs and organization-managed configuration.** Useful
   to enterprises; revisit if there is one.
