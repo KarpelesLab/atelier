@@ -203,9 +203,14 @@ pub(super) fn prune_tool_output(history: &mut [Message], keep: usize) -> usize {
                 m.content = stub;
                 pruned += 1;
             }
-        } else if m.role == "user" && m.content == TOOL_IMAGES_NOTE && !m.images.is_empty() {
+        } else if m.role == "user"
+            && !m.images.is_empty()
+            && let Some(rest) = m.content.strip_prefix(TOOL_IMAGES_NOTE)
+        {
+            // `rest`: what the user queued meanwhile, delivered with the
+            // note (see `Session::push_user_text`). It stays.
             m.content = format!(
-                "[{} image(s) returned by the tool calls above, pruned]",
+                "[{} image(s) returned by the tool calls above, pruned]{rest}",
                 m.images.len()
             );
             m.images.clear();

@@ -1645,7 +1645,7 @@ impl Session {
                 // one more request instead of an error: without tools, and
                 // told to report where it stands.
                 wrapping_up = true;
-                self.history.push(Message::user(WRAP_UP));
+                self.push_user_text(WRAP_UP);
             }
             self.steps += 1;
             // Mid-turn steering: anything the user typed while we were busy is
@@ -1998,7 +1998,7 @@ impl Session {
         for text in &queued {
             ui.queued_delivered(text);
         }
-        self.history.push(Message::user(merge_queued(&queued)));
+        self.push_user_text(&merge_queued(&queued));
         queued.len()
     }
 
@@ -3150,6 +3150,90 @@ mod tests {
         // Once: nothing changed since.
         let after = session.gather_turn_context().unwrap_or_default();
         assert!(!after.contains("Plan mode is off"), "{after}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The conversation never holds two user messages in a row: strict
+    /// chat templates refuse one that does. What would be a second one —
+    /// the prompt after a turn that failed before any answer, a message
+    /// queued before the turn's first request, one delivered right after
+    /// the note that carries a tool's images — joins the message before it.
+    #[test]
+    fn user_messages_never_follow_one_another() {
+        struct Typed(Vec<String>);
+        impl Ui for Typed {
+            fn reasoning(&mut self, _: &str) {}
+            fn content(&mut self, _: &str) {}
+            fn tool_start(&mut self, _: &str, _: &str) {}
+            fn tool_end(&mut self, _: &str, _: &str, _: bool) {}
+            fn info(&mut self, _: &str) {}
+            fn ask_approval(&mut self, _: &str, _: &str) -> Approval {
+                Approval::Deny
+            }
+            fn notice(&mut self, _: &str) {}
+            fn take_queued(&mut self) -> Vec<String> {
+                std::mem::take(&mut self.0)
+            }
+        }
+        let alternates = |s: &Session| s.history.windows(2).all(|w| w[0].role != w[1].role);
+        let (mut session, root) = scratch_session("user-roles");
+        session.set_mode(Mode::Plan);
+
+        // A prompt whose turn failed (nothing answered), then the retry.
+        session.push_user("do the thing");
+        let context = session.history[0].context.clone();
+        assert!(context.as_deref().is_some_and(|c| c.contains("PLAN MODE")));
+        session
+            .pending_images
+            .push("data:image/png;base64,AAAA".into());
+        session.push_user("do the thing, please");
+        assert_eq!(session.history.len(), 1);
+        assert_eq!(
+            session.history[0].content,
+            "do the thing\n\ndo the thing, please"
+        );
+        assert_eq!(session.history[0].images.len(), 1);
+        assert_eq!(session.history[0].context, context);
+
+        // Typed before the turn's first request went out.
+        let mut ui = Typed(vec!["and hurry".into()]);
+        assert_eq!(session.deliver_queued(&mut ui), 1);
+        assert_eq!(session.history.len(), 1);
+        assert!(session.history[0].content.ends_with("please\n\nand hurry"));
+
+        // After tool results it is a message of its own, as ever…
+        let call = provider::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"shot.png"}"#.into(),
+        };
+        session
+            .history
+            .push(Message::assistant_tool_calls("", vec![call]));
+        session.history.push(Message::tool_result("c1", "an image"));
+        ui.0.push("first".into());
+        session.deliver_queued(&mut ui);
+        assert_eq!(session.history.last().unwrap().content, "first");
+        assert_eq!(session.history.len(), 4);
+        // …but not after the note that carries a tool's images, which
+        // compaction still finds, and prunes without losing what was typed.
+        session.history.pop();
+        let images = vec!["data:image/png;base64,AAAA".to_string()];
+        session
+            .history
+            .push(Message::user_with_images(compact::TOOL_IMAGES_NOTE, images));
+        ui.0.push("is that the right screenshot?".into());
+        session.deliver_queued(&mut ui);
+        assert_eq!(session.history.len(), 4);
+        assert!(alternates(&session), "{:?}", session.history);
+        session.history.push(Message::assistant("it is"));
+        assert_eq!(compact::prune_tool_output(&mut session.history, 0), 1);
+        let note = &session.history[3];
+        assert!(note.images.is_empty());
+        assert_eq!(
+            note.content,
+            "[1 image(s) returned by the tool calls above, pruned]\n\nis that the right screenshot?"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
