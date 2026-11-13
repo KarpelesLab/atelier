@@ -200,6 +200,8 @@ stdout/stderr and the exit status.
 |--------------|---------|----------|---------|
 | `command`    | string  | yes      | The shell command |
 | `timeout_ms` | integer | no       | Max run time in ms (default **120000**) |
+| `background` | boolean | no       | Start as a background job (also `run_in_background`) |
+| `sandbox`    | boolean | no       | Only with the [sandbox](sandbox.md) on: `false` runs this command on the host instead, which needs approval |
 
 The child is polled every 20ms and killed if it exceeds the timeout (output
 then reads `[command timed out after Nms and was killed]`). Output over
@@ -240,6 +242,13 @@ and are stopped when atelier exits.
   exit it already saw in a `bash_output` result.
 - A job started by a [subagent](agents.md) is announced to the main
   conversation: the subagent may be gone by the time it ends.
+
+With the [sandbox](sandbox.md) on (`[sandbox] enabled = true`, a build with
+the `sandbox` feature), a foreground command runs in a nixvm guest that sees
+the project and nothing else of the machine, and is not put to the user. A
+result whose failure looks like the sandbox's doing says so, and the model
+can ask for the host with `"sandbox": false`. Background jobs always run on
+the host.
 
 ## `bash_output`
 

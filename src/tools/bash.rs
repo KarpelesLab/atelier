@@ -20,6 +20,12 @@
 //! A job's exit is noticed by a thread that watches it ([`watch`]), which
 //! is what makes the reported runtime the job's own rather than the time
 //! until somebody looked.
+//!
+//! # The sandbox
+//!
+//! With the sandbox on ([`crate::sandbox`]), a foreground command runs in a
+//! nixvm guest that sees only the project, and so needs no approval; one that
+//! asks for the host (`"sandbox": false`) or the background does.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -33,6 +39,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolSpec, spill};
+use crate::sandbox;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Longest `bash_output` will block waiting.
@@ -58,15 +65,38 @@ pub const NOTICE_OPEN: &str = "<background-job ";
 
 pub struct BashTool;
 
+/// Whether the call asks for a background job. `run_in_background` is what
+/// Claude models know it as.
+fn wants_background(args: &Value) -> bool {
+    ["background", "run_in_background"]
+        .iter()
+        .any(|k| args.get(*k).and_then(Value::as_bool) == Some(true))
+}
+
+/// Whether the call asks to run on the host although the sandbox is on.
+fn wants_host(args: &Value) -> bool {
+    args.get("sandbox").and_then(Value::as_bool) == Some(false)
+}
+
 impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
     }
 
+    /// A foreground command the sandbox will run cannot leave the project,
+    /// like the file tools, so it runs unasked (deny and ask rules still
+    /// apply: they are judged before a tool's own default). Everything that
+    /// runs on the host asks: with the sandbox off, a background job, a
+    /// `"sandbox": false` request — and, so that nothing slips through, a
+    /// sandbox that is on but unavailable, which [`call`](Tool::call) refuses.
+    fn requires_approval_in(&self, args: &Value, root: &Path) -> bool {
+        !(matches!(sandbox::state(root), sandbox::State::Ready(_))
+            && !wants_background(args)
+            && !wants_host(args))
+    }
+
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: self.name().to_string(),
-            description: "Run a shell command (via `sh -c`) in the project root. Captures \
+        let mut description = "Run a shell command (via `sh -c`) in the project root. Captures \
                 combined stdout/stderr and the exit status. Very long output comes back as its start and its end, with all of it saved \
                 to a file you can read or grep; \
                 the command is killed if it exceeds the timeout. With `background: true` it \
@@ -75,7 +105,17 @@ impl Tool for BashTool {
                 work. Read its output, or wait for it to print something, with \
                 `bash_output`; stop it with `bash_kill`. Use that for servers, watchers, \
                 and long builds."
-                .to_string(),
+                .to_string();
+        // Only while the sandbox is on, so the description (which is part of
+        // every request) is otherwise what it always was.
+        let sandboxed =
+            std::env::current_dir().is_ok_and(|root| sandbox::state(&root) != sandbox::State::Off);
+        if sandboxed {
+            description.push_str(sandbox::TOOL_NOTE);
+        }
+        ToolSpec {
+            name: self.name().to_string(),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -90,6 +130,10 @@ impl Tool for BashTool {
                     "background": {
                         "type": "boolean",
                         "description": "Run as a background job and return its id immediately (default false)."
+                    },
+                    "sandbox": {
+                        "type": "boolean",
+                        "description": "Only when commands run in a sandbox: false runs this one on the host instead, which the user must approve. Use it after a result says the sandbox was in the way, not before."
                     }
                 },
                 "required": ["command"]
@@ -106,15 +150,38 @@ impl Tool for BashTool {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
-        // `run_in_background` is what Claude models know it as.
-        let background = ["background", "run_in_background"]
-            .iter()
-            .any(|k| args.get(*k).and_then(Value::as_bool) == Some(true));
-        if background {
-            return start_job(command, ctx.project_root);
+        let state = sandbox::state(ctx.project_root);
+        let sandboxed = state != sandbox::State::Off;
+        // With the sandbox on, the host is reached only through a call that
+        // was approved as one (`requires_approval_in`).
+        if sandboxed && (wants_background(&args) || wants_host(&args)) && !ctx.approved {
+            bail!("running on the host while the sandbox is on needs approval");
+        }
+        if wants_background(&args) {
+            let started = start_job(command, ctx.project_root)?;
+            return Ok(if sandboxed {
+                format!("{started}\n[background jobs are not sandboxed: this one runs on the host]")
+            } else {
+                started
+            });
+        }
+        let timeout = Duration::from_millis(timeout_ms);
+        match state {
+            sandbox::State::Ready(setup) if !wants_host(&args) => {
+                let out = sandbox::run(command, ctx.project_root, &setup, timeout)?;
+                return Ok(format_sandboxed(ctx.project_root, timeout_ms, out));
+            }
+            // Asked for and not there: refused, not run on the host instead,
+            // so that turning the sandbox on never means less than it says.
+            sandbox::State::Unavailable(why) if !wants_host(&args) => bail!(
+                "the sandbox is enabled but cannot run commands: {why}. Nothing was run. To \
+                 run this on the host instead, call bash again with \"sandbox\": false (the \
+                 user will be asked)."
+            ),
+            _ => {}
         }
 
-        let mut child = Command::new("sh")
+        let child = Command::new("sh")
             .arg("-c")
             .arg(command)
             .current_dir(ctx.project_root)
@@ -123,59 +190,102 @@ impl Tool for BashTool {
             .stderr(Stdio::piped())
             .spawn()
             .context("spawning shell command")?;
-
-        // Read stdout/stderr on their own threads so a full pipe buffer can't
-        // block the child while the watchdog below isn't draining it.
-        let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-        let stdout_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf);
-            buf
-        });
-        let stderr_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf);
-            buf
-        });
-
-        // Watchdog: poll for exit, killing the child once the timeout elapses.
-        let timeout = Duration::from_millis(timeout_ms);
-        let start = Instant::now();
-        let (status, timed_out) = loop {
-            match child.try_wait().context("waiting for command")? {
-                Some(status) => break (Some(status), false),
-                None if start.elapsed() >= timeout => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break (None, true);
-                }
-                None => std::thread::sleep(POLL_INTERVAL),
-            }
+        let done = capture(child, timeout)?;
+        let status = match done.status {
+            _ if done.timed_out => timed_out_line(timeout_ms),
+            Some(status) => format!("[exit status: {status}]\n"),
+            None => "[exit status: unknown]\n".to_string(),
         };
-
-        let stdout_buf = stdout_handle.join().unwrap_or_default();
-        let stderr_buf = stderr_handle.join().unwrap_or_default();
-
-        Ok(format_result(
-            ctx.project_root,
-            status,
-            timed_out,
-            timeout_ms,
-            stdout_buf,
-            stderr_buf,
-        ))
+        let mut out = format_result(ctx.project_root, status, done.stdout, done.stderr);
+        if sandboxed {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("[ran on the host, not in the sandbox]");
+        }
+        Ok(out)
     }
 }
 
-fn format_result(
-    root: &Path,
-    status: Option<std::process::ExitStatus>,
-    timed_out: bool,
-    timeout_ms: u64,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-) -> String {
+/// What a child process did within its time.
+pub(crate) struct Captured {
+    /// `None` if it was killed at the timeout.
+    pub status: Option<std::process::ExitStatus>,
+    pub timed_out: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Wait for `child` (spawned with piped stdout and stderr), collecting what
+/// it prints, and kill it if it is still running after `timeout`.
+pub(crate) fn capture(mut child: Child, timeout: Duration) -> Result<Captured> {
+    // Read stdout/stderr on their own threads so a full pipe buffer can't
+    // block the child while the watchdog below isn't draining it.
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    // Watchdog: poll for exit, killing the child once the timeout elapses.
+    let start = Instant::now();
+    let (status, timed_out) = loop {
+        match child.try_wait().context("waiting for command")? {
+            Some(status) => break (Some(status), false),
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break (None, true);
+            }
+            None => std::thread::sleep(POLL_INTERVAL),
+        }
+    };
+
+    Ok(Captured {
+        status,
+        timed_out,
+        stdout: stdout_handle.join().unwrap_or_default(),
+        stderr: stderr_handle.join().unwrap_or_default(),
+    })
+}
+
+fn timed_out_line(timeout_ms: u64) -> String {
+    format!("[command timed out after {timeout_ms}ms and was killed]\n")
+}
+
+/// The result of a command that ran in the sandbox: as for one on the host,
+/// plus — when its failure looks like the sandbox's doing — a line saying so
+/// and how to ask for the host.
+fn format_sandboxed(root: &Path, timeout_ms: u64, out: sandbox::Output) -> String {
+    let status = match &out.outcome {
+        // As `ExitStatus` prints it.
+        sandbox::Outcome::Exited(code) => format!("[exit status: exit status: {code}]\n"),
+        sandbox::Outcome::TimedOut => timed_out_line(timeout_ms),
+        sandbox::Outcome::Failed(_) => "[not run: the sandbox failed]\n".to_string(),
+    };
+    let blame = sandbox::diagnose(&out);
+    let mut text = format_result(root, status, out.stdout, out.stderr);
+    if let Some(why) = blame {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[sandbox: {why}. If this command needs the host, call bash again with \
+             \"sandbox\": false and say why — the user will be asked to approve it.]"
+        ));
+    }
+    text
+}
+
+/// `status` (a line saying how the command ended), then its output.
+fn format_result(root: &Path, status: String, stdout: Vec<u8>, stderr: Vec<u8>) -> String {
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
 
@@ -189,16 +299,7 @@ fn format_result(
         combined.push_str(&stderr);
     }
 
-    let mut out = String::new();
-    if timed_out {
-        out.push_str(&format!(
-            "[command timed out after {timeout_ms}ms and was killed]\n"
-        ));
-    } else if let Some(status) = status {
-        out.push_str(&format!("[exit status: {status}]\n"));
-    } else {
-        out.push_str("[exit status: unknown]\n");
-    }
+    let mut out = status;
     // Past the budget, the head and the tail; all of it is in a file.
     out.push_str(&spill::fit(root, combined, MAX_OUTPUT_BYTES));
     out
@@ -1108,6 +1209,220 @@ mod tests {
         assert!(body.starts_with("1\n2\n") && body.ends_with("\n20000\n"));
         assert!(body.contains(" lines omitted (lines "), "{body}");
         assert_eq!(spilled(&root, &out).lines().count(), 20000);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A sandbox that says it is ready, for what is decided before any
+    /// guest runs.
+    fn ready() -> sandbox::State {
+        sandbox::State::Ready(sandbox::Setup {
+            rootfs: PathBuf::from("/nonexistent/rootfs"),
+            memory_mb: 64,
+            interp: false,
+            helper: Some(PathBuf::from("/nonexistent/atelier")),
+            notes: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn only_a_foreground_command_in_a_ready_sandbox_runs_unasked() {
+        let root = Path::new("/project");
+        let plain = json!({"command": "make test"});
+        let background = json!({"command": "make serve", "run_in_background": true});
+        let host = json!({"command": "cargo test", "sandbox": false});
+        // No sandbox: as ever.
+        for args in [&plain, &background, &host] {
+            assert!(BashTool.requires_approval_in(args, root));
+        }
+        {
+            let _reset = sandbox::testing::set(ready());
+            assert!(!BashTool.requires_approval_in(&plain, root));
+            // `"sandbox": true` is the default spelled out.
+            assert!(
+                !BashTool.requires_approval_in(&json!({"command": "ls", "sandbox": true}), root)
+            );
+            assert!(BashTool.requires_approval_in(&background, root));
+            assert!(BashTool.requires_approval_in(&host, root));
+        }
+        // On but unable to run: nothing is waved through.
+        let _reset = sandbox::testing::set(sandbox::State::Unavailable("no root".into()));
+        for args in [&plain, &background, &host] {
+            assert!(BashTool.requires_approval_in(args, root));
+        }
+    }
+
+    #[test]
+    fn deny_and_ask_rules_outrank_the_sandbox() {
+        use crate::permissions::{Decision, Policy};
+        let _reset = sandbox::testing::set(ready());
+        let root = Path::new("/project");
+        let project = crate::settings::Permissions {
+            allow: Vec::new(),
+            ask: vec!["bash(git push *)".to_string()],
+            deny: vec!["bash(rm -rf *)".to_string()],
+        };
+        let policy = Policy::new(&project, &Default::default(), None);
+        let denied = json!({"command": "echo hi && rm -rf build"});
+        // The tool's own answer is "no need to ask"…
+        assert!(!BashTool.requires_approval_in(&denied, root));
+        // …which is only consulted when no rule decides.
+        assert_eq!(
+            policy.decide("bash", &denied, root).decision,
+            Decision::Deny
+        );
+        let asked = json!({"command": "git push origin master"});
+        assert_eq!(policy.decide("bash", &asked, root).decision, Decision::Ask);
+        let free = json!({"command": "make test"});
+        assert_eq!(
+            policy.decide("bash", &free, root).decision,
+            Decision::Default
+        );
+    }
+
+    #[test]
+    fn an_unavailable_sandbox_refuses_instead_of_using_the_host() {
+        let root = tempdir("bash-sandbox-unavailable");
+        let _reset = sandbox::testing::set(sandbox::State::Unavailable(
+            "no root filesystem at /x".into(),
+        ));
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: true,
+        };
+        let err = BashTool
+            .call(&mut ctx, json!({"command": "echo ran > ran.txt"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no root filesystem at /x"), "{err}");
+        assert!(err.contains("\"sandbox\": false"), "{err}");
+        assert!(!root.join("ran.txt").exists(), "it ran on the host");
+
+        // The way out it names works, and says where the command ran.
+        let out = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "echo ran > ran.txt; echo ok", "sandbox": false}),
+            )
+            .unwrap();
+        assert!(root.join("ran.txt").exists());
+        assert!(
+            out.ends_with("ok\n[ran on the host, not in the sandbox]"),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn with_the_sandbox_on_the_host_is_reached_only_by_an_approved_call() {
+        let root = tempdir("bash-sandbox-host");
+        let _reset = sandbox::testing::set(ready());
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        for args in [
+            json!({"command": "echo ran > ran.txt", "sandbox": false}),
+            json!({"command": "echo ran > ran.txt", "background": true}),
+        ] {
+            let err = BashTool.call(&mut ctx, args).unwrap_err().to_string();
+            assert!(err.contains("needs approval"), "{err}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!root.join("ran.txt").exists());
+
+        // Approved, a background job starts — on the host, and says so.
+        ctx.approved = true;
+        let started = BashTool
+            .call(&mut ctx, json!({"command": "true", "background": true}))
+            .unwrap();
+        assert!(started.contains("started background job"), "{started}");
+        assert!(started.contains("runs on the host"), "{started}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_description_mentions_the_sandbox_only_while_it_is_on() {
+        let plain = BashTool.spec();
+        assert!(!plain.description.contains("sandbox"));
+        let _reset = sandbox::testing::set(ready());
+        let noted = BashTool.spec();
+        assert!(noted.description.starts_with(&plain.description));
+        assert!(noted.description.contains("sandbox: false"));
+        // The schema is the same either way.
+        assert_eq!(noted.parameters, plain.parameters);
+    }
+
+    /// Through a real guest: skipped without the feature, a root filesystem
+    /// and the built binary (see `sandbox::testing::live_setup`).
+    #[test]
+    fn a_sandboxed_command_reports_like_one_on_the_host_and_blames_the_sandbox_when_due() {
+        let Some(setup) = sandbox::testing::live_setup() else {
+            return;
+        };
+        let root = std::fs::canonicalize(tempdir("bash-sandbox-live")).unwrap();
+        let _reset = sandbox::testing::set(sandbox::State::Ready(setup));
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            // As the agent calls it; nothing here needed the user.
+            approved: false,
+        };
+        let out = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "pwd; uname -n; echo kept > kept.txt; echo warn >&2"}),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "[exit status: exit status: 0]\n{}\nnixvm\n[stderr]\nwarn\n",
+                root.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("kept.txt")).unwrap(),
+            "kept\n"
+        );
+
+        // A plain failure is reported plainly.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "echo no; exit 2"}))
+            .unwrap();
+        assert_eq!(out, "[exit status: exit status: 2]\nno\n");
+
+        // A program the image doesn't have: the sandbox's doing, with the
+        // way to the host.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "no-such-toolchain build"}))
+            .unwrap();
+        assert!(
+            out.starts_with("[exit status: exit status: 127]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[sandbox: a program it needs is not in the sandbox's image"),
+            "{out}"
+        );
+        assert!(out.contains("\"sandbox\": false"), "{out}");
+
+        // Long output goes to a file in the project, as on the host.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 20000"}))
+            .unwrap();
+        assert!(out.len() < MAX_OUTPUT_BYTES, "{} bytes", out.len());
+        assert_eq!(spilled(&root, &out).lines().count(), 20000);
+
+        // The timeout.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "sleep 30", "timeout_ms": 500}))
+            .unwrap();
+        assert!(out.starts_with("[command timed out after 500ms"), "{out}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

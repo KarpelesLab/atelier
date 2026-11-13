@@ -27,12 +27,22 @@ anyhow = "1"
 regex = "1"
 ignore = "0.4"
 globset = "0.4"
+# The sandbox the `bash` tool can run commands in (see `src/sandbox.rs`), with
+# the `sandbox` feature. Pinned exactly: atelier assembles the guest from
+# nixvm's kernel, loader and filesystem modules, which no 0.0.x release
+# promises to keep as they are. No default features: the library alone, which
+# has no dependencies of its own.
+nixvm = { version = "=0.0.5", default-features = false, optional = true }
 
 [features]
 default = ["tui"]
 # Gates the terminal interface so a headless build (scripted runs, tests,
 # CI) can drop the UI entirely. Nothing in provider/agent/core may depend on it.
 tui = []
+# Run `bash` commands inside nixvm (docs/sandbox.md). Off by default: it needs
+# a Unix target with a libc (nixvm's host-directory mounts), so it is not in
+# the fullrust release builds, and a guest root filesystem the user provides.
+sandbox = ["dep:nixvm"]
 
 [profile.release]
 opt-level = 3

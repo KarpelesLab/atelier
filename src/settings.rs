@@ -65,6 +65,37 @@ pub struct Settings {
     /// Bounds on the pursuit of a `/goal`.
     #[serde(default, skip_serializing_if = "GoalSettings::is_unset")]
     pub goals: GoalSettings,
+    /// Running `bash` commands in a sandbox (see [`crate::sandbox`]).
+    #[serde(default, skip_serializing_if = "SandboxSettings::is_unset")]
+    pub sandbox: SandboxSettings,
+}
+
+/// `[sandbox]`: run the `bash` tool's commands inside nixvm (see
+/// [`crate::sandbox`] and `docs/sandbox.md`). `ATELIER_SANDBOX` overrides
+/// `enabled`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SandboxSettings {
+    /// Route foreground `bash` commands through the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The guest's root filesystem, an extracted Linux userland. Honoured
+    /// only in the user-global file: a project must not choose what the
+    /// guest can read of the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// Hosts the guest may reach. Not implemented yet: the guest has no
+    /// network, and a list here is reported as ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<String>,
+    /// Guest RAM ceiling in MiB (default 4096).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+}
+
+impl SandboxSettings {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[goals]`: how far one prompt may go in pursuit of the session's goal
@@ -441,6 +472,27 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_table_parses_and_is_left_out_when_unset() {
+        let settings: Settings = tomlproc::serde::from_str(
+            "[sandbox]\nenabled = true\nmemory_mb = 512\nnetwork = [\"crates.io\"]\n",
+        )
+        .unwrap();
+        assert_eq!(settings.sandbox.enabled, Some(true));
+        assert_eq!(settings.sandbox.memory_mb, Some(512));
+        assert_eq!(settings.sandbox.network, ["crates.io"]);
+        assert!(settings.sandbox.root.is_none());
+        // It survives the rewrite `/mcp add` and friends do…
+        let text = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        let again: Settings = tomlproc::serde::from_str(&text).unwrap();
+        assert_eq!(again.sandbox, settings.sandbox);
+        // …and a file without it doesn't grow an empty table.
+        let empty: Settings = tomlproc::serde::from_str("").unwrap();
+        assert_eq!(empty.sandbox, SandboxSettings::default());
+        let text = tomlproc::serde::to_string_pretty(&empty).unwrap();
+        assert!(!text.contains("sandbox"), "{text}");
+    }
 
     #[test]
     fn search_table_parses_and_defaults_to_unset() {

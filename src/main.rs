@@ -24,6 +24,7 @@ mod permissions;
 mod provider;
 mod review;
 mod risk;
+mod sandbox;
 mod schema;
 mod session;
 mod settings;
@@ -57,6 +58,12 @@ fn main() -> ExitCode {
 
 fn run() -> Result<u8> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `atelier sandbox-exec …`: one command in a nixvm guest, started by the
+    // `bash` tool (see `sandbox`). Before anything reads the other arguments:
+    // one of them is the command.
+    if args.first().map(String::as_str) == Some(sandbox::HELPER) {
+        return Ok(sandbox::helper_main(&args[1..]));
+    }
     // Anywhere among the options (what follows a bare `--` is a prompt).
     if args
         .iter()
@@ -79,6 +86,11 @@ fn run() -> Result<u8> {
     // call, and which rule decided (see `permissions`).
     if args.first().map(String::as_str) == Some("permissions") {
         return permissions::run_command(&args[1..]).map(|()| 0);
+    }
+    // `atelier sandbox status|run …`: what the sandbox would do here, or a
+    // command run in it by hand (see `sandbox`).
+    if args.first().map(String::as_str) == Some("sandbox") {
+        return sandbox::run_command(&args[1..]);
     }
     // `atelier doctor`: check the setup a session here would run with,
     // without starting one (see `doctor`).

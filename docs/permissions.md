@@ -113,6 +113,14 @@ A name that is no mode is an error, not a fallback: `--mode pln` and
 The status strip shows the mode when it is not `auto-edit`
 (`… · turn 3 · plan`).
 
+With the experimental [sandbox](sandbox.md) on, `bash` moves to the confined
+side for the calls it can confine: a foreground command runs in a guest that
+sees only the project, so it does not ask. A call that asks for the host
+(`"sandbox": false`) or a background job is unconfined as before. The rules
+below apply either way, and before any of this: a `deny` refuses a sandboxed
+command too, and an `allow` written for `bash` is what lets a host run
+through without a prompt.
+
 ## Rules
 
 On top of those defaults, `[permissions]` in `atelier.toml` holds three lists

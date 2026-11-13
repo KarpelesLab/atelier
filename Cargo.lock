@@ -46,6 +46,7 @@ dependencies = [
  "globset",
  "ignore",
  "kataan",
+ "nixvm",
  "oxideav-pdf",
  "purecrypto",
  "regex",
@@ -724,6 +725,12 @@ dependencies = [
  "cfg_aliases",
  "libc",
 ]
+
+[[package]]
+name = "nixvm"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67e356172a2ec86b78417780739a68397bff7ba75504d2a979c6271c5917b926"
 
 [[package]]
 name = "num-bigint-dig"

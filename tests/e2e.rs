@@ -3962,3 +3962,95 @@ fi
         "{asked}"
     );
 }
+
+/// Sandbox — with `[sandbox] enabled = true`, a `bash` call runs in the nixvm
+/// guest without anyone being asked (this run has no auto-approve, and a
+/// headless run denies whatever needs approval); a deny rule still refuses;
+/// and the same tool asking for the host (`"sandbox": false`) needs the
+/// approval nobody is there to give. The tool list tells the model so.
+///
+/// Needs the `sandbox` feature and a guest root filesystem in
+/// `ATELIER_SANDBOX_TEST_ROOT` (an extracted Alpine minirootfs will do);
+/// skipped without.
+#[cfg(feature = "sandbox")]
+#[test]
+fn sandboxed_bash_runs_unasked_while_rules_and_the_host_still_ask() {
+    let Some(rootfs) = std::env::var_os("ATELIER_SANDBOX_TEST_ROOT")
+        .map(PathBuf::from)
+        .filter(|dir| std::fs::symlink_metadata(dir.join("bin/sh")).is_ok())
+    else {
+        eprintln!("skipped: no sandbox root filesystem (set ATELIER_SANDBOX_TEST_ROOT)");
+        return;
+    };
+    let mock = Mock::start(Arc::new(|n| match n {
+        0 => tool_call_response(
+            "call_1",
+            "bash",
+            r#"{"command":"pwd > where.txt; uname -n >> where.txt"}"#,
+        ),
+        1 => tool_call_response("call_2", "bash", r#"{"command":"rm -rf build"}"#),
+        2 => tool_call_response(
+            "call_3",
+            "bash",
+            r#"{"command":"echo host > host.txt","sandbox":false}"#,
+        ),
+        _ => answer_response("done"),
+    }));
+    let dir = std::fs::canonicalize(unique_dir("sandbox")).unwrap();
+    std::fs::write(
+        dir.join("atelier.toml"),
+        "[sandbox]\nenabled = true\n\n[permissions]\ndeny = [\"bash(rm -rf *)\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.join("build")).unwrap();
+
+    let out = run_atelier_env(
+        &mock.base_url(),
+        &dir,
+        &["--print", "go"],
+        None,
+        &[
+            ("ATELIER_APPROVE", "no"),
+            ("ATELIER_SANDBOX_ROOT", rootfs.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(mock.requests(), 4, "{out:?}");
+
+    // The first call ran, in the guest, at the project's own path.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("where.txt")).unwrap(),
+        format!("{}\nnixvm\n", dir.display()),
+    );
+    let last = messages(&mock.body(3));
+    let results: Vec<&str> = last
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    let [ran, denied, host] = results.as_slice() else {
+        panic!("expected three tool results: {results:?}");
+    };
+    assert!(ran.starts_with("[exit status: exit status: 0]"), "{ran}");
+    // The deny rule held although the sandbox would have run it unasked.
+    assert!(denied.contains("bash(rm -rf *)"), "{denied}");
+    assert!(dir.join("build").is_dir());
+    // The host was asked for, and nobody could say yes.
+    assert!(!dir.join("host.txt").exists(), "{host}");
+    assert!(!host.contains("exit status"), "{host}");
+
+    // And the model was told what it is running in.
+    let first: serde_json::Value = serde_json::from_str(&mock.body(0)).unwrap();
+    let bash = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "bash")
+        .expect("a bash tool");
+    let description = bash["function"]["description"].as_str().unwrap();
+    assert!(
+        description.contains("Commands run in a sandbox"),
+        "{description}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

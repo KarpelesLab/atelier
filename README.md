@@ -112,6 +112,7 @@ first conversation, the REPL/TUI fallback).
 | [Hooks](docs/hooks.md) | Commands run on events (before/after a tool call, on a prompt, at turn end) that can observe or decide: `[[hooks]]`, the stdin/stdout contract, trust, `/hooks`, examples |
 | [Subagents](docs/agents.md) | The `task` tool: `explore` and `general`, your own agents as Markdown files in `.atelier/agents/` (also `.claude/agents/`), the step cap, parallel runs, `/agents` |
 | [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
+| [Sandboxed `bash`](docs/sandbox.md) | Experimental (`--features sandbox`): commands in a nixvm guest that sees only the project — setup, what works there, measurements, what is missing |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` — and how it differs from `atelier review` |
@@ -138,6 +139,7 @@ src/
 ├─ mcp/           MCP client (stdio + HTTP transports)
 ├─ context/       per-turn context helpers
 ├─ risk.rs        risk-signal detection for bash approval prompts
+├─ sandbox.rs     bash commands in a nixvm guest                [feature = "sandbox", off]
 └─ tui/           minimal inline interface, mid-turn steering  [feature = "tui", default on]
 ```
 

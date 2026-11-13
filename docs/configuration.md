@@ -55,6 +55,9 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_SEARCH_PROVIDER` | `duckduckgo` (`searxng` if a URL is set) | `web_search` tool | Search provider: `searxng`, `brave`, `tavily` or `duckduckgo`. Overrides `[search] provider` — see [`[search]`](#search) |
 | `ATELIER_SEARCH_URL`      | *(unset)*                        | `web_search` tool | Base URL of the SearXNG instance (required for `searxng`); for the other providers, replaces their endpoint. Overrides `[search] url` |
 | `ATELIER_SEARCH_KEY`      | *(unset)*                        | `web_search` tool | API key for `brave` or `tavily`. Overrides the variable named by `[search] key_env` |
+| `ATELIER_SANDBOX`         | *(unset)*                        | `sandbox::state` | `1`/`true`/`on` runs `bash` commands in the [sandbox](sandbox.md), `0`/`false`/`off` does not, whatever `[sandbox] enabled` says. Needs a build with the `sandbox` feature |
+| `ATELIER_SANDBOX_ROOT`    | `$XDG_DATA_HOME/atelier/sandbox/rootfs` | `sandbox::state` | The sandbox guest's root filesystem (a directory holding a Linux userland). Overrides the user-global `[sandbox] root` |
+| `ATELIER_SANDBOX_INTERP`  | *(unset)*                        | `sandbox::state` | `1` runs the guest on nixvm's software CPU even where hardware virtualization is available |
 | `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending (the body only — never headers, so never a key) |
 
 ## `atelier.toml`
@@ -570,6 +573,26 @@ key_env = "BRAVE_API_KEY"            # the variable holding the key; ATELIER_SEA
 
 The key is sent only as that request header. It is not written to
 `atelier.toml`, tool results, errors or logs.
+
+## `[sandbox]`
+
+Runs the `bash` tool's commands inside nixvm instead of on the host —
+experimental, and only in a build with the `sandbox` feature. See
+[Sandboxed `bash`](sandbox.md) for what that means, what works in the guest
+and how to make its root filesystem.
+
+```toml
+[sandbox]
+enabled = true
+memory_mb = 4096
+```
+
+| Field       | Type    | Meaning |
+|-------------|---------|---------|
+| `enabled`   | bool    | Route foreground `bash` commands through the sandbox. The project's file wins over the user-global one; `ATELIER_SANDBOX` wins over both |
+| `root`      | string  | The guest's root filesystem. **User-global file only** — in a project's `atelier.toml` it is ignored, since it decides what of the host the guest can read. Default `$XDG_DATA_HOME/atelier/sandbox/rootfs`; `ATELIER_SANDBOX_ROOT` wins |
+| `memory_mb` | integer | Guest RAM ceiling in MiB (default 4096) |
+| `network`   | array   | Reserved for an allowlist of hosts. Not implemented: the guest has no network, and `atelier sandbox status` says a list here is ignored |
 
 ## `/config`
 
