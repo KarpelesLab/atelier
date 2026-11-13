@@ -47,10 +47,11 @@
 
 use std::io::{BufRead, BufReader};
 use std::ops::ControlFlow;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{Completion, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 
@@ -69,11 +70,12 @@ pub fn stream_responses(
     base_url: &str,
     access_token: &str,
     model: &str,
+    options: &Map<String, Value>,
     messages: &[Message],
     tools: &[ToolSpec],
     mut on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
 ) -> Result<Completion> {
-    let body = build_body(model, messages, tools);
+    let body = build_body(model, options, messages, tools);
     let body_bytes = serde_json::to_vec(&body)?;
     if std::env::var_os("ATELIER_DEBUG").is_some() {
         eprintln!("--> {}", String::from_utf8_lossy(&body_bytes));
@@ -83,10 +85,13 @@ pub fn stream_responses(
     // Reuse the shared transport helper (fresh connection per request,
     // `connection: close`, bounded retries). The access token rides as the
     // bearer credential, exactly like `stream_chat`'s api key.
-    let reader = super::send_reader_retrying(&url, &body_bytes, Some(access_token))?;
+    let timeout = Duration::from_millis(super::timeout_ms_from_env(super::DEFAULT_CHAT_TIMEOUT_MS));
+    let reader = super::send_reader_retrying(&url, &body_bytes, Some(access_token), &[], timeout)?;
     let status = reader.status();
     if !(200..300).contains(&status) {
-        return Err(super::HttpError::read(status, reader).into());
+        return Err(super::HttpError::read(status, reader)
+            .without(Some(access_token))
+            .into());
     }
 
     let mut accum = ResponsesAccum::default();
@@ -142,7 +147,18 @@ pub fn stream_responses(
 /// `input_image` part array); an assistant turn's tool calls become
 /// `function_call` items; a `tool` result becomes a `function_call_output`
 /// item; and tools are advertised as *flat* function tools.
-fn build_body(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
+///
+/// `options` are a model variant's request options, written for chat
+/// completions (see [`crate::config`]); the two this API spells differently
+/// are translated — `reasoning_effort` to `reasoning.effort`, `max_tokens`
+/// to `max_output_tokens` — and the rest go in as they are, under the
+/// fields built here.
+fn build_body(
+    model: &str,
+    options: &Map<String, Value>,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Value {
     let mut instructions: Option<String> = None;
     let mut input: Vec<Value> = Vec::new();
 
@@ -202,11 +218,17 @@ fn build_body(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
         }
     }
 
-    let mut body = json!({
-        "model": model,
-        "input": input,
-        "stream": true,
-    });
+    let mut body = Value::Object(Map::new());
+    for (key, value) in options {
+        match key.as_str() {
+            "reasoning_effort" => body["reasoning"]["effort"] = value.clone(),
+            "max_tokens" => body["max_output_tokens"] = value.clone(),
+            _ => body[key.as_str()] = value.clone(),
+        }
+    }
+    body["model"] = json!(model);
+    body["input"] = Value::Array(input);
+    body["stream"] = json!(true);
     if let Some(instr) = instructions {
         body["instructions"] = Value::String(instr);
     }
@@ -481,7 +503,7 @@ mod tests {
             }),
         }];
 
-        let body = build_body("gpt-x", &messages, &tools);
+        let body = build_body("gpt-x", &Map::new(), &messages, &tools);
 
         assert_eq!(body["model"], json!("gpt-x"));
         assert_eq!(body["stream"], json!(true));
@@ -530,6 +552,31 @@ mod tests {
         );
     }
 
+    /// A variant's options, written for chat completions, in this API's
+    /// spelling: effort nested under `reasoning`, the output cap renamed,
+    /// the rest as they are — and none of them over the fields built here.
+    #[test]
+    fn build_body_translates_variant_options() {
+        let options = json!({
+            "reasoning_effort": "high",
+            "max_tokens": 900,
+            "temperature": 0.3,
+            "model": "hijacked",
+        });
+        let body = build_body(
+            "gpt-x",
+            options.as_object().unwrap(),
+            &[Message::user("hi")],
+            &[],
+        );
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(body["max_output_tokens"], 900);
+        assert_eq!(body["temperature"], 0.3);
+        assert_eq!(body["model"], "gpt-x");
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("max_tokens").is_none());
+    }
+
     /// A user turn carrying images expands `content` into an `input_text` +
     /// `input_image` part array.
     #[test]
@@ -538,7 +585,7 @@ mod tests {
             "look",
             vec!["data:image/png;base64,AAAA".to_string()],
         )];
-        let body = build_body("gpt-x", &messages, &[]);
+        let body = build_body("gpt-x", &Map::new(), &messages, &[]);
         // No tools -> no `tools` key.
         assert!(body.get("tools").is_none());
         let content = body["input"][0]["content"]

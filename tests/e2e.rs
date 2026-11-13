@@ -49,6 +49,8 @@ struct Mock {
     /// The body of every request received so far, in order, so a test can
     /// check what atelier actually sent.
     bodies: Arc<Mutex<Vec<String>>>,
+    /// The request line and headers of each, lowercased.
+    heads: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -77,6 +79,8 @@ impl Mock {
         let stop_thread = Arc::clone(&stop);
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let bodies_thread = Arc::clone(&bodies);
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let heads_thread = Arc::clone(&heads);
         let handle = thread::spawn(move || {
             let counter = AtomicUsize::new(0);
             while !stop_thread.load(Ordering::SeqCst) {
@@ -85,7 +89,7 @@ impl Mock {
                         let n = counter.fetch_add(1, Ordering::SeqCst);
                         // Ignore per-connection errors: a flaky/aborted
                         // connection must never bring the server down.
-                        let _ = handle_conn(stream, n, &responder, &bodies_thread);
+                        let _ = handle_conn(stream, n, &responder, &bodies_thread, &heads_thread);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -98,6 +102,7 @@ impl Mock {
         Mock {
             port,
             bodies,
+            heads,
             stop,
             handle: Some(handle),
         }
@@ -112,6 +117,11 @@ impl Mock {
     /// The body of the Nth request (0-based) atelier sent.
     fn body(&self, n: usize) -> String {
         self.bodies.lock().unwrap()[n].clone()
+    }
+
+    /// The request line and headers (lowercased) of the Nth request.
+    fn head(&self, n: usize) -> String {
+        self.heads.lock().unwrap()[n].clone()
     }
 
     fn requests(&self) -> usize {
@@ -135,6 +145,7 @@ fn handle_conn(
     n: usize,
     responder: &AnyResponder,
     bodies: &Mutex<Vec<String>>,
+    heads: &Mutex<Vec<String>>,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -143,6 +154,7 @@ fn handle_conn(
 
     // Request line + headers, up to the blank line that ends the head.
     let mut content_length = 0usize;
+    let mut head = String::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -157,7 +169,10 @@ fn handle_conn(
         if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse().unwrap_or(0);
         }
+        head.push_str(&lower);
+        head.push('\n');
     }
+    heads.lock().unwrap().push(head);
 
     // Drain the body so the client's write completes before we reply, and
     // keep it for tests that assert on what was sent.
@@ -2537,4 +2552,348 @@ fn permissions_check_takes_a_mode() {
     assert!(out.starts_with("decision: deny"), "{out}");
     let out = check(&["--mode", "yolo", "--", "git", "push"]);
     assert!(out.starts_with("decision: allow"), "{out}");
+}
+
+/// A `200 OK` JSON response (what `GET /models` gets).
+fn json_response(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// The parsed body of the Nth request a mock received.
+fn request_json(mock: &Mock, n: usize) -> serde_json::Value {
+    serde_json::from_str(&mock.body(n)).expect("request body is JSON")
+}
+
+/// Case 14 — named providers. With a second endpoint configured in
+/// `atelier.toml`, a model addressed as `second/model-b` is requested from
+/// that endpoint — bare model id, the provider's key and extra header — and
+/// the endpoint from the environment sees nothing.
+#[test]
+fn a_model_on_a_named_provider_goes_to_that_endpoint() {
+    let first = Mock::start(always("from the first"));
+    let second = Mock::start(always("from the second"));
+    let dir = unique_dir("providers");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        format!(
+            "[[provider]]\nname = \"second\"\nbase_url = \"{}\"\n\
+             api_key_env = \"SECOND_KEY\"\nheaders = {{ \"X-Org\" = \"abc\" }}\n",
+            second.base_url()
+        ),
+    )
+    .unwrap();
+
+    let out = run_atelier_env(
+        &first.base_url(),
+        &dir,
+        &["--print", "hi"],
+        None,
+        &[
+            ("ATELIER_MODEL", "second/model-b"),
+            ("SECOND_KEY", "k-second-123"),
+            // The environment's own key belongs to the environment's endpoint.
+            ("ATELIER_API_KEY", "k-env-456"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("from the second"), "{stdout}\n{stderr}");
+    assert_eq!(first.requests(), 0, "the env endpoint is not asked");
+    assert_eq!(second.requests(), 1);
+    assert_eq!(request_json(&second, 0)["model"], "model-b");
+    let head = second.head(0);
+    assert!(head.starts_with("post /v1/chat/completions "), "{head}");
+    assert!(
+        head.contains("authorization: bearer k-second-123"),
+        "{head}"
+    );
+    assert!(head.contains("x-org: abc"), "{head}");
+    assert!(!head.contains("k-env-456"), "{head}");
+
+    // And a bare name still means the endpoint from the environment, with
+    // its key.
+    let out = run_atelier_env(
+        &first.base_url(),
+        &dir,
+        &["--print", "hi"],
+        None,
+        &[("ATELIER_API_KEY", "k-env-456")],
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("from the first"));
+    assert_eq!((first.requests(), second.requests()), (1, 1));
+    assert_eq!(request_json(&first, 0)["model"], "mock");
+    let head = first.head(0);
+    assert!(head.contains("authorization: bearer k-env-456"), "{head}");
+    assert!(!head.contains("x-org"), "{head}");
+}
+
+/// Case 15 — a key from `api_key_command`. The command's output is sent as
+/// the bearer token, and appears in nothing atelier prints, with
+/// `ATELIER_DEBUG` set and when the server's error quotes it back.
+#[cfg(unix)]
+#[test]
+fn a_key_from_a_command_is_sent_and_never_printed() {
+    const SECRET: &str = "cmd-secret-8842";
+    let toml = |base_url: &str| {
+        format!(
+            "[defaults]\nprovider = \"vault\"\n\n[[provider]]\nname = \"vault\"\n\
+             base_url = \"{base_url}\"\napi_key_command = \"echo {SECRET}\"\n"
+        )
+    };
+
+    let mock = Mock::start(always("fine"));
+    let dir = unique_dir("key-command");
+    std::fs::write(dir.join("atelier.toml"), toml(&mock.base_url())).unwrap();
+    // The environment points nowhere: the default provider is `vault`.
+    let out = run_atelier_env(
+        "http://127.0.0.1:9/v1",
+        &dir,
+        &["--print", "hi"],
+        None,
+        &[("ATELIER_DEBUG", "1")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("fine"), "{stdout}\n{stderr}");
+    assert!(
+        mock.head(0)
+            .contains(&format!("authorization: bearer {SECRET}")),
+        "{}",
+        mock.head(0)
+    );
+    assert!(stderr.contains("--> {"), "debug output is on: {stderr}");
+    assert!(!stdout.contains(SECRET) && !stderr.contains(SECRET));
+
+    // A server that refuses the key and quotes it: the command is run again
+    // (one retry), then the error is shown without the key.
+    let refusing = Mock::start(Arc::new(|_| {
+        error_response(
+            401,
+            r#"{"error":{"message":"Incorrect API key provided: cmd-secret-8842"}}"#,
+        )
+    }));
+    let dir = unique_dir("key-refused");
+    std::fs::write(dir.join("atelier.toml"), toml(&refusing.base_url())).unwrap();
+    let out = run_atelier_env(
+        "http://127.0.0.1:9/v1",
+        &dir,
+        &["--print", "hi"],
+        None,
+        &[("ATELIER_DEBUG", "1")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert_eq!(refusing.requests(), 2, "one retry with a fresh key");
+    assert!(
+        stderr.contains("HTTP 401: Incorrect API key provided: [key]"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains(SECRET) && !stderr.contains(SECRET));
+}
+
+/// Case 16 — a rotating credential. The key command gives a new key each
+/// time it runs; the endpoint refuses the first request (the cached key
+/// "expired"), atelier runs the command again and the turn goes through.
+#[cfg(unix)]
+#[test]
+fn a_refused_command_key_is_fetched_again() {
+    let mock = Mock::start(Arc::new(|n| match n {
+        // The first key works; the second request finds it expired.
+        1 => error_response(401, r#"{"error":"token expired"}"#),
+        _ => answer_response("ok"),
+    }));
+    let dir = unique_dir("key-rotation");
+    let runs = dir.with_extension("runs");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        format!(
+            "[[provider]]\nname = \"vault\"\nbase_url = \"{}\"\n\
+             api_key_command = \"echo run >> '{runs}'; echo key-$(wc -l < '{runs}' | tr -d ' ')\"\n",
+            mock.base_url(),
+            runs = runs.display()
+        ),
+    )
+    .unwrap();
+
+    let mut repl = Repl::start(
+        "http://127.0.0.1:9/v1",
+        &dir,
+        &[("ATELIER_MODEL", "vault/m")],
+    );
+    repl.line("one");
+    wait_requests(&mock, 1);
+    repl.line("two");
+    wait_requests(&mock, 3);
+    let (stdout, stderr) = repl.finish();
+    assert_eq!(stdout.matches("ok").count(), 2, "{stdout}\n{stderr}");
+    let keys: Vec<bool> = (0..3)
+        .map(|n| mock.head(n).contains("authorization: bearer key-1\n"))
+        .collect();
+    // Cached for the first two requests; a new one after the 401.
+    assert_eq!(keys, [true, true, false]);
+    assert!(mock.head(2).contains("authorization: bearer key-2\n"));
+}
+
+/// Case 17 — variants. `model#variant` adds the variant's fields to the
+/// request body: a built-in effort level, and a configured table with its
+/// free-form `extra`. The model id is sent without the suffix.
+#[test]
+fn a_variant_adds_its_fields_to_the_request_body() {
+    let mock = Mock::start(always("fine"));
+    let dir = unique_dir("variant");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        "[variant.careful]\nreasoning_effort = \"high\"\ntemperature = 0.2\ntop_p = 0.9\n\
+         max_tokens = 512\nextra = { top_k = 40, stop = [\"END\"] }\n",
+    )
+    .unwrap();
+
+    for model in ["mock#low", "mock#careful", "mock#nope"] {
+        let out = run_atelier_env(
+            &mock.base_url(),
+            &dir,
+            &["--print", "hi"],
+            None,
+            &[("ATELIER_MODEL", model)],
+        );
+        assert!(out.status.success(), "{model}");
+    }
+    let low = request_json(&mock, 0);
+    assert_eq!(low["model"], "mock");
+    assert_eq!(low["reasoning_effort"], "low");
+    assert!(low.get("temperature").is_none());
+
+    let careful = request_json(&mock, 1);
+    assert_eq!(careful["model"], "mock");
+    assert_eq!(careful["reasoning_effort"], "high");
+    assert_eq!(careful["temperature"], 0.2);
+    assert_eq!(careful["top_p"], 0.9);
+    assert_eq!(careful["max_tokens"], 512);
+    assert_eq!(careful["top_k"], 40);
+    assert_eq!(careful["stop"][0], "END");
+    // The options are body fields: the messages are the same either way.
+    assert_eq!(low["messages"][0], careful["messages"][0]);
+    assert_eq!(careful["stream"], true);
+
+    // An unknown suffix is part of the model's name.
+    let nope = request_json(&mock, 2);
+    assert_eq!(nope["model"], "mock#nope");
+    assert!(nope.get("reasoning_effort").is_none());
+}
+
+/// Case 18 — a model per role, and switching mid-session. The summary role
+/// has its own model on a second provider, so `/compact`'s summary request
+/// goes there while the conversation stays on the first; `/model` and
+/// `/effort` change the main model and its variant between turns without
+/// rewriting the messages already sent; `/providers` and `/models` list
+/// what is configured, never a key.
+#[test]
+fn roles_and_mid_session_switches() {
+    let first = Mock::start(Arc::new(|n| match n {
+        2 => json_response(r#"{"data":[{"id":"alpha"}]}"#),
+        _ => answer_response("answer"),
+    }));
+    let second = Mock::start(Arc::new(|n| match n {
+        0 => json_response(r#"{"data":[{"id":"model-b"},{"id":"tiny"}]}"#),
+        1 => answer_response("## Goal\nSUMMARY-BY-TINY"),
+        _ => answer_response("from b"),
+    }));
+    let dir = unique_dir("roles");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        format!(
+            "[[provider]]\nname = \"second\"\nbase_url = \"{}\"\napi_key_env = \"SECOND_KEY\"\n\n\
+             [models]\nsmall = \"second/tiny\"\n",
+            second.base_url()
+        ),
+    )
+    .unwrap();
+
+    let env = [("SECOND_KEY", "k-second-123")];
+    let mut repl = Repl::start(&first.base_url(), &dir, &env);
+    repl.line("first question");
+    wait_requests(&first, 1);
+    repl.line("second question");
+    wait_requests(&first, 2);
+    repl.line("/providers");
+    repl.line("/models");
+    wait_requests(&first, 3);
+    wait_requests(&second, 1);
+    // summary -> small -> second/tiny.
+    repl.line("/compact");
+    wait_requests(&second, 2);
+    repl.line("/model second/model-b#high");
+    repl.line("third question");
+    wait_requests(&second, 3);
+    repl.line("/effort");
+    repl.line("/effort off");
+    repl.line("fourth question");
+    wait_requests(&second, 4);
+    repl.line("/effort bogus");
+    let (stdout, stderr) = repl.finish();
+
+    assert_eq!(first.requests(), 3, "two turns and a model list");
+    let summary = request_json(&second, 1);
+    assert_eq!(summary["model"], "tiny");
+    assert!(
+        summary["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("user: first question")
+    );
+    assert!(
+        second
+            .head(1)
+            .contains("authorization: bearer k-second-123")
+    );
+
+    let third = request_json(&second, 2);
+    assert_eq!(third["model"], "model-b");
+    assert_eq!(third["reasoning_effort"], "high");
+    assert!(
+        third["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("SUMMARY-BY-TINY")
+    );
+    let fourth = request_json(&second, 3);
+    assert_eq!(fourth["model"], "model-b");
+    assert!(fourth.get("reasoning_effort").is_none());
+    // Changing the effort left what was already sent as it was: the fourth
+    // request's messages start with the third's, byte for byte.
+    let (before, after) = (
+        serde_json::to_string(&third["messages"]).unwrap(),
+        serde_json::to_string(&fourth["messages"]).unwrap(),
+    );
+    assert!(
+        after.starts_with(before.trim_end_matches(']')),
+        "{before}\n{after}"
+    );
+
+    for line in [
+        "  second  ",
+        "key: $SECOND_KEY (set)",
+        "  summary   second/tiny",
+        "  main      env/mock",
+        "env/alpha",
+        "second/model-b",
+        "second/tiny",
+        "model set to second/model-b#high",
+        "effort: high (second/model-b#high)",
+        "model set to second/model-b",
+        "unknown variant 'bogus'",
+    ] {
+        assert!(stdout.contains(line), "{line:?} in:\n{stdout}\n{stderr}");
+    }
+    assert!(!stdout.contains("k-second-123") && !stderr.contains("k-second-123"));
 }

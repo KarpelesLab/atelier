@@ -9,15 +9,15 @@
 //!
 //! # Contract (stable — the implementer owns `src/review.rs`)
 //!
-//! `review(cfg, model, excerpt) -> Option<String>`: run one review, returning
-//! the note, or `None` when there's nothing worth saying (or on error). Use
-//! `model` (a per-reviewer override) when `Some`, else `cfg.model`. Call
+//! `review(target, excerpt) -> Option<String>`: run one review, returning
+//! the note, or `None` when there's nothing worth saying (or on error).
+//! `target` is the model serving the review role (`[models] review`, else
+//! `[review] model`, else the main model — see `config::Role`). Call
 //! `provider::stream_chat` with a reviewer system prompt and NO tools; ignore
 //! the stream (pass a no-op `on_event`). Treat a trimmed-empty or bare-"OK"
 //! reply as `None`.
 
-use crate::config::Config;
-use crate::provider::{self, Message};
+use crate::provider::{self, Message, Target};
 
 /// System prompt establishing the reviewer's persona and reply contract.
 const REVIEWER_SYSTEM_PROMPT: &str = "You are the coding agent's subconscious — a terse background reviewer watching its work. Given the recent exchange and the edits/commands it just made, reply with ONE short sentence (max ~25 words) flagging any real mistake, bug, risk, or a clearly better approach. Do not restate what was done, do not praise. If nothing needs saying, reply with exactly: OK";
@@ -25,18 +25,13 @@ const REVIEWER_SYSTEM_PROMPT: &str = "You are the coding agent's subconscious �
 /// Run one background review over `excerpt`. Returns a short note, or `None`
 /// when nothing needs saying.
 #[allow(dead_code)] // wired into the agent loop; body is a stub until implemented
-pub fn review(cfg: &Config, model: Option<&str>, excerpt: &str) -> Option<String> {
-    let mut cfg_for_review = cfg.clone();
-    if let Some(model) = model {
-        cfg_for_review.model = model.to_string();
-    }
-
+pub fn review(target: &Target, excerpt: &str) -> Option<String> {
     let messages = [
         Message::system(REVIEWER_SYSTEM_PROMPT),
         Message::user(excerpt),
     ];
 
-    let completion = provider::stream_chat(&cfg_for_review, &messages, &[], |_ev| {
+    let completion = provider::stream_chat(target, &messages, &[], |_ev| {
         std::ops::ControlFlow::Continue(())
     })
     .ok()?;

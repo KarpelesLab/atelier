@@ -11,8 +11,14 @@
 //! Transport is [`rsurl`]: `Request::send_reader()` returns a blocking
 //! `Read` + `.status()`, which we drive line-by-line as an SSE stream.
 //!
+//! Where a request goes — endpoint, key, extra headers, the model id and the
+//! request options of its variant — is a [`Target`] (see [`endpoint`]); the
+//! options are merged into the request *body*, never the messages, so the
+//! prompt a server caches doesn't depend on them.
+//!
 //! Not yet: a non-streaming fallback.
 
+pub mod endpoint;
 pub mod responses;
 
 use std::borrow::Cow;
@@ -26,9 +32,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::Config;
+pub use endpoint::{Provider, Target};
 
-/// Env var overriding both HTTP timeouts below (milliseconds). Read directly
-/// here rather than through `Config` since the provider is the only consumer.
+/// Env var overriding every HTTP connect timeout (milliseconds), a
+/// provider's own `timeout_secs` included. Read directly here rather than
+/// through `Config` since the provider is the only consumer.
 const TIMEOUT_ENV_VAR: &str = "ATELIER_HTTP_TIMEOUT_MS";
 /// Env var naming a file to append one JSONL trace record to per
 /// [`stream_chat`] call (request + final response). Unset by default (no
@@ -58,8 +66,12 @@ fn timeout_ms_from_env(default_ms: u64) -> u64 {
         .unwrap_or(default_ms)
 }
 
-fn connect_timeout(default_ms: u64) -> Duration {
-    Duration::from_millis(timeout_ms_from_env(default_ms))
+/// The connect timeout for a request to `provider`: the env var, else the
+/// provider's `timeout_secs`, else `default_ms`.
+fn connect_timeout(provider: &Provider, default_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms_from_env(
+        provider.timeout_ms.unwrap_or(default_ms),
+    ))
 }
 
 /// A chat message. Covers plain text, an assistant turn carrying tool calls,
@@ -319,6 +331,16 @@ impl HttpError {
         }
     }
 
+    /// Blank `key` out of the body, should the server have echoed the
+    /// credential it was sent ("invalid key sk-…"): the body ends up in an
+    /// error message, and keys are never printed.
+    pub(crate) fn without(mut self, key: Option<&str>) -> Self {
+        if let Some(key) = key.filter(|k| !k.is_empty()) {
+            self.body = self.body.replace(key, "[key]");
+        }
+        self
+    }
+
     /// The server's own explanation: the `error.message` (OpenAI shape),
     /// `error` or `message` string of a JSON body, else the body's text.
     fn detail(&self) -> String {
@@ -387,30 +409,24 @@ pub enum StreamEvent<'a> {
 ///
 /// Returns the accumulated [`Completion`] once the stream ends.
 pub fn stream_chat(
-    cfg: &Config,
+    target: &Target,
     messages: &[Message],
     tools: &[ToolSpec],
     mut on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
 ) -> Result<Completion> {
-    let mut body = json!({
-        "model": cfg.model,
-        "messages": messages.iter().map(Message::to_wire).collect::<Vec<_>>(),
-        "stream": true,
-        "stream_options": { "include_usage": true },
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_wire).collect());
-    }
+    let body = chat_body(target, messages, tools);
     let body_bytes = serde_json::to_vec(&body)?;
+    // The body only: the key travels in a header, which is never printed.
     if std::env::var_os("ATELIER_DEBUG").is_some() {
         eprintln!("--> {}", String::from_utf8_lossy(&body_bytes));
     }
 
-    let url = cfg.endpoint("chat/completions");
-    let reader = send_reader_retrying(&url, &body_bytes, cfg.api_key.as_deref())?;
+    let (reader, key) = post_with_key(&target.provider, "chat/completions", &body_bytes)?;
     let status = reader.status();
     if !(200..300).contains(&status) {
-        return Err(HttpError::read(status, reader).into());
+        return Err(HttpError::read(status, reader)
+            .without(key.as_deref())
+            .into());
     }
 
     let mut out = Completion::default();
@@ -506,11 +522,26 @@ pub fn stream_chat(
 
     if let Ok(path) = std::env::var(TRACE_ENV_VAR) {
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        let entry = build_trace_entry(&cfg.model, &body, &tool_names, &out);
+        let entry = build_trace_entry(&target.model, &body, &tool_names, &out);
         trace(&path, &entry);
     }
 
     Ok(out)
+}
+
+/// The chat-completions request body. The variant's options go in first and
+/// the fields atelier owns are written over them, so no option can replace
+/// the model, the messages or the stream settings.
+fn chat_body(target: &Target, messages: &[Message], tools: &[ToolSpec]) -> Value {
+    let mut body = Value::Object(target.options.clone());
+    body["model"] = json!(target.model);
+    body["messages"] = messages.iter().map(Message::to_wire).collect();
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({ "include_usage": true });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_wire).collect());
+    }
+    body
 }
 
 /// Whether [`stream_chat`] should append [`TRUNCATION_NOTE`] to the
@@ -714,14 +745,15 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// the caller, which reports the failure (a non-2xx status via `bail!`, or
 /// the transport error).
 ///
-/// The connect timeout is configurable via `ATELIER_HTTP_TIMEOUT_MS`
-/// (milliseconds), defaulting to [`DEFAULT_CHAT_TIMEOUT_MS`].
+/// `headers` are sent in addition to the bearer token; `timeout` is the
+/// connect timeout.
 fn send_reader_retrying(
     url: &str,
     body: &[u8],
     api_key: Option<&str>,
+    headers: &[(String, String)],
+    timeout: Duration,
 ) -> Result<rsurl::BodyReader> {
-    let timeout = connect_timeout(DEFAULT_CHAT_TIMEOUT_MS);
     let mut attempt: u32 = 0;
     loop {
         let mut req = rsurl::Request::new("POST", url)
@@ -733,6 +765,9 @@ fn send_reader_retrying(
             // connection here can surface a spurious EAGAIN on the next send.
             .header("connection", "close")
             .body(body.to_vec());
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
         if let Some(key) = api_key {
             req = req.header("authorization", &format!("Bearer {key}"));
         }
@@ -760,6 +795,57 @@ fn send_reader_retrying(
     }
 }
 
+/// POST `body` to `path` on `provider` with its key and headers (see
+/// [`send_reader_retrying`]). A 401 from a provider whose key comes from a
+/// command means the cached key has expired: the command is run again and
+/// the request sent once more. Returns the key that was used along with the
+/// response, so the caller can keep it out of an error message.
+fn post_with_key(
+    provider: &Provider,
+    path: &str,
+    body: &[u8],
+) -> Result<(rsurl::BodyReader, Option<String>)> {
+    let url = provider.endpoint(path);
+    let timeout = connect_timeout(provider, DEFAULT_CHAT_TIMEOUT_MS);
+    let send = || -> Result<_> {
+        let key = provider.key()?;
+        let reader = send_reader_retrying(&url, body, key.as_deref(), &provider.headers, timeout)?;
+        Ok((reader, key))
+    };
+    let (reader, key) = send()?;
+    if reader.status() == 401 && provider.refresh_key() {
+        return send();
+    }
+    Ok((reader, key))
+}
+
+/// What `/models` prints: the ids each configured provider advertises. With
+/// several providers they are written the way `/model` takes them,
+/// `provider/model`, and a provider that can't be reached gets a line saying
+/// so in place of its models; with only the endpoint from the environment,
+/// the bare ids.
+pub fn model_listing(cfg: &Config) -> Vec<String> {
+    let providers = cfg.providers();
+    if let [only] = providers {
+        return match list_models(only) {
+            Ok(models) if models.is_empty() => vec!["(no models returned)".to_string()],
+            Ok(models) => models,
+            Err(e) => vec![format!("error: {e:#}")],
+        };
+    }
+    let mut out = Vec::new();
+    for provider in providers {
+        match list_models(provider) {
+            Ok(models) if models.is_empty() => {
+                out.push(format!("{}: (no models returned)", provider.name));
+            }
+            Ok(models) => out.extend(models.iter().map(|m| format!("{}/{m}", provider.name))),
+            Err(e) => out.push(format!("{}: error: {e:#}", provider.name)),
+        }
+    }
+    out
+}
+
 /// List model ids advertised by the endpoint (`GET /models`).
 ///
 /// Like [`send_reader_retrying`], a response with a transient server status
@@ -767,18 +853,25 @@ fn send_reader_retrying(
 /// at [`MAX_SEND_ATTEMPTS`]) rather than immediately surfaced — this is a
 /// cheap, idempotent GET, so retrying it is straightforward.
 ///
-/// The connect timeout is configurable via `ATELIER_HTTP_TIMEOUT_MS`
-/// (milliseconds), defaulting to [`DEFAULT_LIST_MODELS_TIMEOUT_MS`].
-pub fn list_models(cfg: &Config) -> Result<Vec<String>> {
-    let url = cfg.endpoint("models");
-    let timeout = connect_timeout(DEFAULT_LIST_MODELS_TIMEOUT_MS);
+/// The provider's key and headers are sent, as with a completion. The
+/// connect timeout is `ATELIER_HTTP_TIMEOUT_MS` (milliseconds), else the
+/// provider's own, else [`DEFAULT_LIST_MODELS_TIMEOUT_MS`].
+pub fn list_models(provider: &Provider) -> Result<Vec<String>> {
+    let url = provider.endpoint("models");
+    let timeout = connect_timeout(provider, DEFAULT_LIST_MODELS_TIMEOUT_MS);
+    let key = provider.key()?;
     let mut attempt: u32 = 0;
     let resp = loop {
-        let resp = rsurl::Request::new("GET", &url)
+        let mut req = rsurl::Request::new("GET", &url)
             .context("building request")?
-            .connect_timeout(timeout)
-            .send()
-            .context("sending request")?;
+            .connect_timeout(timeout);
+        for (name, value) in &provider.headers {
+            req = req.header(name, value);
+        }
+        if let Some(key) = &key {
+            req = req.header("authorization", &format!("Bearer {key}"));
+        }
+        let resp = req.send().context("sending request")?;
         if is_retryable_status(resp.status) {
             attempt += 1;
             if attempt < MAX_SEND_ATTEMPTS {
@@ -986,6 +1079,58 @@ mod tests {
         let stored = serde_json::to_value(&msg).unwrap();
         assert_eq!(stored["context"], "## git status\nM a.rs");
         assert_eq!(stored["content"], "fix it");
+    }
+
+    /// A variant's options are top-level body fields next to the ones
+    /// atelier sets, which they can't replace; without options the body is
+    /// what it always was.
+    #[test]
+    fn chat_body_merges_the_variant_options() {
+        let provider = std::sync::Arc::new(Provider::from_env("http://x/v1".into(), None));
+        let mut target = Target {
+            provider,
+            model: "m".into(),
+            options: serde_json::Map::new(),
+        };
+        let messages = [Message::system("sys"), Message::user("hi")];
+        let plain = chat_body(&target, &messages, &[]);
+        assert_eq!(
+            plain,
+            json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            })
+        );
+
+        for (key, value) in [
+            ("reasoning_effort", json!("high")),
+            ("temperature", json!(0.2)),
+            ("model", json!("hijacked")),
+            ("messages", json!([])),
+            ("stream", json!(false)),
+        ] {
+            target.options.insert(key.into(), value);
+        }
+        let body = chat_body(&target, &messages, &[]);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["temperature"], 0.2);
+        for owned in ["model", "messages", "stream", "stream_options"] {
+            assert_eq!(body[owned], plain[owned], "{owned}");
+        }
+    }
+
+    #[test]
+    fn an_echoed_key_is_blanked_out_of_the_error() {
+        let err = HttpError::read(401, &br#"{"error":{"message":"bad key sk-abc"}}"#[..]);
+        let shown = err.without(Some("sk-abc")).to_string();
+        assert_eq!(shown, "provider returned HTTP 401: bad key [key]");
+        let untouched = HttpError::read(401, &b"nope"[..]).without(None);
+        assert_eq!(untouched.body, "nope");
     }
 
     #[test]

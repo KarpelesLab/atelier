@@ -43,7 +43,7 @@ type a message, or /help for commands.
 The entry point ...
 ```
 
-Type `/help` to see the available slash commands (`/models`, `/model`,
+Type `/help` to see the available slash commands (`/models`, `/model`, `/effort`, `/providers`,
 `/login`, `/logout`, `/tools`, `/mcp`, `/review`, `/config`, `/new`,
 `/compact`, `/context`, `/image`, `/memory`, `/clear`, `/quit`, …) — see [tools](tools.md) and [MCP](mcp.md) for what the
 agent itself can do, [permissions](permissions.md) for how tool approval

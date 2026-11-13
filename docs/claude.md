@@ -182,6 +182,8 @@ request, so atelier's rules and modes do not see them — this matters with
   started itself) stops that turn, and the queued message then runs.
 - Subagent activity is shown only as its single top-level tool call.
 - `/models` doesn't list anything; use `ATELIER_MODEL`.
+- Providers, `[models]` roles and variants (`/providers`, `/effort`) don't
+  apply: claude chooses and calls its own models.
 
 ## Terms of use
 

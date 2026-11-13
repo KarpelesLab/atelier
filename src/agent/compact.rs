@@ -38,6 +38,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{Session, Ui};
+use crate::config::Role;
 use crate::context::estimate_tokens;
 use crate::provider::{Message, ToolCall, ToolSpec};
 
@@ -483,9 +484,12 @@ impl Session {
         true
     }
 
-    /// Run a summary request (no tools) and return the summary.
+    /// Run a summary request (no tools) on the model for summaries
+    /// (`[models] summary`, else `small`, else the main one) and return the
+    /// summary.
     fn summarize(&mut self, request: &[Message]) -> Result<String> {
-        let completion = self.request(request, &[], |_| ControlFlow::Continue(()))?;
+        let completion =
+            self.request_as(Role::Summary, request, &[], |_| ControlFlow::Continue(()))?;
         let summary = completion.content.trim().to_string();
         if summary.is_empty() {
             anyhow::bail!("model returned an empty summary");
@@ -737,12 +741,10 @@ mod tests {
     /// A session with no tools and no context providers, whose endpoint
     /// nothing listens on: a summary request would fail, and say so.
     fn session(threshold: u32) -> Session {
-        let cfg = crate::config::Config {
-            base_url: "http://127.0.0.1:9/v1".into(),
-            model: "m".into(),
-            api_key: None,
-            backend: crate::config::Backend::OpenAi,
-        };
+        let cfg = crate::config::Config::single(
+            crate::provider::Provider::from_env("http://127.0.0.1:9/v1".into(), None),
+            "m".into(),
+        );
         let mut session = Session::new(
             cfg,
             std::env::temp_dir().join("atl-compact-unused"),

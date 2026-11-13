@@ -2,8 +2,11 @@
 
 atelier has two configuration layers:
 
-- **`Config`** (`src/config.rs`) — ephemeral connection info read from the
-  environment at startup. Not persisted.
+- **`Config`** (`src/config.rs`) — which backend, which endpoints and which
+  model for which job: read from the environment at startup, with the model
+  tables of `atelier.toml` ([providers](#provider--named-endpoints),
+  [`[models]`](#models--a-model-per-role),
+  [variants](#variantname--reasoning-effort-and-sampling)) laid over it.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
   `atelier.toml` at the project root: configured MCP servers, the
   permission rules, `[defaults]`, `[review]`,
@@ -11,10 +14,12 @@ atelier has two configuration layers:
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
   "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
-`atelier.toml` is read from the current project root. The one user-global
-piece is `[permissions]`, also read from
-`$XDG_CONFIG_HOME/atelier/atelier.toml` (see [`[permissions]`](#permissions)).
-`Config`'s environment variables have no `atelier.toml` equivalent.
+`atelier.toml` is read from the current project root. Some tables are also
+read from your own `$XDG_CONFIG_HOME/atelier/atelier.toml`
+(`~/.config/atelier/atelier.toml` when that variable is unset), with the
+project's entries winning: [`[permissions]`](#permissions),
+[`[[hooks]]`](#hooks), and the model tables — `[[provider]]`, `[models]`,
+`[variant.*]`, `[[price]]`, and `[defaults]`' `model` and `provider`.
 
   always-allow permission list, `[defaults]`, `[review]`, and `[[hooks]]`.
   Read at startup and rewritten whenever it changes (`/mcp add`/`/mcp
@@ -33,15 +38,15 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_BACKEND`         | *(unset)*                        | `Config::from_env` | `claude` selects the [Claude backend](claude.md) (same as `--claude`); otherwise OpenAI-compatible |
 | `ATELIER_CLAUDE_BIN`      | `claude`                         | `Config::from_env` | Claude backend: the Claude Code executable to launch |
 | `ATELIER_CLAUDE_BUILTINS` | *(unset)*                        | `Config::from_env` | Claude backend: `keep` leaves claude's own file/shell/fetch tools on next to atelier's (default: switched off — see [claude.md](claude.md#tools)) |
-| `ATELIER_BASE_URL`        | `http://192.168.0.50:11400/v1`   | `Config::from_env` | OpenAI-compatible endpoint base; every request path is appended to it |
-| `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | `Config::from_env` | Model id sent in every request. Claude backend: passed as `--model` when set (e.g. `opus`, `sonnet`); unset leaves the choice to claude |
-| `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token; sent as `Authorization: Bearer <key>` when set to a non-empty value |
-| `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session — the `yolo` [mode](permissions.md#modes) — for headless/CI runs (see [Permissions](permissions.md)) |
+| `ATELIER_BASE_URL`        | `http://192.168.0.50:11400/v1`   | `Config::from_env` | OpenAI-compatible endpoint base; every request path is appended to it. This endpoint is the provider named `env` — see [providers](#provider--named-endpoints) |
+| `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | `Config::from_env` | The main model: a model id, or `provider/model#variant` (see [addressing a model](#addressing-a-model)). Wins over `[models] main` and `[defaults] model`. Claude backend: passed as `--model` when set (e.g. `opus`, `sonnet`); unset leaves the choice to claude |
+| `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token of the `env` provider; sent to it as `Authorization: Bearer <key>` when set to a non-empty value |
+| `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
 | `ATELIER_MODE`            | *(unset)*                        | `main`, `permissions::Mode::from_env` | The permission [mode](permissions.md#modes) to start in: `plan`, `ask-edits`, `auto-edit` (the default) or `yolo`. Overridden by `--mode`; overrides `ATELIER_APPROVE` and `[defaults] mode`. Any other value is an error |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
 | `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `hooks::Paths::from_env` | `1` runs the project's [hooks](hooks.md) without your stored approval — for headless runs (`--print`), which never ask and otherwise skip unapproved project hooks. Only for checkouts you control |
-| `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000). Non-numeric or `<= 0` values are ignored and the default is used |
+| `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000), and any provider's `timeout_secs`. Non-numeric or `<= 0` values are ignored |
 | `ATELIER_NO_UPDATE`       | *(unset)*                        | `update::spawn_background_check` | Any non-empty value other than `0` turns off release builds' daily background update check (`atelier update` still works) |
 | `ATELIER_UPDATE_API`      | `https://api.github.com`         | `update` | GitHub API base the update check queries (for a mirror, or testing) |
 | `ATELIER_NO_COORDINATOR`  | *(unset)*                        | `coord::start` | Any non-empty value other than `0`: don't join (or start) the [coordinator](coordinator.md) that connects atelier instances |
@@ -49,7 +54,7 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_SEARCH_PROVIDER` | `duckduckgo` (`searxng` if a URL is set) | `web_search` tool | Search provider: `searxng`, `brave`, `tavily` or `duckduckgo`. Overrides `[search] provider` — see [`[search]`](#search) |
 | `ATELIER_SEARCH_URL`      | *(unset)*                        | `web_search` tool | Base URL of the SearXNG instance (required for `searxng`); for the other providers, replaces their endpoint. Overrides `[search] url` |
 | `ATELIER_SEARCH_KEY`      | *(unset)*                        | `web_search` tool | API key for `brave` or `tavily`. Overrides the variable named by `[search] key_env` |
-| `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending |
+| `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending (the body only — never headers, so never a key) |
 
 ## `atelier.toml`
 
@@ -138,7 +143,8 @@ variable when set:
 
 ```toml
 [defaults]
-model = "qwen3-coder:30b"   # overridden by ATELIER_MODEL
+model = "qwen3-coder:30b"   # overridden by ATELIER_MODEL, and by [models] main
+provider = "local"          # the provider a bare model name is on (default: env)
 approve = false             # overridden by ATELIER_APPROVE
 mode = "auto-edit"          # overridden by ATELIER_MODE and --mode
 context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
@@ -151,6 +157,155 @@ both are set. On the command line, `--mode <name>` (or `--mode=<name>`)
 selects the mode for one run, interactive or `--print`; `/mode <name>`
 switches it during a session.
 
+## `[[provider]]` — named endpoints
+
+The environment describes one endpoint (`ATELIER_BASE_URL`,
+`ATELIER_API_KEY`). It is the provider named `env`, and unless you say
+otherwise it is the only one and everything goes to it. `[[provider]]` tables
+add more OpenAI-compatible endpoints, each with a name:
+
+```toml
+[[provider]]
+name = "local"
+base_url = "http://192.168.0.50:11400/v1"
+
+[[provider]]
+name = "hosted"
+base_url = "https://api.example.com/v1"
+api_key_env = "HOSTED_API_KEY"        # the key is in this environment variable
+headers = { "X-Org" = "abc" }         # optional, sent with every request
+timeout_secs = 20                     # optional connect timeout
+
+[[provider]]
+name = "work"
+base_url = "https://llm.corp.example/v1"
+api_key_command = "pass show work/llm"   # or: the key is this command's output
+```
+
+| Field             | Type    | Meaning |
+|-------------------|---------|---------|
+| `name`            | string  | What the provider is called in a model address. One word, no `/` or `#`; `env` is taken |
+| `base_url`        | string  | Endpoint base including `/v1`; `chat/completions` and `models` are appended |
+| `api_key_env`     | string  | **Name** of the environment variable holding the bearer token, read at each request. Unset when a request is made is an error naming the variable |
+| `api_key_command` | string  | Shell command (`sh -c`, run in the project directory) whose standard output, trimmed, is the bearer token. It runs at the first request and the result is kept for the rest of the process; when the endpoint answers 401 it is run again and the request retried once — so a helper that mints short-lived tokens just works. Its standard error is discarded |
+| `headers`         | table   | Extra request headers |
+| `timeout_secs`    | integer | Connect timeout (default 60 s for a completion, 15 s for `/models`); `ATELIER_HTTP_TIMEOUT_MS` wins |
+
+Set at most one of `api_key_env` and `api_key_command`; with neither, no
+`Authorization` header is sent. **The key itself never goes in
+`atelier.toml`**, which gets committed — only where to find it. atelier sends
+it as the `Authorization: Bearer` header of requests to that provider and
+nowhere else: it is not printed by `/providers`, `ATELIER_DEBUG` or
+`ATELIER_TRACE`, and if a server quotes it back in an error, it is blanked
+out of the message.
+
+`api_key_command` runs a shell command named by a file in the repository.
+Put it in your user-global `atelier.toml` when the project isn't yours.
+
+Providers are read from the user-global file and from the project's; a
+project entry replaces a global one of the same name. A table with a mistake
+(no `base_url`, both key sources, a bad name) is skipped with a warning at
+startup. `[defaults] provider` picks the default provider — the one a bare
+model name is on — in place of `env`.
+
+`/providers` lists the providers (name, base URL, where the key comes from)
+and the model serving each role. `/models` lists what each provider's
+`GET /models` reports, written `provider/model` when more than one provider
+is configured.
+
+### Addressing a model
+
+Wherever a model is named — `ATELIER_MODEL`, `[models]`, `[defaults] model`,
+`[review] model`, `/model` — the full form is
+
+```
+provider/model#variant        local/qwen3-coder:30b#high
+```
+
+and both ends are optional: a bare `model` is on the default provider, and
+without `#variant` nothing is added to the request.
+
+Model ids may contain `/` and `#` themselves (`meta/llama-3` on an
+aggregator), so the prefix counts as a provider only if a provider by that
+name is configured, and the suffix as a variant only if a variant by that
+name exists. Otherwise they are part of the model id. `/model` says so when
+a `#suffix` matched no variant, since that is usually a typo.
+
+## `[models]` — a model per role
+
+```toml
+[models]
+main     = "local/qwen3-coder:30b#high"
+small    = "local/qwen3:0.6b"
+subagent = "local/qwen3-coder:30b"
+review   = "hosted/some-critic"
+summary  = "local/qwen3.8:27b"
+```
+
+| Role       | Used for | When unset |
+|------------|----------|------------|
+| `main`     | The conversation. `ATELIER_MODEL` wins over it, and `/model` changes it for the session | `[defaults] model`, else the built-in default |
+| `small`    | Cheap upkeep work. Today that is summaries (below); titles and memory upkeep will use it | `main` |
+| `subagent` | Subagents started by the `task` tool | `main` |
+| `review`   | The [reviewer](review.md) | `[review] model`, else `main` |
+| `summary`  | The hand-off summary of a [compaction](sessions.md#compaction) | `small`, else `main` |
+
+"`main`" in the last column means the main model *as it is at that moment*:
+a role without a model of its own follows `/model`. Each entry is a [model
+address](#addressing-a-model), so roles can live on different providers and
+carry their own variant.
+
+A summary written by a much weaker model than the one doing the work loses
+detail the work depended on; `summary` exists so that `small` can be tiny
+without that cost.
+
+While [signed in with ChatGPT](chatgpt.md) the main model is the ChatGPT
+one, and so are the roles that follow it. A role with a model of its own
+keeps using its provider.
+
+## `[variant.<name>]` — reasoning effort and sampling
+
+A variant is a named set of request options. A model addressed as
+`model#name` has them added to the body of every request:
+
+```toml
+[variant.careful]
+reasoning_effort = "high"
+temperature = 0.2
+top_p = 0.9
+max_tokens = 8192
+extra = { top_k = 40, seed = 7 }     # any other body fields, as they are
+```
+
+| Field              | Type    | Request field |
+|--------------------|---------|---------------|
+| `reasoning_effort` | string  | `reasoning_effort` |
+| `temperature`      | number  | `temperature` |
+| `top_p`            | number  | `top_p` |
+| `max_tokens`       | integer | `max_tokens` |
+| `extra`            | table   | Each key becomes a top-level body field with its value, untouched — for what a particular server understands. Wins over the named fields above |
+
+Three variants exist without being configured: **`low`**, **`medium`** and
+**`high`** set `reasoning_effort` to that word. Defining `[variant.high]`
+yourself replaces the built-in one. Whether an option does anything is up to
+the server: one that doesn't know `reasoning_effort` typically ignores it,
+and some reject unknown fields.
+
+No option can replace the fields atelier sets itself (`model`, `messages`,
+`stream`, `stream_options`, `tools`).
+
+`/model name#variant` switches model and variant together. **`/effort
+low|medium|high|off`** (or any variant's name) changes only the variant of
+the current main model, from the next request on; `/effort` alone shows it.
+Options travel as body fields, never in the messages, so changing them
+mid-session rewrites nothing that was already sent (see [the shape of a
+request](sessions.md#the-shape-of-a-request)).
+
+With the ChatGPT backend (the Responses API) `reasoning_effort` is sent as
+`reasoning.effort` and `max_tokens` as `max_output_tokens`; the other
+options are sent as written. Variants and providers don't apply to the
+[Claude backend](claude.md), where claude calls its own models.
+
 ## `[review]`
 
 The parallel "subconscious" reviewer — see [Review mode](review.md) for what
@@ -159,13 +314,13 @@ it does and how its notes appear.
 ```toml
 [review]
 enabled = false              # overridden by ATELIER_REVIEW
-model = "qwen3-coder:30b"    # optional; defaults to the main model
+model = "qwen3-coder:30b"    # optional; [models] review wins; defaults to the main model
 ```
 
 | Field     | Type   | Meaning |
 |-----------|--------|---------|
 | `enabled` | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
-| `model`   | string | Model override for the reviewer; unset reuses the active model |
+| `model`   | string | Model for the reviewer (a [model address](#addressing-a-model)). `[models] review` is the newer spelling and wins; with neither, the reviewer uses the main model |
 
 ## `[[hooks]]`
 

@@ -102,7 +102,7 @@ first conversation, the REPL/TUI fallback).
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
 | [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, exit codes |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
-| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), instruction files (`AGENTS.md`), the `/config` settings screen |
+| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), named providers, a model per role, effort/sampling variants, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |

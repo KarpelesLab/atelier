@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::auth;
 use crate::claude::{self, Bridge};
-use crate::config::{Backend, Config};
+use crate::config::{Backend, Config, Role};
 use crate::context::{ContextItem, ContextProvider};
 use crate::coord;
 use crate::hooks::{self, Hooks};
@@ -183,8 +183,10 @@ pub enum Dispatch {
 const HELP: &[&str] = &[
     "commands:",
     "  /help                                 show this help",
-    "  /models                               list models offered by the endpoint",
-    "  /model [name]                         show or switch the active model",
+    "  /models                               list the models each provider offers",
+    "  /model [provider/model#variant]       show or switch the active model",
+    "  /effort [low|medium|high|off]         reasoning effort (or another variant) of the model",
+    "  /providers                            list the configured providers and the model per role",
     "  /login                                sign in with ChatGPT (use your ChatGPT plan)",
     "  /logout                               sign out of ChatGPT",
     "  /tools                                list available tools",
@@ -284,14 +286,25 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             ui.info("Claude backend: the model is chosen by claude itself;");
             ui.info("set ATELIER_MODEL (e.g. opus, sonnet) to pass --model");
         }
-        "/models" => match provider::list_models(session.config()) {
-            Ok(models) if models.is_empty() => ui.info("(no models returned)"),
-            Ok(models) => {
-                for m in models {
-                    ui.info(&m);
-                }
+        "/models" => {
+            for line in provider::model_listing(session.config()) {
+                ui.info(&line);
             }
-            Err(e) => ui.info(&format!("error: {e:#}")),
+        }
+        "/providers" | "/effort" if session.is_claude() => {
+            ui.info("not used with the Claude backend: claude calls its own models");
+        }
+        "/providers" => {
+            for line in session.config().describe() {
+                ui.info(&line);
+            }
+        }
+        "/effort" => match args.first() {
+            None => ui.info(&session.effort()),
+            Some(variant) => match session.set_effort(variant) {
+                Ok(model) => ui.info(&format!("model set to {model}")),
+                Err(e) => ui.info(&format!("{e:#}")),
+            },
         },
         "/mcp" => dispatch_mcp(session, &args, ui),
         "/permissions" => {
@@ -318,6 +331,13 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             Some(name) => {
                 session.set_model(name);
                 ui.info(&format!("model set to {name}"));
+                if !session.is_claude()
+                    && let Some(suffix) = session.config().stray_variant(name)
+                {
+                    ui.info(&format!(
+                        "note: '{suffix}' is not a known variant, so it is sent as part of the model name"
+                    ));
+                }
             }
         },
         "/login" | "/logout" if session.is_claude() => {
@@ -916,6 +936,41 @@ impl Session {
         }
     }
 
+    /// The main model as addressed: the ChatGPT backend's when signed in.
+    fn main_model(&self) -> &str {
+        match &self.chatgpt {
+            Some(cg) => &cg.model,
+            None => &self.cfg.model,
+        }
+    }
+
+    /// `/effort`: which variant the main model is addressed with.
+    fn effort(&self) -> String {
+        let model = self.main_model();
+        match self.cfg.parse(model).variant {
+            Some(v) => format!("effort: {v} ({model})"),
+            None => format!("effort: off ({model} has no variant)"),
+        }
+    }
+
+    /// `/effort <variant>|off`: readdress the main model with another
+    /// variant (or none) from the next request on. Returns the model as now
+    /// addressed. Only the request options change — the messages, and with
+    /// them the server's prompt cache, are untouched.
+    fn set_effort(&mut self, variant: &str) -> Result<String> {
+        let variant = match variant {
+            "off" | "none" => None,
+            v if self.cfg.variant_names().contains(&v) => Some(v),
+            v => anyhow::bail!(
+                "unknown variant '{v}' — use off, {}",
+                self.cfg.variant_names().join(", ")
+            ),
+        };
+        let model = self.cfg.with_variant(self.main_model(), variant);
+        self.set_model(&model);
+        Ok(model)
+    }
+
     /// Names of all registered tools, sorted (for `/tools`).
     pub fn tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.tools.specs().into_iter().map(|s| s.name).collect();
@@ -1379,27 +1434,42 @@ impl Session {
         }
     }
 
-    /// One model request through the active backend: the ChatGPT (Responses
-    /// API) one when signed in, otherwise the configured chat/completions
-    /// endpoint.
+    /// One request of the conversation, to the main model.
     fn request(
         &mut self,
         messages: &[Message],
         specs: &[provider::ToolSpec],
         on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
     ) -> Result<Completion> {
-        if let Some(cg) = self.chatgpt.as_mut() {
+        self.request_as(Role::Main, messages, specs, on_event)
+    }
+
+    /// One model request for `role`, through the backend that serves it:
+    /// the role's provider (see [`Config::target`]) — except that, signed in
+    /// with ChatGPT, the main model is the ChatGPT (Responses API) one, and
+    /// so is every role that has no model of its own.
+    fn request_as(
+        &mut self,
+        role: Role,
+        messages: &[Message],
+        specs: &[provider::ToolSpec],
+        on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
+    ) -> Result<Completion> {
+        let own = self.cfg.has_own_model(role);
+        if let Some(cg) = self.chatgpt.as_mut().filter(|_| !own) {
             let token = auth::access_token(&mut cg.tokens)?;
+            let (model, options) = self.cfg.model_and_options(&cg.model);
             provider::responses::stream_responses(
                 OPENAI_BASE,
                 &token,
-                &cg.model,
+                model,
+                &options,
                 messages,
                 specs,
                 on_event,
             )
         } else {
-            provider::stream_chat(&self.cfg, messages, specs, on_event)
+            provider::stream_chat(&self.cfg.target(role), messages, specs, on_event)
         }
     }
 
@@ -1420,11 +1490,10 @@ impl Session {
             return;
         }
         let excerpt = self.review_excerpt();
-        let cfg = self.cfg.clone();
-        let model = self.settings.review.model.clone();
+        let target = self.cfg.target(Role::Review);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            if let Some(note) = crate::review::review(&cfg, model.as_deref(), &excerpt) {
+            if let Some(note) = crate::review::review(&target, &excerpt) {
                 let _ = tx.send(note);
             }
         });
@@ -2134,7 +2203,8 @@ pub fn repl(mut session: Session) -> Result<()> {
     } else {
         eprintln!(
             "atelier — model {} @ {}",
-            session.cfg.model, session.cfg.base_url
+            session.cfg.model,
+            session.cfg.target(Role::Main).provider.base_url
         );
     }
     eprintln!("type a message, or /help for commands.\n");

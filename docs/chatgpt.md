@@ -52,6 +52,10 @@ model: chatgpt:gpt-5
 model set to gpt-5-mini
 ```
 
+A [variant](configuration.md#variantname--reasoning-effort-and-sampling)
+works here too — `/model gpt-5#high`, or `/effort high` — and is sent as the
+Responses API's `reasoning.effort`.
+
 Which models you can actually use depends on your ChatGPT plan — `/models`
 doesn't query this; it only lists what the *configured* chat/completions
 endpoint reports, so check OpenAI's own docs/ChatGPT UI for what your plan

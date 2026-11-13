@@ -13,6 +13,7 @@
 //! args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,6 +49,106 @@ pub struct Settings {
     /// Commands run on lifecycle events (see [`crate::hooks`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<HookConfig>,
+    /// Named model endpoints (see [`crate::config`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider: Vec<ProviderConfig>,
+    /// Which model serves which role.
+    #[serde(default, skip_serializing_if = "ModelRoles::is_empty")]
+    pub models: ModelRoles,
+    /// `[variant.<name>]`: request options a model is addressed with as
+    /// `model#name`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variant: BTreeMap<String, VariantConfig>,
+    /// Token prices, for the cost column of `atelier stats` and `/usage`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price: Vec<PriceConfig>,
+}
+
+/// One `[[provider]]`: an OpenAI-compatible endpoint with a name, addressed
+/// as `name/model`. The key is named, never held: this file gets committed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub name: String,
+    /// Base URL including the `/v1` suffix; request paths are appended.
+    pub base_url: String,
+    /// Name of the environment variable holding the bearer token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Shell command (`sh -c`) whose standard output is the bearer token —
+    /// for a password manager or credentials that rotate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_command: Option<String>,
+    /// Extra headers sent with every request to this provider.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Connect timeout in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// `[models]`: a model per role, each `provider/model` or a bare model name
+/// on the default provider, optionally with a `#variant`. Unset roles fall
+/// back as [`crate::config::Role`] describes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelRoles {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl ModelRoles {
+    fn is_empty(&self) -> bool {
+        [
+            &self.main,
+            &self.small,
+            &self.subagent,
+            &self.review,
+            &self.summary,
+        ]
+        .iter()
+        .all(|r| r.is_none())
+    }
+}
+
+/// One `[variant.<name>]`: options merged into the request body of a model
+/// addressed as `model#name`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VariantConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Further body fields, merged as they are (for what a particular
+    /// server understands: `top_k`, `seed`, …).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One `[[price]]`: what a model costs per million tokens, in whatever
+/// currency the figures are in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceConfig {
+    /// `provider/model`, or a bare model name for that model on any provider.
+    pub model: String,
+    /// Per million prompt tokens.
+    pub input: f64,
+    /// Per million completion tokens.
+    pub output: f64,
+    /// Per million prompt tokens the provider served from its cache
+    /// (default: the `input` price).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<f64>,
 }
 
 /// `[search]`: the `web_search` tool's provider. Each field is overridden by
@@ -137,6 +238,10 @@ pub struct ReviewSettings {
 pub struct Defaults {
     #[serde(default)]
     pub model: Option<String>,
+    /// The provider a bare model name is on (default: `env`, the endpoint
+    /// the environment describes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// `true` is the `yolo` mode, where `mode` does not say otherwise.
     #[serde(default)]
     pub approve: Option<bool>,
@@ -191,14 +296,25 @@ impl Settings {
     }
 
     /// The directory of the user-global settings file:
-    /// `$XDG_CONFIG_HOME/atelier`, else `~/.config/atelier`. Only its
-    /// `[permissions]` are used today (merged under the project's).
+    /// `$XDG_CONFIG_HOME/atelier`, else `~/.config/atelier`. Its
+    /// `[permissions]`, `[[hooks]]` and model tables (`[[provider]]`,
+    /// `[models]`, `[variant.*]`, `[[price]]`, `[defaults] model`/`provider`)
+    /// are used, under the project's.
     pub fn user_dir() -> Option<PathBuf> {
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
         var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".config")))
             .map(|base| base.join("atelier"))
+    }
+
+    /// The user-global settings: defaults when there is no such file, and
+    /// with the error when it can't be read.
+    pub fn load_user() -> Result<Self> {
+        match Self::user_dir() {
+            Some(dir) => Self::load(&dir),
+            None => Ok(Self::default()),
+        }
     }
 
     /// Load settings from `<root>/atelier.toml`, or defaults if absent.
@@ -236,6 +352,70 @@ mod tests {
 
         let empty: Settings = tomlproc::serde::from_str("").unwrap();
         assert!(empty.search.provider.is_none());
+    }
+
+    #[test]
+    fn model_tables_parse_and_survive_a_rewrite() {
+        let text = r#"
+[defaults]
+provider = "local"
+
+[[provider]]
+name = "local"
+base_url = "http://127.0.0.1:1/v1"
+api_key_env = "LOCAL_KEY"
+headers = { "X-Org" = "abc" }
+timeout_secs = 60
+
+[[provider]]
+name = "hosted"
+base_url = "https://example.com/v1"
+api_key_command = "pass show llm"
+
+[models]
+main = "local/qwen3-coder:30b#high"
+small = "qwen3:0.6b"
+
+[variant.creative]
+temperature = 1.1
+max_tokens = 4096
+extra = { top_k = 40, stop = ["x"] }
+
+[[price]]
+model = "hosted/big"
+input = 3
+output = 15.5
+cached = 0.3
+"#;
+        let check = |s: &Settings| {
+            assert_eq!(s.defaults.provider.as_deref(), Some("local"));
+            let [local, hosted] = s.provider.as_slice() else {
+                panic!("expected two providers: {:?}", s.provider);
+            };
+            assert_eq!(local.api_key_env.as_deref(), Some("LOCAL_KEY"));
+            assert_eq!(local.headers["X-Org"], "abc");
+            assert_eq!(local.timeout_secs, Some(60));
+            assert_eq!(hosted.api_key_command.as_deref(), Some("pass show llm"));
+            assert_eq!(s.models.main.as_deref(), Some("local/qwen3-coder:30b#high"));
+            assert!(s.models.summary.is_none());
+            let creative = &s.variant["creative"];
+            assert_eq!(creative.temperature, Some(1.1));
+            assert_eq!(creative.max_tokens, Some(4096));
+            assert_eq!(creative.extra["top_k"], 40);
+            assert_eq!(creative.extra["stop"][0], "x");
+            assert_eq!(s.price[0].input, 3.0);
+            assert_eq!(s.price[0].cached, Some(0.3));
+        };
+        let settings: Settings = tomlproc::serde::from_str(text).unwrap();
+        check(&settings);
+        // `/mcp add` and friends rewrite the whole file.
+        let rewritten = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        check(&tomlproc::serde::from_str(&rewritten).unwrap());
+        // And a file without these tables gains none of them.
+        let plain = tomlproc::serde::to_string_pretty(&Settings::default()).unwrap();
+        for table in ["provider", "models", "variant", "price"] {
+            assert!(!plain.contains(table), "{plain}");
+        }
     }
 
     #[test]

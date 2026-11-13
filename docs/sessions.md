@@ -147,7 +147,9 @@ boundary only ever falls on one of your messages, so a tool result is never
 cut from its call; if the tail holds none of your messages — one long turn —
 the boundary is the start of that turn, and the turn in progress is never
 summarized. The summary is written by the model in a dedicated, tools-free
-request that asks for fixed sections:
+request — to the main model unless `[models]` names another for `summary`
+or `small` (see [a model per role](configuration.md#models--a-model-per-role))
+— that asks for fixed sections:
 
 - **Goal** — what you want, with the constraints you set
 - **Decisions** — each one, and why

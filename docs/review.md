@@ -51,7 +51,10 @@ enabled = true
 model = "qwen3-coder:30b"
 ```
 
-`model` is optional; leave it unset to reuse the active model.
+`model` is optional; leave it unset to reuse the active model. It can name a
+model on another [provider](configuration.md#provider--named-endpoints)
+(`hosted/some-critic`), and `[models] review` sets the same thing alongside
+the other [roles](configuration.md#models--a-model-per-role).
 
 ## How notes appear
 

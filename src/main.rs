@@ -125,14 +125,16 @@ fn run() -> Result<u8> {
         Settings::default()
     });
 
-    // `[defaults] model` fills in when ATELIER_MODEL isn't set in the env.
-    // It names a model on the configured endpoint, so it doesn't apply to
-    // the Claude backend (where claude picks unless ATELIER_MODEL says).
-    if !claude
-        && std::env::var_os("ATELIER_MODEL").is_none()
-        && let Some(m) = &settings.defaults.model
-    {
-        cfg.model = m.clone();
+    // The model tables of `atelier.toml` — providers, a model per role
+    // (`[defaults] model` among them, when ATELIER_MODEL isn't set),
+    // variants — from the project's file over the user-global one. They
+    // describe endpoints atelier calls, so none applies to the Claude
+    // backend (where claude picks unless ATELIER_MODEL says). A user file
+    // that can't be read is reported with the permission rules it also
+    // holds.
+    let user_settings = Settings::load_user().unwrap_or_default();
+    for warning in cfg.apply_settings(&settings, &user_settings) {
+        eprintln!("warning: {warning}");
     }
 
     let mut tools = tools::builtin_registry();
