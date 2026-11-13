@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use super::Message;
 use super::ask::Outcome;
+use super::locks::Lock;
 
 pub struct Options {
     pub dir: PathBuf,
@@ -54,6 +55,15 @@ impl Client {
         bail!(UNSUPPORTED)
     }
     pub fn set_wake_depth(&self, _: u32) {}
+    pub fn lock_acquire(&self, _: &std::path::Path, _: &str) -> Result<Vec<Lock>> {
+        bail!(UNSUPPORTED)
+    }
+    pub fn lock_release(&self, _: Option<&std::path::Path>) -> Result<u64> {
+        bail!(UNSUPPORTED)
+    }
+    pub fn locks(&self) -> Vec<Lock> {
+        Vec::new()
+    }
     pub fn question_open(&self, _: &str) -> bool {
         false
     }

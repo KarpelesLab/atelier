@@ -635,6 +635,9 @@ fn dispatch_peers(session: &mut Session, cmd: &str, args: &[&str], ui: &mut dyn 
                 for l in coord::tools::render_instances(&list) {
                     ui.info(&format!("  {l}"));
                 }
+                for l in coord::tools::render_locks(&coord.locks()) {
+                    ui.info(&l);
+                }
             })
         }
         ("/send", [to, body]) if !body.is_empty() => coord.send(to, body).map(|n| {
@@ -2074,6 +2077,7 @@ impl Session {
                 hooks: &self.hooks,
                 trust: &self.trust,
                 parent: self.child.as_ref().map(|c| &c.link),
+                coord: self.coord.as_deref(),
             },
         )
     }
@@ -2323,6 +2327,9 @@ struct ToolRunner<'a> {
     trust: &'a Trust,
     /// In a subagent's session: the parent, which decides its calls.
     parent: Option<&'a subagent::Link>,
+    /// The link to the other instances, whose locks an edit is checked
+    /// against (see [`coord::locks`]).
+    coord: Option<&'a coord::Client>,
 }
 
 impl ToolRunner<'_> {
@@ -2435,13 +2442,23 @@ impl ToolRunner<'_> {
         if script::wants_tools(name, &args) {
             return self.run_script(args, ui);
         }
+        // An edit of a path another instance says it is working on goes
+        // ahead — locks are advice — but the model is told.
+        let locked = self
+            .coord
+            .and_then(|c| coord::locks::edit_note(c, name, &args, self.root));
         let mut ctx = ToolCtx {
             project_root: self.root,
             fstate: self.fstate,
             approved: true,
         };
         match tool.call_output(&mut ctx, args) {
-            Ok(out) => (out, true),
+            Ok(mut out) => {
+                if let Some(note) = locked {
+                    out.text.push_str(&note);
+                }
+                (out, true)
+            }
             Err(e) => (ToolOutput::text(format!("error: {e:#}")), false),
         }
     }
@@ -3049,6 +3066,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An edit of a path another instance holds a lock on is made all the
+    /// same, and its result says whose path it is.
+    #[cfg(unixlike)]
+    #[test]
+    fn an_edit_under_a_peers_lock_is_made_and_noted() {
+        let peers = Peers::start("locked-edit");
+        let (me, other) = (peers.join("me"), peers.join("other"));
+        let (mut session, root) = scratch_session("locked-edit");
+        session.attach_coordinator(std::sync::Arc::clone(&me));
+        let mut ui = Quiet::default();
+        let mut write = |session: &mut Session, path: &str| {
+            let args = serde_json::json!({"path": path, "content": "x"});
+            let (out, ok) = session.runner().exec("write", args, &mut ui);
+            assert!(ok, "{}", out.text);
+            out.text
+        };
+
+        // Nobody holds anything: the result is the tool's own.
+        assert!(!write(&mut session, "src/a.txt").contains("note:"));
+
+        assert!(
+            other
+                .lock_acquire(&root.join("src"), "moving files")
+                .unwrap()
+                .is_empty()
+        );
+        wait_for("the lock to be known", || !me.locks().is_empty());
+        let result = write(&mut session, "src/a.txt");
+        let note = format!(
+            "\nnote: other says it is working on {}: moving files",
+            root.join("src").display()
+        );
+        assert!(result.ends_with(&note), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.txt")).unwrap(),
+            "x"
+        );
+        // Outside the locked directory there is nothing to say.
+        assert!(!write(&mut session, "b.txt").contains("note:"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// By the time the user prompts, the asker may have given up: the
     /// question is then passed on as a message, with nothing to answer.
     #[cfg(unixlike)]
@@ -3132,6 +3191,7 @@ mod tests {
             hooks: &hooks,
             trust: &trust,
             parent: None,
+            coord: None,
         };
         let mut call = |name: &str, args: Value| {
             let (out, ok) = runner.exec(name, args, &mut StdoutUi::new());

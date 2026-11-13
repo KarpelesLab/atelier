@@ -12,8 +12,9 @@
 //!   coordinator however many instances race to start it.
 //! - **Restart.** When the coordinator ends — a crash, an update, a `kill` —
 //!   every instance notices the closed connection, and the first to retry
-//!   starts a new one; all of them reconnect under the same identity and
-//!   re-subscribe to their topics ([`client`]). The coordinator also ends
+//!   starts a new one; all of them reconnect under the same identity,
+//!   re-subscribe to their topics and announce the locks they hold again
+//!   ([`client`]). The coordinator also ends
 //!   itself when its executable is replaced on disk (a self-update, a
 //!   rebuild), when a newer atelier says hello, and when no instance has
 //!   been connected for a while ([`daemon`]).
@@ -34,6 +35,10 @@
 //! `call` method, `ask`, carries a question to another instance's *agent*
 //! and its answer back — the `peer_ask` and `peer_answer` tools ([`ask`]).
 //!
+//! The coordinator also keeps one table: the advisory locks, by which an
+//! instance says which paths it is working on ([`locks`], the `peer_lock`
+//! tool).
+//!
 //! An idle instance holds what it receives for its user's next prompt,
 //! unless it is set to wake ([`Wake`]; the rules are in `agent::idle`). For
 //! that, every `send`, `publish` and `ask` carries a `wake_depth` — how many
@@ -51,6 +56,7 @@ pub mod client;
 pub mod client;
 #[cfg(unixlike)]
 pub mod daemon;
+pub mod locks;
 #[cfg(all(test, unixlike))]
 mod tests;
 pub mod tools;
@@ -65,7 +71,13 @@ pub use client::Client;
 
 /// Wire protocol revision. A coordinator only serves instances that speak
 /// its revision; one that meets a newer atelier steps down for it.
-pub const PROTO: u64 = 1;
+///
+/// 2: deferred `call` answers up to 30 minutes with error codes for a
+/// timeout and a vanished target, `wake_depth` on what is sent, and the
+/// lock table (`lock`, `unlock`, `locks`, and `locks` in `hello`). An
+/// instance built with these must not be served by a coordinator without
+/// them, which would answer `lock` with "method not found".
+pub const PROTO: u64 = 2;
 /// Set (to anything but `0`) to run without the coordinator.
 pub const ENV_DISABLE: &str = "ATELIER_NO_COORDINATOR";
 /// Overrides the directory holding the socket, lock and log.

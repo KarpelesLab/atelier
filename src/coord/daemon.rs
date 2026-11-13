@@ -4,7 +4,8 @@
 //! (which also handles its requests) and a writer thread fed by a channel,
 //! so routing never blocks on a slow peer. All routing state sits behind a
 //! single mutex and is lost when the daemon ends — instances bring it back
-//! when they reconnect (identity, topic subscriptions).
+//! when they reconnect (identity, topic subscriptions, the advisory locks
+//! they hold — see [`super::locks`]).
 //!
 //! The daemon ends on its own when:
 //! - an instance newer than it says hello (`superseded`): the instance then
@@ -101,6 +102,16 @@ impl Peer {
     }
 }
 
+/// An advisory lock (see [`super::locks`]).
+struct Held {
+    /// The holder's connection.
+    conn: u64,
+    path: PathBuf,
+    note: String,
+    /// Unix seconds when it was first acquired.
+    since: u64,
+}
+
 /// A `call` forwarded to its target, awaiting the answer.
 struct Call {
     caller: u64,
@@ -117,6 +128,8 @@ struct State {
     peers: HashMap<u64, Peer>,
     calls: HashMap<u64, Call>,
     next_call: u64,
+    /// The advisory locks, oldest first.
+    locks: Vec<Held>,
     /// When the last instance left (or the daemon started).
     last_active: Option<Instant>,
     /// Why the daemon is ending, once it is.
@@ -135,6 +148,13 @@ impl State {
     fn drop_conn(&mut self, conn: u64) {
         if let Some(tx) = self.conns.remove(&conn) {
             let _ = tx.send(Out::Close);
+        }
+        // Its locks go with it — while its name is still known, for the
+        // entries of the table the others are sent.
+        let held = self.locks.len();
+        self.locks.retain(|l| l.conn != conn);
+        if self.locks.len() != held {
+            self.announce_locks(Some(conn));
         }
         if let Some(peer) = self.peers.remove(&conn) {
             self.last_active = Some(Instant::now());
@@ -160,6 +180,32 @@ impl State {
             .iter()
             .find(|(_, p)| p.name == to || p.id == to)
             .map(|(c, _)| *c)
+    }
+
+    /// One lock as instances are told of it.
+    fn lock_entry(&self, l: &Held) -> Value {
+        let holder = self.peers.get(&l.conn);
+        json!({
+            "holder": holder.map(|p| p.name.as_str()),
+            "holder_id": holder.map(|p| p.id.as_str()),
+            "path": l.path.to_string_lossy(),
+            "note": l.note,
+            "since": l.since,
+        })
+    }
+
+    /// The whole lock table.
+    fn lock_table(&self) -> Value {
+        self.locks.iter().map(|l| self.lock_entry(l)).collect()
+    }
+
+    /// Tell every instance (but `except`) that the lock table changed: each
+    /// keeps a copy, so that checking it costs no request.
+    fn announce_locks(&self, except: Option<u64>) {
+        let line = notification("locks", json!({ "locks": self.lock_table() }));
+        for conn in self.peers.keys().filter(|c| Some(**c) != except) {
+            self.send(*conn, line.clone());
+        }
     }
 
     /// `wanted`, or `wanted-2`, `wanted-3`, … if other instances hold it.
@@ -528,6 +574,59 @@ impl Daemon {
                     .count();
                 Reply::Now(Ok(json!({ "delivered": delivered })))
             }
+            "lock" => {
+                let Some(path) = text("path").map(PathBuf::from).filter(|p| p.is_absolute()) else {
+                    return fail("lock: 'path' must be an absolute path");
+                };
+                // Advisory: somebody else's lock on the path, around it or
+                // inside it is reported, and that is all that happens.
+                let theirs: Vec<Value> = st
+                    .locks
+                    .iter()
+                    .filter(|l| l.conn != conn && super::locks::overlaps(&l.path, &path))
+                    .map(|l| st.lock_entry(l))
+                    .collect();
+                if !theirs.is_empty() {
+                    return Reply::Now(Ok(json!({ "acquired": false, "held_by": theirs })));
+                }
+                let note = p["note"].as_str().unwrap_or_default().to_string();
+                let since = match st
+                    .locks
+                    .iter_mut()
+                    .find(|l| l.conn == conn && l.path == path)
+                {
+                    // Acquired again: a new note for the same lock.
+                    Some(mine) => {
+                        mine.note = note;
+                        mine.since
+                    }
+                    None => {
+                        let since = now();
+                        st.locks.push(Held {
+                            conn,
+                            path,
+                            note,
+                            since,
+                        });
+                        since
+                    }
+                };
+                st.announce_locks(None);
+                Reply::Now(Ok(json!({ "acquired": true, "since": since })))
+            }
+            "unlock" => {
+                // One path, or with none, everything the caller holds.
+                let path = text("path").map(PathBuf::from);
+                let held = st.locks.len();
+                st.locks
+                    .retain(|l| l.conn != conn || path.as_ref().is_some_and(|p| *p != l.path));
+                let released = held - st.locks.len();
+                if released > 0 {
+                    st.announce_locks(None);
+                }
+                Reply::Now(Ok(json!({ "released": released })))
+            }
+            "locks" => Reply::Now(Ok(json!({ "locks": st.lock_table() }))),
             "call" => {
                 let (Some(to), Some(inner)) = (text("to"), text("method")) else {
                     return fail("call: 'to' and 'method' are required");
@@ -633,10 +732,32 @@ fn hello(st: &mut State, conn: u64, p: &Value) -> Reply {
             since: now(),
         },
     );
+    // The locks it held under the coordinator before this one. They were
+    // granted then, so they are taken as they are: should another instance
+    // have got in first with an overlapping one, both stand — the table is
+    // advice, and each of the two can see the other.
+    let before = st.locks.len();
+    for l in p["locks"].as_array().into_iter().flatten() {
+        let Some(path) = l["path"].as_str().map(PathBuf::from) else {
+            continue;
+        };
+        if path.is_absolute() && !st.locks.iter().any(|h| h.conn == conn && h.path == path) {
+            st.locks.push(Held {
+                conn,
+                path,
+                note: l["note"].as_str().unwrap_or_default().to_string(),
+                since: l["since"].as_u64().unwrap_or_else(now),
+            });
+        }
+    }
+    if st.locks.len() != before {
+        st.announce_locks(Some(conn));
+    }
     Reply::Now(Ok(json!({
         "id": id,
         "name": name,
         "coordinator": { "version": VERSION, "pid": std::process::id(), "proto": PROTO },
+        "locks": st.lock_table(),
     })))
 }
 

@@ -1,7 +1,9 @@
 //! The coordinator, as the agent sees it: `peers` (who else is running,
 //! and which topics to listen to), `peer_send` (talk to them), and
 //! `peer_ask` / `peer_answer` (put a question to another agent and wait for
-//! its answer; answer one that was put to this agent — see [`super::ask`]).
+//! its answer; answer one that was put to this agent — see [`super::ask`]),
+//! and `peer_lock` (say which paths this agent is working on — see
+//! [`super::locks`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::Client;
 use super::ask::{self, Outcome};
+use super::locks::{self, Lock};
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolCtx, ToolRegistry};
 
@@ -20,6 +23,18 @@ pub fn register(registry: &mut ToolRegistry, client: &Arc<Client>) {
     registry.register(Box::new(PeerSend(Arc::clone(client))));
     registry.register(Box::new(PeerAsk(Arc::clone(client))));
     registry.register(Box::new(PeerAnswer(Arc::clone(client))));
+    registry.register(Box::new(PeerLock(Arc::clone(client))));
+}
+
+/// The lock table as lines of text, under a heading; nothing when it is
+/// empty.
+pub fn render_locks(locks: &[Lock]) -> Vec<String> {
+    if locks.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["paths being worked on (advisory locks):".to_string()];
+    lines.extend(locks.iter().map(|l| format!("  {}", l.describe())));
+    lines
 }
 
 /// A `list` answer as lines of text: one per instance, this one marked.
@@ -70,7 +85,8 @@ impl Tool for Peers {
             name: "peers".into(),
             description: "List the other atelier instances (AI coding agents like you) running \
                           on this machine: their name, whether they are idle or working, their \
-                          model and the directory they work in. Optionally subscribe to or \
+                          model and the directory they work in, and the paths any of them \
+                          says it is working on (see peer_lock). Optionally subscribe to or \
                           unsubscribe from topics; messages published to a topic you subscribe \
                           to are delivered to you. Use peer_send to talk to an instance."
                 .into(),
@@ -105,7 +121,9 @@ impl Tool for Peers {
                 }
             }
         }
-        Ok(render_instances(&self.0.list()?).join("\n"))
+        let mut lines = render_instances(&self.0.list()?);
+        lines.extend(render_locks(&self.0.locks()));
+        Ok(lines.join("\n"))
     }
 }
 
@@ -257,5 +275,95 @@ impl Tool for PeerAnswer {
         };
         let from = self.0.answer_question(id, answer)?;
         Ok(format!("answer sent to {from}"))
+    }
+}
+
+struct PeerLock(Arc<Client>);
+
+impl Tool for PeerLock {
+    fn name(&self) -> &str {
+        "peer_lock"
+    }
+
+    // Tells the user's other instances what this one is doing; nothing of
+    // the user's changes, and nothing is prevented by it.
+    fn mutates(&self, _args: &Value) -> bool {
+        false
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "peer_lock".into(),
+            description: "Tell the other atelier instances on this machine which path you are \
+                          working on, so that two agents do not edit the same files unawares. \
+                          action 'acquire' announces a path (a file, or a directory and all \
+                          under it) with a short note on what you are doing there; if another \
+                          instance already holds it, or something inside or around it, you are \
+                          told who, since when and why instead — decide then whether to wait, \
+                          ask it (peer_ask) or work elsewhere. 'release' gives a path back (all \
+                          of yours without 'path'); do it when you are done. 'list' shows every \
+                          lock. Locks are advisory: nothing is blocked, and your locks end when \
+                          this instance exits. Worth it for work that spans several steps in a \
+                          checkout other instances share; not for a single edit."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["acquire", "release", "list"] },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory; relative to the project root, or \
+                                        absolute."
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "With acquire: what you are doing there."
+                    }
+                },
+                "required": ["action"]
+            }),
+        }
+    }
+
+    // Reaches only the user's own instances, and only with a notice.
+    fn requires_approval(&self, _args: &Value) -> bool {
+        false
+    }
+
+    fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
+        let path = args["path"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(|p| locks::normalized(ctx.project_root, p));
+        match (args["action"].as_str(), path) {
+            (Some("acquire"), Some(path)) => {
+                let note = args["note"].as_str().unwrap_or_default();
+                let theirs = self.0.lock_acquire(&path, note)?;
+                if theirs.is_empty() {
+                    return Ok(format!("locked {}", path.display()));
+                }
+                let mut lines = vec![format!(
+                    "not acquired — {} is being worked on by another instance:",
+                    path.display()
+                )];
+                lines.extend(theirs.iter().map(|l| format!("  {}", l.describe())));
+                Ok(lines.join("\n"))
+            }
+            (Some("acquire"), None) => bail!("acquire needs a 'path'"),
+            (Some("release"), path) => Ok(match (self.0.lock_release(path.as_deref())?, path) {
+                (0, Some(path)) => format!("you hold no lock on {}", path.display()),
+                (0, None) => "you hold no locks".to_string(),
+                (n, _) => format!("released {n} lock(s)"),
+            }),
+            (Some("list"), _) => {
+                let lines = render_locks(&self.0.locks());
+                Ok(if lines.is_empty() {
+                    "no locks".to_string()
+                } else {
+                    lines.join("\n")
+                })
+            }
+            _ => bail!("'action' must be acquire, release or list"),
+        }
     }
 }

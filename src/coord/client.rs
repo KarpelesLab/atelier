@@ -4,8 +4,8 @@
 //! starting a coordinator when none answers, says hello, and then reads
 //! what the coordinator sends. Whenever the connection ends — for any
 //! reason — the thread goes back to connecting, for as long as the process
-//! lives, and presents the same identity (id, name, topic subscriptions)
-//! to whichever coordinator it finds next. Requests made while
+//! lives, and presents the same identity (id, name, topic subscriptions,
+//! the advisory locks it holds) to whichever coordinator it finds next. Requests made while
 //! disconnected wait briefly for the link to come back, then fail with an
 //! error saying why it is down.
 //!
@@ -31,6 +31,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use super::ask::{self, Desk, Outcome};
+use super::locks::{self, Lock};
 use super::{ENV_DIR, ERR_GONE, ERR_INCOMPATIBLE, ERR_TIMEOUT, Message, PROTO, socket_path};
 use crate::update::VERSION;
 
@@ -176,6 +177,10 @@ struct Shared {
     asking: Mutex<Vec<String>>,
     /// What goes out as `wake_depth` (see [`Client::set_wake_depth`]).
     wake_depth: AtomicU32,
+    /// The lock table as the coordinator last described it (see [`locks`]).
+    locks: Mutex<Vec<Lock>>,
+    /// The locks this instance holds, announced again to each coordinator.
+    held: Mutex<Vec<Lock>>,
     stop: AtomicBool,
 }
 
@@ -213,6 +218,8 @@ impl Client {
             desk: Mutex::new(Desk::default()),
             asking: Mutex::new(Vec::new()),
             wake_depth: AtomicU32::new(0),
+            locks: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
         });
         let client = Arc::new(Self {
@@ -359,6 +366,42 @@ impl Client {
                 _ => Err(e),
             },
         }
+    }
+
+    /// Announce that this instance is working on `path` (absolute and
+    /// normalized; a directory covers what is under it). Returns the locks
+    /// of other instances that stand in the way — none when it is acquired.
+    /// Acquiring a path already held replaces its note.
+    pub fn lock_acquire(&self, path: &Path, note: &str) -> Result<Vec<Lock>> {
+        let params = json!({ "path": path.to_string_lossy(), "note": note });
+        let r = self.request("lock", params, REQUEST_TIMEOUT)?;
+        if r["acquired"] != true {
+            return Ok(locks::parse(&r["held_by"], &self.sh.id));
+        }
+        let mut held = lock(&self.sh.held);
+        held.retain(|l| l.path != path);
+        held.push(Lock {
+            holder: self.name(),
+            path: path.to_path_buf(),
+            note: note.to_string(),
+            since: r["since"].as_u64().unwrap_or(0),
+            yours: true,
+        });
+        Ok(Vec::new())
+    }
+
+    /// Give up this instance's lock on `path`, or all of its locks with
+    /// `None`. Returns how many were released.
+    pub fn lock_release(&self, path: Option<&Path>) -> Result<u64> {
+        let params = json!({ "path": path.map(|p| p.to_string_lossy()) });
+        let r = self.request("unlock", params, REQUEST_TIMEOUT)?;
+        lock(&self.sh.held).retain(|l| path.is_some_and(|p| p != l.path));
+        Ok(r["released"].as_u64().unwrap_or(0))
+    }
+
+    /// The lock table, from this instance's copy of it: no request is made.
+    pub fn locks(&self) -> Vec<Lock> {
+        lock(&self.sh.locks).clone()
     }
 
     /// Say how far what this instance sends from now on is from a prompt a
@@ -524,6 +567,9 @@ impl Shared {
             delay = match self.session() {
                 Ok(Ended::Lost) => {
                     self.set_down("connection lost; reconnecting");
+                    // What the others hold is unknown until a coordinator
+                    // says; what this instance holds, it still holds.
+                    *lock(&self.locks) = lock(&self.held).clone();
                     RETRY_MIN
                 }
                 Ok(Ended::Refused(why)) => {
@@ -558,6 +604,10 @@ impl Shared {
         let mut hello = self.describe();
         hello["proto"] = PROTO.into();
         hello["topics"] = json!(*lock(&self.topics));
+        hello["locks"] = lock(&self.held)
+            .iter()
+            .map(|l| locks::held_value(&l.path, &l.note, l.since))
+            .collect();
         let mut out = stream.try_clone()?;
         let line = json!({ "jsonrpc": "2.0", "id": 0, "method": "hello", "params": hello });
         out.write_all(format!("{line}\n").as_bytes())?;
@@ -579,6 +629,7 @@ impl Shared {
         if let Some(name) = answer["result"]["name"].as_str() {
             lock(&self.me).name = name.to_string();
         }
+        *lock(&self.locks) = locks::parse(&answer["result"]["locks"], &self.id);
         {
             let mut link = lock(&self.link);
             link.coordinator = answer["result"]["coordinator"]["version"]
@@ -710,6 +761,10 @@ impl Shared {
                         let _ = call.reply.answer(Err(why));
                     }
                 }
+            }
+            // The lock table changed: here it is, whole.
+            (Some("locks"), _) => {
+                *lock(&self.locks) = locks::parse(&params["locks"], &self.id);
             }
             // `shutdown` and anything newer: the closed connection says it all.
             _ => {}

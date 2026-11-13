@@ -11,7 +11,7 @@ can end at any time and be replaced:
 
 - **It ended** (crashed, was killed): every instance notices, the first one
   to retry starts a new coordinator, and they all rejoin it under the same
-  names, with the same topic subscriptions. This takes a fraction of a
+  names, with the same topic subscriptions and locks. This takes a fraction of a
   second and needs nothing from you.
 - **atelier was updated**: the coordinator ends by itself when its
   executable is replaced on disk (a self-update, a rebuild), and when a
@@ -85,6 +85,39 @@ an agent should give `timeout_secs` when a short wait is all the question is
 worth. An idle instance does not answer by itself — the question waits for
 its user's next prompt, like any message — unless it is set to
 [wake](#waking-an-idle-instance) for questions.
+
+## Saying what you are working on
+
+Two agents in one checkout will sooner or later edit the same file. With
+the `peer_lock` tool an agent announces the path it is working on — a file,
+or a directory and everything under it — with a note:
+
+```
+peer_lock {action: "acquire", path: "src/api", note: "renaming the handlers"}
+```
+
+- Another agent that tries to acquire `src/api`, something inside it
+  (`src/api/mod.rs`) or something around it (`src`) is not granted the
+  lock: it is told who holds what, for how long, and the note, and decides
+  for itself — wait, `peer_ask` the holder, or work elsewhere.
+- Another agent that **edits** a path under the lock (`write`, `edit`,
+  `multiedit`, `apply_patch`, `notebook_edit`) still makes the edit, and
+  finds one more line in the tool's result:
+  `note: api says it is working on /home/you/proj/src/api: renaming the handlers`.
+- `peers` (the tool and the `/peers` command) lists the locks under the
+  instances; `peer_lock {action: "list"}` lists only them.
+- `peer_lock {action: "release", path: …}` gives a path back; without a
+  path, all of the instance's.
+
+Locks are **advisory**. Nothing is refused or delayed because of one, and
+atelier never takes one by itself: an agent locks a path because it (or
+you, in your instructions to it) judged the work worth announcing. They are
+not kept anywhere either. A lock ends when its holder releases it or exits;
+if the coordinator restarts, each instance announces what it holds to the
+new one, so the table comes back as it was.
+
+Subagents (the `task` tool) edit without the note: only the instance's own
+conversation is checked against the table.
 
 ## Waking an idle instance
 
@@ -166,8 +199,8 @@ coordinator no matter how many instances try to start one at once.
 
 Instances and coordinator exchange JSON-RPC 2.0, one message per line.
 An instance opens with `hello` (its id, the name it would like, pid,
-directory, model, protocol revision, topics); the coordinator answers with
-the name it gets. After that:
+directory, model, protocol revision, topics, the locks it holds); the
+coordinator answers with the name it gets. After that:
 
 | Request | Does |
 |---|---|
@@ -177,6 +210,9 @@ the name it gets. After that:
 | `subscribe {topic}`, `unsubscribe {topic}` | Topic membership |
 | `publish {topic, body, wake_depth?}` | Deliver `body` to the topic's subscribers |
 | `call {to, method, params, timeout_ms}` | Ask another instance to run `method` and return its answer |
+| `lock {path, note}` | Announce work on `path` (absolute). `{acquired: true, since}`, or `{acquired: false, held_by: […]}` when another instance holds the path, one containing it, or one inside it |
+| `unlock {path?}` | Release the caller's lock on `path`, or all its locks. `{released: n}` |
+| `locks` | The lock table: `{locks: [{holder, holder_id, path, note, since}]}` |
 | `status`, `shutdown` | About the coordinator itself; allowed without `hello` |
 
 Deliveries arrive as a `message` notification (`from`, `body`, `topic` or
@@ -187,6 +223,15 @@ disconnects (error `-32004`) or takes longer than `timeout_ms` (error
 `-32003`; 30 s by default, 30 minutes at most). Instances answer `ping`,
 `info` and `ask` — `call` is the extension point for richer
 instance-to-instance requests (`Client::handle` in `src/coord/client.rs`).
+
+The lock table is the one thing the coordinator keeps, and it keeps it in
+memory. Whenever it changes — an acquire, a release, a holder
+disconnecting — every instance is sent the whole table in a `locks`
+notification and keeps that copy, so looking a path up (which every edit
+does) costs no request. An instance's `hello` lists the locks it holds
+(`locks: [{path, note, since}]`), which is how the table survives a
+coordinator restart, and the answer to `hello` carries the table as it then
+stands (`src/coord/locks.rs`).
 
 The answer to a `call` need not be ready when its handler returns. Handlers
 run on the thread that reads the connection and must not hold it up, so one
@@ -206,5 +251,5 @@ one nobody waits for (`src/coord/ask.rs`).
 
 The code is in `src/coord/`: `daemon.rs` (the coordinator), `client.rs`
 (an instance's connection, reconnection and launch of the coordinator),
-`ask.rs` (questions awaiting this instance's agent), `tools.rs` (the
-agent's tools).
+`ask.rs` (questions awaiting this instance's agent), `locks.rs` (the
+advisory locks), `tools.rs` (the agent's tools).

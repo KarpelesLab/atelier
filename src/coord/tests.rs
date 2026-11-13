@@ -483,6 +483,262 @@ fn the_ask_tools_are_gated_like_what_they_do() {
     client::control(&dir.0, "shutdown").unwrap();
 }
 
+/// `(holder, path, note, yours)` of each lock `c` knows of, sorted.
+fn locks_of(c: &Client) -> Vec<(String, String, String, bool)> {
+    let mut all: Vec<_> = c
+        .locks()
+        .into_iter()
+        .map(|l| (l.holder, l.path.display().to_string(), l.note, l.yours))
+        .collect();
+    all.sort();
+    all
+}
+
+#[test]
+fn locks_say_who_works_where_and_leave_with_their_holder() {
+    let dir = Dir::new("locks");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let src = Path::new("/w/proj/src");
+    let entry = |yours| {
+        vec![(
+            "a".to_string(),
+            "/w/proj/src".to_string(),
+            "renaming".to_string(),
+            yours,
+        )]
+    };
+
+    // Acquired: the holder's copy of the table is current at once, the
+    // others' as soon as the coordinator's notice reaches them.
+    assert!(a.lock_acquire(src, "renaming").unwrap().is_empty());
+    assert_eq!(locks_of(&a), entry(true));
+    wait_for("b to hear of it", || !b.locks().is_empty());
+    assert_eq!(locks_of(&b), entry(false));
+    let since = a.locks()[0].since;
+    assert!(since > 0);
+
+    // Somebody else's lock on the path, around it, or inside it: not
+    // granted, and the answer says whose it is.
+    for path in ["/w/proj/src", "/w/proj/src/main.rs", "/w/proj", "/"] {
+        let held = b.lock_acquire(Path::new(path), "me too").unwrap();
+        assert_eq!(held.len(), 1, "{path}");
+        let l = &held[0];
+        assert_eq!(
+            (
+                l.holder.as_str(),
+                l.path.as_path(),
+                l.note.as_str(),
+                l.since,
+                l.yours
+            ),
+            ("a", src, "renaming", since, false),
+            "{path}"
+        );
+    }
+    assert_eq!(locks_of(&b), entry(false));
+    // Elsewhere is free, a sibling whose name merely starts the same too.
+    assert!(
+        b.lock_acquire(Path::new("/w/proj/docs"), "")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        b.lock_acquire(Path::new("/w/proj/src2"), "")
+            .unwrap()
+            .is_empty()
+    );
+    // A path the coordinator cannot place is refused outright.
+    assert!(b.lock_acquire(Path::new("src"), "").is_err());
+
+    // Acquiring one's own lock again changes its note, not its age.
+    assert!(a.lock_acquire(src, "nearly done").unwrap().is_empty());
+    let mine: Vec<_> = a.locks().into_iter().filter(|l| l.yours).collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(
+        (mine[0].note.as_str(), mine[0].since),
+        ("nearly done", since)
+    );
+
+    // Released: by path (once), or all at once.
+    assert_eq!(a.lock_release(Some(src)).unwrap(), 1);
+    assert_eq!(a.lock_release(Some(src)).unwrap(), 0);
+    assert!(b.lock_acquire(&src.join("main.rs"), "").unwrap().is_empty());
+    assert_eq!(a.lock_acquire(src, "").unwrap().len(), 1);
+    assert_eq!(b.lock_release(None).unwrap(), 3);
+    assert!(b.locks().is_empty());
+    wait_for("a to hear of it", || a.locks().is_empty());
+
+    // A holder that leaves takes its locks with it.
+    assert!(a.lock_acquire(src, "renaming").unwrap().is_empty());
+    wait_for("b to hear of it", || !b.locks().is_empty());
+    a.stop();
+    wait_for("a's lock to go", || b.locks().is_empty());
+    assert!(b.lock_acquire(src, "").unwrap().is_empty());
+    client::control(&dir.0, "shutdown").unwrap();
+}
+
+#[test]
+fn held_locks_are_announced_again_to_a_new_coordinator() {
+    let dir = Dir::new("relock");
+    let first = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    assert!(a.lock_acquire(Path::new("/w/a"), "a's").unwrap().is_empty());
+    assert!(b.lock_acquire(Path::new("/w/b"), "b's").unwrap().is_empty());
+    wait_for("both tables", || {
+        a.locks().len() == 2 && b.locks().len() == 2
+    });
+    let before = locks_of(&a);
+    let since: Vec<u64> = a.locks().iter().map(|l| l.since).collect();
+
+    // The coordinator goes, and its table with it: each instance is left
+    // with what it holds itself.
+    client::control(&dir.0, "shutdown").unwrap();
+    first.join().unwrap();
+    wait_for("a to be on its own", || a.locks().len() == 1);
+    assert_eq!(
+        locks_of(&a),
+        [("a".into(), "/w/a".into(), "a's".into(), true)]
+    );
+
+    // A new one is told by each instance what it holds: the table is back,
+    // ages included, and it still stands in the way.
+    let second = spawn_daemon(&dir.0, Duration::from_secs(60));
+    wait_for("the table to be whole again", || {
+        a.locks().len() == 2 && b.locks().len() == 2
+    });
+    assert_eq!(locks_of(&a), before);
+    let mut again: Vec<u64> = a.locks().iter().map(|l| l.since).collect();
+    again.sort();
+    let mut since = since;
+    since.sort();
+    assert_eq!(again, since);
+    let held = a.lock_acquire(Path::new("/w/b/file"), "").unwrap();
+    assert_eq!((held.len(), held[0].holder.as_str()), (1, "b"));
+    // …and a release reaches the new coordinator.
+    assert_eq!(b.lock_release(None).unwrap(), 1);
+    wait_for("a to hear of it", || a.locks().len() == 1);
+
+    client::control(&dir.0, "shutdown").unwrap();
+    second.join().unwrap();
+}
+
+#[test]
+fn the_lock_tool_announces_and_the_edit_note_warns() {
+    use crate::tools::{FileState, ToolCtx, ToolRegistry};
+    let dir = Dir::new("locktool");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let (a, b) = (client(&dir.0, "a"), client(&dir.0, "b"));
+    wait_for("both linked", || a.list().is_ok() && b.list().is_ok());
+    let root = Path::new("/w/proj");
+    let (mut for_a, mut for_b) = (ToolRegistry::new(), ToolRegistry::new());
+    super::tools::register(&mut for_a, &a);
+    super::tools::register(&mut for_b, &b);
+    let call = |tools: &ToolRegistry, name: &str, args: Value| {
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+            approved: true,
+        };
+        tools.get(name).unwrap().call(&mut ctx, args).unwrap()
+    };
+    // It only tells the user's other instances something: no prompt, and
+    // fine in plan mode.
+    let tool = for_a.get("peer_lock").unwrap();
+    assert!(!tool.requires_approval(&json!({})) && !tool.mutates(&json!({})));
+
+    assert_eq!(
+        call(&for_a, "peer_lock", json!({"action": "list"})),
+        "no locks"
+    );
+    // A relative path is the project's; `.`/`..` are resolved.
+    let got = call(
+        &for_a,
+        "peer_lock",
+        json!({"action": "acquire", "path": "src/./api/../api", "note": "new routes"}),
+    );
+    assert_eq!(got, "locked /w/proj/src/api");
+    wait_for("b to hear of it", || !b.locks().is_empty());
+
+    let refused = call(
+        &for_b,
+        "peer_lock",
+        json!({"action": "acquire", "path": "/w/proj/src/api/mod.rs"}),
+    );
+    assert!(
+        refused.starts_with("not acquired — /w/proj/src/api/mod.rs is being worked on")
+            && refused.contains("\n  /w/proj/src/api — a, for ")
+            && refused.ends_with(": new routes"),
+        "{refused}"
+    );
+    let listed = call(&for_b, "peers", json!({}));
+    assert!(
+        listed.contains("paths being worked on (advisory locks):\n  /w/proj/src/api — a, for "),
+        "{listed}"
+    );
+    assert!(call(&for_a, "peer_lock", json!({"action": "list"})).contains("a (you)"));
+
+    // What an edit by b is told, and when.
+    let note = |tool: &str, args: Value| super::locks::edit_note(&b, tool, &args, root);
+    assert_eq!(
+        note("edit", json!({"path": "src/api/mod.rs"})).as_deref(),
+        Some("\nnote: a says it is working on /w/proj/src/api: new routes")
+    );
+    let patch = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n\
+                 --- a/src/api/mod.rs\n+++ b/src/api/mod.rs\n@@ -1 +1 @@\n-a\n+b\n";
+    assert!(note("apply_patch", json!({"patch": patch})).is_some());
+    assert_eq!(
+        note("write", json!({"path": "src/main.rs", "content": ""})),
+        None
+    );
+    // Reading is nobody's business, and one's own lock is no news.
+    assert_eq!(note("read", json!({"path": "src/api/mod.rs"})), None);
+    assert_eq!(
+        super::locks::edit_note(&a, "edit", &json!({"path": "src/api/mod.rs"}), root),
+        None
+    );
+    // A lock on the very file edited is "this path".
+    call(&for_a, "peer_lock", json!({"action": "release"}));
+    call(
+        &for_a,
+        "peer_lock",
+        json!({"action": "acquire", "path": "Cargo.toml"}),
+    );
+    wait_for("b to hear of it", || {
+        b.locks().iter().any(|l| l.path.ends_with("Cargo.toml"))
+    });
+    assert_eq!(
+        note("write", json!({"path": "Cargo.toml", "content": ""})).as_deref(),
+        Some("\nnote: a says it is working on this path")
+    );
+
+    assert_eq!(
+        call(
+            &for_a,
+            "peer_lock",
+            json!({"action": "release", "path": "Cargo.toml"})
+        ),
+        "released 1 lock(s)"
+    );
+    assert_eq!(
+        call(
+            &for_a,
+            "peer_lock",
+            json!({"action": "release", "path": "Cargo.toml"})
+        ),
+        "you hold no lock on /w/proj/Cargo.toml"
+    );
+    wait_for("b to hear of it", || b.locks().is_empty());
+    assert_eq!(
+        note("write", json!({"path": "Cargo.toml", "content": ""})),
+        None
+    );
+    client::control(&dir.0, "shutdown").unwrap();
+}
+
 /// One raw JSON-RPC exchange.
 fn raw(dir: &Path, request: Value) -> Value {
     let mut s = super::connect(dir).unwrap();

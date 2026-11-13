@@ -34,6 +34,7 @@ the model verbatim as the tool result.
 | `peer_send` | **required** | no (reaches other instances) |
 | `peer_ask`  | **required** | no (sets another instance's agent to work) |
 | `peer_answer` | auto (answers a question already admitted) | n/a |
+| `peer_lock` | auto (a notice to your own instances) | n/a |
 
 "Confined" tools resolve every path with `ToolCtx::resolve` /
 `tools::confine`: a relative path is joined against the project root, `.`/`..`
@@ -595,7 +596,9 @@ has subagents of its own.
 Present when the instance is connected to the [coordinator](coordinator.md).
 
 `peers` lists the atelier instances running on this machine (name, idle or
-working, model, directory, topics), after applying any subscription changes.
+working, model, directory, topics), after applying any subscription changes,
+and below them the paths any instance has announced it is working on (see
+[`peer_lock`](#peer_lock)).
 
 | Param         | Type            | Required | Meaning |
 |---------------|-----------------|----------|---------|
@@ -637,3 +640,20 @@ unanswered.
 |----------|--------|----------|---------|
 | `id`     | string | yes      | The question's id |
 | `answer` | string | yes      | The answer |
+
+## `peer_lock`
+
+Advisory locks between instances — see [Saying what you are working
+on](coordinator.md#saying-what-you-are-working-on). `acquire` announces a
+path with a note, and is answered with the holder's entry instead when
+another instance holds the path, a directory containing it, or something
+inside it. `release` gives it back, `list` shows the table. Nothing is
+blocked by a lock; an edit tool that touches a path another instance holds
+gets `note: <peer> says it is working on this path: <note>` appended to its
+result.
+
+| Param    | Type   | Required | Meaning |
+|----------|--------|----------|---------|
+| `action` | string | yes      | `acquire`, `release` or `list` |
+| `path`   | string | for `acquire` | A file or directory, relative to the project root or absolute. With `release`, omitted means every lock this instance holds |
+| `note`   | string | no       | With `acquire`: what is being done there |
