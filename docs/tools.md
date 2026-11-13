@@ -21,6 +21,7 @@ model verbatim as the tool result.
 | `bash`      | **required** | no (arbitrary shell) |
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
 | `web_fetch` | **required** | no (network) |
+| `web_search` | **required** | no (network) |
 | `node`      | auto, unless `network: true` (then required) | fs yes; network no |
 | `peers`     | auto     | n/a (lists your atelier instances) |
 | `peer_send` | **required** | no (reaches other instances) |
@@ -244,6 +245,37 @@ Returns a `HTTP <status> <reason>` line then the body. **HTML is converted to
 readable text** — scripts, styles and markup dropped, headings as `#` lines,
 list items as `- `, links as `[text](url)`, entities decoded. A longer result
 says `[characters A-B of N]` and ends with how to fetch the next page.
+
+## `web_search`
+
+Search the web and return a numbered list of results. **Requires approval**
+(network access, unconfined — the query leaves the machine).
+
+| Param         | Type     | Required | Meaning |
+|---------------|----------|----------|---------|
+| `query`       | string   | yes      | What to search for |
+| `max_results` | integer  | no       | How many results (default 8, at most 20) |
+| `domains`     | string[] | no       | Only return results from these domains, subdomains included (e.g. `["docs.rs"]`) |
+
+Each result is its title, its URL and a snippet of at most 300 characters:
+
+```
+1. References and Borrowing - The Rust Programming Language
+   https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html
+   The rules of references: at any given time, you can have either one…
+```
+
+Nothing found is `no results for "<query>"`. Read a result with `web_fetch`.
+
+The search goes to the provider set by `ATELIER_SEARCH_PROVIDER` or the
+`[search]` table of `atelier.toml` — `searxng`, `brave`, `tavily`, or
+`duckduckgo` — see [Configuration](configuration.md#search). The default,
+with nothing configured, is DuckDuckGo's HTML results page, which needs no
+key but may refuse automated clients; when the page it returns isn't a
+results page the call fails with an error saying to configure a provider,
+rather than returning made-up or empty results. A failure reads
+`<provider> search failed: <reason>` on one line (host unreachable, HTTP
+status, unexpected response); the API key is never part of it.
 
 ## `notebook_edit`
 

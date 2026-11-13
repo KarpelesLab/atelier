@@ -42,6 +42,27 @@ pub struct Settings {
     /// diagnostics. Empty means "auto-detect from the project's files".
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticCheck>,
+    /// Which provider the `web_search` tool queries.
+    #[serde(default)]
+    pub search: SearchSettings,
+}
+
+/// `[search]`: the `web_search` tool's provider. Each field is overridden by
+/// its environment variable (`ATELIER_SEARCH_PROVIDER`, `ATELIER_SEARCH_URL`,
+/// `ATELIER_SEARCH_KEY`). All unset means DuckDuckGo, which needs no key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchSettings {
+    /// `searxng`, `brave`, `tavily` or `duckduckgo`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The SearXNG instance's base URL; for the other providers, an override
+    /// of their endpoint.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Name of the environment variable holding the API key. The key itself
+    /// is never written here: this file gets committed.
+    #[serde(default)]
+    pub key_env: Option<String>,
 }
 
 /// One `[[diagnostics]]` checker: a read-only lint or typecheck command run
@@ -148,6 +169,20 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_table_parses_and_defaults_to_unset() {
+        let settings: Settings = tomlproc::serde::from_str(
+            "[search]\nprovider = \"brave\"\nkey_env = \"BRAVE_API_KEY\"\n",
+        )
+        .unwrap();
+        assert_eq!(settings.search.provider.as_deref(), Some("brave"));
+        assert_eq!(settings.search.key_env.as_deref(), Some("BRAVE_API_KEY"));
+        assert!(settings.search.url.is_none());
+
+        let empty: Settings = tomlproc::serde::from_str("").unwrap();
+        assert!(empty.search.provider.is_none());
+    }
 
     #[test]
     fn diagnostics_checkers_parse_with_defaults() {

@@ -18,6 +18,8 @@ always asks (or is pre-authorized).
 - **Unconfined = ask.** `Tool::requires_approval` defaults to `true`, and
   only the tools above override it. That leaves:
   - **`bash`** — runs anything via `sh -c`.
+  - **`web_fetch`** and **`web_search`** — reach the network: a URL or a
+    query leaves the machine, and what comes back is untrusted text.
   - **Every MCP tool** (`mcp__<server>__<tool>`) — `McpTool` doesn't override
     the default, so any tool from any connected server always requires
     approval, regardless of what it actually does.

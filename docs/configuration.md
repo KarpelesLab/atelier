@@ -6,8 +6,8 @@ atelier has two configuration layers:
   environment at startup. Not persisted.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
   `atelier.toml` at the project root: configured MCP servers, the
-  always-allow permission list, `[defaults]`, `[review]`, and
-  `[[diagnostics]]`. Read at startup
+  always-allow permission list, `[defaults]`, `[review]`,
+  `[[diagnostics]]`, and `[search]`. Read at startup
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
   "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
@@ -33,6 +33,9 @@ have no `atelier.toml` equivalent.
 | `ATELIER_UPDATE_API`      | `https://api.github.com`         | `update` | GitHub API base the update check queries (for a mirror, or testing) |
 | `ATELIER_NO_COORDINATOR`  | *(unset)*                        | `coord::start` | Any non-empty value other than `0`: don't join (or start) the [coordinator](coordinator.md) that connects atelier instances |
 | `ATELIER_COORDINATOR_DIR` | `$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier` | `coord::runtime_dir` | Directory of the coordinator's socket, lock and log |
+| `ATELIER_SEARCH_PROVIDER` | `duckduckgo` (`searxng` if a URL is set) | `web_search` tool | Search provider: `searxng`, `brave`, `tavily` or `duckduckgo`. Overrides `[search] provider` — see [`[search]`](#search) |
+| `ATELIER_SEARCH_URL`      | *(unset)*                        | `web_search` tool | Base URL of the SearXNG instance (required for `searxng`); for the other providers, replaces their endpoint. Overrides `[search] url` |
+| `ATELIER_SEARCH_KEY`      | *(unset)*                        | `web_search` tool | API key for `brave` or `tavily`. Overrides the variable named by `[search] key_env` |
 | `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending |
 
 ## `atelier.toml`
@@ -216,6 +219,35 @@ downloaded):
 
 Configuring any checker turns auto-detection off, so list every one you want
 — or a single always-clean one (`command = "true"`) to have none.
+
+## `[search]`
+
+Which provider the [`web_search`](tools.md#web_search) tool queries. Each
+field is overridden by its environment variable, and both are read on every
+call, so a change needs no restart.
+
+```toml
+[search]
+provider = "searxng"                 # overridden by ATELIER_SEARCH_PROVIDER
+url = "https://searx.example.org"    # overridden by ATELIER_SEARCH_URL
+key_env = "BRAVE_API_KEY"            # the variable holding the key; ATELIER_SEARCH_KEY wins
+```
+
+| Field      | Type   | Meaning |
+|------------|--------|---------|
+| `provider` | string | `searxng`, `brave`, `tavily` or `duckduckgo`. Unset: `searxng` if a URL is set, else `duckduckgo` |
+| `url`      | string | The SearXNG instance's base URL. For the other providers it replaces the endpoint (a proxy) |
+| `key_env`  | string | **Name** of the environment variable that holds the API key — the key itself never goes in `atelier.toml` |
+
+| Provider     | Needs | Request |
+|--------------|-------|---------|
+| `duckduckgo` | nothing | `GET https://html.duckduckgo.com/html/?q=…`, the HTML results page, parsed. No key, but no guarantee either: DuckDuckGo may answer an automated client with a challenge, and `web_search` then fails asking for one of the providers below |
+| `searxng`    | `url` | `GET {url}/search?q=…&format=json`. The instance must enable the `json` format (`search.formats` in its `settings.yml`), or it answers 403 |
+| `brave`      | key   | `GET https://api.search.brave.com/res/v1/web/search?q=…&count=N`, key in `X-Subscription-Token` |
+| `tavily`     | key   | `POST https://api.tavily.com/search`, key as `Authorization: Bearer` |
+
+The key is sent only as that request header. It is not written to
+`atelier.toml`, tool results, errors or logs.
 
 ## `/config`
 

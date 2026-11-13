@@ -217,7 +217,7 @@ fn html_to_text(html: &str) -> String {
 }
 
 /// The value of attribute `name` in a tag's text.
-fn attr(tag: &str, name: &str) -> Option<String> {
+pub(super) fn attr(tag: &str, name: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
     let mut from = 0;
     while let Some(i) = lower[from..].find(name) {
@@ -244,7 +244,7 @@ fn attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-fn decode_entities(s: &str) -> String {
+pub(super) fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }

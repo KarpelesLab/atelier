@@ -445,7 +445,7 @@ fn base64url_encode(data: &[u8]) -> String {
 }
 
 /// Percent-encode everything but the RFC 3986 unreserved set.
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
@@ -464,7 +464,7 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Percent-decode a query component (`%XX` → byte); leaves other bytes as-is.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

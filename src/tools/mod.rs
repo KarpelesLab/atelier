@@ -42,6 +42,7 @@ mod read;
 mod todo;
 mod tree;
 mod web_fetch;
+mod web_search;
 mod write;
 
 /// Execution context handed to every tool call.
@@ -229,6 +230,7 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(bash::BashKillTool));
     reg.register(Box::new(notebook::NotebookEditTool));
     reg.register(Box::new(web_fetch::WebFetchTool));
+    reg.register(Box::new(web_search::WebSearchTool));
     reg.register(Box::new(grep::GrepTool));
     reg.register(Box::new(glob::GlobTool));
     reg.register(Box::new(ls::LsTool));
