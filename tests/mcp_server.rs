@@ -203,6 +203,7 @@ fn tools_are_listed_with_schemas_and_annotations() {
         "glob",
         "ls",
         "tree",
+        "symbols",
         "bash",
         "bash_output",
         "bash_kill",
@@ -573,6 +574,56 @@ fn plan_mode_refuses_write() {
         .expect("run atelier");
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
+}
+
+/// `symbols` is served, reads only (plan mode runs it), and starts the
+/// language server the project configures only once the project is trusted:
+/// until then the command — which would leave a file behind — is not run,
+/// and the answer is the textual one, saying so.
+#[test]
+fn symbols_runs_in_plan_mode_and_starts_a_server_only_when_trusted() {
+    let settings = "[[lsp]]\nname = \"marker\"\n\
+        command = \"sh -c 'echo started > lsp.started; cat > /dev/null'\"\n\
+        extensions = [\"rs\"]\ntimeout_secs = 1\n";
+    let dir = project("symbols", settings);
+    std::fs::write(
+        dir.join("lib.rs"),
+        "pub fn greet() {}\nfn main() { greet(); }\n",
+    )
+    .unwrap();
+
+    let mut client = Client::connect(&dir, &["--mode", "plan"], &[]);
+    let references = json!({ "action": "references", "path": "lib.rs", "line": 1 });
+    let (text, ok) = client.call("symbols", references);
+    assert!(ok, "{text}");
+    assert!(text.starts_with("textual approximation"), "{text}");
+    assert!(
+        text.contains("this project is not trusted, so marker is not started"),
+        "{text}"
+    );
+    assert!(
+        text.contains("lib.rs:2:13  — fn main() { greet(); }"),
+        "{text}"
+    );
+    assert!(!dir.join("lsp.started").exists());
+    client.finish();
+
+    // Accepted for the run, the command is started. It is no language
+    // server, so it is given up on and the answer is textual all the same.
+    let mut client = Client::connect(&dir, &[], &[("ATELIER_TRUST_PROJECT", "1")]);
+    let outline = json!({ "action": "outline", "path": "lib.rs" });
+    let (text, ok) = client.call("symbols", outline);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("marker did not answer `initialize`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("lib.rs:1:8  fn  greet  — pub fn greet() {}"),
+        "{text}"
+    );
+    assert!(dir.join("lsp.started").exists());
+    client.finish();
 }
 
 /// A line that is not JSON gets a parse error (id null) and the server goes

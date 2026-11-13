@@ -470,7 +470,7 @@ stdout; warnings go to stderr.
 ### The tools
 
 `read`, `write`, `edit`, `multiedit`, `apply_patch`, `notebook_edit`, `grep`,
-`glob`, `ls`, `tree`, `bash` (with `bash_output` and `bash_kill`),
+`glob`, `ls`, `tree`, `symbols`, `bash` (with `bash_output` and `bash_kill`),
 `web_fetch`, `web_search`, `node`, `todo`, `memory` and `skill` — the same
 tools, with the same schemas, a session has ([Built-in tools](tools.md)):
 

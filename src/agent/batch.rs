@@ -88,6 +88,7 @@ const PARALLEL: &[&str] = &[
     "glob",
     "ls",
     "tree",
+    "symbols",
     "web_fetch",
     "web_search",
     "skill",

@@ -304,8 +304,8 @@ order while they fit, then the start of the next, and the prompt lists the
 files that were cut or left out, telling the reviewer to read them itself.
 
 **What it can do.** Only look: its tools are the built-in [`explore`
-agent](agents.md)'s (`read`, `grep`, `glob`, `ls`, `tree`, `web_fetch`,
-`web_search`) — no `bash`, no editing, no subagents. Nothing is saved: the
+agent](agents.md)'s (`read`, `grep`, `glob`, `ls`, `tree`, `symbols`,
+`web_fetch`, `web_search`) — no `bash`, no editing, no subagents. Nothing is saved: the
 session kept for `--continue` is neither read nor replaced. Approvals and
 [hooks](hooks.md) apply as in any headless run. It runs on atelier's own
 loop only — not with the [Claude backend](claude.md), whose tools atelier

@@ -22,6 +22,8 @@ wait for `/trust`.
 | `[[mcp_http]]` | A URL of the file's choosing, contacted as the session starts with the headers it lists |
 | `[[diagnostics]]` | Commands run every turn, unprompted |
 | Auto-detected checkers (no `[[diagnostics]]`, and a `Cargo.toml`, `tsconfig.json`, `go.mod`, `pyproject.toml` or `setup.py`) | They run the project's own build: `cargo check` runs build scripts and proc macros, `npx tsc` runs a binary from `node_modules`. Detection itself is skipped too — one probe (`python -c 'import pyflakes'`) runs in the project directory |
+| `[[lsp]]` | A command of the file's choosing, started when the `symbols` tool is first used on a matching file |
+| Auto-detected language servers (a `Cargo.toml`, `go.mod`, `tsconfig.json`, `package.json`, Python project file or `compile_commands.json`, and no `[[lsp]]` for that language) | They run the project's code: rust-analyzer runs build scripts and proc macros, the TypeScript server loads the `typescript` in `node_modules` |
 | `[[provider]]` (every entry) | An endpoint the whole conversation — your prompts, file contents, memory — can be sent to; `api_key_env` sends an environment variable of the file's choosing there, `api_key_command` runs a shell command, `headers` are sent along |
 | `[permissions] allow` | Calls the agent then makes without asking: a file that says `allow = ["bash"]` would approve its own commands |
 | `[permissions.reviewer]` with `enabled = true` | A model answering approval prompts in your place, under a policy file of the repository's choosing: a file that could switch it on could appoint a lenient judge of its own commands |
@@ -66,6 +68,8 @@ endpoint and model.
 - MCP servers are neither started nor contacted. (With the
   [Claude backend](claude.md) they are not passed to claude.)
 - No checker runs, configured or detected: there are no diagnostics.
+- No language server is started, configured or detected: the
+  [`symbols`](tools.md#symbols) tool answers from the text, and says so.
 - The project's providers do not exist; requests go to your own.
 - Only your own allow rules count: the user-global ones, and those you save
   with "always" during the session (they are written to `atelier.toml` as
@@ -106,9 +110,9 @@ whose only gated item is the auto-detected checkers gets a single line.
 
 | Command | Does |
 |---------|------|
-| `/trust` | Shows the gated settings, accepts them as they are, and puts them into effect: MCP servers are started, checkers run from the next turn, allow rules and hooks apply, providers and the models configured on them are in use. Two things wait for the next session: a `yolo` default (`/mode yolo` switches now) and `session_start` hooks |
+| `/trust` | Shows the gated settings, accepts them as they are, and puts them into effect: MCP servers are started, checkers run from the next turn, `symbols` starts language servers from its next call, allow rules and hooks apply, providers and the models configured on them are in use. Two things wait for the next session: a `yolo` default (`/mode yolo` switches now) and `session_start` hooks |
 | `/trust show` | Lists the gated settings and whether they are in effect |
-| `/trust revoke` | Forgets the decision. Checkers, allow rules and hooks stop and the MCP tools are withdrawn at once; a server already started, a provider or a mode the project configured are gone after a restart |
+| `/trust revoke` | Forgets the decision. Checkers, allow rules and hooks stop, `symbols` goes back to answering from the text and the MCP tools are withdrawn at once; a server already started (MCP, or a language server — it is no longer asked anything), a provider or a mode the project configured are gone after a restart |
 | `/hooks trust` | The same as `/trust` (hooks used to be trusted on their own) |
 
 HTTP header values are not printed in the summary (they may be tokens), only
@@ -128,6 +132,11 @@ accept anything. What goes into the hash, in the file's order:
 - each `[[diagnostics]]`: `name`, `command` — or, with none configured and a
   marker file present, the one fact that checkers are auto-detected (not
   which: the code they run changes with every pull anyway);
+- each `[[lsp]]`: `name`, `command` — and, for a project with language
+  servers to detect, the one fact that they are. Where the checkers are
+  auto-detected too, that fact is theirs: accepting that the project's build
+  runs unasked covers both, the servers are listed on the checkers' line,
+  and a project you trusted before `symbols` existed is not asked again;
 - each `[[provider]]`: `name`, `base_url`, `api_key_env`, `api_key_command`,
   `headers`;
 - each `[permissions] allow` rule;
@@ -143,7 +152,8 @@ So a `git pull` that edits a hook's command, or the agent editing
 makes the project untrusted again at the next start, and the notice says the
 settings changed. (Within a session the policy file is not re-read, so such
 a rewrite changes nothing before then either.) Editing anything else
-(`[review] enabled`, a `deny` rule, a checker's `when` globs) does not.
+(`[review] enabled`, a `deny` rule, a checker's `when` globs, a language
+server's `extensions`) does not.
 
 Trust is about the project's *settings*. Once you accept `cargo check` as a
 checker, it runs whatever the repository's build scripts are after the next

@@ -10,6 +10,9 @@
 //! - `[[diagnostics]]`, and the checkers detected from the project's files
 //!   when there are none (`cargo check` runs build scripts, `npx tsc` a
 //!   binary from `node_modules`): commands run every turn;
+//! - `[[lsp]]`, and the language servers detected from the project's files
+//!   (rust-analyzer runs build scripts and proc macros): programs the
+//!   `symbols` tool starts;
 //! - `[[provider]]`: an endpoint the conversation is sent to, possibly with
 //!   an environment variable of the file's choosing as its key
 //!   (`api_key_env`) or a shell command to produce one (`api_key_command`);
@@ -197,6 +200,10 @@ enum Kind {
     Checker,
     /// The checkers detected from the project's files, as one item.
     AutoCheckers,
+    Lsp,
+    /// The language servers detected from the project's files, as one
+    /// item — when [`Kind::AutoCheckers`] does not already stand for them.
+    AutoLsp,
     Provider,
     Allow,
     Yolo,
@@ -215,6 +222,8 @@ impl Kind {
             Kind::McpHttp => "mcp_http",
             Kind::Checker => "diagnostics",
             Kind::AutoCheckers => "diagnostics-auto",
+            Kind::Lsp => "lsp",
+            Kind::AutoLsp => "lsp-auto",
             Kind::Provider => "provider",
             Kind::Allow => "allow",
             Kind::Yolo => "yolo",
@@ -231,6 +240,8 @@ impl Kind {
             Kind::Mcp | Kind::McpHttp => ("MCP server", "MCP servers"),
             Kind::Checker => ("checker", "checkers"),
             Kind::AutoCheckers => return "the auto-detected checkers".to_string(),
+            Kind::Lsp => ("language server", "language servers"),
+            Kind::AutoLsp => return "the auto-detected language servers".to_string(),
             Kind::Provider => ("provider", "providers"),
             Kind::Allow => ("allow rule", "allow rules"),
             Kind::Yolo => return "the yolo mode default".to_string(),
@@ -356,16 +367,50 @@ fn items(root: &Path, settings: &Settings) -> Vec<Item> {
         true => crate::context::detectable_checkers(root),
         false => Vec::new(),
     };
+    // The same goes for the language servers the `symbols` tool would
+    // start. Accepting the detected checkers is accepting that the
+    // project's build runs unasked, which is all a detected server adds —
+    // so where that item exists the servers are listed on it, and projects
+    // trusted before `symbols` existed are not asked again. Only a project
+    // with servers to detect and no detected checkers gets an item for them.
+    let servers = crate::lsp::detectable(root, &settings.lsp);
     if !detected.is_empty() {
         // Hashed as the one fact that detection is on: which markers a
         // project has is not a setting, and code the checkers run changes
         // with every pull anyway.
+        let also = match servers.is_empty() {
+            true => String::new(),
+            false => format!(
+                "; and language servers, started when the symbols tool needs one: {}",
+                servers.join("; ")
+            ),
+        };
         add(
             Kind::AutoCheckers,
             json!(true),
             format!(
-                "auto-detected checkers, run each turn (they run the project's build): {}",
+                "auto-detected checkers, run each turn (they run the project's build): {}{also}",
                 detected.join("; ")
+            ),
+        );
+    } else if !servers.is_empty() {
+        add(
+            Kind::AutoLsp,
+            json!(true),
+            format!(
+                "auto-detected language servers, started when the symbols tool needs one \
+                 (they run the project's build): {}",
+                servers.join("; ")
+            ),
+        );
+    }
+    for s in &settings.lsp {
+        add(
+            Kind::Lsp,
+            json!([s.name, s.command]),
+            format!(
+                "language server '{}', started when the symbols tool needs it: {}",
+                s.name, s.command
             ),
         );
     }
@@ -619,6 +664,7 @@ impl Trust {
         s.mcp.clear();
         s.mcp_http.clear();
         s.diagnostics.clear();
+        s.lsp.clear();
         s.permissions = self.permissions(&s.permissions);
         if starts_in_yolo(&s) {
             s.defaults.mode = s.defaults.mode.filter(|m| *m != Mode::Yolo);
@@ -1235,8 +1281,39 @@ key_env = "GITHUB_TOKEN"
         // Configured checkers replace detection, in the hash as in fact.
         let configured = settings("[[diagnostics]]\nname = \"l\"\ncommand = \"make l\"\n");
         let list = items(&root, &configured);
-        assert_eq!(list.len(), 1);
         assert_eq!(list[0].kind, Kind::Checker);
+        assert!(list.iter().all(|i| i.kind != Kind::AutoCheckers));
+
+        // Language servers: detected ones ride on the detected checkers'
+        // item (the same build, run unasked) and get one of their own only
+        // without it; configured ones are items like any other command.
+        let list = items(&root, &none);
+        assert_eq!(list.len(), 1);
+        assert!(
+            list[0].line.contains("rust-analyzer; gopls"),
+            "{}",
+            list[0].line
+        );
+        assert_eq!(fingerprint(&list), with_cargo);
+        let list = items(&root, &configured);
+        let kinds: Vec<Kind> = list.iter().map(|i| i.kind).collect();
+        assert_eq!(kinds, [Kind::Checker, Kind::AutoLsp]);
+        let with_auto = fingerprint(&list);
+        let own = settings(
+            "[[diagnostics]]\nname = \"l\"\ncommand = \"make l\"\n\
+             [[lsp]]\nname = \"rust\"\ncommand = \"ra --x\"\nextensions = [\"rs\"]\n\
+             [[lsp]]\nname = \"go\"\ncommand = \"gopls\"\nextensions = [\"go\"]\n",
+        );
+        let list = items(&root, &own);
+        let kinds: Vec<Kind> = list.iter().map(|i| i.kind).collect();
+        assert_eq!(kinds, [Kind::Checker, Kind::Lsp, Kind::Lsp]);
+        assert!(list[1].line.contains("'rust'") && list[1].line.contains("ra --x"));
+        assert_ne!(fingerprint(&list), with_auto);
+        assert_eq!(tally(&list), "1 checker, 2 language servers");
+        // Untrusted, they are taken out with the rest.
+        let closed = Trust::load(&root, &own, Store::default());
+        assert_eq!(closed.state(), State::Untrusted);
+        assert!(closed.effective(&own).lsp.is_empty());
 
         let trust = Trust::load(&root, &none, Store::default());
         assert_eq!(trust.state(), State::Untrusted);

@@ -9,7 +9,7 @@ atelier has two configuration layers:
   [variants](#variantname--reasoning-effort-and-sampling)) laid over it.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
   `atelier.toml` at the project root: configured MCP servers, the
-  permission rules, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`,
+  permission rules, `[defaults]`, `[review]`, `[[diagnostics]]`, `[[lsp]]`, `[search]`,
   `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]` and the model
   tables. Read at startup
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
@@ -67,7 +67,8 @@ stderr.
 
 **Not all of it applies at once.** The file comes with the repository, so
 the tables that run commands or grant access — `[[mcp]]`, `[[mcp_http]]`,
-`[[diagnostics]]` (and auto-detected checkers), `[[provider]]`,
+`[[diagnostics]]` (and auto-detected checkers), `[[lsp]]` (and auto-detected
+language servers), `[[provider]]`,
 `[permissions] allow`, a `yolo` default, `[[hooks]]`, `[search] key_env` and
 `url`, `[sandbox] enabled` —
 take effect only once you have accepted them for the project with `/trust`
@@ -671,6 +672,41 @@ downloaded):
 
 Configuring any checker turns auto-detection off, so list every one you want
 — or a single always-clean one (`command = "true"`) to have none.
+
+## `[[lsp]]`
+
+Language servers for the [`symbols`](tools.md#symbols) tool, by file
+extension. Without any, `symbols` uses the server it
+[detects](tools.md#two-tiers) from the project's files, when that server is
+installed; an entry replaces the detected server for the extensions it
+lists, and adds languages atelier knows no server for.
+
+```toml
+[[lsp]]
+name = "rust"
+command = "rust-analyzer"
+extensions = ["rs"]
+
+[[lsp]]
+name = "zig"
+command = "zls"
+extensions = ["zig"]
+timeout_secs = 30
+```
+
+| Field          | Type     | Meaning |
+|----------------|----------|---------|
+| `name`         | string   | What the server is called in results |
+| `command`      | string   | The command line, split like a shell would (quotes honored) and run directly in the project root — no shell. It must speak LSP on stdin/stdout (`--stdio` for the servers that need telling) |
+| `extensions`   | string[] | The file extensions it serves, with or without the dot |
+| `timeout_secs` | integer  | How long one `symbols` call waits for it, loading included, before answering from the text instead (default 20) |
+
+The server is started the first time `symbols` needs it, not at startup, and
+only in a [trusted project](trust.md) — it runs the project's code. The list
+is read on each call, so an edit applies to servers not yet started. A
+command that cannot be started, or that does not answer `initialize`, is
+given up on for the session and `symbols` says why in its results;
+`atelier doctor` lists the servers a project has.
 
 ## `[search]`
 

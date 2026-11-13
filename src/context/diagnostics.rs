@@ -235,7 +235,7 @@ pub fn detectable(root: &Path) -> Vec<String> {
 }
 
 /// Whether `program` is an existing file in some `PATH` directory.
-fn on_path(program: &str) -> bool {
+pub fn on_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };

@@ -254,8 +254,9 @@ pub fn run_command(args: &[String]) -> Result<u8> {
     session.set_mode(mode);
 
     let served = serve(&mut session, io::stdin().lock(), io::stdout().lock());
-    // Background `bash` jobs would outlive the server.
+    // Background `bash` jobs and language servers would outlive the server.
     tools::bash::kill_all();
+    crate::lsp::kill_all();
     served.map(|()| 0)
 }
 

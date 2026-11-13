@@ -19,6 +19,7 @@ mod events;
 mod headless;
 mod hooks;
 mod js;
+mod lsp;
 mod mcp;
 mod memory;
 mod oauth;
@@ -281,9 +282,10 @@ fn open_session(claude: bool, mode: Option<permissions::Mode>) -> Result<agent::
     Ok(session)
 }
 
-/// On the way out: stop the `bash` tool's background jobs, which would
-/// otherwise outlive atelier.
+/// On the way out: stop the `bash` tool's background jobs and the language
+/// servers of the `symbols` tool, which would otherwise outlive atelier.
 fn finish<T>(result: T) -> T {
     tools::bash::kill_all();
+    lsp::kill_all();
     result
 }

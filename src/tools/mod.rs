@@ -44,6 +44,7 @@ mod notebook;
 mod read;
 mod skill;
 pub mod spill;
+mod symbols;
 pub mod task;
 mod todo;
 mod tree;
@@ -310,6 +311,7 @@ pub fn builtin_registry() -> ToolRegistry {
         skill::SkillTool::new(crate::skills::global_dirs()),
     ));
     reg.register(Box::new(tree::TreeTool));
+    reg.register(Box::new(symbols::SymbolsTool::new()));
     reg.register(Box::new(ask::AskTool));
     reg.register(Box::new(crate::js::NodeTool));
     reg

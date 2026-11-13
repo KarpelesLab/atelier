@@ -227,9 +227,8 @@ impl Mode {
                 "PLAN MODE (read-only) is on. Tools that can change anything — write, edit, \
                  multiedit, apply_patch, notebook_edit, node, bash (but for commands the user's \
                  allow rules name), saving or deleting memories, MCP tools not marked \
-                 read-only — are refused. Investigate with the \
-                 read-only tools (read, grep, glob, ls, tree, web_fetch, web_search), then \
-                 present a concrete plan of the changes you would make and stop. The user \
+                 read-only — are refused. Investigate with the read-only tools (read, grep, \
+                 glob, ls, tree, symbols, web_fetch, web_search), then present a concrete plan of the changes you would make and stop. The user \
                  will switch modes to let you carry it out."
                     .to_string(),
             ),
@@ -2816,6 +2815,7 @@ mod tests {
             ("glob", json!({"pattern": "*"})),
             ("ls", json!({})),
             ("tree", json!({})),
+            ("symbols", json!({"action": "search", "query": "x"})),
             ("todo", json!({"action": "add", "text": "x"})),
             ("skill", json!({"name": "x"})),
             ("memory", json!({"action": "read", "name": "x"})),
@@ -2864,6 +2864,7 @@ mod tests {
             "glob",
             "ls",
             "tree",
+            "symbols",
             "todo",
             "skill",
             "memory",

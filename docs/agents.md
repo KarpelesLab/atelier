@@ -14,7 +14,7 @@ model). Two are built in; you define more as Markdown files.
 
 | Agent | Tools | For |
 |-------|-------|-----|
-| `explore` | `read`, `grep`, `glob`, `ls`, `tree`, `web_fetch`, `web_search` | Read-only search: where things are and how they work, reported with `file:line` references. Cannot modify anything |
+| `explore` | `read`, `grep`, `glob`, `ls`, `tree`, `symbols`, `web_fetch`, `web_search` | Read-only search: where things are and how they work, reported with `file:line` references. Cannot modify anything |
 | `general` | every tool the session has, except `task` | A self-contained multi-step task: research, an isolated change, running and fixing something |
 
 `/agents` lists every agent available, where each is defined, its tools and

@@ -43,6 +43,10 @@ pub struct Settings {
     /// diagnostics. Empty means "auto-detect from the project's files".
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticCheck>,
+    /// Language servers for the `symbols` tool, by file extension. They
+    /// replace the auto-detected server for the extensions they list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lsp: Vec<LspServerConfig>,
     /// Which provider the `web_search` tool queries.
     #[serde(default)]
     pub search: SearchSettings,
@@ -349,6 +353,43 @@ pub struct DiagnosticCheck {
 /// A minute: what `cargo check` was always given.
 fn default_diagnostic_timeout() -> u64 {
     60
+}
+
+/// One `[[lsp]]` table: a language server the `symbols` tool starts for
+/// files with one of `extensions` (see [`crate::lsp`]).
+///
+/// ```toml
+/// [[lsp]]
+/// name = "rust"
+/// command = "rust-analyzer"
+/// extensions = ["rs"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspServerConfig {
+    /// What the server is called in results.
+    pub name: String,
+    /// The command line, split like a shell would (quotes honored) and run
+    /// directly in the project root — no shell. It must speak LSP on its
+    /// stdin and stdout.
+    pub command: String,
+    /// File extensions it serves, with or without the dot.
+    pub extensions: Vec<String>,
+    /// Seconds one `symbols` call waits for it before falling back to
+    /// textual search.
+    #[serde(default = "default_lsp_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl LspServerConfig {
+    /// Whether files with extension `ext` (no dot) are this server's.
+    pub fn serves(&self, ext: &str) -> bool {
+        let listed = self.extensions.iter().map(|e| e.trim_start_matches('.'));
+        listed.into_iter().any(|e| e.eq_ignore_ascii_case(ext))
+    }
+}
+
+fn default_lsp_timeout() -> u64 {
+    crate::lsp::DEFAULT_TIMEOUT.as_secs()
 }
 
 /// One `[[hooks]]` table: a command to run when `event` happens. Kept as

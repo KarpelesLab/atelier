@@ -19,6 +19,7 @@ the model verbatim as the tool result.
 | `glob`      | auto     | yes |
 | `ls`        | auto     | yes |
 | `tree`      | auto     | yes |
+| `symbols`   | auto     | yes (a location outside it is named, not read) |
 | `todo`      | auto     | yes |
 | `ask`       | auto (it only talks to you) | n/a |
 | `memory`    | auto     | to the memory directories (the project's `.atelier/memory/` and the user-global one) |
@@ -48,7 +49,7 @@ write".
 
 When the model asks for several tool calls in one step, the ones that only
 look run at the same time (`src/agent/batch.rs`): a run of consecutive calls
-to `read`, `grep`, `glob`, `ls`, `tree`, `web_fetch`, `web_search`, `skill`,
+to `read`, `grep`, `glob`, `ls`, `tree`, `symbols`, `web_fetch`, `web_search`, `skill`,
 `memory` (`read` and `list` only) and `bash_output`, up to 8 at once. Any
 other call — one that writes, `bash`, `ask`, `task`, `todo`, an MCP tool —
 ends the run and is executed by itself, in its place: `[read a, grep x,
@@ -342,6 +343,109 @@ Print an indented directory tree, respecting `.gitignore`.
 
 Directories get a trailing `/`; capped at 200 entries with a truncation note.
 Confined to the project root and auto-approved.
+
+## `symbols`
+
+Code navigation: where a name is defined, who uses it, what a file declares,
+what a symbol's signature and documentation are. The model is told to prefer
+it over `grep` for those questions.
+
+| Param    | Type    | Required | Meaning |
+|----------|---------|----------|---------|
+| `action` | string  | yes      | `definition`, `references`, `hover`, `outline` or `search` |
+| `path`   | string  | all but `search` | The file, relative to the project root |
+| `line`   | integer | `definition`, `references`, `hover` | The line the symbol is on, from 1 |
+| `symbol` | string  | no       | The symbol's name as written on that line; its first occurrence is used — as a whole word when there is one — and for `a::b` or `self.b` the last name. Saves counting columns |
+| `column` | integer | no       | Instead of `symbol`: the column, in characters from 1. With neither, the name the line *declares* is meant (handy after `outline` or `search`) |
+| `query`  | string  | `search` | A name, or part of one |
+
+| Action | Answers |
+|--------|---------|
+| `definition` | Where the symbol at the position is defined |
+| `references` | Where it is used, its declaration aside |
+| `hover` | Its signature and documentation |
+| `outline` | The symbols the file declares, in order |
+| `search` | Symbols anywhere in the project whose name matches `query` — the way in when you have a name and no position |
+
+Every location is one line — path relative to the project, line and column
+from 1, the kind and name where known, the source line — and lists are capped
+(100 locations, 200 for an outline) with a count of the rest:
+
+```
+references to `keep_in_walk` (its declaration aside) — 5 locations (rust-analyzer)
+src/tools/grep.rs:84:34  — .filter_entry(spill::keep_in_walk(ctx.project_root))
+src/tools/glob.rs:72:34  — .filter_entry(spill::keep_in_walk(ctx.project_root))
+…
+```
+
+```
+outline of src/lsp/frame.rs — 20 symbols (rust-analyzer)
+src/lsp/frame.rs:29:15  function  write  — pub(crate) fn write(writer: &mut dyn Write, message: &Value) -> io::Result<()> {
+src/lsp/frame.rs:49:19  struct  Decoder  — pub(crate) struct Decoder {
+src/lsp/frame.rs:55:19  method  impl Decoder.push  — pub(crate) fn push(&mut self, bytes: &[u8]) {
+…
+```
+
+### Two tiers
+
+**With a language server**, the answers are the compiler's: `definition`
+follows imports and trait impls, `references` tells two functions of the same
+name apart. The result's first line names the server. One is used when the
+project has it:
+
+| Project root has | Server (must be on `PATH`; nothing is installed) | Files |
+|------------------|--------------------------------------------------|-------|
+| `Cargo.toml` | `rust-analyzer` | `.rs` |
+| `go.mod` | `gopls` | `.go` |
+| `tsconfig.json` or `package.json` | `typescript-language-server --stdio` | `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs` |
+| `pyproject.toml`, `setup.py`, `setup.cfg` or `requirements.txt` | `pyright-langserver --stdio`, else `pylsp` | `.py` `.pyi` |
+| `compile_commands.json` (also under `build/`) | `clangd` | `.c` `.h` `.cc` `.cpp` `.cxx` `.hpp` `.hh` `.hxx` |
+
+or when [`[[lsp]]`](configuration.md#lsp) in `atelier.toml` names one for the
+file's extension (which replaces the detected one). `search` asks every
+server the project has.
+
+A server is started the first time it is needed and kept for the session —
+indexing takes a while, and answers are fast only afterwards. A file is sent
+to it when first asked about and again whenever its text changed since, so
+edits made between calls are seen. A call waits until the server says it is
+done loading (a server that is still indexing answers "nothing found", which
+would be passed on as fact), for at most 20 seconds in all (`timeout_secs`
+of a `[[lsp]]` entry). A server that dies is started again once; it is
+stopped, with everything it started, when atelier exits. rust-analyzer is
+started with `checkOnSave` off, so it does not run `cargo check` beside your
+own builds.
+
+**A language server runs the project's code** — rust-analyzer runs build
+scripts and proc macros, the TypeScript server loads the `typescript` in
+`node_modules` — so one is started, configured or detected, only in a
+[trusted project](trust.md), like the diagnostics checkers.
+
+**Without a server** — none for the language, not installed, the project not
+trusted, or no answer in time — the tool answers from the text: declarations
+are recognised by their shape (`fn name`, `class Name`, `func (r T) Name`, …
+for Rust, Go, Python, TypeScript/JavaScript and C/C++), names are matched as
+whole words, across the project's files as `grep` would walk them. `hover`
+is the declaration line under its comment. There are no scopes or types in
+this: same-named symbols are all candidates, a name in a comment is a
+"reference". Such a result therefore opens with a line saying so and why:
+
+```
+textual approximation (no language server for Rust: rust-analyzer did not answer within 20s (it may still be indexing the project; a later call may get through)) — names and declaration shapes matched as text, not analysed
+definition of `keep_in_walk` — 1 candidate
+src/tools/spill.rs:106:8  fn  keep_in_walk  — pub fn keep_in_walk(
+```
+
+A definition in the standard library or a dependency is reported with its
+absolute path and line, marked `outside the project, not read`; reading it is
+[`read`](#read)'s job, with its approval for paths outside the project.
+
+Diagnostics do not come from the language server — they come from the
+project's own [checkers](configuration.md#diagnostics).
+
+Read-only, confined to the project root and auto-approved; available in
+`plan` mode and to the `explore` agent, and run in parallel with other
+read-only calls.
 
 ## `web_fetch`
 

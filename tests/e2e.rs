@@ -2249,6 +2249,7 @@ fn task_runs_a_subagent_and_returns_its_report() {
             "grep",
             "ls",
             "read",
+            "symbols",
             "tree",
             "web_fetch",
             "web_search"
@@ -2546,7 +2547,11 @@ fn a_subagents_call_asks_the_user_and_names_the_agent() {
     // `/agents`.
     assert!(stdout.contains("2 agent(s):"), "{stdout}");
     assert!(stdout.contains("  explore — Read-only search"));
-    assert!(stdout.contains("built-in · tools: read, grep, glob, ls, tree, web_fetch, web_search"));
+    assert!(
+        stdout.contains(
+            "built-in · tools: read, grep, glob, ls, tree, symbols, web_fetch, web_search"
+        )
+    );
 }
 
 /// A responder for a `write` of `out.txt`, then a `read` of `seed.txt`, then
@@ -3660,6 +3665,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "grep",
     "ls",
     "read",
+    "symbols",
     "tree",
     "web_fetch",
     "web_search",

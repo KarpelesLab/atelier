@@ -101,6 +101,7 @@ const EXPLORE_TOOLS: &[&str] = &[
     "glob",
     "ls",
     "tree",
+    "symbols",
     "web_fetch",
     "web_search",
 ];

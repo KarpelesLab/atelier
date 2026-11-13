@@ -42,6 +42,7 @@ pub use budget::{estimate_tokens, render_budgeted};
 #[allow(unused_imports)]
 pub use dedup::{Delta, dedup_items};
 pub use diagnostics::detectable as detectable_checkers;
+pub use diagnostics::on_path;
 pub use instructions::{
     InstructionFiles, instruction_files, nested_instructions, pick as instruction_file,
     review_section,

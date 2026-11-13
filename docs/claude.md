@@ -78,7 +78,7 @@ them; the system prompt tells claude which is which:
 | `NotebookEdit` | `notebook_edit` |
 | `Bash` | `bash` (`background: true` for long-running commands) |
 | `Monitor`, `BashOutput`, `KillShell` | `bash_output` (`wait_ms`, `until`), `bash_kill` |
-| `Glob`, `Grep`, `LS` | `glob`, `grep`, `ls`, `tree` |
+| `Glob`, `Grep`, `LS` | `glob`, `grep`, `ls`, `tree`; and `symbols` for code navigation, which replaces nothing of claude's |
 | `WebFetch` | `web_fetch` (HTML → text, paged) |
 | `TodoWrite` | `todo` |
 | `AskUserQuestion` | `ask` (printed as numbered lines, answered on the input line) |

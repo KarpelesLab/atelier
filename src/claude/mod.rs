@@ -107,8 +107,9 @@ editing it. \
 builds) pass `background: true`, then `bash_output` to read new output or \
 wait for it to finish or print a pattern (`wait_ms`, `until`) — instead of \
 Monitor — and `bash_kill` to stop it. \
-- `grep`, `glob`, `ls`, `tree` to search and explore; `web_fetch` instead \
-of WebFetch; `todo` for a task list; `node` for sandboxed JavaScript. \
+- `grep`, `glob`, `ls`, `tree` to search and explore; `symbols` to navigate \
+code (where a name is defined, who uses it, what a file declares); \
+`web_fetch` instead of WebFetch; `todo` for a task list; `node` for sandboxed JavaScript. \
 - `ask` instead of AskUserQuestion, to put a question with options to the \
 user.";
 

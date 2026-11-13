@@ -32,6 +32,10 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   repository root down, with `@path` imports; a subdirectory's file applies
   once the agent works there. See
   [Configuration](docs/configuration.md#instruction-files).
+- **Navigation by symbol.** A `symbols` tool answers "where is this defined,
+  who calls it, what is in this file" from the project's language server
+  when one is installed (rust-analyzer, gopls, …) and from the text when
+  not — saying which. See [Tools](docs/tools.md#symbols).
 - **Confinement over coarse yes/no.** Every file tool and the `node`
   scripting tool are sandboxed to the project root and run without
   prompting; only genuinely unconfined execution (`bash`, MCP tools,

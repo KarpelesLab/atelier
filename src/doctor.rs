@@ -601,6 +601,10 @@ fn check_extensions(report: &mut Report, root: &Path, settings: &Settings) {
         user_config.as_deref(),
         trust.hooks_state(),
     );
+    report.ok(
+        "language servers",
+        language_servers(root, settings, trust.active(), &context::on_path),
+    );
     let (user, project) = hooks.counts();
     let (status, trust) = match hooks.trust_state() {
         _ if project == 0 => (Status::Ok, String::new()),
@@ -630,6 +634,38 @@ fn check_extensions(report: &mut Report, root: &Path, settings: &Settings) {
             Status::Warn,
             format!("{detail}; left out: {}", problems.join("; ")),
         );
+    }
+}
+
+/// Which language servers the `symbols` tool has for this project, and
+/// whether it may start them: they run the project's code, so only in a
+/// trusted project (see `lsp`). None is started here. `has` says whether a
+/// program is on `PATH`.
+fn language_servers(
+    root: &Path,
+    settings: &Settings,
+    trusted: bool,
+    has: &dyn Fn(&str) -> bool,
+) -> String {
+    let fallback = "the symbols tool uses textual search";
+    let found = crate::lsp::all(root, &settings.lsp, has);
+    if found.is_empty() {
+        let missing = crate::lsp::detectable(root, &settings.lsp);
+        return match missing.is_empty() {
+            true => format!("none configured or detected; {fallback}"),
+            false => format!("{} not on PATH; {fallback}", missing.join(", ")),
+        };
+    }
+    let names: Vec<String> = found.into_iter().map(|s| s.name).collect();
+    match trusted {
+        true => format!(
+            "{} — started when the symbols tool needs one",
+            some_of(&names)
+        ),
+        false => format!(
+            "{} — the project is NOT trusted, so none is started and {fallback}: /trust",
+            some_of(&names)
+        ),
     }
 }
 
@@ -827,6 +863,37 @@ mod tests {
         let all = parse(&["--mcp", "--json", "--offline", "--claude"]).unwrap();
         assert!(all.json && all.offline && all.mcp && all.claude);
         assert_eq!(parse(&["--fix"]), Err("unknown argument --fix".to_string()));
+    }
+
+    #[test]
+    fn language_servers_are_listed_with_whether_they_may_start() {
+        let root = crate::trust::testing::dir("doctor-lsp");
+        let none = Settings::default();
+        let line = |settings: &Settings, trusted: bool, installed: bool| {
+            language_servers(&root, settings, trusted, &|_| installed)
+        };
+        assert_eq!(
+            line(&none, true, true),
+            "none configured or detected; the symbols tool uses textual search"
+        );
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        assert_eq!(
+            line(&none, true, false),
+            "rust-analyzer not on PATH; the symbols tool uses textual search"
+        );
+        assert_eq!(
+            line(&none, true, true),
+            "rust-analyzer — started when the symbols tool needs one"
+        );
+        let configured: Settings = tomlproc::serde::from_str(
+            "[[lsp]]\nname = \"zig\"\ncommand = \"zls\"\nextensions = [\"zig\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            line(&configured, false, true),
+            "zig, rust-analyzer — the project is NOT trusted, so none is started and the \
+             symbols tool uses textual search: /trust"
+        );
     }
 
     #[test]
