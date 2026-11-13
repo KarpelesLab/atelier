@@ -39,6 +39,8 @@
 //! `name` (plus optional `arguments`) via `prompts/get` into a readable
 //! transcript. A server that doesn't support prompts (an erroring or empty
 //! `prompts/list`) simply gets no such tool — the connection still succeeds.
+//! The prompts also come back in the [`Connection`], each to be a slash
+//! command of the user's (see `prompt.rs`).
 //!
 //! A server's `initialize` answer may also carry `instructions` for whoever
 //! uses its tools. They come back with the tools in the [`Connection`], and
@@ -120,6 +122,7 @@ use tool::McpTool;
 pub use http::{HttpServer, connect_http};
 
 pub use catalog::Catalog;
+pub use prompt::Prompt;
 pub use tool::Annotations;
 
 /// A connected server: what [`connect_stdio`] and [`connect_http`] return.
@@ -133,6 +136,10 @@ pub struct Connection {
     /// (`mcp__<server>__<tool>`) name. The tools atelier adds itself
     /// (`read_resource`, `get_prompt`) have none.
     pub annotations: HashMap<String, Annotations>,
+    /// The server's prompts, for the user to run as `/mcp:<server>:<prompt>`.
+    /// The tool filters do not apply: they decide what the model is offered,
+    /// and these are the user's to type.
+    pub prompts: Vec<Prompt>,
 }
 
 /// Seconds a handshake request may take unless the server's
@@ -335,6 +342,7 @@ pub(crate) fn assemble(
     {
         tools.push(tool);
     }
+    let prompts = Prompt::advertised(&conn, &found.prompts);
     if options.allows("get_prompt")
         && let Some(tool) = maybe_prompt_tool(conn, server_name, found.prompts)
     {
@@ -344,6 +352,7 @@ pub(crate) fn assemble(
         tools,
         instructions: found.instructions,
         annotations,
+        prompts,
     }
 }
 

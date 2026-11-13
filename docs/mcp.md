@@ -369,3 +369,36 @@ If a server advertises **prompts** (`prompts/list`), atelier adds a
 `mcp__<server>__get_prompt` tool whose description lists the prompt names and
 arguments. The model calls it with `{ name, arguments }` to expand a prompt
 template into text. Servers without prompts get no such tool.
+
+### Prompts as slash commands
+
+Each prompt is also a command of yours: `/mcp:<server>:<prompt> [arguments]`.
+`/help` lists them after the custom commands, with the prompt's description
+and its arguments (`<required>`, `[optional]`).
+
+```text
+› /mcp:kb:review src/parser.rs style=terse
+/mcp:kb:review → expanded from prompt 'review' of MCP server 'kb' (412 chars)
+```
+
+- **Arguments.** What you type is split into words like a shell would
+  (quotes group). A word `name=value` naming one of the prompt's arguments
+  sets it; the other words fill the arguments still unset, in the order the
+  server declared them, and the last of those takes whatever words remain —
+  so a prompt with one argument can be given a sentence without quotes. If a
+  required argument has no value, or words are left over that no argument
+  takes, atelier prints the usage line and does not call the server.
+- **What is sent.** The server is asked with `prompts/get`; the text of the
+  messages it returns, in order, becomes your prompt for the turn. Content
+  that is not text is noted in place (`[image omitted]`); roles are dropped;
+  more than 64 KiB is cut.
+- **It is the server's text, not yours.** atelier prints the line above so
+  you can see that a prompt was sent on a server's word, and sends the text
+  exactly as received. Nothing in it is expanded or executed: the
+  `` !`command` `` and `$1` of [command files](commands.md) are those files'
+  syntax only, and reach the model here as plain characters.
+
+The tool filters (`enabled_tools` / `disabled_tools`) decide what the *model*
+is offered; they do not remove these commands. A [command
+file](commands.md) with the same name (`mcp/kb/review.md`) wins. With the
+Claude backend the servers are claude's, and there are no such commands.

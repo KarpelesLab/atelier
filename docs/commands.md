@@ -110,4 +110,7 @@ start another command. A template that does `` !`sh -c "$1"` `` or
   interactive TUI and REPL.
 - A command typed while a turn is running is queued and runs when the turn
   ends, like the built-in ones.
-- MCP prompts do not appear as commands.
+- The prompts of connected MCP servers are commands too,
+  `/mcp:<server>:<prompt>` — see [MCP prompts](mcp.md#prompts-as-slash-commands).
+  They are not templates: none of the placeholders or `` !`command` `` lines
+  above apply to what a server returns.

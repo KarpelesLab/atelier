@@ -12,11 +12,17 @@
 //!
 //! It also records whether the servers' tools are currently *deferred* (see
 //! `deferred.rs`), since the model has to be told when they are.
+//!
+//! And it is where the session finds the servers' prompts, each a slash
+//! command (see `prompt.rs`). A [`Prompt`] is handed out as a clone, so a
+//! `prompts/get` is made with this catalog's lock long released — a slow
+//! server must not hold up the context provider reading it on another
+//! thread.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{Annotations, Connection};
+use super::{Annotations, Connection, Prompt};
 
 /// Most bytes of one server's `instructions` kept for the model. They are
 /// sent with every request, and a server's author decides their length: one
@@ -43,6 +49,8 @@ struct Entry {
     instructions: Option<String>,
     /// What the server said about its tools, by registered name.
     annotations: HashMap<String, Annotations>,
+    /// The server's prompts, in its order.
+    prompts: Vec<Prompt>,
 }
 
 impl Catalog {
@@ -60,6 +68,7 @@ impl Catalog {
             tools: tools.collect(),
             instructions,
             annotations: connection.annotations.clone(),
+            prompts: connection.prompts.clone(),
         });
     }
 
@@ -115,6 +124,42 @@ impl Catalog {
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
+    /// The prompt a command names: `/mcp:<server>:<prompt>` (a server's name
+    /// has no colon; a prompt's may). With the server's name, for the line
+    /// that says where a prompt came from. `None` when `command` is not of
+    /// that form or names nothing connected.
+    pub fn prompt(&self, command: &str) -> Option<(String, Prompt)> {
+        let (server, name) = command.strip_prefix("/mcp:")?.split_once(':')?;
+        let state = self.state();
+        let entry = state.entries.iter().find(|e| e.server == server)?;
+        let prompt = entry.prompts.iter().find(|p| p.name == name)?;
+        Some((entry.server.clone(), prompt.clone()))
+    }
+
+    /// The lines `/help` adds for the prompts, or nothing when there are
+    /// none. `shadowed` says whether a command (given without its slash) is
+    /// already something else — a command file wins, so such a prompt is
+    /// left out, since typing its name would never reach it.
+    pub fn prompt_help(&self, shadowed: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in &self.state().entries {
+            for prompt in &entry.prompts {
+                let command = format!("mcp:{}:{}", entry.server, prompt.name);
+                if shadowed(&command) {
+                    continue;
+                }
+                let usage = format!("/{command} {}", prompt.usage());
+                let description = prompt.description.as_deref().unwrap_or("");
+                // Same column as the built-in list above it.
+                out.push(format!("  {:<37} {description}", usage.trim_end()));
+            }
+        }
+        if !out.is_empty() {
+            out.insert(0, "MCP prompts:".to_string());
+        }
+        out
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         // Nothing done under the lock can leave the state half-written, so
         // a panic elsewhere while it was held doesn't make it unusable.
@@ -125,7 +170,7 @@ impl Catalog {
 }
 
 /// `text`, cut to at most `max` bytes at a character boundary, saying so.
-fn cap(text: &str, max: usize) -> String {
+pub(super) fn cap(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
@@ -145,7 +190,59 @@ mod tests {
             tools: Vec::new(),
             instructions: instructions.map(str::to_string),
             annotations: HashMap::new(),
+            prompts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn prompts_are_found_by_command_and_listed_for_help() {
+        use crate::mcp::jsonrpc::JsonRpc;
+        use crate::mcp::testutil::FakeRpc;
+        use serde_json::json;
+
+        let conn: Arc<Mutex<dyn JsonRpc>> = Arc::new(Mutex::new(FakeRpc::new(|_, _| None)));
+        let mut kb = connection(None);
+        kb.prompts = Prompt::advertised(
+            &conn,
+            &[
+                json!({ "name": "review", "description": "Review a file",
+                        "arguments": [{ "name": "path", "required": true }, { "name": "style" }] }),
+                json!({ "name": "ns:daily" }),
+            ],
+        );
+        let catalog = Catalog::default();
+        catalog.insert("quiet", &connection(None));
+        catalog.insert("kb", &kb);
+
+        let (server, prompt) = catalog.prompt("/mcp:kb:review").unwrap();
+        assert_eq!((server.as_str(), prompt.name.as_str()), ("kb", "review"));
+        // Only the first colon after the server's name separates.
+        assert_eq!(
+            catalog.prompt("/mcp:kb:ns:daily").unwrap().1.name,
+            "ns:daily"
+        );
+        for not in [
+            "/mcp:kb:nope",
+            "/mcp:other:review",
+            "/mcp:kb",
+            "/mcp",
+            "/kb:review",
+        ] {
+            assert!(catalog.prompt(not).is_none(), "{not}");
+        }
+
+        let lines = catalog.prompt_help(&|command| command == "mcp:kb:ns:daily");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "MCP prompts:");
+        assert!(
+            lines[1].starts_with("  /mcp:kb:review <path> [style] "),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with(" Review a file"), "{lines:?}");
+
+        catalog.remove("kb");
+        assert!(catalog.prompt("/mcp:kb:review").is_none());
+        assert!(catalog.prompt_help(&|_| false).is_empty());
     }
 
     #[test]

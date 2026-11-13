@@ -87,6 +87,7 @@ mod tests {
             tools: Vec::new(),
             instructions: instructions.map(str::to_string),
             annotations: Default::default(),
+            prompts: Vec::new(),
         }
     }
 

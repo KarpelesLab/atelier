@@ -294,6 +294,10 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
     {
         return outcome;
     }
+    // Then the prompts of the connected MCP servers, `/mcp:<server>:<prompt>`.
+    if let Some(outcome) = dispatch_mcp_prompt(session, trimmed, ui) {
+        return outcome;
+    }
     let tokens = match crate::shlex::split(trimmed) {
         Ok(t) => t,
         Err(e) => {
@@ -318,6 +322,12 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             let global = crate::commands::global_dir();
             let builtin = |name: &str| is_builtin(&format!("/{name}"));
             for l in crate::commands::help(&session.root, global.as_deref(), &builtin) {
+                ui.info(&l);
+            }
+            let custom = |name: &str| {
+                crate::commands::find(&session.root, global.as_deref(), name).is_some()
+            };
+            for l in session.mcp_catalog.prompt_help(&custom) {
                 ui.info(&l);
             }
         }
@@ -535,6 +545,42 @@ fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option
         }
         Err(e) => {
             ui.info(&format!("{name}: {e}"));
+            Dispatch::Handled
+        }
+    })
+}
+
+/// Run `line` as an MCP prompt command, `/mcp:<server>:<prompt> [arguments]`,
+/// if a connected server has that prompt: fetch it and send its text as the
+/// prompt. `None` when the line names no such prompt.
+///
+/// The arguments are checked against what the server declared before it is
+/// asked for anything. The text that comes back is the server's, not the
+/// user's: it is sent exactly as received — never expanded like a command
+/// file's template, whose `` !`command` `` would let a server run a shell
+/// here — and the line printed says which server it came from.
+fn dispatch_mcp_prompt(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option<Dispatch> {
+    let (name, typed) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let (server, prompt) = session.mcp_catalog.prompt(name)?;
+    let arguments = match prompt.bind(typed.trim()) {
+        Ok(arguments) => arguments,
+        Err(e) => {
+            ui.info(&format!("{name}: {e}"));
+            ui.info(format!("usage: {name} {}", prompt.usage()).trim_end());
+            return Some(Dispatch::Handled);
+        }
+    };
+    Some(match prompt.get(arguments) {
+        Ok(text) => {
+            ui.info(&format!(
+                "{name} → expanded from prompt '{}' of MCP server '{server}' ({} chars)",
+                prompt.name,
+                text.chars().count()
+            ));
+            Dispatch::Expanded(text)
+        }
+        Err(e) => {
+            ui.info(&format!("{name}: {e:#}"));
             Dispatch::Handled
         }
     })
