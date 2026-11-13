@@ -960,7 +960,6 @@ impl Session {
     /// Render what claude produced between turns (reports on background
     /// work). Cheap when there's nothing; a no-op for the OpenAI backend.
     /// Returns whether anything arrived.
-    #[cfg_attr(not(tui), allow(dead_code))]
     pub fn poll_background(&mut self, ui: &mut dyn Ui) -> bool {
         let (Some(bridge), mut runner) = self.parts() else {
             return false;
@@ -1150,10 +1149,26 @@ impl Session {
     /// Returns the number of images now staged. The path is the user's own, so
     /// it isn't confined to the project root.
     pub fn stage_image(&mut self, path: &str) -> Result<usize> {
-        let bytes = std::fs::read(path).with_context(|| format!("reading image {path:?}"))?;
-        let mime = image_mime(path);
-        let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
-        self.pending_images.push(data_url);
+        self.stage_images(&[path.to_string()])
+    }
+
+    /// Stage several images at once, each a file path or a `data:` URL (a
+    /// program driving the session has the bytes, not necessarily a file:
+    /// see [`crate::serve`]). All of them or none: one that can't be read
+    /// leaves nothing staged from this call. Returns the number now staged.
+    pub fn stage_images(&mut self, sources: &[String]) -> Result<usize> {
+        let mut urls = Vec::with_capacity(sources.len());
+        for source in sources {
+            if source.starts_with("data:") {
+                urls.push(source.clone());
+                continue;
+            }
+            let bytes =
+                std::fs::read(source).with_context(|| format!("reading image {source:?}"))?;
+            let mime = image_mime(source);
+            urls.push(format!("data:{mime};base64,{}", base64_encode(&bytes)));
+        }
+        self.pending_images.extend(urls);
         Ok(self.pending_images.len())
     }
 

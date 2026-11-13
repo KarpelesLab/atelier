@@ -35,8 +35,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{EXIT_ERROR, HeadlessUi, run_prompt, truncate};
+use super::{EXIT_ERROR, HeadlessUi, run_prompt};
 use crate::agent::Session;
+use crate::events::truncate;
 use crate::{agents, context};
 
 /// Exit status: the review ran and found something at or above `--fail-on`.

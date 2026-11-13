@@ -54,6 +54,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::agent::{Approval, Session, StepLimit, Ui};
+use crate::events;
 use crate::schema;
 use crate::tools::ask::{Answer, Question};
 
@@ -70,11 +71,6 @@ pub const EXIT_SCHEMA: u8 = 4;
 /// Exit status: `--goal`'s condition was still unmet when its bounds
 /// (`[goals]`) were reached.
 pub const EXIT_GOAL: u8 = 6;
-
-/// The most of a tool's output a `tool_end` event carries, in bytes. Tool
-/// results can be whole files; a consumer following along wants the gist,
-/// and the event says when it was cut (`"truncated": true`).
-const TOOL_OUTPUT_CAP: usize = 16 * 1024;
 
 /// What stdout carries (`--output-format`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,9 +234,8 @@ enum Reply {
 
 /// Read a stdin line as the answer to question `id`:
 /// `{"type":"answer","id":…,"labels":[…]}` or `{"type":"answer","id":…,
-/// "text":"…"}`. Labels must be options of the question, exactly as given
-/// (the parent has them from the `question` event); `text` is the free
-/// answer and is only taken where the question allows one.
+/// "text":"…"}`. What makes labels or text acceptable is the same as for
+/// `atelier serve` (see [`events::answer`]).
 fn parse_answer(line: &str, id: u64, question: &Question) -> Reply {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return Reply::Other;
@@ -251,55 +246,24 @@ fn parse_answer(line: &str, id: u64, question: &Question) -> Reply {
     if v["id"].as_u64() != Some(id) {
         return Reply::Invalid(format!("answer does not carry the question's id ({id})"));
     }
-    if let Some(labels) = v["labels"].as_array() {
-        let mut chosen = Vec::new();
-        // In the order offered, whatever order they were sent in.
-        for option in &question.options {
-            if labels.iter().any(|l| l.as_str() == Some(&option.label)) {
-                chosen.push(option.label.clone());
-            }
-        }
-        let unknown = labels
-            .iter()
-            .find(|l| !chosen.iter().any(|c| l.as_str() == Some(c)));
-        return match (unknown, chosen.len()) {
-            (Some(l), _) => Reply::Invalid(format!("{l} is not a label of this question")),
-            (None, 0) => Reply::Invalid("\"labels\" is empty".to_string()),
-            (None, 2..) if !question.multi_select => {
-                Reply::Invalid("this question takes one label".to_string())
-            }
-            (None, _) => Reply::Answer(Answer::Labels(chosen)),
-        };
-    }
-    match v["text"].as_str().map(str::trim) {
-        Some(text) if !text.is_empty() && question.allow_other => {
-            Reply::Answer(Answer::Text(text.to_string()))
-        }
-        Some(text) if !text.is_empty() => {
-            Reply::Invalid("this question only takes its own labels".to_string())
-        }
-        _ => Reply::Invalid(r#"an answer needs "labels":[...] or "text":"...""#.to_string()),
+    match events::answer(&v, question) {
+        Ok(answer) => Reply::Answer(answer),
+        Err(why) => Reply::Invalid(why),
     }
 }
 
 /// The `question` event for the `ask` tool.
 fn question_event(id: u64, q: &Question) -> Value {
-    let options: Vec<Value> = q
-        .options
-        .iter()
-        .map(|o| match &o.description {
-            Some(d) => json!({ "label": o.label, "description": d }),
-            None => json!({ "label": o.label }),
-        })
-        .collect();
-    json!({
-        "type": "question",
-        "id": id,
-        "question": q.question,
-        "options": options,
-        "multi_select": q.multi_select,
-        "allow_other": q.allow_other,
-    })
+    let mut event = typed("question", events::question(q));
+    event["id"] = Value::from(id);
+    event
+}
+
+/// A `stream-json` event: the payload this and `atelier serve` both send
+/// (see [`events`]), marked with its `type`.
+fn typed(kind: &str, mut payload: Value) -> Value {
+    payload["type"] = Value::from(kind);
+    payload
 }
 
 /// One `--input-format stream-json` line: `{"type":"user","text":"…"}`.
@@ -559,19 +523,6 @@ fn emit(event: &Value) {
     let _ = out.flush();
 }
 
-/// Cut `text` to at most `cap` bytes, on a character boundary; says whether
-/// anything was dropped.
-fn truncate(text: &str, cap: usize) -> (&str, bool) {
-    if text.len() <= cap {
-        return (text, false);
-    }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&text[..end], true)
-}
-
 /// The [`Ui`] of a headless run. In `text` mode only the model's answer goes
 /// to stdout so it stays clean for piping, and everything else — reasoning,
 /// tool activity, info and notices — goes to stderr; `json` keeps the stderr
@@ -648,7 +599,7 @@ impl HeadlessUi {
 impl Ui for HeadlessUi {
     fn reasoning(&mut self, text: &str) {
         if self.streaming() {
-            emit(&json!({ "type": "reasoning", "text": text }));
+            emit(&typed("reasoning", events::text(text)));
         } else {
             // Keep it off stdout; surface it for anyone watching the run.
             eprint!("{text}");
@@ -661,7 +612,7 @@ impl Ui for HeadlessUi {
         }
         self.answer.push_str(text);
         match self.format {
-            OutputFormat::StreamJson => emit(&json!({ "type": "text", "text": text })),
+            OutputFormat::StreamJson => emit(&typed("text", events::text(text))),
             OutputFormat::Text if !self.structured => {
                 print!("{text}");
                 io::stdout().flush().ok();
@@ -675,11 +626,7 @@ impl Ui for HeadlessUi {
     fn tool_start(&mut self, name: &str, arguments: &str) {
         self.answer.clear();
         if self.streaming() {
-            // The arguments are JSON as the model wrote it; pass them on
-            // parsed when they are valid, verbatim when they aren't.
-            let arguments =
-                serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| Value::from(arguments));
-            emit(&json!({ "type": "tool_start", "name": name, "arguments": arguments }));
+            emit(&typed("tool_start", events::tool_start(name, arguments)));
         } else {
             eprintln!("⚙ {name} {arguments}");
         }
@@ -689,12 +636,7 @@ impl Ui for HeadlessUi {
         // Also here: a denied call ends without ever starting.
         self.answer.clear();
         if self.streaming() {
-            let (output, truncated) = truncate(result, TOOL_OUTPUT_CAP);
-            let mut event = json!({ "type": "tool_end", "name": name, "ok": ok, "output": output });
-            if truncated {
-                event["truncated"] = Value::Bool(true);
-            }
-            emit(&event);
+            emit(&typed("tool_end", events::tool_end(name, result, ok)));
         } else {
             let mark = if ok { "✓" } else { "✗" };
             eprintln!("{mark} {name}: {result}");
@@ -715,7 +657,7 @@ impl Ui for HeadlessUi {
 
     fn info(&mut self, text: &str) {
         if self.streaming() {
-            emit(&json!({ "type": "info", "text": text }));
+            emit(&typed("info", events::text(text)));
         } else {
             eprintln!("{text}");
         }
@@ -730,12 +672,10 @@ impl Ui for HeadlessUi {
     /// available.
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         if self.streaming() {
-            let arguments =
-                serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| Value::from(arguments));
             emit(&json!({
                 "type": "approval",
                 "tool": tool,
-                "arguments": arguments,
+                "arguments": events::arguments(arguments),
                 "decision": "denied",
             }));
         }
@@ -766,7 +706,7 @@ impl Ui for HeadlessUi {
 
     fn notice(&mut self, text: &str) {
         if self.streaming() {
-            emit(&json!({ "type": "notice", "text": text }));
+            emit(&typed("notice", events::text(text)));
         } else {
             eprintln!("{text}");
         }
@@ -776,7 +716,7 @@ impl Ui for HeadlessUi {
         // Only a stream consumer gets the reviewer's notes; the stderr side
         // of the other formats never showed them.
         if self.streaming() {
-            emit(&json!({ "type": "review", "text": text }));
+            emit(&typed("review", events::text(text)));
         }
     }
 }
@@ -938,13 +878,5 @@ mod tests {
             parse_answer(r#"{"type":"answer","id":1,"text":"other"}"#, 1, &multi),
             Reply::Invalid(_)
         ));
-    }
-
-    #[test]
-    fn truncate_respects_char_boundaries() {
-        assert_eq!(truncate("abc", 10), ("abc", false));
-        assert_eq!(truncate("abcdef", 3), ("abc", true));
-        // 'é' is two bytes; a cut in its middle backs off.
-        assert_eq!(truncate("aé", 2), ("a", true));
     }
 }

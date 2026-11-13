@@ -12,8 +12,11 @@
 //! `trust`, `mcp-serve`) are picked off in `main` before this runs. Those that are
 //! runs on a session (`review`, `debug prompt`) are recognized by [`subcommand`]; their
 //! arguments are their own, parsed by the module that implements them.
+//! `serve` is one more exception: it runs a session, so it takes the
+//! session's flags and is parsed here.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -27,6 +30,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
        atelier debug prompt [prompt...]
        atelier doctor [--json] [--offline] [--mcp]
+       atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS]
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
@@ -49,6 +53,10 @@ with --print:
       --output-schema FILE   JSON Schema the final answer must satisfy
       --goal CONDITION       keep working until CONDITION holds (see /goal)
 
+serve: the session as JSON-RPC 2.0 on stdin/stdout, for a program to drive
+      --approval-timeout N   seconds an approval or a question waits for the
+                             client's answer before it counts as a refusal
+
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
              4 answer failed --output-schema, 6 --goal not met in its bounds
 
@@ -69,6 +77,9 @@ pub struct Cli {
     /// `--print`/`-p`: run headlessly with these options, instead of the
     /// interactive interface.
     pub print: Option<Options>,
+    /// `serve` as the first argument: speak the embedding protocol on
+    /// stdin/stdout (see `serve`) instead of the interactive interface.
+    pub serve: Option<crate::serve::Options>,
 }
 
 /// Parse the arguments after the program name. The error is the message for
@@ -84,9 +95,13 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut max_turns = None;
     let mut schema = None;
     let mut goal = None;
+    let mut approval_timeout = None;
     let mut words: Vec<&str> = Vec::new();
 
-    let mut it = args.iter().map(String::as_str);
+    // `serve` is a mode of the session like `--print`, so it shares the
+    // session's flags; as a subcommand it comes first.
+    let serve = args.first().map(String::as_str) == Some("serve");
+    let mut it = args[usize::from(serve)..].iter().map(String::as_str);
     while let Some(arg) = it.next() {
         if arg == "--" {
             // Everything after is the prompt, dashes and all.
@@ -116,6 +131,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--max-turns" => max_turns = Some(positive(flag, value()?)?),
             "--output-schema" => schema = Some(load_schema(Path::new(value()?))?),
             "--goal" => goal = Some(condition(value()?)?),
+            "--approval-timeout" => approval_timeout = Some(positive(flag, value()?)?),
             _ if inline.is_some() => return Err(format!("{flag} takes no value")),
             "--claude" => claude = true,
             "--continue" | "-c" => resume = true,
@@ -134,6 +150,15 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     ];
     if !print && let Some((flag, _)) = headless_only.iter().find(|(_, set)| *set) {
         return Err(format!("{flag} only applies with --print"));
+    }
+    if !serve && approval_timeout.is_some() {
+        return Err("--approval-timeout only applies with serve".to_string());
+    }
+    if serve && print {
+        return Err("serve and --print are two ways to run; pick one".to_string());
+    }
+    if serve && let Some(word) = words.first() {
+        return Err(format!("serve takes no argument '{word}'"));
     }
     let input = input.unwrap_or(InputFormat::Text);
     if print && input == InputFormat::StreamJson && !words.is_empty() {
@@ -155,6 +180,9 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             schema,
             goal,
             prompt: (!words.is_empty()).then(|| words.join(" ")),
+        }),
+        serve: serve.then(|| crate::serve::Options {
+            approval_timeout: approval_timeout.map(|secs| Duration::from_secs(secs.into())),
         }),
     })
 }
@@ -310,6 +338,34 @@ mod tests {
         // A misspelt mode stops the run rather than falling back to another.
         assert!(parse_err(&["--mode", "pln"]).contains("unknown mode 'pln'"));
         assert_eq!(parse_err(&["--mode"]), "--mode needs a value");
+    }
+
+    #[test]
+    fn serve_is_a_subcommand_with_the_session_flags() {
+        assert_eq!(parse_ok(&[]).serve, None);
+        let cli = parse_ok(&["serve", "--continue", "--mode", "plan", "--claude"]);
+        assert!(cli.resume && cli.claude && cli.print.is_none());
+        assert_eq!(cli.mode, Some(Mode::Plan));
+        assert_eq!(cli.serve.unwrap().approval_timeout, None);
+        assert_eq!(
+            parse_ok(&["serve", "--approval-timeout=30"])
+                .serve
+                .unwrap()
+                .approval_timeout,
+            Some(Duration::from_secs(30))
+        );
+        // Only as the first argument: elsewhere it is a word like any other.
+        assert_eq!(parse_ok(&["--continue", "serve"]).serve, None);
+        assert_eq!(
+            parse_err(&["--approval-timeout", "5"]),
+            "--approval-timeout only applies with serve"
+        );
+        assert!(parse_err(&["serve", "--approval-timeout", "0"]).contains("positive number"));
+        assert!(parse_err(&["serve", "-p", "hi"]).contains("pick one"));
+        assert_eq!(
+            parse_err(&["serve", "now"]),
+            "serve takes no argument 'now'"
+        );
     }
 
     #[test]

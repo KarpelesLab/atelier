@@ -14,6 +14,7 @@ mod config;
 mod context;
 mod coord;
 mod doctor;
+mod events;
 mod headless;
 mod hooks;
 mod js;
@@ -26,6 +27,7 @@ mod review;
 mod risk;
 mod sandbox;
 mod schema;
+mod serve;
 mod session;
 mod settings;
 mod shlex;
@@ -237,6 +239,11 @@ fn run() -> Result<u8> {
     // on the `tui` feature, so `--print` works in both build configs.
     if let Some(opts) = cli.print {
         return Ok(finish(headless::run(session, opts)));
+    }
+    // `atelier serve`: the session over JSON-RPC on stdin/stdout, for a
+    // program to drive (see `serve`). Its stdout is the protocol's alone.
+    if let Some(opts) = cli.serve {
+        return Ok(finish(serve::run(session, opts)));
     }
 
     #[cfg(tui)]

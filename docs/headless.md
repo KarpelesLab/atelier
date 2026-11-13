@@ -5,6 +5,11 @@ opening the TUI/REPL. It is the interface for scripts, CI and programs that
 drive atelier: stdout is a contract chosen with `--output-format`, and the
 exit status says how the run ended.
 
+A program that needs the other half of the conversation — answering
+approval prompts, steering or interrupting a turn in progress, running slash
+commands — wants [`atelier serve`](protocol.md) instead: the same events, as
+JSON-RPC 2.0 over stdio.
+
 ```sh
 atelier -p "summarize src/main.rs"                    # answer text on stdout
 atelier -p < prompt.txt                               # no prompt words: read stdin

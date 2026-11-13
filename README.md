@@ -102,6 +102,7 @@ first conversation, the REPL/TUI fallback).
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
 | [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, `--goal`, exit codes; `atelier review` (a read-only review of a change, for you or CI) |
 | [Troubleshooting](docs/troubleshooting.md) | `atelier doctor`: a checklist of the setup (config files, endpoint, model, instruction files, hooks, MCP, …); `atelier debug prompt`: the exact first request a prompt would make, without sending it |
+| [Embedding protocol](docs/protocol.md) | `atelier serve`: the session as JSON-RPC 2.0 over stdio, for editors and other front ends — start, steer and interrupt turns, answer approvals and questions, run commands; events, error codes, how ACP maps onto it |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
@@ -131,6 +132,8 @@ src/
 ├─ settings.rs    atelier.toml (MCP servers, permissions)
 ├─ session.rs     on-disk session persistence (.atelier/session.json)
 ├─ headless.rs    --print: non-interactive runs, JSON output, exit codes
+├─ serve.rs       serve: the embedding protocol (JSON-RPC 2.0 over stdio)
+├─ events.rs      the event payloads --print's stream-json and serve share
 ├─ schema.rs      the JSON Schema subset behind --output-schema
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls, vision
 ├─ claude/        Claude backend: drives the `claude` CLI; serves it atelier's tools (mcp-serve)
