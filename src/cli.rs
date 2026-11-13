@@ -25,7 +25,7 @@ use crate::permissions::Mode;
 
 /// What a usage error prints after its message, and `--help` on its own.
 pub const USAGE: &str = "\
-usage: atelier [--claude] [--continue] [--mode MODE]
+usage: atelier [--claude | --local] [--continue] [--mode MODE]
        atelier --print [options] [--] [prompt...]
        atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
        atelier debug prompt [prompt...]
@@ -33,6 +33,7 @@ usage: atelier [--claude] [--continue] [--mode MODE]
        atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS]
        atelier acp [--claude] [--mode MODE] [--max-turns N]
        atelier update | coordinator [status|stop]
+       atelier local [status|download|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier permissions reviewer-policy
        atelier stats [--days N] [--project] [--json]
@@ -74,6 +75,8 @@ exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
 pub struct Cli {
     /// `--claude`: the Claude Code backend.
     pub claude: bool,
+    /// `--local`: a model on this machine (see `local`).
+    pub local: bool,
     /// `--continue`/`-c`: resume the saved session first.
     pub resume: bool,
     /// `--help`/`-h`.
@@ -95,6 +98,7 @@ pub struct Cli {
 /// the user (exit status 2).
 pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut claude = false;
+    let mut local = false;
     let mut resume = false;
     let mut help = false;
     let mut mode = None;
@@ -145,6 +149,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--approval-timeout" => approval_timeout = Some(positive(flag, value()?)?),
             _ if inline.is_some() => return Err(format!("{flag} takes no value")),
             "--claude" => claude = true,
+            "--local" => local = true,
             "--continue" | "-c" => resume = true,
             "--print" | "-p" => print = true,
             "--help" | "-h" => help = true,
@@ -194,6 +199,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 
     Ok(Cli {
         claude,
+        local,
         resume,
         help,
         mode,

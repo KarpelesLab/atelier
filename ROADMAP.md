@@ -438,6 +438,20 @@ stale-edit rejection, ambient per-turn context with dedup, the mediated `node`
 tool, mid-turn steering, the subconscious reviewer, three sanctioned backends,
 the coordinator, a libc-free static binary.
 
+### M23 — A model on this machine ✅
+
+`atelier --local` / `/local` ([docs/local.md](docs/local.md), `src/local.rs`):
+for the user with no endpoint, key or subscription. oxinfer is fetched from
+its releases and run as a separate process — an OpenAI-compatible server on
+loopback, so it is one more provider — with Qwen3.8 27B (text, images,
+tools) by default. The weights (56 GB) are only downloaded after a yes; one
+supervised server is shared by all sessions and stops a minute after the
+last one leaves.
+
+- ⏳ Not yet run with the default 27B model (the plumbing was exercised
+  end to end with a 0.8B one); choosing a model by what the machine can
+  run; updating the installed oxinfer; Windows.
+
 ### Progress on M15–M22
 
 | | Status | Left |

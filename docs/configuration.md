@@ -31,6 +31,7 @@ other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
 | Variable                  | Default                          | Read by | Meaning |
 |----------------------------|-----------------------------------|---------|---------|
 | `ATELIER_BACKEND`         | *(unset)*                        | `Config::from_env` | `claude` selects the [Claude backend](claude.md) (same as `--claude`); otherwise OpenAI-compatible |
+| `ATELIER_BACKEND=local`, `ATELIER_LOCAL_MODEL`, `ATELIER_LOCAL_ACCEPT`, `ATELIER_OXINFER_BIN` | *(unset)* | `local` | The [model on this machine](local.md): select it, name the model, agree to its download unattended, use your own oxinfer |
 | `ATELIER_CLAUDE_BIN`      | `claude`                         | `Config::from_env` | Claude backend: the Claude Code executable to launch |
 | `ATELIER_CLAUDE_BUILTINS` | *(unset)*                        | `Config::from_env` | Claude backend: `keep` leaves claude's own file/shell/fetch tools on next to atelier's (default: switched off — see [claude.md](claude.md#tools)) |
 | `ATELIER_BASE_URL`        | `http://192.168.0.50:11400/v1`   | `Config::from_env` | OpenAI-compatible endpoint base; every request path is appended to it. This endpoint is the provider named `env` — see [providers](#provider--named-endpoints) |

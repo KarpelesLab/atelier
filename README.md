@@ -126,6 +126,7 @@ first conversation, the REPL/TUI fallback).
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing, deferred tools and code mode; [`atelier mcp`](docs/mcp.md#atelier-as-an-mcp-server): atelier's own tools as an MCP server for another agent |
 | [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` — and how it differs from `atelier review` |
 | [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |
+| [A model on this machine](docs/local.md) | `atelier --local`: no key, no subscription — oxinfer fetched and run for you, Qwen3.8 27B by default (text and images); `/local`, `atelier local` |
 | [Claude backend](docs/claude.md) | `--claude`: driving your Claude Code CLI from atelier |
 | [Coordinator](docs/coordinator.md) | How running ateliers find and message each other: `/peers`, `/send`, topics, asking another agent and getting its answer, advisory locks on paths, the `peer*` tools |
 

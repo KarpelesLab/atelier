@@ -29,6 +29,9 @@ use crate::settings::ProviderConfig;
 /// (`ATELIER_BASE_URL`, `ATELIER_API_KEY`).
 pub const ENV_PROVIDER: &str = "env";
 
+/// The name of the provider that is the local model server.
+pub const LOCAL_PROVIDER: &str = "local";
+
 /// A named OpenAI-compatible endpoint.
 #[derive(Debug)]
 pub struct Provider {
@@ -88,6 +91,17 @@ impl Provider {
             name: ENV_PROVIDER.to_string(),
             base_url,
             key: api_key.map_or(KeySource::None, KeySource::Fixed),
+            headers: Vec::new(),
+            timeout_ms: None,
+        }
+    }
+
+    /// The model server atelier runs on this machine (see [`crate::local`]).
+    pub fn local(base_url: String, key: String) -> Self {
+        Self {
+            name: LOCAL_PROVIDER.to_string(),
+            base_url,
+            key: KeySource::Fixed(key),
             headers: Vec::new(),
             timeout_ms: None,
         }

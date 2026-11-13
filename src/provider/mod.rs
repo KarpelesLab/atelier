@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-pub use endpoint::{Provider, Target};
+pub use endpoint::{LOCAL_PROVIDER, Provider, Target};
 
 /// Env var overriding every HTTP connect timeout (milliseconds), a
 /// provider's own `timeout_secs` included. Read directly here rather than

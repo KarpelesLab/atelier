@@ -223,6 +223,22 @@ impl Config {
         }
     }
 
+    /// Make the local model server the main model's provider: `local` is
+    /// added (or replaced — the server's port and key change when it is
+    /// restarted) and the main model becomes the one it serves.
+    pub fn use_local(&mut self, provider: Provider) {
+        let provider = Arc::new(provider);
+        match self.providers.iter_mut().find(|p| p.name == provider.name) {
+            Some(slot) => *slot = provider,
+            None => self.providers.push(provider),
+        }
+        self.model = format!(
+            "{}/{}",
+            crate::provider::LOCAL_PROVIDER,
+            crate::local::MODEL_ID
+        );
+    }
+
     /// Lay the model tables of `atelier.toml` over the environment: the
     /// project's file and the user-global one, the project winning wherever
     /// both name the same thing. Returns what was wrong with them, for the

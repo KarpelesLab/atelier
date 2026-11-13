@@ -78,6 +78,11 @@ pub struct Settings {
     /// Limits on subagents (see `agent::subagent`).
     #[serde(default, skip_serializing_if = "AgentSettings::is_empty")]
     pub agents: AgentSettings,
+    /// The model run on this machine (see [`crate::local`]). Honoured in
+    /// the user-global file only: what to download and load is not a
+    /// project's to choose.
+    #[serde(default, skip_serializing_if = "LocalSettings::is_unset")]
+    pub local: LocalSettings,
     /// This instance among the others (see [`crate::coord`]).
     #[serde(default, skip_serializing_if = "CoordinatorSettings::is_unset")]
     pub coordinator: CoordinatorSettings,
@@ -206,6 +211,26 @@ pub struct GoalSettings {
 
 impl GoalSettings {
     /// Nothing set: the table is left out when the settings are written.
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[local]`: the model `atelier --local` runs with oxinfer.
+///
+/// ```toml
+/// [local]
+/// model = "google/gemma-4-E4B-it,quant=q8"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalSettings {
+    /// `SOURCE[,KEY=VALUE...]` as `oxinfer serve --model` takes it: a
+    /// Hugging Face repository, a folder or a file, and oxinfer's options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl LocalSettings {
     fn is_unset(&self) -> bool {
         *self == Self::default()
     }

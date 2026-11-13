@@ -19,6 +19,7 @@ mod events;
 mod headless;
 mod hooks;
 mod js;
+mod local;
 mod lsp;
 mod mcp;
 mod memory;
@@ -98,6 +99,15 @@ fn run() -> Result<u8> {
     if args.first().map(String::as_str) == Some("sandbox") {
         return sandbox::run_command(&args[1..]);
     }
+    // `atelier local [status|download|stop]`: the model on this machine;
+    // `local-serve` is its server's supervisor, started by atelier itself
+    // (see `local`).
+    if args.first().map(String::as_str) == Some("local") {
+        return local::run_command(&args[1..]).map(|()| 0);
+    }
+    if args.first().map(String::as_str) == Some("local-serve") {
+        return local::supervise(&args[1..]).map(|()| 0);
+    }
     // `atelier doctor`: check the setup a session here would run with,
     // without starting one (see `doctor`).
     if args.first().map(String::as_str) == Some("doctor") {
@@ -174,11 +184,11 @@ fn run() -> Result<u8> {
     // to drive (see `acp`). The session is opened when the editor asks for
     // one, in the directory it names — so not here.
     if let Some(opts) = cli.acp {
-        let claude = cli.claude;
-        let open = move || open_session(claude, mode);
+        let (claude, local) = (cli.claude, cli.local);
+        let open = move || with_local(open_session(claude, mode)?, local);
         return Ok(finish(acp::run(open, opts)));
     }
-    let mut session = open_session(cli.claude, mode)?;
+    let mut session = with_local(open_session(cli.claude, mode)?, cli.local)?;
     if cli.resume {
         eprintln!("{}", session.resume());
     }
@@ -221,6 +231,42 @@ fn run() -> Result<u8> {
 /// starts: the configuration from the environment and the `atelier.toml`
 /// files, the tools, the link to the other instances. `claude` is
 /// `--claude`; `mode` is the permission mode asked for, if one was.
+/// `session`, served by a model on this machine when `--local` or
+/// `ATELIER_BACKEND=local` asks for it (see `local`). Nobody is at a prompt
+/// yet, so a download that needs a yes fails with how to give it.
+fn with_local(mut session: agent::Session, flag: bool) -> Result<agent::Session> {
+    if flag || std::env::var("ATELIER_BACKEND").is_ok_and(|v| v == "local") {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            // Someone is there to say yes to a download.
+            session.use_local(&mut agent::StdoutUi::new())?;
+        } else {
+            session.use_local(&mut Quiet)?;
+        }
+    }
+    Ok(session)
+}
+
+/// What starting the local model has to say when nobody is at a terminal:
+/// on stderr, since stdout may be a `--print` answer or a protocol.
+struct Quiet;
+
+impl agent::Ui for Quiet {
+    fn reasoning(&mut self, _: &str) {}
+    fn content(&mut self, _: &str) {}
+    fn tool_start(&mut self, _: &str, _: &str) {}
+    fn tool_end(&mut self, _: &str, _: &str, _: bool) {}
+    fn info(&mut self, text: &str) {
+        eprintln!("{text}");
+    }
+    fn ask_approval(&mut self, _: &str, _: &str) -> agent::Approval {
+        agent::Approval::Deny
+    }
+    fn notice(&mut self, text: &str) {
+        eprintln!("{text}");
+    }
+}
+
 fn open_session(claude: bool, mode: Option<permissions::Mode>) -> Result<agent::Session> {
     // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
     let mut cfg = Config::from_env(claude);

@@ -238,6 +238,8 @@ const HELP: &[&str] = &[
     "  /providers                            list the configured providers and the model per role",
     "  /login                                sign in with ChatGPT (use your ChatGPT plan)",
     "  /logout                               sign out of ChatGPT",
+    "  /local                                run a model on this machine (oxinfer): no key, no",
+    "                                        subscription; downloads what it needs, after asking",
     "  /tools                                list available tools",
     "  /review [on|off]                      the parallel reviewer (\"subconscious\")",
     "  /config                               open the settings screen (full-screen in the TUI)",
@@ -471,6 +473,13 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 Err(e) => ui.info(&format!("login failed: {e:#}")),
             }
         }
+        "/local" => match session.use_local(ui) {
+            Ok(()) => ui.info(&format!(
+                "model: {} — on this machine, from now on",
+                session.backend_label()
+            )),
+            Err(e) => ui.info(&format!("error: {e:#}")),
+        },
         "/logout" => {
             let _ = auth::logout();
             session.logout_chatgpt();
@@ -877,6 +886,9 @@ pub struct Session {
     /// The user was warned that quitting stops claude's background tasks; a
     /// second quit goes ahead.
     quit_warned: bool,
+    /// The model server on this machine, while this session uses it (see
+    /// [`crate::local`]): held so the server knows it has a user.
+    local: Option<crate::local::Local>,
     /// The link to the other atelier instances (see [`coord`]), if any.
     coord: Option<std::sync::Arc<coord::Client>>,
     /// Messages from other instances that arrived (and were shown) while
@@ -990,6 +1002,7 @@ impl Session {
             claude_session: None,
             claude_restart: false,
             quit_warned: false,
+            local: None,
             coord: None,
             peer_pending: Vec::new(),
             idle,
@@ -1064,6 +1077,77 @@ impl Session {
     }
 
     /// Drop the ChatGPT backend (back to the configured chat/completions one).
+    /// Serve this session from a model on this machine (see
+    /// [`crate::local`]): install oxinfer and fetch the model's weights if
+    /// they are missing — the weights only once the user agrees — start the
+    /// server or join the one already running, and make it the main model.
+    pub fn use_local(&mut self, ui: &mut dyn Ui) -> Result<()> {
+        use crate::local;
+        if self.is_claude() {
+            anyhow::bail!("the Claude backend runs claude's own models; start without --claude");
+        }
+        let user = Settings::load_user().unwrap_or_default();
+        let model = local::Model::configured(&user);
+        // One already running is joined at once; the rest is what it takes
+        // to get the first one going.
+        let running = local::join(&model)?;
+        let bin = match &running {
+            Some(_) => None,
+            None => Some(local::binary(&mut |line| ui.info(line))?),
+        };
+        let plan = match &bin {
+            Some(bin) => local::plan(bin, &model),
+            None => local::Plan::default(),
+        };
+        for line in plan.lines(&model) {
+            ui.info(&line);
+        }
+        if let Some(gb) = plan.download_gb {
+            // Tens of gigabytes: never without a yes.
+            let agreed = std::env::var(local::ENV_ACCEPT).is_ok_and(|v| v == "1")
+                || matches!(
+                    ui.ask_user(&Question {
+                        question: format!("Download {} ({gb:.0} GB) now?", model.source()),
+                        options: vec![
+                            ask::Choice {
+                                label: "Download".into(),
+                                description: Some("it can take a while; progress is shown".into()),
+                            },
+                            ask::Choice {
+                                label: "Not now".into(),
+                                description: None,
+                            },
+                        ],
+                        multi_select: false,
+                        allow_other: false,
+                    }),
+                    Some(Answer::Labels(labels)) if labels == ["Download"]
+                );
+            if !agreed {
+                anyhow::bail!(
+                    "not downloaded. `atelier local download` fetches it from a shell; \
+                     {}=1 agrees where nobody can be asked",
+                    local::ENV_ACCEPT
+                );
+            }
+            let bin = bin.as_deref().expect("a plan comes from the program");
+            local::download(bin, &model, &mut |line| ui.info(line))?;
+        }
+        let server = match (running, &bin) {
+            (Some(server), _) => server,
+            (None, Some(bin)) => local::connect(bin, &model, &mut |line| ui.info(line))?,
+            (None, None) => unreachable!("no server running means the program was looked up"),
+        };
+        self.cfg.use_local(provider::Provider::local(
+            server.base_url.clone(),
+            server.key.clone(),
+        ));
+        // The main model is the local one now, not the ChatGPT plan's.
+        self.chatgpt = None;
+        self.local = Some(server);
+        Ok(())
+    }
+
     pub fn logout_chatgpt(&mut self) {
         self.chatgpt = None;
     }
@@ -1950,7 +2034,22 @@ impl Session {
                 on_event,
             )
         } else {
-            provider::stream_chat(&self.cfg.target(role), messages, specs, on_event)
+            let target = self.cfg.target(role);
+            let result = provider::stream_chat(&target, messages, specs, on_event);
+            // The built-in endpoint is a development server: whoever can't
+            // reach it and has configured nothing is told what to do next.
+            let unconfigured = target.provider.name == crate::provider::endpoint::ENV_PROVIDER
+                && std::env::var_os("ATELIER_BASE_URL").is_none();
+            match result {
+                Err(e) if unconfigured && e.downcast_ref::<provider::HttpError>().is_none() => {
+                    Err(e.context(
+                        "no model endpoint is configured and the built-in one is out of reach — \
+                         /local (or `atelier --local`) runs a model on this machine; \
+                         ATELIER_BASE_URL names an endpoint of yours",
+                    ))
+                }
+                result => result,
+            }
         }
     }
 
