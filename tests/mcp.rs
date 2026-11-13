@@ -26,6 +26,10 @@ use serde_json::{Value, json};
 
 /// One HTTP request as a fake server sees it.
 struct Request {
+    /// Path and query.
+    target: String,
+    /// Header names lower-cased.
+    headers: HashMap<String, String>,
     body: String,
 }
 
@@ -116,6 +120,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
+    let target = line.split_whitespace().nth(1)?.to_string();
     let mut headers = HashMap::new();
     loop {
         let mut line = String::new();
@@ -132,6 +137,8 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).ok()?;
     Some(Request {
+        target,
+        headers,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
 }
@@ -496,4 +503,106 @@ command = "echo fired >> wrapper.log"
         "mcp__tracker__delete_issue\nmcp__tracker__create_issue\n"
     );
     assert!(!dir.join("wrapper.log").exists());
+}
+
+/// A remote server that wants OAuth: at startup it is reported with the
+/// command to sign in (no browser opens — the run just carries on), and with
+/// a stored grant it connects, refreshing the expired access token first.
+/// `/mcp logout` then forgets the grant. (The sign-in itself needs a browser
+/// and is tested in-process, in `src/mcp/oauth.rs` and `src/agent/mod.rs`.)
+#[test]
+fn an_oauth_server_is_reported_at_startup_and_connects_with_a_stored_grant() {
+    // Accepts only the token its `/token` endpoint hands out on refresh.
+    let guarded = Server::start(|request, _| {
+        if request.target == "/token" {
+            let refreshed = request.body.contains("grant_type=refresh_token")
+                && request.body.contains("refresh_token=rt-old");
+            return match refreshed {
+                true => Reply::json(&json!({ "access_token": "fresh", "expires_in": 3600 })),
+                false => Reply {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: String::new(),
+                },
+            };
+        }
+        if request.headers.get("authorization").map(String::as_str) != Some("Bearer fresh") {
+            let challenge = "Bearer resource_metadata=\"http://127.0.0.1:9/none\"";
+            return Reply {
+                status: 401,
+                headers: vec![("WWW-Authenticate".into(), challenge.into())],
+                body: String::new(),
+            };
+        }
+        let msg: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+        let Some(id) = msg.get("id") else {
+            return Reply {
+                status: 202,
+                headers: Vec::new(),
+                body: String::new(),
+            };
+        };
+        let result = match msg["method"].as_str().unwrap_or("") {
+            "initialize" => json!({ "capabilities": {} }),
+            "tools/list" => json!({ "tools": [{ "name": "whoami" }] }),
+            _ => {
+                let error = json!({ "code": -32601, "message": "Method not found" });
+                return Reply::json(&json!({ "jsonrpc": "2.0", "id": id, "error": error }));
+            }
+        };
+        Reply::json(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    });
+    let model = model(vec![say("unused")]);
+    let url = guarded.url("/mcp");
+    let dir = project(
+        "oauth",
+        &format!("[[mcp_http]]\nname = \"guarded\"\nurl = \"{url}\"\n"),
+    );
+
+    // Not signed in.
+    let out = run_repl(&model, &dir, "/tools\n");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("mcp: 'guarded' needs sign-in — run /mcp login guarded"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("mcp__guarded__"), "{stdout}");
+
+    // Signed in earlier, access token since expired.
+    let auth_file = dir.with_extension("config").join("atelier/mcp-auth.json");
+    std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+    let grant = json!({
+        "client_id": "c1",
+        "token_endpoint": guarded.url("/token"),
+        "access_token": "stale",
+        "refresh_token": "rt-old",
+        "expires_at": 1,
+    });
+    std::fs::write(&auth_file, json!({ url.as_str(): grant }).to_string()).unwrap();
+
+    let out = run_repl(&model, &dir, "/tools\n/mcp logout guarded\n/tools\n");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(
+        stderr.contains("mcp: connected 'guarded' (http, 1 tool(s))"),
+        "{stderr}"
+    );
+    let (before, after) = stdout
+        .split_once("signed out of 'guarded'")
+        .unwrap_or_else(|| panic!("no sign-out in: {stdout}"));
+    assert!(before.contains("  mcp__guarded__whoami\n"), "{stdout}");
+    assert!(!after.contains("mcp__guarded__"), "{stdout}");
+    // The refreshed token was stored (and kept the refresh token it had),
+    // until the sign-out removed the server's entry.
+    let refresh = guarded
+        .bodies()
+        .into_iter()
+        .find(|b| b.contains("grant_type=refresh_token"));
+    assert!(refresh.expect("a refresh request").contains("client_id=c1"));
+    let stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&auth_file).unwrap()).unwrap();
+    assert_eq!(stored, json!({}));
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&auth_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
 }

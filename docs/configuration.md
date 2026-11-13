@@ -112,12 +112,18 @@ transport at startup, same as `[[mcp]]`:
 | `name`    | string     | Logical server name; tools are namespaced `mcp__<name>__<tool>` |
 | `url`     | string     | The server's MCP endpoint URL |
 | `headers` | string[]   | `"Name: Value"` strings sent on every request (default: empty) |
+| `client_id` | string   | OAuth client id for `/mcp login`, when the authorization server has no dynamic registration (default: atelier registers itself) |
 | `enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_secs`, `tool_timeout_secs` | | As for `[[mcp]]` |
 
 Managed via `/mcp add <name> <http(s)://url> [Header: Value ...]` and `/mcp
 remove <name>` — the same subcommands as stdio servers; atelier tells the two
 apart by whether the target looks like a URL. See [MCP](mcp.md) for the
 transport details and its known gaps.
+
+A server that requires OAuth is signed in to with `/mcp login <name>`; its
+tokens go to `mcp-auth.json` in the user config directory
+(`$XDG_CONFIG_HOME/atelier/`, else `~/.config/atelier/`), mode 0600 — not
+into this file. See [MCP → Signing in](mcp.md#signing-in-to-a-remote-server-oauth).
 
 ### `[permissions]`
 

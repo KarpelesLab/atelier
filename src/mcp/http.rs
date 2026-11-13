@@ -14,6 +14,16 @@
 //! if present, it is echoed back as a request header (`Mcp-Session-Id`) on
 //! every subsequent call, as the spec requires.
 //!
+//! ## Authorization
+//!
+//! A connection given a token store ([`HttpServer::tokens`]) sends the
+//! server's stored OAuth access token as `Authorization: Bearer`, refreshed
+//! first if it has expired (see `oauth.rs`). A `401` is answered with one
+//! refresh and one retry — the server may have revoked the token early —
+//! and, failing that, with [`LoginRequired`]: connecting never opens a
+//! browser. A server whose configured `headers` already carry an
+//! `Authorization` is left to them.
+//!
 //! ## What this v1 does *not* cover
 //!
 //! - Server-initiated requests/notifications delivered on a long-lived GET
@@ -45,10 +55,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::jsonrpc::JsonRpc;
+use super::oauth::{self, LoginRequired, TokenStore};
 use super::{Connection, ServerOptions};
 
 /// Configuration for one Streamable-HTTP MCP server.
@@ -61,6 +72,19 @@ pub struct HttpServer {
     pub headers: Vec<(String, String)>,
     /// Tool filters and timeouts.
     pub options: ServerOptions,
+    /// A client id registered with the server's authorization server, for
+    /// `/mcp login`; without one atelier registers itself.
+    pub client_id: Option<String>,
+    /// Where OAuth tokens for servers are kept; `None` sends none.
+    pub tokens: Option<TokenStore>,
+}
+
+impl HttpServer {
+    /// Whether the user configured the `Authorization` header themselves.
+    fn has_own_authorization(&self) -> bool {
+        let is_auth = |(name, _): &(String, String)| name.eq_ignore_ascii_case("authorization");
+        self.headers.iter().any(is_auth)
+    }
 }
 
 /// Connect to an MCP server over Streamable HTTP and return its tools and
@@ -72,10 +96,12 @@ pub struct HttpServer {
 /// shared across every returned tool; calls are serialized through it.
 pub fn connect_http(server: &HttpServer) -> Result<Connection> {
     let options = &server.options;
+    let auth = server.tokens.clone();
     let mut conn = HttpConn::new(
         server.url.clone(),
         server.headers.clone(),
         options.startup_timeout,
+        auth.filter(|_| !server.has_own_authorization()),
     );
 
     // "2025-03-26" is the protocol revision that introduced Streamable HTTP;
@@ -101,16 +127,24 @@ pub(crate) struct HttpConn {
     next_id: u64,
     /// How long one POST may take, start to end.
     timeout: Duration,
+    /// Where this server's OAuth token is looked up before each request.
+    auth: Option<TokenStore>,
 }
 
 impl HttpConn {
-    pub(crate) fn new(url: String, headers: Vec<(String, String)>, timeout: Duration) -> Self {
+    pub(crate) fn new(
+        url: String,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+        auth: Option<TokenStore>,
+    ) -> Self {
         Self {
             url,
             headers,
             session_id: None,
             next_id: 0,
             timeout,
+            auth,
         }
     }
 
@@ -119,21 +153,25 @@ impl HttpConn {
     fn post(&mut self, msg: &Value) -> Result<PostResponse> {
         let body = serde_json::to_vec(msg).context("encoding JSON-RPC message")?;
 
-        let mut req = rsurl::Request::new("POST", &self.url)
-            .context("building HTTP request")?
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .max_time(self.timeout)
-            .read_timeout(Some(self.timeout))
-            .body(body);
-        for (name, value) in &self.headers {
-            req = req.header(name, value);
+        let token = match &self.auth {
+            Some(store) => oauth::bearer(store, &self.url)?,
+            None => None,
+        };
+        let mut resp = self.send(&body, token.as_deref())?;
+        if resp.status == 401
+            && let Some(store) = &self.auth
+        {
+            // A token the server no longer takes although it has not
+            // expired by our reckoning: one refresh, one more try.
+            if token.is_some()
+                && let Some(fresh) = oauth::refresh(store, &self.url)?
+            {
+                resp = self.send(&body, Some(&fresh))?;
+            }
+            if resp.status == 401 {
+                return Err(anyhow!(LoginRequired));
+            }
         }
-        if let Some(session_id) = &self.session_id {
-            req = req.header("mcp-session-id", session_id);
-        }
-
-        let resp = send_within(req, self.timeout)?;
         if !(200..300).contains(&resp.status) {
             bail!(
                 "MCP HTTP server returned HTTP {}: {}",
@@ -151,6 +189,28 @@ impl HttpConn {
             content_type,
             body: resp.body,
         })
+    }
+
+    /// One POST of `body`, with the configured headers, the session id once
+    /// known, and `bearer` as the access token if there is one.
+    fn send(&self, body: &[u8], bearer: Option<&str>) -> Result<rsurl::Response> {
+        let mut req = rsurl::Request::new("POST", &self.url)
+            .context("building HTTP request")?
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .max_time(self.timeout)
+            .read_timeout(Some(self.timeout))
+            .body(body);
+        for (name, value) in &self.headers {
+            req = req.header(name, value);
+        }
+        if let Some(token) = bearer {
+            req = req.header("authorization", &format!("Bearer {token}"));
+        }
+        if let Some(session_id) = &self.session_id {
+            req = req.header("mcp-session-id", session_id);
+        }
+        send_within(req, self.timeout)
     }
 }
 
@@ -563,6 +623,8 @@ mod tests {
             url: format!("http://{addr}/mcp"),
             headers: vec![],
             options: ServerOptions::default(),
+            client_id: None,
+            tokens: None,
         };
         let tools = connect_http(&server)
             .expect("connect_http should succeed")
@@ -642,7 +704,113 @@ mod tests {
                 tool_timeout: Duration::from_millis(tool_ms),
                 ..ServerOptions::default()
             },
+            client_id: None,
+            tokens: None,
         }
+    }
+
+    /// The protected fake server, as configured with the token store `store`.
+    fn protected(fake: &oauth::testutil::FakeAuth, store: &TokenStore) -> HttpServer {
+        HttpServer {
+            name: "guarded".into(),
+            url: fake.url(),
+            headers: vec![],
+            options: ServerOptions::default(),
+            client_id: None,
+            tokens: Some(store.clone()),
+        }
+    }
+
+    fn whoami(connection: &Connection) -> Result<String> {
+        let mut fstate = crate::tools::FileState::new();
+        let mut ctx = crate::tools::ToolCtx {
+            project_root: std::path::Path::new("/"),
+            fstate: &mut fstate,
+            approved: true,
+        };
+        connection.tools[0].call(&mut ctx, json!({}))
+    }
+
+    #[test]
+    fn a_server_wanting_sign_in_fails_with_login_required_until_signed_in() {
+        use oauth::testutil::{fake_auth, sign_in, temp_store};
+        let fake = fake_auth();
+        let store = temp_store("http-connect");
+
+        let err = match connect_http(&protected(&fake, &store)) {
+            Ok(_) => panic!("connected without credentials"),
+            Err(e) => e,
+        };
+        assert!(err.downcast_ref::<LoginRequired>().is_some(), "{err:#}");
+        // Without a token store a 401 is just a failed request.
+        let mut plain = protected(&fake, &store);
+        plain.tokens = None;
+        let err = connect_http(&plain).err().expect("still refused");
+        assert!(err.downcast_ref::<LoginRequired>().is_none());
+        assert!(format!("{err:#}").contains("HTTP 401"), "{err:#}");
+
+        sign_in(&store, &fake, None).unwrap();
+        let connection = connect_http(&protected(&fake, &store)).expect("connects once signed in");
+        assert_eq!(connection.tools[0].name(), "mcp__guarded__whoami");
+        assert_eq!(whoami(&connection).unwrap(), "called \"whoami\"");
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.bearers.last().map(String::as_str), Some("Bearer at-1"));
+    }
+
+    #[test]
+    fn a_rejected_token_is_refreshed_once_and_the_call_retried() {
+        use oauth::testutil::{fake_auth, sign_in, temp_store};
+        let fake = fake_auth();
+        let store = temp_store("http-refresh");
+        sign_in(&store, &fake, None).unwrap();
+        let connection = connect_http(&protected(&fake, &store)).unwrap();
+
+        // The server stops taking the token although it has not expired.
+        let url = fake.url();
+        let mut grant = store.get(&url).unwrap();
+        grant.access_token = "revoked".into();
+        store
+            .update(|grants| grants.insert(url.clone(), grant))
+            .unwrap();
+        assert_eq!(whoami(&connection).unwrap(), "called \"whoami\"");
+        assert_eq!(store.get(&url).unwrap().access_token, fake.valid_token());
+        {
+            let seen = fake.seen.lock().unwrap();
+            let last: Vec<&str> = seen
+                .bearers
+                .iter()
+                .rev()
+                .take(2)
+                .map(String::as_str)
+                .collect();
+            assert_eq!(last, ["Bearer at-2", "Bearer revoked"]);
+        }
+
+        // Nothing left to refresh with: the call says to sign in again.
+        let mut grant = store.get(&url).unwrap();
+        grant.access_token = "revoked".into();
+        grant.refresh_token = None;
+        store
+            .update(|grants| grants.insert(url.clone(), grant))
+            .unwrap();
+        let err = whoami(&connection).unwrap_err();
+        assert!(err.downcast_ref::<LoginRequired>().is_some(), "{err:#}");
+    }
+
+    #[test]
+    fn a_configured_authorization_header_is_left_alone() {
+        use oauth::testutil::{fake_auth, sign_in, temp_store};
+        let fake = fake_auth();
+        let store = temp_store("http-own-header");
+        sign_in(&store, &fake, None).unwrap();
+        let mut server = protected(&fake, &store);
+        server.headers = vec![("Authorization".into(), "Bearer mine".into())];
+        // The user's header is sent as is, and its rejection is not turned
+        // into a sign-in request.
+        let err = connect_http(&server).err().expect("the fake rejects it");
+        assert!(err.downcast_ref::<LoginRequired>().is_none(), "{err:#}");
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.bearers.last().map(String::as_str), Some("Bearer mine"));
     }
 
     #[test]

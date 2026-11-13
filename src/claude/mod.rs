@@ -1524,6 +1524,7 @@ mod tests {
             name: "web".into(),
             url: "https://e.x/mcp".into(),
             headers: vec!["Authorization: Bearer t".into()],
+            client_id: None,
             options: McpOptions::default(),
         });
         // Configured but switched off: claude isn't told about it.
@@ -1531,6 +1532,7 @@ mod tests {
             name: "off".into(),
             url: "https://e.x/off".into(),
             headers: Vec::new(),
+            client_id: None,
             options: McpOptions {
                 enabled: false,
                 ..McpOptions::default()

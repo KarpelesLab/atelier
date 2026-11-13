@@ -196,6 +196,8 @@ const HELP: &[&str] = &[
     "  /mcp add <name> <command> [args...]   add a stdio MCP server",
     "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
     "  /mcp remove <name>                    remove an MCP server",
+    "  /mcp login <name>                     sign in to an HTTP MCP server (OAuth, in your browser)",
+    "  /mcp logout <name>                    forget that sign-in",
     "  /permissions                          list the permission rules in force, by source",
     "  /mode [plan|ask-edits|auto-edit|yolo] show or switch how much runs without asking",
     "  /new [force]                          start a fresh conversation (clear saved session);",
@@ -578,6 +580,44 @@ fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
                 Ok(n) => ui.info(&format!(
                     "added MCP server '{name}' — {n} tool(s) now available"
                 )),
+                Err(e) if needs_login(&e) => ui.info(&format!(
+                    "added MCP server '{name}' — it requires sign-in: run /mcp login {name}"
+                )),
+                Err(e) => ui.info(&format!("error: {e:#}")),
+            }
+        }
+        Some("login") => {
+            let Some(name) = args.get(1) else {
+                ui.info("usage: /mcp login <name>");
+                return;
+            };
+            if session.is_claude() {
+                ui.info("not used with the Claude backend: claude signs in to MCP servers itself");
+                return;
+            }
+            ui.info(&format!("opening your browser to sign in to '{name}'…"));
+            let mut open = |url: &str| {
+                crate::oauth::open_browser(url);
+                ui.info("if your browser didn't open, visit:");
+                ui.info(url);
+            };
+            match session.mcp_login(name, &mut open) {
+                Ok(n) => ui.info(&format!(
+                    "signed in to '{name}' — {n} tool(s) now available"
+                )),
+                Err(e) => ui.info(&format!("sign-in failed: {e:#}")),
+            }
+        }
+        Some("logout") => {
+            let Some(name) = args.get(1) else {
+                ui.info("usage: /mcp logout <name>");
+                return;
+            };
+            match session.mcp_logout(name) {
+                Ok(true) => ui.info(&format!(
+                    "signed out of '{name}' — its tools are gone until you sign in again"
+                )),
+                Ok(false) => ui.info(&format!("not signed in to '{name}'")),
                 Err(e) => ui.info(&format!("error: {e:#}")),
             }
         }
@@ -594,7 +634,7 @@ fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
         }
         Some(other) => {
             ui.info(&format!(
-                "unknown /mcp subcommand '{other}' — use: add, remove, or no args to list"
+                "unknown /mcp subcommand '{other}' — use: add, remove, login, logout, or no args to list"
             ));
         }
     }
@@ -608,6 +648,8 @@ pub struct Session {
     context: Vec<Box<dyn ContextProvider>>,
     /// The connected MCP servers, as the MCP context provider sees them.
     mcp_catalog: mcp::Catalog,
+    /// Where OAuth tokens for remote MCP servers are kept.
+    mcp_tokens: mcp::oauth::TokenStore,
     settings: Settings,
     /// How much runs without asking (see [`crate::permissions`]); `yolo` is
     /// `ATELIER_APPROVE=all`.
@@ -705,6 +747,7 @@ impl Session {
             tools,
             context,
             mcp_catalog,
+            mcp_tokens: mcp::oauth::TokenStore::user(),
             settings,
             mode,
             usage_ctx: 0,
@@ -1092,7 +1135,7 @@ impl Session {
         }
         for s in &self.settings.mcp_http {
             match s.options.enabled {
-                true => servers.push(mcp::Server::Http(to_http(s))),
+                true => servers.push(mcp::Server::Http(to_http(s, &self.mcp_tokens))),
                 false => status.push(format!("mcp: '{}' (http) is disabled", s.name)),
             }
         }
@@ -1106,6 +1149,10 @@ impl Session {
                 Ok(connection) => {
                     let n = self.mcp_register(name, connection);
                     format!("mcp: connected '{name}' ({kind}{n} tool(s))")
+                }
+                // Said, not acted on: a browser never opens unasked.
+                Err(e) if needs_login(&e) => {
+                    format!("mcp: '{name}' needs sign-in — run /mcp login {name}")
                 }
                 Err(e) => format!("mcp: failed to connect '{name}': {e:#}"),
             });
@@ -1197,13 +1244,24 @@ impl Session {
             name: name.to_string(),
             url: url.to_string(),
             headers,
+            client_id: None,
             options: McpOptions::default(),
         };
         if self.is_claude() {
             self.settings.mcp_http.push(cfg);
             return self.claude_mcp_changed().map(|_| 0);
         }
-        let connection = mcp::connect_http(&to_http(&cfg))?;
+        let connection = match mcp::connect_http(&to_http(&cfg, &self.mcp_tokens)) {
+            Ok(connection) => connection,
+            // The server is there and wants a sign-in: keep it, so that
+            // `/mcp login` has something to sign in to.
+            Err(e) if needs_login(&e) => {
+                self.settings.mcp_http.push(cfg);
+                self.settings.save(&self.root)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let n = self.mcp_register(name, connection);
         self.mcp_defer();
         self.settings.mcp_http.push(cfg);
@@ -1223,11 +1281,57 @@ impl Session {
         if self.is_claude() {
             return self.claude_mcp_changed().map(|_| true);
         }
-        self.tools.remove_prefix(&format!("mcp__{name}__"));
-        self.mcp_catalog.remove(name);
+        self.mcp_disconnect(name);
         self.mcp_defer();
         self.settings.save(&self.root)?;
         Ok(true)
+    }
+
+    /// Sign in to the HTTP MCP server `name` (OAuth; see `mcp::oauth`) and
+    /// connect it. `open` is given the URL to send the user to. Returns how
+    /// many tools the server brought.
+    pub fn mcp_login(&mut self, name: &str, open: &mut dyn FnMut(&str)) -> Result<usize> {
+        let Some(cfg) = self.settings.mcp_http.iter().find(|m| m.name == name) else {
+            anyhow::bail!(
+                "no HTTP MCP server named '{name}' (sign-in is for [[mcp_http]] servers)"
+            );
+        };
+        let server = to_http(cfg, &self.mcp_tokens);
+        let request = mcp::oauth::LoginRequest {
+            url: &server.url,
+            headers: &server.headers,
+            client_id: server.client_id.as_deref(),
+            timeout: mcp::oauth::CALLBACK_TIMEOUT,
+        };
+        mcp::oauth::login(&self.mcp_tokens, &request, open)?;
+        // Whatever it had registered before (nothing, if it was waiting for
+        // this sign-in) is replaced by what it offers now.
+        self.mcp_disconnect(name);
+        let connection = mcp::connect_http(&server)?;
+        let n = self.mcp_register(name, connection);
+        self.mcp_defer();
+        Ok(n)
+    }
+
+    /// Forget the sign-in to the HTTP MCP server `name` and drop its tools.
+    /// Returns whether there was a sign-in to forget.
+    pub fn mcp_logout(&mut self, name: &str) -> Result<bool> {
+        let Some(cfg) = self.settings.mcp_http.iter().find(|m| m.name == name) else {
+            anyhow::bail!("no HTTP MCP server named '{name}'");
+        };
+        if !self.mcp_tokens.remove(&cfg.url)? {
+            return Ok(false);
+        }
+        self.mcp_disconnect(name);
+        self.mcp_defer();
+        Ok(true)
+    }
+
+    /// Drop a server's live tools and what the catalog knows of it; its
+    /// configuration stays.
+    fn mcp_disconnect(&mut self, name: &str) {
+        self.tools.remove_prefix(&format!("mcp__{name}__"));
+        self.mcp_catalog.remove(name);
     }
 
     /// Persist an MCP change under the Claude backend and have the next turn
@@ -2143,7 +2247,12 @@ fn to_stdio(cfg: &McpServerConfig) -> StdioServer {
     }
 }
 
-fn to_http(cfg: &HttpServerConfig) -> HttpServer {
+/// Whether connecting failed because the server wants an OAuth sign-in.
+fn needs_login(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<mcp::oauth::LoginRequired>().is_some()
+}
+
+fn to_http(cfg: &HttpServerConfig, tokens: &mcp::oauth::TokenStore) -> HttpServer {
     let headers = cfg
         .headers
         .iter()
@@ -2155,6 +2264,8 @@ fn to_http(cfg: &HttpServerConfig) -> HttpServer {
         url: cfg.url.clone(),
         headers,
         options: to_options(&cfg.options),
+        client_id: cfg.client_id.clone(),
+        tokens: Some(tokens.clone()),
     }
 }
 
@@ -2673,6 +2784,70 @@ mod tests {
         // Once: nothing changed since.
         let after = session.gather_turn_context().unwrap_or_default();
         assert!(!after.contains("Plan mode is off"), "{after}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The OAuth path as the session drives it: a server that wants a
+    /// sign-in is reported with the command to run and nothing is opened;
+    /// `/mcp login` signs in and connects it; `/mcp logout` undoes both.
+    #[test]
+    fn an_mcp_server_wanting_sign_in_is_reported_then_signed_in_to() {
+        use crate::mcp::oauth::testutil::{browser, fake_auth, temp_store};
+
+        let fake = fake_auth();
+        let root = std::env::temp_dir().join(format!("atl-agent-oauth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = Settings::default();
+        settings.mcp_http.push(HttpServerConfig {
+            name: "guarded".into(),
+            url: fake.url(),
+            headers: Vec::new(),
+            client_id: None,
+            options: McpOptions::default(),
+        });
+        let cfg = Config::single(
+            crate::provider::Provider::from_env("http://127.0.0.1:9/v1".into(), None),
+            "none".into(),
+        );
+        let mut session =
+            Session::new(cfg, root.clone(), ToolRegistry::new(), Vec::new(), settings);
+        session.mcp_tokens = temp_store("session");
+
+        assert_eq!(
+            session.connect_configured_mcp(),
+            ["mcp: 'guarded' needs sign-in — run /mcp login guarded"]
+        );
+        assert!(session.tool_names().is_empty());
+        assert!(
+            fake.seen.lock().unwrap().authorizations.is_empty(),
+            "startup must not begin a sign-in"
+        );
+
+        let mut opened = Vec::new();
+        let mut open = |url: &str| {
+            opened.push(url.to_string());
+            browser(url);
+        };
+        assert_eq!(session.mcp_login("guarded", &mut open).unwrap(), 1);
+        assert_eq!(session.tool_names(), ["mcp__guarded__whoami"]);
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].starts_with(&fake.http.url("/authorize?")));
+        // Once signed in, a restart connects without asking.
+        assert!(session.mcp_tokens.get(&fake.url()).is_some());
+        session.mcp_disconnect("guarded");
+        assert_eq!(
+            session.connect_configured_mcp(),
+            ["mcp: connected 'guarded' (http, 1 tool(s))"]
+        );
+
+        let err = session.mcp_login("nope", &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("no HTTP MCP server named 'nope'"));
+
+        assert!(session.mcp_logout("guarded").unwrap());
+        assert!(session.tool_names().is_empty());
+        assert!(session.mcp_tokens.get(&fake.url()).is_none());
+        assert!(!session.mcp_logout("guarded").unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 

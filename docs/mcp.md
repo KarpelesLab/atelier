@@ -129,10 +129,81 @@ With the [Claude backend](claude.md) the servers are handed to `claude`, which
 connects them itself: `enabled = false` is honoured (the server is left out),
 tool filters and timeouts are not.
 
+## Signing in to a remote server (OAuth)
+
+An `[[mcp_http]]` server may require OAuth. Nothing needs configuring for the
+common case:
+
+```
+/mcp add tracker https://mcp.example.com/mcp
+added MCP server 'tracker' — it requires sign-in: run /mcp login tracker
+/mcp login tracker
+opening your browser to sign in to 'tracker'…
+signed in to 'tracker' — 12 tool(s) now available
+```
+
+- **At startup** a server that answers `401` and has no usable stored token
+  is reported — `mcp: 'tracker' needs sign-in — run /mcp login tracker` — and
+  skipped. atelier never opens a browser on its own.
+- **`/mcp login <name>`** signs in and connects the server. The browser is
+  opened on the authorization page (the URL is also printed); atelier waits up
+  to five minutes for the redirect back to a listener on `127.0.0.1`.
+- **`/mcp logout <name>`** forgets the tokens and drops the server's tools;
+  the server stays configured.
+
+What `/mcp login` does, in order (`src/mcp/oauth.rs`):
+
+1. Sends `initialize` without credentials and reads the `WWW-Authenticate`
+   header of the `401`.
+2. Fetches the **protected-resource metadata** (RFC 9728) from the header's
+   `resource_metadata` URL, falling back to
+   `/.well-known/oauth-protected-resource` on the server's origin, to learn
+   the authorization server. A server that publishes none is taken to be its
+   own authorization server.
+3. Fetches the **authorization-server metadata** (RFC 8414
+   `/.well-known/oauth-authorization-server`, else OpenID Connect discovery).
+4. **Registers a client dynamically** (RFC 7591) as a public client for the
+   loopback redirect it is about to use — unless the server's table sets
+   `client_id`, for authorization servers without dynamic registration:
+
+   ```toml
+   [[mcp_http]]
+   name = "tracker"
+   url = "https://mcp.example.com/mcp"
+   client_id = "my-registered-client"
+   ```
+
+   A pre-registered client must allow `http://127.0.0.1:<any port>/callback`
+   as a redirect URI; the port is chosen at each sign-in.
+5. Runs the **authorization-code grant with PKCE** (S256), with the server's
+   URL as the `resource` (RFC 8707) and the scopes the `401` or the resource
+   metadata asked for, checks `state` on the way back, and exchanges the code.
+
+Tokens are stored per server URL in `$XDG_CONFIG_HOME/atelier/mcp-auth.json`
+(else `~/.config/atelier/mcp-auth.json`), readable by the owner only (0600),
+never in `atelier.toml`. The access token is sent as `Authorization: Bearer`
+to that server URL and nowhere else; an expired one is refreshed first, and
+one the server rejects early is refreshed once and the request retried. When
+it cannot be refreshed the call fails and the server asks for `/mcp login`
+again.
+
+Safeguards: every endpoint named by the discovery documents must be `https`
+(or `http` on loopback) or the sign-in is refused; an authorization server
+that lists its PKCE methods without `S256` is refused. A server whose
+`headers` already include an `Authorization` is left to that header — no
+stored token is added and a `401` is an ordinary error.
+
+Not covered: client secrets (confidential clients), a fixed redirect port,
+and re-running discovery when an authorization server moves its token
+endpoint (sign in again). With the [Claude backend](claude.md) `claude`
+signs in to MCP servers itself.
+
 ## Managing servers
 
 - `/mcp` (no arguments) — list every configured server, stdio and HTTP alike
   (HTTP entries are marked `(http)`).
+- `/mcp login <name>` / `/mcp logout <name>` — sign in to, or out of, an HTTP
+  server that requires OAuth (see above).
 - `/mcp remove <name>` (or `/mcp rm <name>`) — drop the server (whichever
   kind it is) from `atelier.toml` and remove its tools (everything named
   `mcp__<name>__*`) from the live registry.

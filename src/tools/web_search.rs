@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use super::web_fetch::{attr, decode_entities};
 use super::{Tool, ToolCtx, ToolSpec};
-use crate::auth::{percent_decode, percent_encode};
+use crate::oauth::{percent_decode, percent_encode};
 use crate::settings::{SearchSettings, Settings};
 
 const DEFAULT_RESULTS: usize = 8;

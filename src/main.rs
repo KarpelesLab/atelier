@@ -18,6 +18,7 @@ mod hooks;
 mod js;
 mod mcp;
 mod memory;
+mod oauth;
 mod permissions;
 mod provider;
 mod review;

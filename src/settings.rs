@@ -294,6 +294,10 @@ pub struct HttpServerConfig {
     pub url: String,
     #[serde(default)]
     pub headers: Vec<String>,
+    /// A client id registered with the server's OAuth authorization server,
+    /// used by `/mcp login`. Without one atelier registers itself (RFC 7591).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     #[serde(flatten)]
     pub options: McpOptions,
 }

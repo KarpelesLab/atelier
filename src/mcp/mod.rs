@@ -63,6 +63,12 @@
 //! `deferred.rs`, which also explains how such a call is still approved and
 //! judged as the tool it runs.
 //!
+//! # Sign-in
+//!
+//! An HTTP server may require OAuth. Connecting never starts a sign-in: the
+//! transport sends the stored token if there is one, and otherwise fails
+//! with [`oauth::LoginRequired`] for the session to report. See `oauth.rs`.
+//!
 //! # Per-server options
 //!
 //! [`ServerOptions`] carries what the user may set on any server, whichever
@@ -83,6 +89,7 @@ mod conn;
 pub mod deferred;
 mod http;
 mod jsonrpc;
+pub mod oauth;
 mod prompt;
 mod resource;
 #[cfg(test)]
@@ -703,6 +710,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method 
                 url,
                 headers: Vec::new(),
                 options: ServerOptions::default(),
+                client_id: None,
+                tokens: None,
             })
         };
         let servers = [
