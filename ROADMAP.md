@@ -5,8 +5,8 @@ OpenAI-compatible model APIs, runs tools in a project directory, speaks MCP,
 and continuously feeds itself context (git status, diagnostics, …) — driven
 from a deliberately minimal terminal interface.
 
-Status: **pre-M0** (empty repo). This document is the plan of record; it will
-change as we build.
+Status: **M0–M14 done** (§3); **M15–M22** (§3b) are next. This document is
+the plan of record; it changes as we build.
 
 ---
 
@@ -389,9 +389,282 @@ A daemon that connects every atelier running on the machine
 - ✅ **Surfaces**: `peers`/`peer_send` tools, `/peers`, `/send`,
   `/subscribe`; peers' messages are shown and reach the model mid-turn or
   with the next prompt, marked as another agent's.
-- ⏳ Waking an idle instance on a message (opt-in); `call` handlers that
-  reach the agent (ask a peer and await its answer, hand off a task);
-  shared advisory locks ("I'm editing this file"); non-Unix transport.
+- ⏳ Continued in M18 (subagents ride the coordinator): waking an idle
+  instance on a message, `call` handlers that reach the agent, advisory
+  locks. Also open: a non-Unix transport.
+---
+
+## 3b. Next — the rest of what a harness does
+
+M0–M14 built the loop, the tools and the plumbing. What follows comes from
+going through what Claude Code, opencode and Codex CLI do for the agent and
+the user *besides drawing a screen*, and keeping what earns its place. The
+interface stays what §1 says: an input line, a status strip, and scrollback.
+Every item below must work through plain printed output, slash commands,
+files on disk and the headless protocol — none needs a pane, a picker
+overlay or a mouse.
+
+### Where atelier stands
+
+| Capability | Claude Code | opencode | Codex CLI | atelier today | Planned |
+|---|---|---|---|---|---|
+| Instruction files | `CLAUDE.md` hierarchy, `@` imports, path-scoped rules | `AGENTS.md` up the tree, nested ones loaded lazily, globs/URLs, live reload | `AGENTS.md` root→cwd, override files, size cap | first of 4 files at the root, cut at 3000 chars | M15 |
+| Memory across sessions | agent-written memory files with an index | — | background extract → consolidate, off by default | — | M15 |
+| Sessions | many per project, resume by id, fork | SQLite, fork at a message, export/import | named, resume/fork/archive | one per project, `--continue` | M16 |
+| Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | — | M16 |
+| Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | auto summary only | M16 |
+| Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | per-tool "always", risk signals | M17 |
+| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | — (`node` tool is mediated; `bash` isn't) | M17 |
+| Approvals without the user | — | — | reviewer agent with a policy, fails closed | `ATELIER_APPROVE=all` | M17 |
+| Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | — | M17 |
+| Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | reviewer only; peers via coordinator | M18 |
+| Custom commands | Markdown, arguments, shell output | same, plus per-command agent/model | (skills) | — | M19 |
+| Skills | `SKILL.md`, loaded on demand | same, also reads `.claude/skills` | same, `.agents/skills` | — | M19 |
+| Hooks | pre/post tool, prompt, stop, session, compact | plugin events | same set + permission request, hash-pinned trust | — | M19 |
+| Ask the user | structured question tool | `question` tool | `request_user_input` | — | M20 |
+| Web search | yes | yes (several providers) | yes | `web_fetch` only | M20 |
+| Diagnostics after edits | LSP tool, IDE diagnostics | LSP in v1, **dropped in v2** for lint/typecheck commands | — | `cargo check` only | M20 |
+| Parallel tool calls | yes | yes | yes | sequential | M20 |
+| MCP extras | OAuth, resources, prompts as commands, deferred tools, serve as MCP | OAuth, prompts as commands, "code mode" | OAuth, tool filters, deferred tools, serve as MCP | stdio+HTTP, resources, prompts | M20 |
+| Headless / embedding | `-p`, JSON stream in/out, SDK | `run --format json`, HTTP server, ACP | `exec --json`, output schema, app-server | `--print` (text) | M21 |
+| Scheduled / CI work | loops, cron, GitHub action | GitHub action | cloud tasks, GitHub review | — | M21 |
+| Model per role, effort | per subagent, effort levels | per agent/command, variants, small model | per role, effort, review model | one model (+ reviewer's) | M22 |
+| Prompt-cache care | automatic | summary reuses the cache, cache warming | — | fresh context rewrites the system message every turn | M22 |
+| Instances that talk | agent teams | — | message board (in development) | ✅ coordinator (M14) | M18 |
+
+Already ahead or equal, and to be kept that way: file-state tracking and
+stale-edit rejection, ambient per-turn context with dedup, the mediated `node`
+tool, mid-turn steering, the subconscious reviewer, three sanctioned backends,
+the coordinator, a libc-free static binary.
+
+### M15 — Instructions & memory
+
+What the agent knows before the first prompt, and what it keeps afterwards.
+
+- **Instruction files, properly.** Load *all* that apply instead of the first
+  found: user-global (`~/.config/atelier/AGENTS.md`), then every `AGENTS.md`
+  from the repository root down to the working directory, concatenated
+  root→leaf (`CLAUDE.md` and `.cursorrules` stay as fallbacks per directory).
+  A real byte budget (Codex: 32 KiB) replaces the 3000-char cut, and
+  truncation says so.
+- **Nested instructions on demand** (opencode v2): an `AGENTS.md` in a
+  subdirectory is injected the first time the agent reads or edits under it,
+  once. Changed instruction files are re-injected as an update before the next
+  request rather than waiting for a restart.
+- **`@path` imports** and extra instruction globs from `atelier.toml`.
+- **Memory.** A per-project directory of small Markdown notes with a one-line
+  index, written and pruned by the agent through a `memory` tool, and read
+  back as ambient context (index always; notes when relevant). Typed entries —
+  about the user, corrections the user gave, project facts not in the code,
+  pointers to outside resources. `/memory` lists, opens the directory, forgets.
+  Explicitly *not* a log of completed work.
+- **Guard rails** (from Codex): nothing is memorized from sessions whose
+  context held untrusted outside content (web pages, MCP output) unless the
+  user asks; secrets are redacted; memory is plain files the user can read,
+  edit and commit or ignore.
+- `/init` writes a first `AGENTS.md` from the repository.
+
+**Exit:** a correction given in one session changes behaviour in the next
+without being repeated; a subdirectory's rules apply only when working there.
+
+### M16 — Sessions, undo, and compaction that loses less
+
+- **Many sessions per project**, stored under `.atelier/sessions/` with an
+  index (id, title from a cheap model, time, turn count). `--continue` resumes
+  the latest; `--resume [id]` and `/sessions` list them as printed lines to
+  pick by number — no picker screen. `/fork` branches the conversation;
+  `/export` writes a transcript.
+- **Checkpoints and undo.** Before each model step that edits, snapshot the
+  touched files in a private git object store beside the repository (opencode:
+  no commits, the user's index untouched; fall back to plain copies outside
+  git). `/undo` and `/redo` restore only the paths that step changed and put
+  the prompt back in the input line; `/rewind` goes to any earlier turn.
+  Commands run through `bash` are outside what can be undone, and the
+  interface says so when one ran in the step being reverted.
+- **Compaction in stages.** First drop the bodies of old tool results (keep
+  one line saying what they were); only then summarize. The summary is a
+  structured hand-off (goal, decisions, state of the work, files touched, next
+  steps), the recent tail stays verbatim by token count, and `/compact
+  [instructions]` does it on demand. The agent's todo list and memory live
+  outside the history, so they survive untouched.
+- **`/context`** prints where the window goes (system, instructions, context
+  items, tools, history) so both user and agent can see what to trim.
+
+**Exit:** a bad edit is undone with one command; a long session resumes after
+compaction still knowing what it was doing and why.
+
+### M17 — Permission rules and a real sandbox
+
+Today's model is one bit per tool. Codex shows how far the other end goes.
+
+- **Rules.** `[permissions]` grows `allow` / `ask` / `deny` lists of patterns
+  over tool name and arguments: `bash(git diff *)`, `bash(cargo *)`,
+  `mcp__github__*`, `read(~/.ssh/**)`. Deny wins, then ask, then allow.
+  A compound shell command is split and every part must pass; one that can't
+  be parsed is never auto-allowed. "Always" at the prompt proposes the
+  narrowest useful pattern, not the whole tool. User-global rules sit under
+  project rules; `atelier permissions check -- <command>` explains a decision.
+- **Modes.** `plan` (read-only tools; the agent investigates and proposes,
+  edits are refused with a reason it can act on), `default`, `auto-edit`
+  (today's behaviour), `yolo` (today's `ATELIER_APPROVE=all`). `/mode`, and
+  the status strip shows the current one.
+- **Sandboxed `bash`.** On Linux, run commands in new user/mount/network
+  namespaces with the project writable, the rest read-only, `.git/hooks` and
+  `atelier.toml` protected, and no network unless allowed — set up by
+  atelier's own code through the kernel interfaces (no `bwrap` dependency, so
+  it works in the libc-free build); Seatbelt on macOS. A command that fails
+  *because of* the sandbox is reported as such, and the agent may ask to rerun
+  it outside with a stated reason — that request is what the user approves.
+  With a sandbox, most commands stop needing approval at all.
+- **Network by allowlist.** Sandboxed commands reach the network only through
+  a local proxy that admits listed domains.
+- **Approvals by a reviewer.** Optionally, would-be prompts go to a reviewer
+  model with a written policy (`[permissions] reviewer`), which allows, denies
+  or escalates to the user, and fails closed. This is what makes unattended
+  and coordinator-driven work safe without `yolo`.
+- **Project trust.** A freshly cloned repository's `atelier.toml` (MCP
+  servers to launch, hooks, permission rules) is not honoured until the user
+  says the project is trusted.
+
+**Exit:** a day's work prompts a handful of times instead of on every command,
+and a hostile `curl | sh` in a README can neither write outside the project
+nor reach the network.
+
+### M18 — Subagents
+
+- **A `task` tool**: run a named agent on a prompt in a fresh context and get
+  its final report. Built-ins: `explore` (read-only search), `general`.
+  Several calls in one step run in parallel; the transcript shows one line per
+  subagent, its tool activity summarized, never interleaved streams.
+- **Agents as files**: `.atelier/agents/<name>.md` (and user-global), with
+  front matter for description, model, reasoning effort, tools, permission
+  rules and a step cap; the body is the system prompt. Reads `.claude/agents`
+  too. At the cap, tools are withdrawn and the agent is told to report what is
+  done and what is left (opencode).
+- **Background agents**: started with `background: true`, they report when
+  finished the way peers' messages arrive today; `/agents` lists the running
+  ones, and Ctrl-C never kills them (the rule the Claude backend already
+  follows).
+- **Isolation**: an agent may run in its own git worktree, so parallel
+  writers don't trample each other; its diff comes back for the parent to
+  apply.
+- **Built on the coordinator.** A subagent is an atelier instance: the same
+  routing carries a parent's task, the child's report and messages between
+  siblings, whether the child is a thread, a process, or an instance the user
+  opened in another terminal. This is where M14's `call` gets its real
+  methods (`task`, `ask`), where idle instances may be woken on request, and
+  where advisory locks ("I am editing this file") belong.
+
+**Exit:** "look through the codebase for X" costs the main conversation a
+paragraph instead of forty file reads; three independent changes proceed at
+once without conflicts.
+
+### M19 — Commands, skills, hooks
+
+The three ways a project teaches the harness, all as plain files.
+
+- **Custom slash commands**: `.atelier/commands/<name>.md` → `/name`, with
+  `$ARGUMENTS`/`$1`, `` !`command` `` output injection, and optional front
+  matter (agent, model, run as a subagent). MCP prompts appear as commands.
+- **Skills**: `SKILL.md` directories (`.atelier/skills`, also `.claude/skills`
+  and `.agents/skills`, which the other three already share). Only name and
+  description are advertised, within a small budget; a `skill` tool loads the
+  body and its files when the task calls for it.
+- **Hooks**: commands run on events — session start/end, prompt submitted,
+  before a tool (may deny or rewrite arguments), after a tool, before/after
+  compaction, turn end (may send the agent back to work), subagent start/stop,
+  permission request (may answer it). JSON on stdin, decision on stdout.
+  Formatters after edits and a notification when a turn ends are just hooks,
+  shipped as documented examples rather than features. Hooks from a project
+  run only once the user has reviewed them, and again after they change
+  (Codex's hash-pinned trust).
+
+**Exit:** a project's conventions (format on save, run tests before stopping,
+a `/release` routine) live in its repository and apply to whoever opens it.
+
+### M20 — Tools the others have
+
+- **`ask`**: a structured question to the user — a few options, optionally
+  multi-select — printed as numbered lines and answered on the input line.
+  Cheaper and clearer than the agent stopping to ask in prose.
+- **`web_search`**, behind a provider setting (a search API key, a SearXNG
+  URL, or the model provider's own search where it exists); approval like
+  `web_fetch`.
+- **Diagnostics for every language, the cheap way.** opencode built LSP
+  support and then removed it in favour of running the project's own
+  lint/typecheck commands. Follow that: `[diagnostics]` commands per file
+  pattern, auto-detected for common stacks, run after edits with only the
+  *change* in diagnostics reported (§4's edit→verify loop, generalized from
+  today's `cargo check`). An LSP-backed `symbols` tool (definition,
+  references) is worth having later for navigation, not for diagnostics.
+- **Parallel tool calls** for read-only tools in one model step.
+- **Tool output to a file**: results past the budget are saved under
+  `.atelier/` and the agent gets the head, the tail and the path, instead of
+  a truncation it can't see past.
+- **MCP**: OAuth for remote servers; per-server tool allow/deny lists and
+  timeouts; server instructions passed to the model; elicitation answered
+  through `ask`; **deferred tools** — with many servers, advertise names and
+  load schemas on demand; or route MCP through the `node` tool ("code mode"),
+  which atelier is unusually well placed to do since the JS runtime is
+  already mediated. And `atelier mcp-serve` as a public mode, so other
+  harnesses can use atelier's tools and sessions.
+- **Background commands that notify**: a finished `bash` background job wakes
+  the agent rather than waiting to be polled.
+
+### M21 — Headless, protocol, automation
+
+- **`--print` grows up**: `--output-format json|stream-json` (events for
+  text, reasoning, tool calls, approvals, usage, final result),
+  `--input-format stream-json` for multi-turn driving, `--output-schema` for
+  a validated structured answer, `--max-turns`, `--resume`, and exit codes
+  that distinguish failure, refusal and limits.
+- **A protocol to embed atelier**: the same events as JSON-RPC over stdio
+  (and over the coordinator's socket, which is already there) — start, steer
+  and interrupt turns, answer approvals, fork, compact. With ACP on top,
+  editors get atelier without atelier growing a UI. This is also how any
+  other front end stays out of this repository.
+- **Goals and loops**: `/goal` keeps the agent going until a stated,
+  checkable condition holds, within a token budget; `/loop <interval>
+  <prompt>` and scheduled runs through the coordinator, which is the one
+  process that outlives every instance.
+- **CI**: a GitHub action for review and for `@atelier` in issues and pull
+  requests, built on `--print`; `atelier review` (uncommitted, a base branch,
+  a commit) as a first-class read-only run using the reviewer that already
+  exists.
+- `atelier doctor`, and a way to print the exact prompt a turn would send.
+
+### M22 — Models, effort and the cache
+
+- **A model per role**: main, subagents, reviewer, a small one for titles,
+  summaries and memory upkeep; `/model` variants carrying reasoning effort
+  and sampling settings; effort changeable mid-session.
+- **Named providers** in `atelier.toml` (several endpoints, each with its
+  key source, headers and quirks) instead of one base URL in the environment,
+  with a key helper command for rotating credentials.
+- **A cache-stable prompt.** Today the per-turn context is folded into the
+  system message, so the first bytes of every request change and a server's
+  prompt cache — llama.cpp's KV cache as much as a hosted provider's — is
+  thrown away each turn. Keep the system message and tool list byte-identical
+  for the life of a session, and deliver fresh context as late messages
+  that replace their predecessors. On a local 30B model this is the largest
+  latency win available.
+- **Cost and usage** per session and per day (`atelier stats`), with prices
+  for providers that have them, and budgets that warn before they stop.
+- **Telemetry** stays local: a trace file per session that replays (§5).
+
+### Considered and left out
+
+- **A full-screen or paned interface**, pickers, themes, mouse support — the
+  point of atelier is not having them (§7).
+- **An in-process plugin API or marketplace.** Files (commands, skills,
+  agents), hooks, and MCP cover it without loading other people's code into
+  the harness.
+- **LSP for diagnostics** — see M20; opencode's reversal is the evidence.
+- **Remote instruction URLs and organization-managed configuration.** Useful
+  to enterprises; revisit if there is one.
+- **Hosted "cloud tasks".** The coordinator and CI cover unattended work on
+  the user's own machines.
+
 ---
 
 ## 4. Harness ergonomics — designing for the agent's experience
@@ -485,4 +758,5 @@ truth. Each item maps to a milestone.
   user's own `claude` CLI rather than its credentials.
 - Full-screen / mouse-driven / multi-pane TUI.
 - Editing or reflowing output already committed to scrollback.
-- A plugin marketplace, web UI, or multi-user server.
+- A plugin marketplace, web UI, or multi-user server (§3b, "Considered and
+  left out", has the reasons and the rest of the list).
