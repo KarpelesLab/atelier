@@ -152,7 +152,7 @@ earlier `allow`; a rewrite of the arguments is what the next hook sees.
 | `pre_compact` | older history is about to be summarized | `messages` (how many) | watch |
 | `post_compact` | the summary replaced them | `messages` | watch |
 | `turn_end` | the model gave its final answer for a prompt | `answer` (cut at 16 KiB), `continues` | **`continue`** (or exit 2): the agent is sent back to work, with the reason as a new user message marked `[turn_end hook]` |
-| `subagent_start`, `subagent_stop` | reserved | — | accepted in the file, never fired yet (atelier has no subagents yet) |
+| `subagent_start`, `subagent_stop` | reserved | — | accepted in the file, never fired yet. A [subagent's](agents.md) own tool calls do fire `pre_tool`, `permission_request` and `post_tool`, like the agent's; the `task` call that starts it fires none of them, and its conversation gets no `user_prompt` or `turn_end` |
 
 Notes on the details:
 

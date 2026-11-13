@@ -105,7 +105,7 @@ first conversation, the REPL/TUI fallback).
 | [GitHub Action](docs/github-action.md) | `uses: KarpelesLab/atelier@v0`: review pull requests with inline comments, run a prompt on a schedule, answer `@atelier` in issue and pull request comments — inputs, example workflows, the safety model |
 | [Embedding protocol](docs/protocol.md) | `atelier serve`: the session as JSON-RPC 2.0 over stdio, for editors and other front ends — start, steer and interrupt turns, answer approvals and questions, run commands; events, error codes, how ACP maps onto it |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
-| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
+| [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`, `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |

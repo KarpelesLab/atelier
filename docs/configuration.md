@@ -9,8 +9,9 @@ atelier has two configuration layers:
   [variants](#variantname--reasoning-effort-and-sampling)) laid over it.
 - **`Settings`** (`src/settings.rs`) — durable, user-editable state stored in
   `atelier.toml` at the project root: configured MCP servers, the
-  permission rules, `[defaults]`, `[review]`,
-  `[[diagnostics]]`, and `[search]`. Read at startup
+  permission rules, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`,
+  `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]` and the model
+  tables. Read at startup
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
   "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
@@ -21,17 +22,9 @@ project's entries winning: [`[permissions]`](#permissions),
 [`[[hooks]]`](#hooks), and the model tables — `[[provider]]`, `[models]`,
 `[variant.*]`, `[[price]]`, and `[defaults]`' `model` and `provider`.
 [`[instructions]`](#instruction-files) is read from both, and both lists
-apply.
-
-  always-allow permission list, `[defaults]`, `[review]`, and `[[hooks]]`.
-  Read at startup and rewritten whenever it changes (`/mcp add`/`/mcp
-  remove`, granting "always" on a tool approval, `/review [on|off]`, or the
-  `/config` editor).
-
-There is currently no project-vs-user-global precedence: `atelier.toml` is
-read only from the current project root, and `Config`'s environment variables
-have no `atelier.toml` equivalent. The one exception is [`[[hooks]]`](#hooks),
-which is also read from a user-global `atelier.toml`.
+apply; so is [`[sandbox]`](#sandbox), whose `root` counts only there. The
+other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
+`[search]`, `[goals]`, the rest of `[defaults]`) are the project's alone.
 
 ## Environment variables
 
@@ -43,7 +36,7 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_BASE_URL`        | `http://192.168.0.50:11400/v1`   | `Config::from_env` | OpenAI-compatible endpoint base; every request path is appended to it. This endpoint is the provider named `env` — see [providers](#provider--named-endpoints) |
 | `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | `Config::from_env` | The main model: a model id, or `provider/model#variant` (see [addressing a model](#addressing-a-model)). Wins over `[models] main` and `[defaults] model`. Claude backend: passed as `--model` when set (e.g. `opus`, `sonnet`); unset leaves the choice to claude |
 | `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token of the `env` provider; sent to it as `Authorization: Bearer <key>` when set to a non-empty value |
-| `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
+| `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session: the `yolo` [mode](permissions.md#modes). Meant for headless/CI runs — `--print` asks nobody, so without it (or an allow rule) a call that needs approval is denied |
 | `ATELIER_MODE`            | *(unset)*                        | `main`, `permissions::Mode::from_env` | The permission [mode](permissions.md#modes) to start in: `plan`, `ask-edits`, `auto-edit` (the default) or `yolo`. Overridden by `--mode`; overrides `ATELIER_APPROVE` and `[defaults] mode`. Any other value is an error |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
 | `ATELIER_PARALLEL_TOOLS`  | *(unset)*                        | `agent::batch` | `0`, `off`, `no` or `false` runs the read-only tool calls of one model step one after the other instead of [at the same time](tools.md#read-only-calls-run-in-parallel); any other value turns that on. Overrides `[defaults] parallel_tools` |
@@ -61,6 +54,7 @@ which is also read from a user-global `atelier.toml`.
 | `ATELIER_SANDBOX`         | *(unset)*                        | `sandbox::state` | `1`/`true`/`on` runs `bash` commands in the [sandbox](sandbox.md), `0`/`false`/`off` does not, whatever `[sandbox] enabled` says. Needs a build with the `sandbox` feature |
 | `ATELIER_SANDBOX_ROOT`    | `$XDG_DATA_HOME/atelier/sandbox/rootfs` | `sandbox::state` | The sandbox guest's root filesystem (a directory holding a Linux userland). Overrides the user-global `[sandbox] root` |
 | `ATELIER_SANDBOX_INTERP`  | *(unset)*                        | `sandbox::state` | `1` runs the guest on nixvm's software CPU even where hardware virtualization is available |
+| `ATELIER_TRACE`           | *(unset)*                        | `provider` | File path to append a JSONL trace to, one line per model request (messages, tool calls, usage), for debugging |
 | `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending (the body only — never headers, so never a key) |
 
 ## `atelier.toml`
@@ -164,14 +158,12 @@ deny  = ["read(~/.ssh/**)", "bash(rm -rf *)"]
 
 The same table in `$XDG_CONFIG_HOME/atelier/atelier.toml` (else
 `~/.config/atelier/atelier.toml`) holds user-global rules, merged with the
-project's — that file's other tables are not read. `atelier permissions
+project's. `atelier permissions
 check -- <command>` explains a decision. See [Permissions](permissions.md)
 for the pattern syntax per tool and how compound shell commands are judged.
 
 The project's `allow` list counts only in a [trusted project](trust.md);
 its `ask` and `deny` lists always do.
-
-- `ATELIER_TRACE` — file path to append a JSONL trace (one line per model request: messages, tool calls, usage) for debugging.
 
 ## `[defaults]`
 
@@ -482,7 +474,7 @@ timeout_secs = 30              # optional, default 60
 
 `[[hooks]]` is read from two files: the project's `atelier.toml`, and your
 own `$XDG_CONFIG_HOME/atelier/atelier.toml` (`~/.config/atelier/atelier.toml`
-when that variable is unset), of which only this table is read. Your own
+when that variable is unset). Your own
 hooks always run. A project's run only in a [trusted project](trust.md)
 (`/trust`), and need accepting again whenever they change; decisions are kept
 in `$XDG_STATE_HOME/atelier/trust.json` (`~/.local/state/atelier/trust.json`).

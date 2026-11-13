@@ -167,7 +167,7 @@ Params: `{"line": "/mode plan"}`.
 |--------|-----------|---------|
 | `handled` | `true` | The command ran; nothing more to do |
 | `prompt` | `false` | The line is not a command. `text` is the line: send it with `turn/start` if that is what was meant |
-| `expanded` | `false` | A custom command expanded into a prompt. `text` is the expanded prompt; atelier does not start the turn itself — the client decides |
+| `expanded` | `false` | A custom command expanded into a prompt. `text` is the expanded prompt; atelier does not start the turn itself — the client decides. `model` is the model the command file asks for (`model:` in its front matter), or `null`: `turn/start` takes no model, so a client that honours it switches with `/model` before the turn and back after |
 | `quit` | `false` | `/quit`: leaving is the client's call (`shutdown`) |
 | `config` | `false` | `/config`: the settings screen belongs to the terminal interface; a client presents its own |
 

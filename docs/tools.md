@@ -1,8 +1,12 @@
 # Built-in tools
 
-All tools live in `src/tools/` (registered in `builtin_registry`) plus the
-`node` tool in `src/js/`. Every tool call's result string is fed back to the
-model verbatim as the tool result.
+Most tools live in `src/tools/` and are registered in `builtin_registry`;
+the `node` tool is in `src/js/`, `task` is added at startup (not with the
+[Claude backend](claude.md), where claude has its own), and `peers` /
+`peer_send` come with the [coordinator](coordinator.md). The tools of MCP
+servers, and `mcp_search` / `mcp_call` that stand in for them when there are
+many, are in [MCP](mcp.md). Every tool call's result string is fed back to
+the model verbatim as the tool result.
 
 | Tool    | Approval | Confined to project root |
 |---------|----------|----------------------------|
@@ -21,7 +25,7 @@ model verbatim as the tool result.
 | `skill`     | auto     | to the skill directories (read-only; a skill's files only from inside that skill's directory) |
 | `task`      | auto to start; each call the subagent makes is approved like the agent's own | as the tools the subagent uses |
 | `notebook_edit` | auto | yes |
-| `bash`      | **required** | no (arbitrary shell) |
+| `bash`      | **required** — except a foreground command the experimental [sandbox](sandbox.md) runs, when that is on | no (arbitrary shell), unless sandboxed |
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
 | `web_fetch` | **required** | no (network) |
 | `web_search` | **required** | no (network) |
@@ -209,9 +213,10 @@ The child is polled every 20ms and killed if it exceeds the timeout (output
 then reads `[command timed out after Nms and was killed]`). Output over
 20,000 bytes comes back as its start and its end, with all of it saved to a
 file ([below](#long-output-goes-to-a-file)). **`bash` is the one built-in tool that is not confined**
-— it can run anything — so it always requires approval (see
+— it can run anything — so it requires approval (see
 [Permissions](permissions.md), including the risk-signal warnings shown
-alongside the prompt).
+alongside the prompt), unless the [sandbox](sandbox.md) will run the
+command.
 
 With `background: true` (or `run_in_background: true`) the command starts as
 a **background job** instead and the call returns its id (`job-N`) at once —
