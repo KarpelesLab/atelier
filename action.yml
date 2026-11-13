@@ -1,0 +1,115 @@
+name: atelier
+description: >-
+  Run the atelier coding agent in a workflow: review a pull request, run a
+  prompt, or answer @atelier in issue and pull request comments.
+author: KarpelesLab
+branding:
+  icon: terminal
+  color: gray-dark
+
+# Documentation, example workflows and the safety model: docs/github-action.md.
+# The scripts are in .github/action/; they are plain bash and are tested by
+# tests/action.rs without GitHub.
+
+inputs:
+  mode:
+    description: "What to do: `review` (atelier review of the change), `prompt` (run the `prompt` input), or `comment` (act on a comment that starts with the trigger phrase)."
+    default: review
+  prompt:
+    description: "The prompt to run, in `prompt` mode."
+    default: ""
+  base-url:
+    description: "OpenAI-compatible endpoint base (ATELIER_BASE_URL), e.g. `http://llm.internal:8080/v1`."
+    default: ""
+  model:
+    description: "Model to use (ATELIER_MODEL)."
+    default: ""
+  api-key:
+    description: "Bearer token for the endpoint (ATELIER_API_KEY). Pass a secret; leave empty for an endpoint that needs none."
+    default: ""
+  version:
+    description: "atelier release tag to install (e.g. `v0.9.0`), or `latest`."
+    default: latest
+  fail-on:
+    description: "`review` mode: fail the step when a finding is at least this severe (`P0`..`P3`). Empty: findings never fail the step."
+    default: ""
+  max-turns:
+    description: "Stop the run after this many model requests."
+    default: "30"
+  post:
+    description: "`review` mode: where the findings go — `comments` (one pull request review with inline comments), `summary` (the step summary) or `none`. Default: `comments` on a pull_request event, else `summary`."
+    default: ""
+  trust-project:
+    description: "`true` accepts the gated settings of the checkout's atelier.toml (MCP servers, hooks, allow rules, providers). Only for workflows that run on branches you trust; ignored for code from a fork."
+    default: "false"
+  permission-mode:
+    description: "atelier's permission mode: `plan` (read-only), `ask-edits`, `auto-edit` or `yolo`. Default: `plan` for review, `auto-edit` for prompt and comment."
+    default: ""
+  working-directory:
+    description: "Directory to run in, relative to the workspace."
+    default: ""
+  extra-args:
+    description: "More arguments for atelier, split on whitespace (no quoting)."
+    default: ""
+  github-token:
+    description: "Token used to read the pull request and post reviews and replies. Never given to atelier."
+    default: ${{ github.token }}
+  trigger:
+    description: "`comment` mode: the phrase a comment must start with."
+    default: "@atelier"
+  allow-forks:
+    description: "`comment` mode: `true` lets a comment run atelier on a pull request from a fork. Off by default; read the documentation before turning it on."
+    default: "false"
+
+outputs:
+  result:
+    description: "The final answer (review mode: the findings as Markdown), cut to 60000 characters."
+    value: ${{ steps.run.outputs.result }}
+  findings:
+    description: "`review` mode: the findings as a JSON array of {file, line, severity, summary, scenario}."
+    value: ${{ steps.run.outputs.findings }}
+  exit-code:
+    description: "atelier's exit status (0 success, 3 max-turns, 5 a finding at or above fail-on, …)."
+    value: ${{ steps.run.outputs.exit-code }}
+  triggered:
+    description: "`comment` mode: `true` when the comment was a request atelier acted on, `false` when it was ignored."
+    value: ${{ steps.run.outputs.triggered }}
+  head-ref:
+    description: "`comment` mode on a pull request: the head branch's name. Untrusted text — pass it to later steps through `env:`, never inside a `run:` script."
+    value: ${{ steps.run.outputs.head-ref }}
+
+runs:
+  using: composite
+  steps:
+    # Expressions appear in `env:` only. A `run:` line is a constant, so no
+    # input and nothing from the event is ever part of a script's source.
+    - name: Install atelier
+      id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/.github/action/install.sh"
+
+    - name: Run atelier
+      id: run
+      shell: bash
+      env:
+        ATELIER_BIN: ${{ steps.install.outputs.bin }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_MAX_TURNS: ${{ inputs.max-turns }}
+        INPUT_POST: ${{ inputs.post }}
+        INPUT_TRUST_PROJECT: ${{ inputs.trust-project }}
+        INPUT_PERMISSION_MODE: ${{ inputs.permission-mode }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra-args }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_TRIGGER: ${{ inputs.trigger }}
+        INPUT_ALLOW_FORKS: ${{ inputs.allow-forks }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/.github/action/run.sh"

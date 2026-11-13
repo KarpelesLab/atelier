@@ -25,3 +25,15 @@ jobs:
         run: cargo build --all-targets
       - name: test
         run: cargo test
+
+  action:
+    # The GitHub Action's scripts (action.yml, .github/action/*.sh; see
+    # docs/github-action.md). Their behaviour is covered by tests/action.rs
+    # in the job above; this one lints them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        run: shellcheck -x .github/action/*.sh
