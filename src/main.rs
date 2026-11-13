@@ -93,11 +93,24 @@ fn run() -> Result<u8> {
             .ok_or_else(|| anyhow::anyhow!("usage: atelier mcp-serve <socket>"))?;
         return claude::relay(socket).map(|()| 0);
     }
+    // `atelier review …`: a run of its own, on the session set up below
+    // like any other. Its arguments are its own (see `cli::subcommand`).
+    let sub = match cli::subcommand(&args) {
+        Ok(sub) => sub,
+        Err(cli::Early::Help(text)) => {
+            println!("{text}");
+            return Ok(0);
+        }
+        Err(cli::Early::Usage(msg)) => {
+            eprintln!("atelier: {msg}");
+            return Ok(headless::EXIT_USAGE);
+        }
+    };
     // Everything else is flags (see `cli`): `--continue`/`-c` resumes the
     // saved session; `--print`/`-p` runs non-interactively and exits (see
     // `headless::run`). The two combine (`--continue --print ...`) to resume
     // history and then run a prompt against it.
-    let cli = match cli::parse(&args) {
+    let cli = match cli::parse(if sub.is_some() { &[] } else { &args }) {
         Ok(cli) => cli,
         Err(msg) => {
             eprintln!("atelier: {msg}\n\n{}", cli::USAGE);
@@ -176,8 +189,15 @@ fn run() -> Result<u8> {
     }
     // Hooks: say which of the project's are waiting for approval (a headless
     // run can't ask, so it skips them), then run `session_start`.
-    for line in session.start_hooks(cli.print.is_none()) {
+    for line in session.start_hooks(cli.print.is_none() && sub.is_none()) {
         eprintln!("{line}");
+    }
+
+    match sub {
+        Some(cli::Sub::Review(opts)) => {
+            return Ok(finish(headless::review::run(session, opts)));
+        }
+        None => {}
     }
 
     // Handled before the interactive TUI/REPL branch below, and unconditional

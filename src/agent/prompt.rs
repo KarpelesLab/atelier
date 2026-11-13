@@ -113,10 +113,12 @@ impl Session {
 
     /// The system message for the next request (see [`system_message`]).
     pub(super) fn system_message(&self) -> String {
-        // A subagent's session speaks from its agent's prompt.
-        let prompt = match &self.child {
-            Some(child) => child.system.as_str(),
-            None => SYSTEM_PROMPT,
+        // A subagent's session speaks from its agent's prompt, a standalone
+        // run from its own.
+        let prompt = match (&self.child, &self.standalone) {
+            (Some(child), _) => child.system.as_str(),
+            (None, Some(system)) => system.as_str(),
+            (None, None) => SYSTEM_PROMPT,
         };
         system_message(prompt, &self.standing, self.summary.as_deref())
     }

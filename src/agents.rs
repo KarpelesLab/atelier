@@ -72,6 +72,13 @@ const EXPLORE_TOOLS: &[&str] = &[
     "web_search",
 ];
 
+/// Whether `tool` is one that only looks: the built-in `explore` agent's
+/// set. Also what a run that must not change anything is given (`atelier
+/// review`), so the two cannot drift apart.
+pub fn read_only(tool: &str) -> bool {
+    EXPLORE_TOOLS.contains(&tool)
+}
+
 const EXPLORE_PROMPT: &str = "\
 You are a read-only exploration agent working inside a project directory. \
 Your job is to find things — where something is defined, how a piece of code \

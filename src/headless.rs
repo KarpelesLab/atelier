@@ -36,6 +36,11 @@
 //! backend): the schema is appended to the prompt, the JSON is pulled out of
 //! the final answer and checked by [`crate::schema`], and a failing answer is
 //! sent back once with the reason before the run gives up.
+//!
+//! `atelier review` ([`review`]) is a headless run with its prompt, tools
+//! and answer shape decided for the caller; it is built on the pieces here.
+
+pub mod review;
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};

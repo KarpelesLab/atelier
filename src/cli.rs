@@ -8,20 +8,23 @@
 //! doesn't know is an error rather than part of the prompt: a script that
 //! misspells `--max-turns` should find out, not run unbounded.
 //!
-//! Subcommands (`update`, `coordinator`, `mcp-serve`) are picked off in
-//! `main` before this runs.
+//! Subcommands that are programs of their own (`update`, `coordinator`,
+//! `mcp-serve`) are picked off in `main` before this runs. Those that are
+//! runs on a session (`review`) are recognized by [`subcommand`]; their
+//! arguments are their own, parsed by the module that implements them.
 
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::headless::{InputFormat, Options, OutputFormat};
+use crate::headless::{InputFormat, Options, OutputFormat, review};
 use crate::permissions::Mode;
 
 /// What a usage error prints after its message, and `--help` on its own.
 pub const USAGE: &str = "\
 usage: atelier [--claude] [--continue] [--mode MODE]
        atelier --print [options] [--] [prompt...]
+       atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
        atelier update | coordinator [status|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier stats [--days N] [--project] [--json]
@@ -43,7 +46,9 @@ with --print:
       --output-schema FILE   JSON Schema the final answer must satisfy
 
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
-             4 answer failed --output-schema";
+             4 answer failed --output-schema
+
+`atelier review --help` describes that command.";
 
 /// The parsed command line.
 #[derive(Debug)]
@@ -143,6 +148,43 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             prompt: (!words.is_empty()).then(|| words.join(" ")),
         }),
     })
+}
+
+/// A subcommand that runs on a session, set up by `main` as for any run.
+#[derive(Debug)]
+pub enum Sub {
+    /// `atelier review …` (see [`review`]).
+    Review(review::Options),
+}
+
+/// Why a subcommand's arguments end the program before anything runs.
+#[derive(Debug)]
+pub enum Early {
+    /// `--help`: print this and exit 0.
+    Help(&'static str),
+    /// A usage error: the message, with the subcommand's usage (exit 2).
+    Usage(String),
+}
+
+/// The subcommand `args` (after the program name) ask for, if their first
+/// word names one; `None` means they are flags for [`parse`].
+pub fn subcommand(args: &[String]) -> Result<Option<Sub>, Early> {
+    let Some((name, rest)) = args.split_first() else {
+        return Ok(None);
+    };
+    // As for the main flags: what follows a bare `--` is not an option.
+    let wants_help = || {
+        let options = rest.iter().take_while(|a| *a != "--");
+        options.into_iter().any(|a| a == "--help" || a == "-h")
+    };
+    match name.as_str() {
+        "review" if wants_help() => Err(Early::Help(review::USAGE)),
+        "review" => match review::parse(rest) {
+            Ok(opts) => Ok(Some(Sub::Review(opts))),
+            Err(msg) => Err(Early::Usage(format!("review: {msg}\n\n{}", review::USAGE))),
+        },
+        _ => Ok(None),
+    }
 }
 
 fn output_format(v: &str) -> Result<OutputFormat, String> {
@@ -259,6 +301,30 @@ mod tests {
             .unwrap();
         assert_eq!(opts.prompt.as_deref(), Some("--continue is -a flag"));
         assert!(!parse_ok(&["-p", "--", "--continue"]).resume);
+    }
+
+    #[test]
+    fn subcommands_take_their_own_arguments() {
+        let sub = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            subcommand(&args)
+        };
+        assert!(matches!(sub(&[]), Ok(None)));
+        assert!(matches!(sub(&["-p", "review", "this"]), Ok(None)));
+        assert!(matches!(
+            sub(&["review", "--uncommitted"]),
+            Ok(Some(Sub::Review(_)))
+        ));
+        assert!(matches!(sub(&["review", "-h"]), Err(Early::Help(_))));
+        // After `--` it is an instruction for the reviewer.
+        assert!(matches!(
+            sub(&["review", "--", "--help"]),
+            Ok(Some(Sub::Review(_)))
+        ));
+        let Err(Early::Usage(msg)) = sub(&["review", "--frob"]) else {
+            panic!("expected a usage error");
+        };
+        assert!(msg.starts_with("review: unknown option --frob\n\nusage: atelier review"));
     }
 
     #[test]

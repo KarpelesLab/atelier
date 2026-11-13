@@ -46,6 +46,7 @@ use crate::settings::{HttpServerConfig, McpOptions, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 
+mod standalone;
 mod subagent;
 
 const SYSTEM_PROMPT: &str = "\
@@ -712,6 +713,11 @@ pub struct Session {
     /// prompt and its line to the parent. Such a session is never persisted,
     /// and wraps up at its step cap instead of failing.
     child: Option<subagent::Child>,
+    /// Set when this session is a run with a job of its own (`atelier
+    /// review` — see [`standalone`]): its system prompt, in place of
+    /// atelier's. Such a session is not the project's conversation, and is
+    /// never persisted as it.
+    standalone: Option<String>,
 }
 
 impl Session {
@@ -775,6 +781,7 @@ impl Session {
             coord: None,
             peer_pending: Vec::new(),
             child: None,
+            standalone: None,
         }
     }
 
@@ -1103,8 +1110,9 @@ impl Session {
 
     /// Persist the current conversation (summary + history) to disk (best-effort).
     fn persist(&self) {
-        // A subagent's conversation is not the project's saved session.
-        if self.child.is_some() {
+        // A subagent's conversation is not the project's saved session, nor
+        // is a standalone run's.
+        if self.child.is_some() || self.standalone.is_some() {
             return;
         }
         let _ = crate::session::save(&self.root, self.summary.as_deref(), &self.history);

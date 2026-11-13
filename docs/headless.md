@@ -109,6 +109,8 @@ Usage numbers are 0 when the endpoint doesn't report usage.
 | 3 | `max_turns` | `--max-turns` ran out before the model finished |
 | 4 | `schema_error` | The answer didn't satisfy `--output-schema`, even after the retry |
 
+| 5 | — | [`atelier review --fail-on`](#atelier-review) only: the review ran and reported a finding at or above that severity |
+
 A denied tool call is not a failure by itself: the model sees the denial
 and the run ends however the model ends it.
 
@@ -218,6 +220,97 @@ printf '%s\n' \
   atelier -p --input-format stream-json --output-format stream-json |
   jq -r 'select(.type == "result") | .result'
 ```
+
+## `atelier review`
+
+A headless run with the prompt, the tools and the shape of the answer
+decided for you: it gathers a change from git, has a model review it
+**read-only**, and prints the defects found.
+
+```sh
+atelier review                              # uncommitted work, or the branch against its base
+atelier review --base origin/main           # everything since the branch left origin/main
+atelier review --commit 4acaa2d             # what one commit changed
+atelier review "pay attention to locking"   # extra words are instructions for the reviewer
+atelier review --output-format json --fail-on P1   # for CI
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--uncommitted` | The working tree against `HEAD` — staged, unstaged and untracked files. The default when `git status` shows changes |
+| `--base BRANCH` | Everything since the current branch left `BRANCH` (its merge base), uncommitted work included. The default when the tree is clean, with the branch `origin/HEAD` points to, else `main`, else `master` |
+| `--commit SHA` | What one commit changed, with its message (a merge: what it brought into its first parent) |
+| `--output-format text\|json` | Default `text`; see below |
+| `--fail-on P0\|P1\|P2\|P3` | Exit with status 5 when a finding is at least that severe |
+| `--max-turns N` | Stop after N model requests (status 3) |
+
+**What the reviewer gets.** The diff, taken by atelier itself (`git diff`,
+with paths relative to the current directory and limited to it); the
+project's instruction files, as every session does; and, if one of them has
+a section headed `Review` or `Code review` (any heading level), that section
+again as part of its instructions. A diff over 96 KiB is cut: whole files in
+order while they fit, then the start of the next, and the prompt lists the
+files that were cut or left out, telling the reviewer to read them itself.
+
+**What it can do.** Only look: its tools are the built-in [`explore`
+agent](agents.md)'s (`read`, `grep`, `glob`, `ls`, `tree`, `web_fetch`,
+`web_search`) — no `bash`, no editing, no subagents. Nothing is saved: the
+session kept for `--continue` is neither read nor replaced. Approvals and
+[hooks](hooks.md) apply as in any headless run. It runs on atelier's own
+loop only — not with the [Claude backend](claude.md), whose tools atelier
+cannot restrict.
+
+**What it reports.** Defects with consequences (correctness, security, data
+loss, concurrency, API misuse) that it could confirm against the code — no
+style remarks, no summary of the change. An empty list is a normal result.
+Each finding has a severity, `P0` (must not ship) to `P3` (minor).
+
+`text` prints a block per finding, worst first, or `No findings.`:
+
+```
+P1 src/cache.rs:88
+  The entry is inserted before the size check, so the cache can exceed its limit.
+  Fails when: two inserts race at capacity; both pass the check and the map grows past `max`.
+```
+
+`json` prints one object:
+
+```json
+{
+  "findings": [
+    { "file": "src/cache.rs", "line": 88, "severity": "P1",
+      "summary": "The entry is inserted before the size check…",
+      "scenario": "Two inserts race at capacity…" }
+  ],
+  "reviewed": { "target": "uncommitted", "files": ["src/cache.rs"],
+                "truncated": false, "omitted": [] }
+}
+```
+
+`reviewed` says what was looked at: `target` (`uncommitted`, `base` with
+`base` and `merge_base`, or `commit` with `commit`), every changed file, and
+which of them the diff in the prompt did not show in full (`omitted`;
+`truncated` is whether there are any). The findings are obtained the way
+[`--output-schema`](#structured-answers) obtains any structured answer:
+asked for as JSON, validated, and asked for once more when they don't fit.
+Progress (the reviewer's tool calls, its answer as written) goes to stderr
+in both formats.
+
+**Exit status.** 0 means the review *ran* — with findings or without — so a
+script can tell "nothing wrong" from "could not look". 1 is a failure (not a
+git repository, an unknown commit, a provider error), 2 a usage error, 3
+`--max-turns`, 4 findings that were not valid JSON even after the retry. Only
+`--fail-on` makes findings a non-zero status: 5.
+
+```sh
+# In CI: fail the job on anything P1 or worse, keep the report.
+atelier review --base origin/main --output-format json --fail-on P1 > review.json
+```
+
+When there is nothing to review (a clean tree on the default branch), no
+model is asked: the output is an empty list and the status 0.
+
+This is not the [background reviewer](review.md) that `/review on` turns on.
 
 ## Recipes with `jq`
 

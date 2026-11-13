@@ -5,6 +5,10 @@ It watches the exchange — the user's ask, the tool calls the agent just made,
 and their results — and can post a short note back into the dialog. It has no
 tools and makes no edits: it can only observe and comment.
 
+> **Not `atelier review`.** That is a command you run to have a *change*
+> reviewed — see [below](#atelier-review-is-something-else). This page is
+> about the reviewer that watches the agent work.
+
 ## What it does
 
 After each batch of tool calls, the session spawns a background reviewer on
@@ -68,6 +72,21 @@ output:
 Notes can appear after any tool-call batch (as soon as that review finishes)
 and, for whichever reviews are still running, at the end of the turn — so you
 may see one mid-turn or right before the prompt returns.
+
+## `atelier review` is something else
+
+| | Review mode (`/review on`) | `atelier review` |
+|--|---------------------------|------------------|
+| Reviews | The agent's own work, as it happens: each batch of tool calls | A change in the repository: uncommitted work, a branch against its base, one commit |
+| Runs | In the background of an interactive or headless session | As its own command, then exits |
+| Can | Only comment: one request, no tools | Read and search the project (read-only tools) before it reports |
+| Says | One short note in the dialog, or nothing | A list of defects with `file:line`, a failure scenario and a severity, as text or JSON |
+| For | Catching a mistake while the agent can still fix it | Review before a commit or a merge, and CI (`--fail-on`) |
+
+`/review on|off` and `[review]` in `atelier.toml` are about the first only;
+`atelier review` has no setting and does not turn the background reviewer
+on. It is documented with the other non-interactive runs: [Headless
+runs](headless.md#atelier-review).
 
 ## See also
 

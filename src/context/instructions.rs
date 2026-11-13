@@ -155,9 +155,7 @@ impl Loader {
         let mut fence: Option<char> = None;
         for line in text.lines() {
             let trimmed = line.trim();
-            let marker = ['`', '~']
-                .into_iter()
-                .find(|c| trimmed.starts_with(&c.to_string().repeat(3)));
+            let marker = fence_marker(trimmed);
             match (fence, marker) {
                 (None, Some(c)) => fence = Some(c),
                 (Some(open), Some(c)) if open == c => fence = None,
@@ -245,6 +243,14 @@ fn import_area(file: &Path) -> &Path {
         .unwrap_or(dir)
 }
 
+/// The fence character (`` ` `` or `~`) of a line (already trimmed) that
+/// opens or closes a fenced code block.
+fn fence_marker(line: &str) -> Option<char> {
+    ['`', '~']
+        .into_iter()
+        .find(|c| line.starts_with(&c.to_string().repeat(3)))
+}
+
 /// The path an import line names, if `line` (already trimmed) is one.
 fn import_target(line: &str) -> Option<&str> {
     line.strip_prefix('@')
@@ -315,6 +321,94 @@ impl ContextProvider for InstructionsProvider {
 /// [`InstructionsProvider`]'s, or not this project's at all.
 pub fn nested_instructions(root: &Path, dirs: &[PathBuf]) -> Option<String> {
     nested(&Loader::from_env(), root, dirs)
+}
+
+/// The titles (compared ignoring case) of the section an instruction file
+/// gives a reviewer.
+const REVIEW_TITLES: &[&str] = &["review", "code review"];
+
+/// The most of the review sections handed to a reviewer.
+const REVIEW_SECTION_BYTES: usize = 8 * 1024;
+
+/// What the instruction files that apply at `root` say about reviewing: the
+/// text under their headings titled "Review" or "Code review" (any level,
+/// any case), in file order — or `None` when no file has such a section.
+///
+/// For `atelier review`, whose reviewer should follow the project's own
+/// idea of what matters in a review. The whole files are in front of it too
+/// (standing context); this lifts the part addressed to it into its
+/// instructions, where it is not one rule among fifty.
+pub fn review_section(root: &Path) -> Option<String> {
+    review_sections(&Loader::from_env(), root)
+}
+
+fn review_sections(loader: &Loader, root: &Path) -> Option<String> {
+    let mut found = Vec::new();
+    for file in loader.applicable(root) {
+        let Ok(text) = read_text(&file, None) else {
+            continue;
+        };
+        let mut stack = vec![canonical(&file)];
+        let text = loader.expand(&file, &text, &mut stack);
+        found.extend(sections_titled(&text, REVIEW_TITLES));
+    }
+    let mut all = found.join("\n\n");
+    if all.len() > REVIEW_SECTION_BYTES {
+        all.truncate(floor_char_boundary(&all, REVIEW_SECTION_BYTES));
+        all.push_str("\n[cut: the rest is in the instruction files]");
+    }
+    (!all.is_empty()).then_some(all)
+}
+
+/// The bodies of the sections of the Markdown `text` whose heading is one
+/// of `titles`: everything up to the next heading of the same or a higher
+/// level, sub-headings included. A `#` line inside a fenced code block is a
+/// comment in a code sample, not a heading.
+fn sections_titled(text: &str, titles: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    // The level of the wanted heading we are under, and its body so far.
+    let mut open: Option<(usize, String)> = None;
+    let mut fence: Option<char> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let marker = fence_marker(trimmed);
+        match (fence, marker) {
+            (None, Some(c)) => fence = Some(c),
+            (Some(o), Some(c)) if o == c => fence = None,
+            _ => {}
+        }
+        let heading = heading(trimmed).filter(|_| fence.is_none() && marker.is_none());
+        if let Some((level, title)) = heading {
+            if open.as_ref().is_some_and(|(at, _)| level <= *at) {
+                out.extend(open.take().map(|(_, body)| body));
+            }
+            if open.is_none() && titles.iter().any(|t| title.eq_ignore_ascii_case(t)) {
+                open = Some((level, String::new()));
+                continue;
+            }
+        }
+        if let Some((_, body)) = &mut open {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    out.extend(open.map(|(_, body)| body));
+    out.iter()
+        .map(|body| body.trim().to_string())
+        .filter(|body| !body.is_empty())
+        .collect()
+}
+
+/// The level and title of an ATX heading line (`## Title`), already trimmed.
+fn heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.bytes().take_while(|b| *b == b'#').count();
+    let rest = &line[level..];
+    if !(1..=6).contains(&level) || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // A closing run of `#` and a trailing colon are decoration.
+    let title = rest.trim().trim_end_matches('#').trim_end();
+    Some((level, title.trim_end_matches(':')))
 }
 
 fn nested(loader: &Loader, root: &Path, dirs: &[PathBuf]) -> Option<String> {
@@ -683,6 +777,41 @@ mod tests {
         assert!(nested(&Loader::default(), &root, &[root.join("src")]).is_none());
         assert!(nested(&Loader::default(), &root, &[]).is_none());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_sections_are_found_at_any_level_and_end_at_the_next_peer() {
+        let text = "# Project\nintro\n\n## Code Review:\nCheck locking.\n\n### Details\nmore\n\n\
+                    ```sh\n# not a heading\n```\n\n## Style\ntabs\n\n# review\nTop-level too.\n";
+        assert_eq!(
+            sections_titled(text, REVIEW_TITLES),
+            [
+                "Check locking.\n\n### Details\nmore\n\n```sh\n# not a heading\n```",
+                "Top-level too."
+            ]
+        );
+        assert!(sections_titled("## Reviewers\nalice\n", REVIEW_TITLES).is_empty());
+        assert!(sections_titled("#Review\nno space\n", REVIEW_TITLES).is_empty());
+        // An empty section says nothing.
+        assert!(sections_titled("## Review\n\n## Next\nx\n", REVIEW_TITLES).is_empty());
+    }
+
+    #[test]
+    fn review_section_is_read_from_the_applicable_files() {
+        let dir = temp_dir("review-section");
+        write(&dir.join("AGENTS.md"), "Rules.\n\n## Review\n@review.md\n");
+        write(
+            &dir.join("review.md"),
+            "Every unsafe block needs a comment.",
+        );
+        let loader = Loader::default();
+        assert_eq!(
+            review_sections(&loader, &dir).as_deref(),
+            Some("Every unsafe block needs a comment.")
+        );
+        write(&dir.join("AGENTS.md"), "Rules only.\n");
+        assert_eq!(review_sections(&loader, &dir), None);
         let _ = fs::remove_dir_all(&dir);
     }
 }

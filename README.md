@@ -100,7 +100,7 @@ first conversation, the REPL/TUI fallback).
 | Doc | Covers |
 |-----|--------|
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
-| [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, exit codes |
+| [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, exit codes; `atelier review` (a read-only review of a change, for you or CI) |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
@@ -112,7 +112,7 @@ first conversation, the REPL/TUI fallback).
 | [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |
-| [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` |
+| [Review](docs/review.md) | The parallel "subconscious" reviewer: `/review`, `[review]`, `ATELIER_REVIEW` — and how it differs from `atelier review` |
 | [Sign in with ChatGPT](docs/chatgpt.md) | `/login`/`/logout`, the Responses API backend, token storage |
 | [Claude backend](docs/claude.md) | `--claude`: driving your Claude Code CLI from atelier |
 | [Coordinator](docs/coordinator.md) | How running ateliers find and message each other: `/peers`, `/send`, topics, the `peers`/`peer_send` tools |

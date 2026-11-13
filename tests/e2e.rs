@@ -3424,3 +3424,195 @@ fn a_background_job_that_ends_between_turns_leads_the_next_prompt() {
     );
     assert!(!stdout.contains("job 1 finished"), "{stdout}");
 }
+
+/// Run git in `dir` for a test's setup, with an identity of its own and
+/// none of the user's configuration.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("run git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// A git repository in a fresh temp directory with one commit on `main`:
+/// `lib.txt`, and an `AGENTS.md` with a section for reviewers.
+fn review_repo(name: &str) -> PathBuf {
+    let dir = unique_dir(name);
+    git(&dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("lib.txt"), "one\n").unwrap();
+    std::fs::write(
+        dir.join("AGENTS.md"),
+        "# Project\nUse tabs.\n\n## Review\nCheck the frobnicator twice.\n\n## Style\nNone.\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "first"]);
+    dir
+}
+
+/// The tools `atelier review` may offer: those that only look.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "glob",
+    "grep",
+    "ls",
+    "read",
+    "tree",
+    "web_fetch",
+    "web_search",
+];
+
+/// Review 1 — `atelier review` on uncommitted work. The one request carries
+/// the diff (the edit and the untracked file), the reviewer's own system
+/// prompt with the project's "Review" section, and only read-only tools;
+/// the findings come back as JSON ordered by severity; `--fail-on P1` turns
+/// a P1 into exit status 5, which without the flag is 0; and nothing is
+/// written to the project.
+#[test]
+fn review_sends_the_diff_to_a_read_only_reviewer() {
+    let mock = Mock::start(always(
+        r#"{"findings":[
+            {"file":"notes.txt","line":1,"severity":"P3","summary":"Minor.","scenario":"Rarely."},
+            {"file":"lib.txt","line":2,"severity":"P1","summary":"Two is wrong.","scenario":"Count to two."}
+        ]}"#,
+    ));
+    let dir = review_repo("review");
+    std::fs::write(dir.join("lib.txt"), "one\ntwo changed\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "brand new\n").unwrap();
+
+    let args = [
+        "review",
+        "--output-format",
+        "json",
+        "--fail-on",
+        "P1",
+        "mind the gap",
+    ];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+    assert_eq!(mock.requests(), 1);
+
+    let sent = request(&mock.body(0));
+    let system = &messages_of(&sent, "system")[0];
+    assert!(system.starts_with("You are a code reviewer"), "{system}");
+    assert!(system.contains(
+        "review instructions, from its instruction files:\n\nCheck the frobnicator twice."
+    ));
+    // The instruction files themselves are standing context, as ever.
+    assert!(system.contains("Use tabs."));
+    let user = &messages_of(&sent, "user")[0];
+    assert!(user.contains("the uncommitted changes"), "{user}");
+    assert!(user.contains("+two changed"), "{user}");
+    assert!(user.contains("+brand new"), "{user}");
+    assert!(user.contains("mind the gap"));
+    assert!(!user.contains("The diff above is incomplete"));
+    let tools = tool_names(&sent);
+    assert!(tools.contains(&"read".to_string()) && tools.contains(&"grep".to_string()));
+    for tool in &tools {
+        assert!(
+            READ_ONLY_TOOLS.contains(&tool.as_str()),
+            "{tool} is offered"
+        );
+    }
+
+    let review = &json_lines(&out)[0];
+    let findings = review["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 2);
+    assert_eq!(findings[0]["severity"], "P1");
+    assert_eq!(findings[0]["file"], "lib.txt");
+    assert_eq!(findings[0]["line"], 2);
+    assert_eq!(findings[1]["severity"], "P3");
+    assert_eq!(review["reviewed"]["target"], "uncommitted");
+    assert_eq!(
+        review["reviewed"]["files"],
+        serde_json::json!(["lib.txt", "notes.txt"])
+    );
+    assert_eq!(review["reviewed"]["truncated"], false);
+
+    // As text, without --fail-on: the same findings, and success.
+    let out = run_atelier(&mock.base_url(), &dir, &["review"], None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "P1 lib.txt:2\n  Two is wrong.\n  Fails when: Count to two.\n\n\
+         P3 notes.txt:1\n  Minor.\n  Fails when: Rarely.\n"
+    );
+    // A P1 does not reach P0.
+    let out = run_atelier(&mock.base_url(), &dir, &["review", "--fail-on=P0"], None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // Read-only: no saved session, nothing new in the working tree.
+    assert!(!dir.join(".atelier").exists());
+}
+
+/// Review 2 — the other targets. On a clean branch the default is the
+/// branch against the default branch; `--commit` reviews one commit, with
+/// its message; an answer that is not the JSON asked for is sent back once;
+/// an empty change asks the model nothing; and outside a repository the run
+/// fails with status 1.
+#[test]
+fn review_targets_a_base_branch_or_a_commit_and_retries_bad_json() {
+    let mock = Mock::start(Arc::new(|n| {
+        text_response(if n == 0 {
+            "It all looks fine to me."
+        } else {
+            r#"{"findings":[]}"#
+        })
+    }));
+    let dir = review_repo("review-base");
+
+    // Clean, on the default branch itself: nothing to compare.
+    let args = ["review", "--output-format=json"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(mock.requests(), 0);
+    let empty = &json_lines(&out)[0];
+    assert_eq!(empty["findings"], serde_json::json!([]));
+    assert_eq!(empty["reviewed"]["base"], "main");
+
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("lib.txt"), "one\nfeature line\n").unwrap();
+    git(&dir, &["commit", "-q", "-am", "add the feature line"]);
+
+    let args = ["review", "--fail-on", "P3"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "No findings.\n");
+    assert_eq!(mock.requests(), 2);
+    let first = &messages_of(&request(&mock.body(0)), "user")[0];
+    assert!(first.contains("since it left main"), "{first}");
+    assert!(first.contains("+feature line"));
+    let retry = messages_of(&request(&mock.body(1)), "user");
+    assert!(retry[1].contains("does not satisfy the required JSON Schema"));
+
+    let args = ["review", "--commit", "HEAD", "--output-format", "json"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(json_lines(&out)[0]["reviewed"]["target"], "commit");
+    let user = &messages_of(&request(&mock.body(2)), "user")[0];
+    assert!(
+        user.contains("Its commit message:\nadd the feature line"),
+        "{user}"
+    );
+    assert!(user.contains("+feature line"));
+
+    let args = ["review", "--commit", "nope"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nope does not name a commit"));
+
+    let out = run_atelier(&mock.base_url(), &dir, &["review", "--frob"], None);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+
+    let outside = unique_dir("review-norepo");
+    let out = run_atelier(&mock.base_url(), &outside, &["review"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not inside a git work tree"));
+    assert_eq!(mock.requests(), 3);
+}
