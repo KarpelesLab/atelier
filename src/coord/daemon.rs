@@ -379,7 +379,13 @@ impl Daemon {
             }
             return;
         };
-        let reply = self.request(conn, id, method, &msg["params"]);
+        // The answer is queued under the lock the request ran under. Were it
+        // released in between, another connection's `send` could put a
+        // `message` for an instance that has just registered in front of
+        // its `hello` answer — and the instance, which takes the first line
+        // it reads for that answer, would lose the message.
+        let mut st = self.lock();
+        let reply = self.request(&mut st, conn, id, method, &msg["params"]);
         let (result, stop) = match reply {
             Reply::Later => return,
             Reply::Now(r) => (r, None),
@@ -390,15 +396,22 @@ impl Daemon {
                 Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": v }).to_string(),
                 Err((code, m)) => error(id, code, &m),
             };
-            self.lock().send(conn, line);
+            st.send(conn, line);
         }
+        drop(st);
         if let Some(why) = stop {
             self.stop(&why);
         }
     }
 
-    fn request(&self, conn: u64, id: Option<&Value>, method: &str, p: &Value) -> Reply {
-        let mut st = self.lock();
+    fn request(
+        &self,
+        st: &mut State,
+        conn: u64,
+        id: Option<&Value>,
+        method: &str,
+        p: &Value,
+    ) -> Reply {
         // Open to any connection — `atelier coordinator status|stop` never
         // registers as an instance.
         match method {
@@ -425,7 +438,7 @@ impl Daemon {
                 return Reply::Now(Ok(json!({ "instances": instances })));
             }
             "shutdown" => return Reply::ThenStop(Ok(json!({})), "requested".into()),
-            "hello" => return hello(&mut st, conn, p),
+            "hello" => return hello(st, conn, p),
             _ => {}
         }
 
