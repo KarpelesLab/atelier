@@ -142,6 +142,8 @@ const HELP: &[&str] = &[
     "  /new [force]                          start a fresh conversation (clear saved session);",
     "                                        force: even if claude has background tasks running",
     "  /image <path>                         attach an image to your next message (vision)",
+    "  /memory                               list what the agent remembers, and where it is kept",
+    "  /memory forget <name>                 delete one memory",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
     "  /subscribe <topic>                    receive what instances publish to a topic",
@@ -281,6 +283,12 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             },
             None => ui.info("usage: /image <path>"),
         },
+        "/memory" => {
+            let store = crate::memory::Store::new(&session.root, crate::memory::global_dir());
+            for l in crate::memory::command(&store, &args) {
+                ui.info(&l);
+            }
+        }
         "/peers" | "/subscribe" | "/unsubscribe" => dispatch_peers(session, cmd, &args, ui),
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),

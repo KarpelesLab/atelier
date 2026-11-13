@@ -30,6 +30,7 @@ mod environment;
 mod git;
 mod instructions;
 mod layout;
+mod memory;
 mod todos;
 
 // Not yet called from the agent loop (wiring is done separately); re-exported
@@ -69,12 +70,13 @@ pub trait ContextProvider: Send + Sync {
     fn gather(&self, root: &Path) -> Option<ContextItem>;
 }
 
-/// The default set of context providers: project instructions, cargo-check
-/// diagnostics, git status, recent diff, recent commits, project layout,
-/// open TODOs, and environment facts (in priority order).
+/// The default set of context providers: project instructions, the memory
+/// index, cargo-check diagnostics, git status, recent diff, recent commits,
+/// project layout, open TODOs, and environment facts (in priority order).
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
     vec![
         Box::new(instructions::InstructionsProvider),
+        Box::new(memory::MemoryProvider::new(crate::memory::global_dir())),
         Box::new(diagnostics::DiagnosticsProvider),
         Box::new(git::GitStatusProvider),
         Box::new(diff::GitDiffProvider),

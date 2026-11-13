@@ -16,6 +16,7 @@ model verbatim as the tool result.
 | `ls`        | auto     | yes |
 | `tree`      | auto     | yes |
 | `todo`      | auto     | yes |
+| `memory`    | auto     | to the memory directories (the project's `.atelier/memory/` and the user-global one) |
 | `notebook_edit` | auto | yes |
 | `bash`      | **required** | no (arbitrary shell) |
 | `bash_output`, `bash_kill` | auto (act on jobs `bash` started) | n/a |
@@ -289,6 +290,29 @@ work across turns (and across compaction).
 
 Renders as `[x] 1. done` / `[ ] 2. pending` with a count summary. Confined and
 auto-approved.
+
+## `memory`
+
+Notes that persist across sessions, one Markdown file each, in
+`.atelier/memory/` (project) or the user-global memory directory. The index
+of saved memories is injected as context every turn; this tool reads the
+notes and maintains them. See [memory](memory.md) for the file format and
+what the agent is told to save.
+
+| Param         | Type   | Required | Meaning |
+|---------------|--------|----------|---------|
+| `action`      | string | yes      | `save` · `read` · `list` · `delete` |
+| `name`        | string | for save/read/delete | kebab-case slug (lower-case letters, digits, single hyphens; max 64 chars) |
+| `description` | string | for save | one line (max 200 chars), shown in the index |
+| `type`        | string | for save | `user` · `feedback` · `project` · `reference` |
+| `content`     | string | for save | the note, Markdown, max 8 KiB |
+| `scope`       | string | no       | `project` (default for save) · `global` (type `user` only). For read/delete the default is whichever has the name, project first |
+
+`save` overwrites a memory of the same name and regenerates `MEMORY.md`.
+Errors the model can act on: an invalid name, a note over 8 KiB, a full
+directory (200 memories), and content that looks like a secret (private-key
+blocks, `sk-…`/`ghp_…`/AWS-style keys, `password=…` and the like) — the save
+is refused. Confined to the memory directories and auto-approved.
 
 ## `peers`, `peer_send`
 

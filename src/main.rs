@@ -13,6 +13,7 @@ mod coord;
 mod headless;
 mod js;
 mod mcp;
+mod memory;
 mod provider;
 mod review;
 mod risk;

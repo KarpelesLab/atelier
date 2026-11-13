@@ -93,6 +93,7 @@ first conversation, the REPL/TUI fallback).
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
+| [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Permissions](docs/permissions.md) | The confinement/approval model, risk signals |
 | [Scripting](docs/scripting.md) | The `node` tool: sandboxed JS, `fs`, optional network |
 | [MCP](docs/mcp.md) | Connecting MCP servers (stdio + HTTP), tool namespacing |

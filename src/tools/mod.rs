@@ -35,6 +35,7 @@ mod edit;
 mod glob;
 mod grep;
 mod ls;
+mod memory;
 mod multiedit;
 mod notebook;
 mod read;
@@ -232,6 +233,9 @@ pub fn builtin_registry() -> ToolRegistry {
     reg.register(Box::new(glob::GlobTool));
     reg.register(Box::new(ls::LsTool));
     reg.register(Box::new(todo::TodoTool));
+    reg.register(Box::new(memory::MemoryTool::new(
+        crate::memory::global_dir(),
+    )));
     reg.register(Box::new(tree::TreeTool));
     reg.register(Box::new(crate::js::NodeTool));
     reg
