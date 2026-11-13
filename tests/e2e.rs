@@ -574,6 +574,71 @@ fn instruction_files_are_sent_root_first_and_nested_on_demand() {
     assert!(last.contains("page content") && last.contains("WEB-RULE-91cc"));
 }
 
+/// `[instructions] files` adds instruction files: after the `AGENTS.md` found
+/// by name, in the order written with a glob's matches sorted, each under its
+/// path — the user-global settings' files before the project's. What the
+/// project's settings name outside the repository is not read.
+#[test]
+fn instruction_files_named_in_the_settings_reach_the_system_message_in_order() {
+    let mock = Mock::start(always("ok"));
+    let dir = unique_dir("instruction-files");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join("team")).unwrap();
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "ROOT-RULE-11aa").unwrap();
+    std::fs::write(dir.join("team/b.md"), "TEAM-B-22bb").unwrap();
+    std::fs::write(dir.join("team/a.md"), "TEAM-A-33cc").unwrap();
+    std::fs::write(dir.join("docs/conventions.md"), "CONVENTIONS-44dd").unwrap();
+    let outside = dir.with_extension("outside.md");
+    std::fs::write(&outside, "OUTSIDE-55ee").unwrap();
+    std::fs::write(
+        dir.join("atelier.toml"),
+        format!(
+            "[instructions]\nfiles = [\"team/*.md\", \"docs/conventions.md\", \"{}\"]\n",
+            outside.display()
+        ),
+    )
+    .unwrap();
+    // The user's own settings may name a file anywhere.
+    let config = dir.join(".no-user-config/atelier");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("atelier.toml"),
+        format!("[instructions]\nfiles = [\"{}\"]\n", outside.display()),
+    )
+    .unwrap();
+
+    let out = run_print(&mock.base_url(), &dir, "hello");
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let system = system_message(&bodies[0]);
+    let order = [
+        "OUTSIDE-55ee",
+        "ROOT-RULE-11aa",
+        "TEAM-A-33cc",
+        "TEAM-B-22bb",
+        "CONVENTIONS-44dd",
+        "[skipped: outside the project]",
+    ];
+    let at: Vec<usize> = order
+        .iter()
+        .map(|needle| {
+            system
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {system}"))
+        })
+        .collect();
+    assert!(at.is_sorted(), "{system}");
+    assert_eq!(system.matches("OUTSIDE-55ee").count(), 1, "{system}");
+    assert!(
+        system.contains(&format!(
+            "### {}\nTEAM-A-33cc",
+            dir.join("team/a.md").display()
+        )),
+        "{system}"
+    );
+}
+
 /// stdout as JSON lines: every non-empty line must parse, which is the
 /// `stream-json` contract (nothing else on stdout).
 fn json_lines(out: &Output) -> Vec<serde_json::Value> {

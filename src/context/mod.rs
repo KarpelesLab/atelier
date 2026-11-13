@@ -43,7 +43,8 @@ pub use budget::{estimate_tokens, render_budgeted};
 pub use dedup::{Delta, dedup_items};
 pub use diagnostics::detectable as detectable_checkers;
 pub use instructions::{
-    instruction_files, nested_instructions, pick as instruction_file, review_section,
+    InstructionFiles, instruction_files, nested_instructions, pick as instruction_file,
+    review_section,
 };
 pub use mcp::McpProvider;
 
@@ -96,8 +97,10 @@ pub trait ContextProvider: Send + Sync {
 /// files. What a subagent gets: the rules of the project apply to it too,
 /// but the snapshot of the moment (git status, diagnostics, layout) is its
 /// parent's to pass on in the task, and gathering it per child is not free.
-pub fn standing_providers() -> Vec<Box<dyn ContextProvider>> {
-    vec![Box::new(instructions::InstructionsProvider::new())]
+///
+/// `files` are the `[instructions] files` of the settings.
+pub fn standing_providers(files: InstructionFiles) -> Vec<Box<dyn ContextProvider>> {
+    vec![Box::new(instructions::InstructionsProvider::new(files))]
 }
 
 /// The default set of context providers: project instructions, the memory
@@ -109,12 +112,16 @@ pub fn standing_providers() -> Vec<Box<dyn ContextProvider>> {
 /// empty, the diagnostics provider picks checkers from the project's files.
 /// Either way they are commands of the project's choosing, which run only
 /// while `trust` says the project is trusted.
+///
+/// `files` are its `[instructions] files` (and the user-global ones): more
+/// instruction files to load.
 pub fn default_providers(
     checkers: Vec<DiagnosticCheck>,
+    files: InstructionFiles,
     trust: &Trust,
 ) -> Vec<Box<dyn ContextProvider>> {
     vec![
-        Box::new(instructions::InstructionsProvider::new()),
+        Box::new(instructions::InstructionsProvider::new(files)),
         Box::new(memory::MemoryProvider::new(crate::memory::global_dir())),
         Box::new(skills::SkillsProvider::new(crate::skills::global_dirs())),
         Box::new(diagnostics::DiagnosticsProvider::new(

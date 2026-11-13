@@ -68,6 +68,9 @@ pub struct Settings {
     /// Running `bash` commands in a sandbox (see [`crate::sandbox`]).
     #[serde(default, skip_serializing_if = "SandboxSettings::is_unset")]
     pub sandbox: SandboxSettings,
+    /// More instruction files to load.
+    #[serde(default, skip_serializing_if = "InstructionSettings::is_unset")]
+    pub instructions: InstructionSettings,
 }
 
 /// `[sandbox]`: run the `bash` tool's commands inside nixvm (see
@@ -95,6 +98,30 @@ pub struct SandboxSettings {
 impl SandboxSettings {
     fn is_unset(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// `[instructions]`: instruction files beyond the `AGENTS.md` found by name
+/// (see `context::instructions`).
+///
+/// ```toml
+/// [instructions]
+/// files = ["docs/conventions.md", "team/*.md"]
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstructionSettings {
+    /// Paths or globs, loaded in this order (a glob's matches sorted). In a
+    /// project's file they are relative to the project root and confined to
+    /// the repository; in the user-global file they may be absolute or
+    /// start with `~/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+impl InstructionSettings {
+    /// Nothing set: the table is left out when the settings are written.
+    fn is_unset(&self) -> bool {
+        self.files.is_empty()
     }
 }
 
@@ -432,7 +459,8 @@ impl Settings {
     /// `$XDG_CONFIG_HOME/atelier`, else `~/.config/atelier`. Its
     /// `[permissions]`, `[[hooks]]` and model tables (`[[provider]]`,
     /// `[models]`, `[variant.*]`, `[[price]]`, `[defaults] model`/`provider`)
-    /// are used, under the project's.
+    /// are used, under the project's; its `[instructions] files` are loaded
+    /// as well as the project's.
     pub fn user_dir() -> Option<PathBuf> {
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
         var("XDG_CONFIG_HOME")
@@ -584,6 +612,24 @@ cached = 0.3
 
         let empty = tomlproc::serde::to_string_pretty(&Settings::default()).unwrap();
         assert!(!empty.contains("goals"), "{empty}");
+    }
+
+    #[test]
+    fn instruction_files_parse_and_are_left_out_when_unset() {
+        let settings: Settings = tomlproc::serde::from_str(
+            "[instructions]\nfiles = [\"docs/conventions.md\", \"team/*.md\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.instructions.files,
+            ["docs/conventions.md", "team/*.md"]
+        );
+        let rewritten = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        let again: Settings = tomlproc::serde::from_str(&rewritten).unwrap();
+        assert_eq!(again.instructions, settings.instructions);
+
+        let plain = tomlproc::serde::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!plain.contains("instructions"), "{plain}");
     }
 
     #[test]

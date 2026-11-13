@@ -18,6 +18,21 @@
 //! the model can then tell whose rule it is following, and so can the user
 //! reading a transcript.
 //!
+//! # Files named in the settings
+//!
+//! `[instructions] files` in `atelier.toml` names more files — paths or
+//! globs ([`InstructionFiles`]). They are instruction files like the others
+//! (same headers, imports and budget) and keep the least-specific-first
+//! order: the user-global settings' files follow the user-global
+//! `AGENTS.md`, the project's follow the root→leaf chain. Within one list
+//! the order is the one written, and a glob's matches are sorted.
+//!
+//! A project's `atelier.toml` is a file of the repository, read without
+//! asking, so what it names is confined like a project file's imports: a
+//! path that resolves outside the repository (through `..`, an absolute
+//! path, `~/`, or a symlink) is not read, and a note says so. The user's
+//! own settings may name files anywhere.
+//!
 //! # Imports
 //!
 //! A line that is nothing but `@path` is replaced by that file's content
@@ -46,7 +61,9 @@
 //!   `FileState` reports each directory once per session).
 
 use super::{ContextItem, ContextProvider};
-use std::path::{Path, PathBuf};
+use crate::settings::Settings;
+use globset::GlobBuilder;
+use std::path::{Component, Path, PathBuf};
 
 /// Candidate instruction files, in precedence order. The first one that
 /// exists in a directory wins for that directory.
@@ -65,6 +82,96 @@ const BUDGET_BYTES: usize = 32 * 1024;
 /// How deep `@imports` may nest below the file that was loaded for its name.
 const MAX_IMPORT_DEPTH: usize = 5;
 
+/// How far below its fixed leading directories a glob in `[instructions]
+/// files` is looked for when it contains `**`. The patterns are resolved on
+/// every turn, so the walk has to stay small.
+const MAX_GLOB_DEPTH: usize = 8;
+
+/// Directory entries one glob may look at before it is given up on as too
+/// broad (`**/*.md` at the root of a large tree).
+const MAX_GLOB_VISITS: usize = 10_000;
+
+/// Most files one glob may contribute.
+const MAX_GLOB_FILES: usize = 64;
+
+/// The `[instructions] files` lists of the two settings files (see the
+/// module docs): paths or globs, kept as written.
+#[derive(Debug, Clone, Default)]
+pub struct InstructionFiles {
+    /// From the user-global `atelier.toml`. Relative ones are resolved
+    /// against that file's directory.
+    user: Vec<String>,
+    /// From the project's `atelier.toml`, relative to the project root.
+    project: Vec<String>,
+}
+
+impl InstructionFiles {
+    /// The lists of the project's settings and the user-global ones.
+    pub fn new(project: &Settings, user: &Settings) -> Self {
+        Self {
+            user: user.instructions.files.clone(),
+            project: project.instructions.files.clone(),
+        }
+    }
+
+    /// [`new`](Self::new), reading the user-global settings from disk — for
+    /// a caller that holds only the project's.
+    pub fn with_user(project: &Settings) -> Self {
+        Self::new(project, &Settings::load_user().unwrap_or_default())
+    }
+
+    /// Both lists read from disk, for the project at `root`.
+    fn load(root: &Path) -> Self {
+        Self::with_user(&Settings::load(root).unwrap_or_default())
+    }
+}
+
+/// One entry of the list to show the model.
+#[derive(Debug, Clone, PartialEq)]
+enum Source {
+    File {
+        path: PathBuf,
+        /// It is the user's own — their global file, or one their settings
+        /// name — and so may import from anywhere (see [`Loader::import`]).
+        own: bool,
+    },
+    /// Something `[instructions] files` named that is not read, and why:
+    /// shown in its place, like an import that can't be honoured.
+    Skipped { named: String, why: String },
+}
+
+impl Source {
+    /// A file of the project.
+    fn project(path: PathBuf) -> Self {
+        Source::File { path, own: false }
+    }
+
+    /// What it is shown as: its header, and its name in the closing note.
+    fn name(&self) -> String {
+        match self {
+            Source::File { path, .. } => path.display().to_string(),
+            Source::Skipped { named, .. } => named.clone(),
+        }
+    }
+}
+
+/// The files being expanded, outermost first — to spot an import cycle and
+/// bound the nesting — and what the outermost one may import.
+struct Trail {
+    stack: Vec<PathBuf>,
+    /// The file loaded for its name is the user's own: no confinement.
+    own: bool,
+}
+
+impl Trail {
+    fn new(file: &Path, own: bool) -> Self {
+        Self {
+            stack: vec![canonical(file)],
+            own,
+        }
+    }
+}
+
 /// Reads instruction files. Carries the two locations that lie outside the
 /// project, so tests can point them at a temp dir instead of the real home.
 #[derive(Clone, Default)]
@@ -73,11 +180,13 @@ struct Loader {
     global: Option<PathBuf>,
     /// What a leading `~/` in an import expands to.
     home: Option<PathBuf>,
+    /// The files the settings name.
+    extra: InstructionFiles,
 }
 
 impl Loader {
     /// The locations for this process, from `XDG_CONFIG_HOME` and `HOME`.
-    fn from_env() -> Self {
+    fn from_env(extra: InstructionFiles) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -85,54 +194,181 @@ impl Loader {
         Self {
             global: config.map(|c| c.join("atelier").join("AGENTS.md")),
             home,
+            extra,
         }
     }
 
-    /// The files that apply at `root`, least specific first.
-    fn applicable(&self, root: &Path) -> Vec<PathBuf> {
-        let global = self.global.iter().filter(|p| p.is_file()).cloned();
-        let project = chain(root)
-            .iter()
-            .filter_map(|dir| pick(dir))
-            .collect::<Vec<_>>();
-        global.chain(project).collect()
+    /// What applies at `root`, least specific first: the user's files, then
+    /// the project's (see the module docs). A file reached twice — named by
+    /// two patterns, or already loaded for its name — is shown once, where
+    /// it first comes.
+    fn applicable(&self, root: &Path) -> Vec<Source> {
+        let mut found = Vec::new();
+        if let Some(path) = self.global.clone().filter(|p| p.is_file()) {
+            found.push(Source::File { path, own: true });
+        }
+        // The user-global settings sit next to the user-global file.
+        let config_dir = self.global.as_deref().and_then(Path::parent);
+        self.named(&self.extra.user, config_dir, None, &mut found);
+
+        let dirs = chain(root);
+        found.extend(dirs.iter().filter_map(|dir| pick(dir)).map(Source::project));
+        let repository = canonical(&dirs[0]);
+        self.named(
+            &self.extra.project,
+            Some(root),
+            Some(&repository),
+            &mut found,
+        );
+
+        let mut seen = Vec::new();
+        found.retain(|source| match source {
+            Source::File { path, .. } => {
+                let key = canonical(path);
+                let fresh = !seen.contains(&key);
+                seen.push(key);
+                fresh
+            }
+            Source::Skipped { .. } => true,
+        });
+        found
     }
 
-    /// Renders `files` in order, each under a header naming it, within
-    /// [`BUDGET_BYTES`]. `None` when there is nothing to show.
-    fn render(&self, files: &[PathBuf]) -> Option<String> {
-        let mut out = String::new();
-        let mut cut: Option<&Path> = None;
-        let mut dropped: Vec<String> = Vec::new();
-        for file in files {
-            if cut.is_some() {
-                dropped.push(file.display().to_string());
+    /// Resolve the `patterns` of one `[instructions] files` list into `out`.
+    /// A relative pattern is taken from `base`; with `area`, only files
+    /// inside it are read (the project's list — the user's has none).
+    fn named(
+        &self,
+        patterns: &[String],
+        base: Option<&Path>,
+        area: Option<&Path>,
+        out: &mut Vec<Source>,
+    ) {
+        for pattern in patterns.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            let skipped = |named: String, why: &str| Source::Skipped {
+                named,
+                why: why.to_string(),
+            };
+            let path = match (pattern.strip_prefix("~/"), &self.home, base) {
+                (Some(rest), Some(home), _) => home.join(rest),
+                (Some(_), None, _) => {
+                    out.push(skipped(pattern.to_string(), "no home directory"));
+                    continue;
+                }
+                // `join` keeps an absolute pattern as it is.
+                (None, _, Some(base)) => base.join(pattern),
+                (None, _, None) => PathBuf::from(pattern),
+            };
+            let inside = |real: &Path| area.is_none_or(|area| real.starts_with(area));
+
+            if !is_glob(pattern) {
+                // Resolved first, so that `..` and symlinks are judged by
+                // where they lead; what can't be resolved isn't there.
+                out.push(match std::fs::canonicalize(&path) {
+                    Ok(real) if !inside(&real) => {
+                        skipped(pattern.to_string(), "outside the project")
+                    }
+                    Ok(_) => Source::File {
+                        path,
+                        own: area.is_none(),
+                    },
+                    Err(_) => skipped(pattern.to_string(), "not found"),
+                });
                 continue;
             }
-            let content = match read_text(file, None) {
-                Ok(text) => {
-                    // The stack holds the files being expanded, to spot a
-                    // cycle; it starts with the one loaded for its name.
-                    let mut stack = vec![canonical(file)];
-                    self.expand(file, &text, &mut stack)
-                }
-                Err(why) => format!("[skipped: {why}]"),
+
+            let (dir, glob) = split_glob(&path);
+            let Ok(matcher) = GlobBuilder::new(&glob)
+                // `*` stays within one directory; `**` is how to cross them.
+                .literal_separator(true)
+                .build()
+                .map(|g| g.compile_matcher())
+            else {
+                out.push(skipped(pattern.to_string(), "not a valid pattern"));
+                continue;
             };
-            let section = format!("### {}\n{}\n\n", file.display(), content.trim());
+            // A glob that matches nothing says nothing — unlike a plain
+            // path, it does not promise a file.
+            let Ok(real_dir) = std::fs::canonicalize(&dir) else {
+                continue;
+            };
+            if !inside(&real_dir) {
+                out.push(skipped(pattern.to_string(), "outside the project"));
+                continue;
+            }
+            let depth = if glob.contains("**") {
+                MAX_GLOB_DEPTH
+            } else {
+                glob.split('/').count()
+            };
+            let mut walk = Walk::default();
+            walk.files(&dir, depth);
+            let mut matches: Vec<PathBuf> = walk
+                .found
+                .into_iter()
+                .filter(|file| matcher.is_match(file.strip_prefix(&dir).unwrap_or(file)))
+                .collect();
+            matches.sort();
+            let surplus = matches.len().saturating_sub(MAX_GLOB_FILES);
+            matches.truncate(MAX_GLOB_FILES);
+            for path in matches {
+                // A match may still be a symlink leading out.
+                out.push(if inside(&canonical(&path)) {
+                    Source::File {
+                        path,
+                        own: area.is_none(),
+                    }
+                } else {
+                    skipped(path.display().to_string(), "outside the project")
+                });
+            }
+            if walk.visits > MAX_GLOB_VISITS {
+                let why = format!(
+                    "too broad — gave up after {MAX_GLOB_VISITS} directory entries, \
+                     so some matches may be missing"
+                );
+                out.push(skipped(pattern.to_string(), &why));
+            } else if surplus > 0 {
+                let why = format!(
+                    "{surplus} more file(s) match than the {MAX_GLOB_FILES} one pattern may add"
+                );
+                out.push(skipped(pattern.to_string(), &why));
+            }
+        }
+    }
+
+    /// Renders `sources` in order, each under a header naming it, within
+    /// [`BUDGET_BYTES`]. `None` when there is nothing to show.
+    fn render(&self, sources: &[Source]) -> Option<String> {
+        let mut out = String::new();
+        let mut cut: Option<String> = None;
+        let mut dropped: Vec<String> = Vec::new();
+        for source in sources {
+            if cut.is_some() {
+                dropped.push(source.name());
+                continue;
+            }
+            let content = match source {
+                Source::File { path, own } => match read_text(path, None) {
+                    Ok(text) => self.expand(path, &text, &mut Trail::new(path, *own)),
+                    Err(why) => format!("[skipped: {why}]"),
+                },
+                Source::Skipped { why, .. } => format!("[skipped: {why}]"),
+            };
+            let section = format!("### {}\n{}\n\n", source.name(), content.trim());
             let room = BUDGET_BYTES - out.len();
             if section.len() <= room {
                 out.push_str(&section);
             } else {
                 out.push_str(&section[..floor_char_boundary(&section, room)]);
-                cut = Some(file);
+                cut = Some(source.name());
             }
         }
         let mut out = out.trim_end().to_string();
         if let Some(file) = cut {
             out.push_str(&format!(
-                "\n[instructions truncated at the {} KiB budget: {} was cut short",
+                "\n[instructions truncated at the {} KiB budget: {file} was cut short",
                 BUDGET_BYTES / 1024,
-                file.display()
             ));
             if !dropped.is_empty() {
                 out.push_str(&format!("; left out entirely: {}", dropped.join(", ")));
@@ -148,8 +384,8 @@ impl Loader {
     /// An import is a line consisting only of `@path`: relative to the
     /// importing file, absolute, or under `~/`. Lines inside a fenced code
     /// block are left alone — an `@decorator` in a code sample is not an
-    /// import. `stack` is the chain of files currently being expanded.
-    fn expand(&self, file: &Path, text: &str, stack: &mut Vec<PathBuf>) -> String {
+    /// import. `trail` is the chain of files currently being expanded.
+    fn expand(&self, file: &Path, text: &str, trail: &mut Trail) -> String {
         let mut out = String::with_capacity(text.len());
         // The fence character (` or ~) of the code block we're inside, if any.
         let mut fence: Option<char> = None;
@@ -162,7 +398,7 @@ impl Loader {
                 _ => {}
             }
             match import_target(trimmed).filter(|_| fence.is_none() && marker.is_none()) {
-                Some(target) => match self.import(file, target, stack) {
+                Some(target) => match self.import(file, target, trail) {
                     Ok(content) => out.push_str(content.trim_end()),
                     Err(why) => out.push_str(&format!("[import @{target} skipped: {why}]")),
                 },
@@ -175,13 +411,8 @@ impl Loader {
 
     /// The expanded content of the file `target` names when imported from
     /// `from`, or why it can't be imported.
-    fn import(
-        &self,
-        from: &Path,
-        target: &str,
-        stack: &mut Vec<PathBuf>,
-    ) -> Result<String, String> {
-        if stack.len() > MAX_IMPORT_DEPTH {
+    fn import(&self, from: &Path, target: &str, trail: &mut Trail) -> Result<String, String> {
+        if trail.stack.len() > MAX_IMPORT_DEPTH {
             return Err(format!("imports nest deeper than {MAX_IMPORT_DEPTH}"));
         }
         let path = match target.strip_prefix("~/") {
@@ -190,22 +421,20 @@ impl Loader {
             None => from.parent().unwrap_or(Path::new("")).join(target),
         };
         let key = canonical(&path);
-        if stack.contains(&key) {
+        if trail.stack.contains(&key) {
             return Err("import cycle".to_string());
         }
         // A repository's instruction files are loaded without asking, so
         // they may only pull in files of that repository: otherwise a cloned
         // project could put any text file of the user's (credentials, keys)
-        // into the prompt. The user's own global file may import anything.
-        let top = &stack[0];
-        let own = self.global.as_deref().map(canonical).as_ref() == Some(top);
-        if !own && !key.starts_with(import_area(top)) {
+        // into the prompt. The user's own files may import anything.
+        if !trail.own && !key.starts_with(import_area(&trail.stack[0])) {
             return Err("outside the project".to_string());
         }
         let text = read_text(&path, Some(BUDGET_BYTES as u64))?;
-        stack.push(key);
-        let content = self.expand(&path, &text, stack);
-        stack.pop();
+        trail.stack.push(key);
+        let content = self.expand(&path, &text, trail);
+        trail.stack.pop();
         Ok(content)
     }
 }
@@ -241,6 +470,65 @@ fn import_area(file: &Path) -> &Path {
     dir.ancestors()
         .find(|d| d.join(".git").exists())
         .unwrap_or(dir)
+}
+
+/// Whether an `[instructions] files` entry is a pattern rather than a path.
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', '{'])
+}
+
+/// Cut the pattern `path` into the directory its leading plain components
+/// name — where to look — and the glob for what is below it, `/`-separated.
+fn split_glob(path: &Path) -> (PathBuf, String) {
+    let mut dir = PathBuf::new();
+    let mut glob: Vec<String> = Vec::new();
+    for component in path.components() {
+        let text = component.as_os_str().to_string_lossy();
+        let plain = !matches!(component, Component::Normal(_)) || !is_glob(&text);
+        if glob.is_empty() && plain {
+            dir.push(component);
+        } else {
+            glob.push(text.into_owned());
+        }
+    }
+    (dir, glob.join("/"))
+}
+
+/// A bounded walk for the files a glob may match.
+#[derive(Default)]
+struct Walk {
+    found: Vec<PathBuf>,
+    /// Directory entries looked at; past [`MAX_GLOB_VISITS`] the walk stops.
+    visits: usize,
+}
+
+impl Walk {
+    /// Collect the files up to `depth` levels below `dir`. Symlinked
+    /// directories are not entered (no loops, no walking out of the tree),
+    /// and neither is `.git`.
+    fn files(&mut self, dir: &Path, depth: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            self.visits += 1;
+            if self.visits > MAX_GLOB_VISITS {
+                return;
+            }
+            // Does not follow symlinks: a link is neither a directory here…
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth > 1 && entry.file_name() != ".git" {
+                    self.files(&entry.path(), depth - 1);
+                }
+            // …nor a file, so it is asked what it leads to.
+            } else if entry.path().is_file() {
+                self.found.push(entry.path());
+            }
+        }
+    }
 }
 
 /// The fence character (`` ` `` or `~`) of a line (already trimmed) that
@@ -295,9 +583,10 @@ pub struct InstructionsProvider {
 }
 
 impl InstructionsProvider {
-    pub fn new() -> Self {
+    /// `files` are the `[instructions] files` of the settings.
+    pub fn new(files: InstructionFiles) -> Self {
         Self {
-            loader: Loader::from_env(),
+            loader: Loader::from_env(files),
         }
     }
 }
@@ -320,13 +609,20 @@ impl ContextProvider for InstructionsProvider {
 /// `root` itself and anything above or outside it are ignored: those files are
 /// [`InstructionsProvider`]'s, or not this project's at all.
 pub fn nested_instructions(root: &Path, dirs: &[PathBuf]) -> Option<String> {
-    nested(&Loader::from_env(), root, dirs)
+    // Only the directories' own files are rendered: no settings needed.
+    nested(&Loader::from_env(InstructionFiles::default()), root, dirs)
 }
 
 /// The instruction files a session at `root` loads up front, least specific
-/// first — what [`InstructionsProvider`] renders. For `atelier doctor`.
+/// first — what [`InstructionsProvider`] renders, the files the settings
+/// name included. For `atelier doctor`.
 pub fn instruction_files(root: &Path) -> Vec<PathBuf> {
-    Loader::from_env().applicable(root)
+    let sources = Loader::from_env(InstructionFiles::load(root)).applicable(root);
+    let file = |source| match source {
+        Source::File { path, .. } => Some(path),
+        Source::Skipped { .. } => None,
+    };
+    sources.into_iter().filter_map(file).collect()
 }
 
 /// The titles (compared ignoring case) of the section an instruction file
@@ -345,17 +641,19 @@ const REVIEW_SECTION_BYTES: usize = 8 * 1024;
 /// (standing context); this lifts the part addressed to it into its
 /// instructions, where it is not one rule among fifty.
 pub fn review_section(root: &Path) -> Option<String> {
-    review_sections(&Loader::from_env(), root)
+    review_sections(&Loader::from_env(InstructionFiles::load(root)), root)
 }
 
 fn review_sections(loader: &Loader, root: &Path) -> Option<String> {
     let mut found = Vec::new();
-    for file in loader.applicable(root) {
-        let Ok(text) = read_text(&file, None) else {
+    for source in loader.applicable(root) {
+        let Source::File { path, own } = source else {
             continue;
         };
-        let mut stack = vec![canonical(&file)];
-        let text = loader.expand(&file, &text, &mut stack);
+        let Ok(text) = read_text(&path, None) else {
+            continue;
+        };
+        let text = loader.expand(&path, &text, &mut Trail::new(&path, own));
         found.extend(sections_titled(&text, REVIEW_TITLES));
     }
     let mut all = found.join("\n\n");
@@ -425,7 +723,8 @@ fn nested(loader: &Loader, root: &Path, dirs: &[PathBuf]) -> Option<String> {
     // Path order puts a directory before those inside it: root→leaf again.
     below.sort();
     below.dedup();
-    let files: Vec<PathBuf> = below.into_iter().filter_map(|dir| pick(dir)).collect();
+    let picked = below.into_iter().filter_map(|dir| pick(dir));
+    let files: Vec<Source> = picked.map(Source::project).collect();
     let body = loader.render(&files)?;
     Some(format!(
         "\n\n<nested-instructions>\n\
@@ -525,7 +824,7 @@ mod tests {
         let provider = InstructionsProvider {
             loader: Loader {
                 global: Some(dir.join("config/atelier/AGENTS.md")),
-                home: None,
+                ..Loader::default()
             },
         };
         let b = body(&provider, &project);
@@ -570,8 +869,8 @@ mod tests {
 
         let provider = InstructionsProvider {
             loader: Loader {
-                global: None,
                 home: Some(dir.join("home")),
+                ..Loader::default()
             },
         };
         let b = body(&provider, &dir);
@@ -604,6 +903,7 @@ mod tests {
             loader: Loader {
                 global: Some(dir.join("cfg/AGENTS.md")),
                 home: Some(dir.clone()),
+                ..Loader::default()
             },
         };
         let b = body(&provider, &repo.join("sub"));
@@ -611,6 +911,163 @@ mod tests {
         assert_eq!(b.matches("skipped: outside the project").count(), 3, "{b}");
         assert!(b.contains("shared"), "{b}");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A loader with `project` as the project settings' list and `user` as
+    /// the user-global one, whose config directory is `dir/cfg`.
+    fn with_files(dir: &Path, user: &[&str], project: &[&str]) -> InstructionsProvider {
+        let list = |patterns: &[&str]| patterns.iter().map(|p| p.to_string()).collect();
+        InstructionsProvider {
+            loader: Loader {
+                global: Some(dir.join("cfg/AGENTS.md")),
+                home: Some(dir.join("home")),
+                extra: InstructionFiles {
+                    user: list(user),
+                    project: list(project),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn files_named_in_the_settings_follow_the_ones_found_by_name() {
+        let dir = temp_dir("named");
+        let repo = dir.join("repo");
+        write(&repo.join(".git/HEAD"), "");
+        write(&repo.join("AGENTS.md"), "CHAIN rules");
+        write(&repo.join("docs/conventions.md"), "CONVENTIONS\n@more.md\n");
+        write(&repo.join("docs/more.md"), "imported by a named file");
+        write(&repo.join("team/b.md"), "TEAM-B");
+        write(&repo.join("team/a.md"), "TEAM-A");
+        write(&repo.join("team/notes.txt"), "NOT-MARKDOWN");
+        write(&repo.join("team/deep/c.md"), "TOO-DEEP");
+        write(&dir.join("cfg/AGENTS.md"), "GLOBAL rules");
+        write(&dir.join("cfg/mine.md"), "USER-RELATIVE");
+        write(&dir.join("home/notes/style.md"), "USER-HOME");
+
+        let provider = with_files(
+            &dir,
+            &["mine.md", "~/notes/*.md"],
+            // A glob before a path: the order written, not sorted across.
+            &["team/*.md", "docs/conventions.md", "AGENTS.md", "none/*.md"],
+        );
+        let b = body(&provider, &repo);
+        let order = [
+            "GLOBAL rules",
+            "USER-RELATIVE",
+            "USER-HOME",
+            "CHAIN rules",
+            "TEAM-A",
+            "TEAM-B",
+            "CONVENTIONS\nimported by a named file",
+        ];
+        let at: Vec<usize> = order
+            .iter()
+            .map(|needle| b.find(needle).unwrap_or_else(|| panic!("{needle} in {b}")))
+            .collect();
+        assert!(at.is_sorted(), "{b}");
+        assert!(b.contains(&format!("### {}\nTEAM-A", repo.join("team/a.md").display())));
+        assert!(
+            !b.contains("NOT-MARKDOWN") && !b.contains("TOO-DEEP"),
+            "{b}"
+        );
+        // Named again, the root file is not shown twice; a glob without a
+        // match says nothing.
+        assert_eq!(b.matches("CHAIN rules").count(), 1, "{b}");
+        assert!(!b.contains("none/"), "{b}");
+
+        // `**` crosses directories.
+        let b = body(&with_files(&dir, &[], &["team/**/*.md"]), &repo);
+        assert!(b.contains("TOO-DEEP") && b.contains("TEAM-A"), "{b}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_projects_settings_cannot_name_files_outside_the_repository() {
+        let dir = temp_dir("named-area");
+        let repo = dir.join("repo");
+        let project = repo.join("app");
+        write(&repo.join(".git/HEAD"), "");
+        write(&repo.join("shared.md"), "SHARED in the repository");
+        write(&project.join("ok.md"), "OK");
+        write(&dir.join("secret.md"), "TOP-SECRET");
+        write(&dir.join("home/key.md"), "TOP-SECRET");
+        write(&dir.join("outside/x.md"), "TOP-SECRET");
+        std::os::unix::fs::symlink(dir.join("secret.md"), project.join("link.md")).unwrap();
+        fs::create_dir_all(project.join("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.join("secret.md"), project.join("linked/l.md")).unwrap();
+        let absolute = dir.join("secret.md").display().to_string();
+        let patterns = [
+            "ok.md",
+            // Above the project root, still in the repository: fine.
+            "../shared.md",
+            "../../secret.md",
+            &absolute,
+            "~/key.md",
+            "link.md",
+            "../../outside/*.md",
+            "linked/*.md",
+            "missing.md",
+            "bad/[.md",
+        ];
+
+        let b = body(&with_files(&dir, &[], &patterns), &project);
+        assert!(
+            b.contains("OK") && b.contains("SHARED in the repository"),
+            "{b}"
+        );
+        assert!(!b.contains("TOP-SECRET"), "{b}");
+        for named in [
+            "../../secret.md",
+            &absolute,
+            "~/key.md",
+            "link.md",
+            "../../outside/*.md",
+            &project.join("linked/l.md").display().to_string(),
+        ] {
+            let note = format!("### {named}\n[skipped: outside the project]");
+            assert!(b.contains(&note), "{note} in {b}");
+        }
+        assert!(b.contains("### missing.md\n[skipped: not found]"), "{b}");
+        assert!(
+            b.contains("### bad/[.md\n[skipped: not a valid pattern]"),
+            "{b}"
+        );
+
+        // The same paths in the user's own settings are theirs to name, and
+        // such a file imports from anywhere.
+        write(&dir.join("home/key.md"), "@../outside/x.md\n");
+        let b = body(&with_files(&dir, &[&absolute, "~/key.md"], &[]), &project);
+        assert_eq!(b.matches("TOP-SECRET").count(), 2, "{b}");
+        assert!(!b.contains("skipped"), "{b}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_glob_adds_a_bounded_number_of_files_and_says_so() {
+        let dir = temp_dir("named-many");
+        for n in 0..MAX_GLOB_FILES + 3 {
+            write(
+                &dir.join(format!("rules/{n:03}.md")),
+                &format!("RULE-{n:03}"),
+            );
+        }
+        let b = body(&with_files(&dir, &[], &["rules/*.md"]), &dir);
+        assert!(
+            b.contains("RULE-000") && b.contains("RULE-063"),
+            "sorted, first kept"
+        );
+        assert!(!b.contains("RULE-064"));
+        assert!(
+            b.ends_with(
+                "### rules/*.md\n[skipped: 3 more file(s) match than the 64 one pattern may add]"
+            ),
+            "{b}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

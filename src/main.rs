@@ -202,7 +202,11 @@ fn run() -> Result<u8> {
             agents::global_dir(),
         )));
     }
-    let context = context::default_providers(settings.diagnostics.clone(), &trust);
+    let context = context::default_providers(
+        settings.diagnostics.clone(),
+        context::InstructionFiles::new(&settings, &user_settings),
+        &trust,
+    );
     let mut session = agent::Session::new(cfg, root, tools, context, settings, trust);
     if let Some(mode) = mode {
         session.set_mode(mode);

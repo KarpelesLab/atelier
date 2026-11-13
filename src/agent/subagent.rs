@@ -361,7 +361,7 @@ impl Session {
             self.cfg.clone(),
             self.root.clone(),
             tools,
-            context::standing_providers(),
+            context::standing_providers(context::InstructionFiles::with_user(&self.settings)),
             self.settings.clone(),
             // The same decision as its parent's, not another reading of it.
             self.trust.clone(),

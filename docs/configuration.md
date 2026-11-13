@@ -20,6 +20,8 @@ read from your own `$XDG_CONFIG_HOME/atelier/atelier.toml`
 project's entries winning: [`[permissions]`](#permissions),
 [`[[hooks]]`](#hooks), and the model tables — `[[provider]]`, `[models]`,
 `[variant.*]`, `[[price]]`, and `[defaults]`' `model` and `provider`.
+[`[instructions]`](#instruction-files) is read from both, and both lists
+apply.
 
   always-allow permission list, `[defaults]`, `[review]`, and `[[hooks]]`.
   Read at startup and rewritten whenever it changes (`/mcp add`/`/mcp
@@ -501,6 +503,32 @@ followed — missing, a cycle, not text, or over 32 KiB — leaves a one-line
 `[import @… skipped: …]` note in its place. Lines inside a fenced code block
 are never imports. A project's instruction files can only import files of
 their own repository; your user-global file can import from anywhere.
+
+**More files: `[instructions]`.** `atelier.toml` can name instruction files
+that are not found by name:
+
+```toml
+[instructions]
+files = ["docs/conventions.md", "team/*.md"]
+```
+
+Each entry is a path or a glob (`*` within one directory, `**` across
+directories — at most eight levels deep and 64 files per pattern), relative to
+the directory atelier was launched in. They are loaded after the `AGENTS.md`
+chain above, in the order written, a glob's matches sorted by path — each
+under a header with its path, with imports, and within the same budget as the
+other instruction files. A file already loaded is not repeated. A path that
+does not exist leaves a `[skipped: not found]` note; a glob that matches
+nothing is silent.
+
+A project's `atelier.toml` can only name files of its own repository: an
+entry that resolves outside it — `..` past the repository root, an absolute
+path, `~/`, a symlink leading out — is not read, and a
+`[skipped: outside the project]` note takes its place. The same table in your
+user-global `~/.config/atelier/atelier.toml` has no such limit: its entries
+may be absolute or start with `~/` (relative ones are taken from that file's
+directory), apply to every project, and are loaded right after your
+user-global `AGENTS.md`.
 
 **Size.** The loaded files share a budget of 32 KiB. Past it the text is cut,
 and a closing note names the file that was cut and any that were left out —

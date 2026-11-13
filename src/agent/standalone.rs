@@ -28,7 +28,8 @@ impl Session {
     /// and keeps only the tools `keep` accepts. See the module docs.
     pub fn standalone(&mut self, system: String, keep: impl Fn(&str) -> bool) {
         self.tools = self.tools.filtered(keep);
-        self.context = context::standing_providers();
+        self.context =
+            context::standing_providers(context::InstructionFiles::with_user(&self.settings));
         self.review_enabled = false;
         self.coord = None;
         self.history.clear();
