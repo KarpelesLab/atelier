@@ -25,19 +25,27 @@
 //! process drives: each line on stdin is a prompt, run in the same
 //! conversation and answered by its own `result`.
 //!
+//! The `ask` tool needs someone to answer. With `stream-json` both ways
+//! there is: the parent process. The question goes out as a `question`
+//! event and the run waits for the matching `answer` line on stdin (see
+//! [`HeadlessUi::ask_user`]). Every other combination has no one to ask,
+//! and the model is told to decide for itself.
+//!
 //! `--output-schema` asks for an answer of a given JSON shape. It is done
 //! with the prompt rather than a provider feature (so it works on every
 //! backend): the schema is appended to the prompt, the JSON is pulled out of
 //! the final answer and checked by [`crate::schema`], and a failing answer is
 //! sent back once with the reason before the run gives up.
 
-use std::io::{self, BufRead, Read, Write};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
 use crate::agent::{Approval, Session, StepLimit, Ui};
 use crate::schema;
+use crate::tools::ask::{Answer, Question};
 
 /// Exit status: the run failed (provider, network, I/O).
 pub const EXIT_ERROR: u8 = 1;
@@ -98,6 +106,9 @@ pub fn run(mut session: Session, opts: Options) -> u8 {
         format: opts.output,
         structured: opts.schema.is_some(),
         answer: String::new(),
+        asks: opts.output == OutputFormat::StreamJson && opts.input == InputFormat::StreamJson,
+        questions: 0,
+        backlog: VecDeque::new(),
     };
     if opts.output == OutputFormat::StreamJson {
         emit(&init_event(&session));
@@ -122,7 +133,9 @@ pub fn run(mut session: Session, opts: Options) -> u8 {
             ui.result(&outcome)
         }
         InputFormat::StreamJson => {
-            for line in io::stdin().lock().lines() {
+            // Line by line without holding the stdin lock: a question asked
+            // mid-prompt reads its answer from the same stream.
+            while let Some(line) = ui.next_line() {
                 let outcome = match line.map_err(|e| e.to_string()).map(|l| parse_input(&l)) {
                     // Blank lines separate nothing; skip them.
                     Ok(Ok(None)) => continue,
@@ -156,6 +169,94 @@ fn read_stdin_prompt() -> io::Result<String> {
     let mut s = String::new();
     io::stdin().read_to_string(&mut s)?;
     Ok(s.trim().to_string())
+}
+
+/// One line of stdin, without its line ending; `None` at end of input.
+fn read_stdin_line() -> Option<io::Result<String>> {
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(Ok(line.trim_end_matches(['\n', '\r']).to_string())),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// What a stdin line turned out to be while a question was waiting.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    /// The answer to the question.
+    Answer(Answer),
+    /// An `answer` line that can't be accepted; the reason is reported and
+    /// the question keeps waiting.
+    Invalid(String),
+    /// Not an answer at all: the next prompt, sent early.
+    Other,
+}
+
+/// Read a stdin line as the answer to question `id`:
+/// `{"type":"answer","id":…,"labels":[…]}` or `{"type":"answer","id":…,
+/// "text":"…"}`. Labels must be options of the question, exactly as given
+/// (the parent has them from the `question` event); `text` is the free
+/// answer and is only taken where the question allows one.
+fn parse_answer(line: &str, id: u64, question: &Question) -> Reply {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Reply::Other;
+    };
+    if v["type"].as_str() != Some("answer") {
+        return Reply::Other;
+    }
+    if v["id"].as_u64() != Some(id) {
+        return Reply::Invalid(format!("answer does not carry the question's id ({id})"));
+    }
+    if let Some(labels) = v["labels"].as_array() {
+        let mut chosen = Vec::new();
+        // In the order offered, whatever order they were sent in.
+        for option in &question.options {
+            if labels.iter().any(|l| l.as_str() == Some(&option.label)) {
+                chosen.push(option.label.clone());
+            }
+        }
+        let unknown = labels
+            .iter()
+            .find(|l| !chosen.iter().any(|c| l.as_str() == Some(c)));
+        return match (unknown, chosen.len()) {
+            (Some(l), _) => Reply::Invalid(format!("{l} is not a label of this question")),
+            (None, 0) => Reply::Invalid("\"labels\" is empty".to_string()),
+            (None, 2..) if !question.multi_select => {
+                Reply::Invalid("this question takes one label".to_string())
+            }
+            (None, _) => Reply::Answer(Answer::Labels(chosen)),
+        };
+    }
+    match v["text"].as_str().map(str::trim) {
+        Some(text) if !text.is_empty() && question.allow_other => {
+            Reply::Answer(Answer::Text(text.to_string()))
+        }
+        Some(text) if !text.is_empty() => {
+            Reply::Invalid("this question only takes its own labels".to_string())
+        }
+        _ => Reply::Invalid(r#"an answer needs "labels":[...] or "text":"...""#.to_string()),
+    }
+}
+
+/// The `question` event for the `ask` tool.
+fn question_event(id: u64, q: &Question) -> Value {
+    let options: Vec<Value> = q
+        .options
+        .iter()
+        .map(|o| match &o.description {
+            Some(d) => json!({ "label": o.label, "description": d }),
+            None => json!({ "label": o.label }),
+        })
+        .collect();
+    json!({
+        "type": "question",
+        "id": id,
+        "question": q.question,
+        "options": options,
+        "multi_select": q.multi_select,
+        "allow_other": q.allow_other,
+    })
 }
 
 /// One `--input-format stream-json` line: `{"type":"user","text":"…"}`.
@@ -431,11 +532,28 @@ struct HeadlessUi {
     /// The answer so far: the text since the last tool call. What the model
     /// says before calling a tool is commentary on the way, not the answer.
     answer: String,
+    /// Events out and lines in (`stream-json` both ways): a parent process
+    /// is following along and can answer the `ask` tool's questions.
+    asks: bool,
+    /// Questions asked so far; the next one's `id`.
+    questions: u64,
+    /// Input lines that arrived while a question was waiting and weren't
+    /// its answer: prompts sent ahead, served before stdin is read again.
+    backlog: VecDeque<String>,
 }
 
 impl HeadlessUi {
     fn streaming(&self) -> bool {
         self.format == OutputFormat::StreamJson
+    }
+
+    /// The next input line: one set aside while a question waited, else
+    /// from stdin. `None` at end of input.
+    fn next_line(&mut self) -> Option<io::Result<String>> {
+        match self.backlog.pop_front() {
+            Some(line) => Some(Ok(line)),
+            None => read_stdin_line(),
+        }
     }
 
     /// Report how a prompt ended, in the output format, and return its exit
@@ -549,6 +667,28 @@ impl Ui for HeadlessUi {
         Approval::Deny
     }
 
+    /// Only a parent process on both ends of `stream-json` can be asked:
+    /// the question is an event, the answer a line on stdin. Anything else
+    /// that arrives meanwhile is a prompt sent early and is kept for later;
+    /// an answer that doesn't fit is reported and the wait goes on. Input
+    /// ending before an answer leaves no one to ask.
+    fn ask_user(&mut self, question: &Question) -> Option<Answer> {
+        if !self.asks {
+            return None;
+        }
+        self.questions += 1;
+        let id = self.questions;
+        emit(&question_event(id, question));
+        loop {
+            let line = read_stdin_line()?.ok()?;
+            match parse_answer(&line, id, question) {
+                Reply::Answer(answer) => return Some(answer),
+                Reply::Invalid(why) => self.notice(&format!("question {id}: {why}")),
+                Reply::Other => self.backlog.push_back(line),
+            }
+        }
+    }
+
     fn notice(&mut self, text: &str) {
         if self.streaming() {
             emit(&json!({ "type": "notice", "text": text }));
@@ -658,6 +798,68 @@ mod tests {
         assert_eq!(End::Input(String::new()).exit_code(), EXIT_USAGE);
         assert_eq!(End::MaxTurns.exit_code(), EXIT_MAX_TURNS);
         assert_eq!(End::Schema(String::new()).exit_code(), EXIT_SCHEMA);
+    }
+
+    #[test]
+    fn answers_are_matched_to_the_question_and_checked() {
+        let q = Question::from_args(&json!({
+            "question": "Which?",
+            "options": [{"label": "A", "description": "first"}, "B", "C"],
+        }))
+        .unwrap();
+        assert_eq!(
+            question_event(3, &q),
+            json!({
+                "type": "question",
+                "id": 3,
+                "question": "Which?",
+                "options": [{"label": "A", "description": "first"}, {"label": "B"}, {"label": "C"}],
+                "multi_select": false,
+                "allow_other": true,
+            })
+        );
+
+        let reply = |line: &str| parse_answer(line, 3, &q);
+        assert_eq!(
+            reply(r#"{"type":"answer","id":3,"labels":["B"]}"#),
+            Reply::Answer(Answer::Labels(vec!["B".into()]))
+        );
+        assert_eq!(
+            reply(r#"{"type":"answer","id":3,"text":" neither "}"#),
+            Reply::Answer(Answer::Text("neither".into()))
+        );
+        // Not answers: kept as input for later.
+        assert_eq!(reply(r#"{"type":"user","text":"next"}"#), Reply::Other);
+        assert_eq!(reply("not json"), Reply::Other);
+        assert_eq!(reply(""), Reply::Other);
+        // Answers that don't fit keep the question waiting.
+        let invalid = |line: &str| matches!(reply(line), Reply::Invalid(_));
+        assert!(invalid(r#"{"type":"answer","id":2,"labels":["B"]}"#));
+        assert!(invalid(r#"{"type":"answer","labels":["B"]}"#));
+        assert!(invalid(r#"{"type":"answer","id":3,"labels":["b"]}"#));
+        assert!(invalid(r#"{"type":"answer","id":3,"labels":["A","Z"]}"#));
+        assert!(invalid(r#"{"type":"answer","id":3,"labels":[]}"#));
+        assert!(invalid(r#"{"type":"answer","id":3,"labels":["A","B"]}"#));
+        assert!(invalid(r#"{"type":"answer","id":3,"text":""}"#));
+        assert!(invalid(r#"{"type":"answer","id":3}"#));
+
+        let multi = Question {
+            multi_select: true,
+            allow_other: false,
+            ..q.clone()
+        };
+        assert_eq!(
+            parse_answer(
+                r#"{"type":"answer","id":1,"labels":["C","A","C"]}"#,
+                1,
+                &multi
+            ),
+            Reply::Answer(Answer::Labels(vec!["A".into(), "C".into()]))
+        );
+        assert!(matches!(
+            parse_answer(r#"{"type":"answer","id":1,"text":"other"}"#, 1, &multi),
+            Reply::Invalid(_)
+        ));
     }
 
     #[test]

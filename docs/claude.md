@@ -81,9 +81,10 @@ them; the system prompt tells claude which is which:
 | `Glob`, `Grep`, `LS` | `glob`, `grep`, `ls`, `tree` |
 | `WebFetch` | `web_fetch` (HTML → text, paged) |
 | `TodoWrite` | `todo` |
+| `AskUserQuestion` | `ask` (printed as numbered lines, answered on the input line) |
 
 Everything without an atelier counterpart stays: subagents (`Agent`/`Task`),
-`WebSearch`, `LSP`, `AskUserQuestion`, plan mode, skills, worktrees, cron, …
+`WebSearch`, `LSP`, plan mode, skills, worktrees, cron, …
 Subagents get the same set (atelier's tools included). atelier's tools are
 marked to load up front (`anthropic/alwaysLoad`), not deferred behind
 `ToolSearch`.

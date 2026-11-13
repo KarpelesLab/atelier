@@ -61,6 +61,7 @@ don't know: the set will grow.
 | `text` | `text` | A chunk of the model's answer. Concatenate the chunks to get the text |
 | `tool_start` | `name`, `arguments` | A tool is about to run. `arguments` is the parsed JSON object (or the raw string, if the model wrote invalid JSON) |
 | `tool_end` | `name`, `ok`, `output`, `truncated`? | A tool finished; `ok` is false for an error result. `output` is cut to 16 KiB, with `"truncated": true` when it was |
+| `question` | `id`, `question`, `options`, `multi_select`, `allow_other` | The model asked the user something (the [`ask` tool](tools.md#ask)) and the run is waiting for an `answer` line on stdin. Only with `--input-format stream-json`; see [Questions](#questions) |
 | `approval` | `tool`, `arguments`, `decision` | A tool call needed approval. `decision` is always `"denied"` today (headless runs have nobody to ask); `"allowed"` is reserved. A `tool_end` with `ok: false` follows, without a `tool_start` |
 | `info` | `text` | Informational output, e.g. the risk signals of a call that needs approval |
 | `notice` | `text` | Out-of-band status, e.g. the schema retry, or an error from background work |
@@ -178,6 +179,34 @@ not also be given as arguments.
 The run stops at the first prompt that doesn't succeed, with that prompt's
 exit status: later prompts were written expecting it to have worked. A line
 that isn't a `user` object stops it the same way (`input_error`, status 2).
+
+### Questions
+
+The model can put a question to the user with the [`ask`
+tool](tools.md#ask). In a headless run there is usually no one to ask, and
+the tool tells the model so (it is asked to decide for itself and state its
+assumption). The exception is `stream-json` in both directions, where the
+parent process stands in for the user. The question arrives as an event,
+
+```json
+{"type":"question","id":1,"question":"Which database?","options":[{"label":"SQLite","description":"one file"},{"label":"Postgres"}],"multi_select":false,"allow_other":true}
+```
+
+and the prompt waits until stdin carries the answer with the same `id` —
+labels exactly as given (one, or several when `multi_select`), or free text
+when `allow_other`:
+
+```json
+{"type":"answer","id":1,"labels":["Postgres"]}
+{"type":"answer","id":1,"text":"neither, keep it in memory"}
+```
+
+An `answer` that doesn't fit (wrong `id`, an unknown label, several labels
+for a single choice, text where only the options are allowed) is reported
+in a `notice` event and the question keeps waiting. A `user` line that
+arrives meanwhile is not lost: it runs as the next prompt. If stdin ends
+first, the model is told there was no one to ask. `id` counts up from 1
+over the run.
 
 A parent process can hold stdin open and send the next prompt after reading
 each `result`:

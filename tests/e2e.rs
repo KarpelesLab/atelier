@@ -1219,3 +1219,115 @@ command = "exit 2"
     );
     assert!(stderr.contains("ATELIER_TRUST_HOOKS=1"), "{stderr}");
 }
+
+/// A responder whose first answer is an `ask` tool call (two options) and
+/// whose later ones are `"ok"`.
+fn ask_then_done() -> Responder {
+    Arc::new(|n| {
+        if n == 0 {
+            sse_response(&[
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"ask","arguments":"{\"question\":\"Which one?\",\"options\":[{\"label\":\"Alpha\",\"description\":\"the first\"},{\"label\":\"Beta\"}]}"}}]}}]}"#,
+            ])
+        } else {
+            sse_response(&[r#"{"choices":[{"index":0,"delta":{"content":"ok"}}]}"#])
+        }
+    })
+}
+
+/// Case 11 — the `ask` tool with `stream-json` both ways: the question is an
+/// event, the parent's `answer` line on stdin becomes the tool result, and a
+/// prompt sent ahead of the answer still runs afterwards.
+#[test]
+fn ask_is_answered_over_stream_json() {
+    let mock = Mock::start(ask_then_done());
+    let dir = unique_dir("ask-stream");
+
+    let input = concat!(
+        r#"{"type":"user","text":"choose"}"#,
+        "\n",
+        r#"{"type":"user","text":"and then"}"#,
+        "\n",
+        r#"{"type":"answer","id":1,"labels":["Gamma"]}"#,
+        "\n",
+        r#"{"type":"answer","id":1,"labels":["Beta"]}"#,
+        "\n",
+    );
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ],
+        Some(input),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let events = json_lines(&out);
+    let questions = of_type(&events, "question");
+    assert_eq!(questions.len(), 1, "{events:?}");
+    assert_eq!(questions[0]["id"], 1);
+    assert_eq!(questions[0]["question"], "Which one?");
+    assert_eq!(questions[0]["options"][0]["description"], "the first");
+    assert_eq!(questions[0]["options"][1]["label"], "Beta");
+    assert_eq!(questions[0]["multi_select"], false);
+    // The answer naming no option was refused, and the wait went on.
+    assert!(
+        of_type(&events, "notice")
+            .iter()
+            .any(|n| n["text"].as_str().unwrap().contains("Gamma")),
+        "{events:?}"
+    );
+    assert!(
+        mock.body(1)
+            .contains(r#"The user chose the option \"Beta\"."#),
+        "{}",
+        mock.body(1)
+    );
+    // The early prompt ran as the second one.
+    assert_eq!(of_type(&events, "result").len(), 2);
+    assert!(mock.body(2).contains("and then"));
+}
+
+/// Case 12 — the `ask` tool with no one to ask (one-shot `--print`): the
+/// model is told so instead of the run blocking on stdin.
+#[test]
+fn ask_without_an_interface_tells_the_model_to_decide() {
+    let mock = Mock::start(ask_then_done());
+    let dir = unique_dir("ask-print");
+
+    let out = run_print(&mock.base_url(), &dir, "choose");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        mock.body(1)
+            .contains("cannot ask: this is a non-interactive session"),
+        "{}",
+        mock.body(1)
+    );
+}
+
+/// Case 13 — the `ask` tool in the line REPL: the options are printed, an
+/// answer that can't be taken gets the hint again, and the next line of
+/// stdin is the answer.
+#[test]
+fn ask_is_answered_on_the_repl_input() {
+    let mock = Mock::start(ask_then_done());
+    let dir = unique_dir("ask-repl");
+
+    let out = run_atelier(&mock.base_url(), &dir, &[], Some("choose\n1 2\n2\n"));
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("? Which one?"), "{stdout}");
+    assert!(stdout.contains("  1. Alpha — the first"), "{stdout}");
+    assert!(stdout.contains("  2. Beta"), "{stdout}");
+    assert!(stdout.contains("choose one option"), "{stdout}");
+    assert_eq!(stdout.matches("or type your own answer").count(), 2);
+    assert!(
+        mock.body(1)
+            .contains(r#"The user chose the option \"Beta\"."#),
+        "{}",
+        mock.body(1)
+    );
+}

@@ -60,6 +60,17 @@
 //! served in order as if it had just been typed — commands run, prompts start
 //! new turns. Approval prompts arrive over the same channel and are answered
 //! from the main thread, so the keyboard is never read by two threads.
+//!
+//! ## Questions from the model
+//!
+//! The `ask` tool's question travels the same way ([`UiEvent::AskUser`]): the
+//! question and its numbered options are committed to the scrollback like any
+//! other lines, and the renderer remembers it as pending
+//! ([`Renderer::question`]). While it is, the next line submitted on the
+//! input line answers it instead of being queued ([`question_key`]); an
+//! answer that can't be understood prints the hint again and keeps waiting,
+//! and Ctrl-C on an empty line dismisses the question (the turn goes on, and
+//! the model is told the user declined).
 
 mod config;
 mod input;
@@ -75,6 +86,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::agent::{self, Session, Ui};
+use crate::tools::ask::{Answer, Question};
 
 use input::LineEditor;
 use term::{Event, Key};
@@ -274,6 +286,8 @@ enum UiEvent {
         tool: String,
         arguments: String,
     },
+    /// The worker is blocked waiting for the user to answer a question.
+    AskUser(Question),
     /// The turn is over; `Err` carries the rendered error, if any. Always the
     /// last event a worker sends.
     Finished(Result<(), String>),
@@ -285,12 +299,14 @@ enum UiEvent {
 fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> {
     let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
     let (ans_tx, ans_rx) = mpsc::channel::<agent::Approval>();
+    let (reply_tx, reply_rx) = mpsc::channel::<Answer>();
     let queue = Arc::clone(&r.queue);
     let stop = Arc::clone(&r.stop);
     stop.store(false, Ordering::Relaxed);
 
     r.working = Some(Instant::now());
     r.approval_pending = false;
+    r.question = None;
     r.refresh()?;
 
     let result = std::thread::scope(|s| {
@@ -298,6 +314,7 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
             let mut ui = ChanUi {
                 tx: ev_tx.clone(),
                 answers: ans_rx,
+                replies: reply_rx,
                 queue,
                 stop,
             };
@@ -305,23 +322,27 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
             // The receiver only disappears if the pump failed; nothing to do.
             let _ = ev_tx.send(UiEvent::Finished(outcome));
         });
-        // If the pump errors out, `ans_tx` drops with it, which unblocks a
-        // worker waiting on an approval (it sees `Deny`) so the scope can join.
-        pump(r, &ev_rx, &ans_tx)
+        // If the pump errors out, the senders drop with it, which unblocks a
+        // worker waiting on an approval (it sees `Deny`) or on an answer (no
+        // one to ask) so the scope can join.
+        pump(r, &ev_rx, ans_tx, reply_tx)
     });
 
     r.working = None;
     r.approval_pending = false;
+    r.question = None;
     r.commit_pending_if_any();
     result
 }
 
 /// The working-state event loop: interleave keyboard input (edit/queue lines,
-/// answer approvals) with the worker's output until it reports `Finished`.
+/// answer approvals and questions) with the worker's output until it reports
+/// `Finished`. It owns the answer senders, so they are gone when it returns.
 fn pump(
     r: &mut Renderer,
     events: &Receiver<UiEvent>,
-    answers: &Sender<agent::Approval>,
+    answers: Sender<agent::Approval>,
+    replies: Sender<Answer>,
 ) -> Result<()> {
     let mut last_paint = Instant::now();
     loop {
@@ -333,6 +354,10 @@ fn pump(
                     if let Some(a) = approval_key(k) {
                         r.approval_pending = false;
                         let _ = answers.send(a);
+                    }
+                } else if r.question.is_some() {
+                    if let Some(answer) = question_key(r, k) {
+                        let _ = replies.send(answer);
                     }
                 } else {
                     working_key(r, k);
@@ -394,6 +419,23 @@ fn working_key(r: &mut Renderer, k: Key) {
     }
 }
 
+/// A keystroke while a question from the model is pending: the input line
+/// edits as usual, and Enter answers the question with it instead of queuing
+/// it. `Some` once there is an answer to hand back. Ctrl-C keeps doing one
+/// thing per press: it clears typed text first, then dismisses the question.
+fn question_key(r: &mut Renderer, k: Key) -> Option<Answer> {
+    if k == Key::Ctrl('c') && r.editor.is_empty() {
+        r.question = None;
+        r.push_line("! question dismissed".into(), true);
+        return Some(Answer::Declined);
+    }
+    match edit_key(r, k) {
+        KeyAction::Submit(line) => r.answer(&line),
+        // Ctrl-D never exits while the worker waits on us.
+        KeyAction::Exit | KeyAction::Edited => None,
+    }
+}
+
 /// Map a key to an approval answer; `None` for keys that don't answer.
 fn approval_key(k: Key) -> Option<agent::Approval> {
     match k {
@@ -439,16 +481,18 @@ fn apply_event(r: &mut Renderer, ev: UiEvent) {
             r.emit_block("   [y] once   [a] always   [n] deny", false);
             r.approval_pending = true;
         }
+        UiEvent::AskUser(question) => r.ask(question),
         UiEvent::Finished(_) => {} // consumed by the pump
     }
 }
 
 /// The worker-side [`Ui`]: forwards every callback to the main thread and
-/// blocks only for approval answers. Queued input is read straight from the
+/// blocks only for approval answers and answers to questions. Queued input is read straight from the
 /// shared queue.
 struct ChanUi {
     tx: Sender<UiEvent>,
     answers: Receiver<agent::Approval>,
+    replies: Receiver<Answer>,
     queue: Queue,
     stop: Arc<AtomicBool>,
 }
@@ -491,6 +535,11 @@ impl Ui for ChanUi {
         });
         // A vanished main thread means no one can approve: deny.
         self.answers.recv().unwrap_or(agent::Approval::Deny)
+    }
+    fn ask_user(&mut self, question: &Question) -> Option<Answer> {
+        self.send(UiEvent::AskUser(question.clone()));
+        // A vanished main thread means there is no one to ask.
+        self.replies.recv().ok()
     }
     fn notice(&mut self, text: &str) {
         self.send(UiEvent::Notice(text.to_string()));
@@ -552,6 +601,9 @@ struct Renderer {
     /// The worker is blocked on an approval prompt: keys answer it instead of
     /// editing the line.
     approval_pending: bool,
+    /// A question from the model (the `ask` tool) the user hasn't answered
+    /// yet: the next submitted line answers it.
+    question: Option<Question>,
     /// Lines submitted while working, awaiting delivery.
     queue: Queue,
     /// Set by Ctrl-C to stop the running turn; read by the worker through
@@ -570,6 +622,7 @@ impl Renderer {
             live_height: 0,
             working: None,
             approval_pending: false,
+            question: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             stop: Arc::new(AtomicBool::new(false)),
         }
@@ -581,6 +634,34 @@ impl Renderer {
     fn enqueue(&mut self, line: String) {
         self.push_line(format!("{PROMPT}{line}  (queued)"), true);
         lock(&self.queue).push_back(line);
+    }
+
+    /// Print a question from the model — itself, its numbered options and
+    /// how to answer, as ordinary scrollback lines — and wait for the answer
+    /// on the input line.
+    fn ask(&mut self, question: Question) {
+        self.commit_pending_if_any();
+        for line in question.lines() {
+            self.push_line(line, false);
+        }
+        self.question = Some(question);
+    }
+
+    /// Take a submitted line as the answer to the pending question. The line
+    /// is echoed like any input; if it can't be understood, the reason and
+    /// the hint are printed and the question stays pending (`None`).
+    fn answer(&mut self, line: &str) -> Option<Answer> {
+        let question = self.question.take()?;
+        self.push_line(format!("{PROMPT}{line}"), false);
+        match question.parse(line) {
+            Ok(answer) => Some(answer),
+            Err(why) => {
+                self.push_line(format!("  {why}"), true);
+                self.push_line(question.hint(), false);
+                self.question = Some(question);
+                None
+            }
+        }
     }
 
     /// The next queued line, if any, in submission order.
@@ -601,12 +682,14 @@ impl Renderer {
     }
 
     /// The status strip as shown: the working indicator (spinner, elapsed,
-    /// pending approval) and queue depth lead, so they survive clipping on a
+    /// pending approval or question) and queue depth lead, so they survive clipping on a
     /// narrow terminal; then the per-turn `status` (model · cwd · …).
     fn status_line(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.approval_pending {
             parts.push("⚠ approval needed [y/a/n]".into());
+        } else if self.question.is_some() {
+            parts.push("? waiting for your answer".into());
         } else if let Some(t0) = self.working {
             let elapsed = t0.elapsed();
             parts.push(format!(
@@ -781,6 +864,27 @@ impl Ui for TuiUi<'_> {
                 }
                 Ok(Event::Resize) => {}
                 Err(_) => return agent::Approval::Deny,
+            }
+        }
+    }
+    /// Reached when claude's background work asks between turns: there is
+    /// no pump then, so the keyboard is read here until the answer is in.
+    fn ask_user(&mut self, question: &Question) -> Option<Answer> {
+        self.r.ask(question.clone());
+        loop {
+            let _ = self.r.refresh();
+            match term::read() {
+                Ok(Event::Key(k)) => {
+                    if let Some(answer) = question_key(self.r, k) {
+                        let _ = self.r.refresh();
+                        return Some(answer);
+                    }
+                }
+                Ok(Event::Resize) => {}
+                Err(_) => {
+                    self.r.question = None;
+                    return Some(Answer::Declined);
+                }
             }
         }
     }
@@ -988,6 +1092,119 @@ mod tests {
         assert_eq!(r.pop_queued().as_deref(), Some("later"));
         assert_eq!(r.pop_queued(), None);
         assert_eq!(r.clear_queue(), 0);
+    }
+
+    fn typed(r: &mut Renderer, text: &str) -> Option<Answer> {
+        for c in text.chars() {
+            assert_eq!(question_key(r, Key::Char(c)), None);
+        }
+        question_key(r, Key::Enter)
+    }
+
+    fn sample_question(allow_other: bool) -> Question {
+        Question::from_args(&serde_json::json!({
+            "question": "Which database?",
+            "options": [
+                {"label": "Postgres", "description": "needs a server"},
+                {"label": "SQLite"},
+                {"label": "Plain files"},
+            ],
+            "allow_other": allow_other,
+        }))
+        .unwrap()
+    }
+
+    fn texts(r: &Renderer) -> Vec<&str> {
+        r.scroll.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_question_is_printed_and_answered_on_the_input_line() {
+        let mut r = Renderer::new();
+        r.working = Some(Instant::now());
+        r.emit("partial", false);
+        apply_event(&mut r, UiEvent::AskUser(sample_question(true)));
+        // Ordinary scrollback lines, after whatever was mid-line.
+        assert_eq!(
+            texts(&r),
+            vec![
+                "partial",
+                "? Which database?",
+                "  1. Postgres — needs a server",
+                "  2. SQLite",
+                "  3. Plain files",
+                "  (answer with a number, or type your own answer)",
+            ]
+        );
+        let status = r.status_line();
+        assert!(status.contains("? waiting for your answer"), "{status}");
+        assert!(!status.contains("working"), "{status}");
+
+        // The submitted line answers the question: echoed, not queued.
+        r.scroll.clear();
+        assert_eq!(
+            typed(&mut r, "2"),
+            Some(Answer::Labels(vec!["SQLite".into()]))
+        );
+        assert_eq!(texts(&r), vec!["› 2"]);
+        assert_eq!(r.queued_len(), 0);
+        assert!(r.question.is_none());
+        assert!(r.editor.is_empty());
+        assert!(r.status_line().contains("working"));
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_understood_reprints_the_hint_and_waits() {
+        let mut r = Renderer::new();
+        r.ask(sample_question(false));
+        r.scroll.clear();
+        assert_eq!(typed(&mut r, "9"), None);
+        assert_eq!(
+            texts(&r),
+            vec![
+                "› 9",
+                "  \"9\" is not one of the 3 options",
+                "  (answer with a number)",
+            ]
+        );
+        assert!(r.question.is_some());
+        assert!(r.status_line().contains("waiting for your answer"));
+        // An empty line is no answer either.
+        assert_eq!(typed(&mut r, ""), None);
+        assert!(r.question.is_some());
+        // Then a good one goes through.
+        assert_eq!(
+            typed(&mut r, "plain"),
+            Some(Answer::Labels(vec!["Plain files".into()]))
+        );
+        assert!(r.question.is_none());
+    }
+
+    #[test]
+    fn a_typed_answer_of_the_users_own_is_passed_on_where_allowed() {
+        let mut r = Renderer::new();
+        r.ask(sample_question(true));
+        assert_eq!(typed(&mut r, "MySQL"), Some(Answer::Text("MySQL".into())));
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_line_then_dismisses_the_question() {
+        let mut r = Renderer::new();
+        r.ask(sample_question(true));
+        assert_eq!(question_key(&mut r, Key::Char('2')), None);
+        // First press: only the typed text goes.
+        assert_eq!(question_key(&mut r, Key::Ctrl('c')), None);
+        assert!(r.editor.is_empty());
+        assert!(r.question.is_some());
+        // Second: the question; the turn itself is not stopped.
+        assert_eq!(question_key(&mut r, Key::Ctrl('c')), Some(Answer::Declined));
+        assert!(r.question.is_none());
+        assert!(!r.stop.load(Ordering::Relaxed));
+        assert_eq!(r.scroll.last().unwrap().text, "! question dismissed");
+        // Ctrl-D doesn't exit or answer while a question waits.
+        r.ask(sample_question(true));
+        assert_eq!(question_key(&mut r, Key::Ctrl('d')), None);
+        assert!(r.question.is_some());
     }
 
     #[test]

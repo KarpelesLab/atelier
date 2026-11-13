@@ -26,6 +26,7 @@ use crate::hooks::{self, Hooks};
 use crate::mcp::{self, HttpServer, StdioServer};
 use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
+use crate::tools::ask::{self, Answer, Question};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 
 const SYSTEM_PROMPT: &str = "\
@@ -78,6 +79,12 @@ pub trait Ui {
     fn info(&mut self, text: &str);
     /// Ask the user to approve a side-effecting tool call before it runs.
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval;
+    /// Put a question from the model (the `ask` tool) to the user and wait
+    /// for the answer. `None` means there is no one to ask — the default,
+    /// for interfaces with no user at the other end.
+    fn ask_user(&mut self, _question: &Question) -> Option<Answer> {
+        None
+    }
     /// An out-of-band notice (errors, status). Used by the TUI.
     #[allow(dead_code)]
     fn notice(&mut self, text: &str);
@@ -1221,7 +1228,7 @@ impl Session {
                     continue;
                 }
                 ui.tool_start(&call.name, &call.arguments);
-                let (out, ok) = self.runner().exec_json(&call.name, &call.arguments);
+                let (out, ok) = self.runner().exec_json(&call.name, &call.arguments, ui);
                 // Hooks: `post_tool` may append to what the model sees.
                 let out = self
                     .runner()
@@ -1650,7 +1657,7 @@ impl ToolRunner<'_> {
     }
 
     /// Execute a call whose arguments are a JSON string (as models send).
-    fn exec_json(&mut self, name: &str, arguments: &str) -> (ToolOutput, bool) {
+    fn exec_json(&mut self, name: &str, arguments: &str, ui: &mut dyn Ui) -> (ToolOutput, bool) {
         let args = if arguments.trim().is_empty() {
             Value::Null
         } else {
@@ -1662,12 +1669,20 @@ impl ToolRunner<'_> {
                 }
             }
         };
-        self.exec(name, args)
+        self.exec(name, args, ui)
     }
 
     /// Execute a call that has passed [`approve`](Self::approve), returning
     /// its output and whether it succeeded.
-    fn exec(&mut self, name: &str, args: Value) -> (ToolOutput, bool) {
+    fn exec(&mut self, name: &str, args: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
+        // `ask` is the one tool that needs the interface, which a tool's
+        // `call` has no way to reach: answer it here, through `ui`.
+        if name == ask::NAME {
+            return match ask::ask(&args, &mut |q| ui.ask_user(q)) {
+                Ok(text) => (ToolOutput::text(text), true),
+                Err(e) => (ToolOutput::text(format!("error: {e:#}")), false),
+            };
+        }
         let Some(tool) = self.tools.get(name) else {
             return (
                 ToolOutput::text(format!("error: unknown tool '{name}'")),
@@ -1733,7 +1748,7 @@ impl claude::ToolHost for ToolRunner<'_> {
         if let Err(msg) = self.approve_hooked(name, &pre.arguments, pre.allow, ui) {
             return (ToolOutput::text(msg), false);
         }
-        let (out, ok) = self.exec_json(name, &pre.arguments);
+        let (out, ok) = self.exec_json(name, &pre.arguments, ui);
         (self.post_tool(name, &pre.arguments, out, ok, ui), ok)
     }
 }
@@ -1791,6 +1806,9 @@ impl Ui for PeerUi<'_> {
     }
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.inner.ask_approval(tool, arguments)
+    }
+    fn ask_user(&mut self, question: &Question) -> Option<Answer> {
+        self.inner.ask_user(question)
     }
     fn notice(&mut self, text: &str) {
         self.inner.notice(text);
@@ -1976,6 +1994,26 @@ impl Ui for StdoutUi {
             Some('y') | Some('Y') => Approval::Once,
             Some('a') | Some('A') => Approval::Always,
             _ => Approval::Deny,
+        }
+    }
+    fn ask_user(&mut self, question: &Question) -> Option<Answer> {
+        self.end_reasoning();
+        for line in question.lines() {
+            println!("{line}");
+        }
+        loop {
+            print!("? ");
+            io::stdout().flush().ok();
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                // End of input: whoever was there is gone.
+                Ok(0) | Err(_) => return Some(Answer::Declined),
+                Ok(_) => {}
+            }
+            match question.parse(&line) {
+                Ok(answer) => return Some(answer),
+                Err(why) => println!("  {why}\n{}", question.hint()),
+            }
         }
     }
     fn notice(&mut self, text: &str) {
@@ -2277,7 +2315,7 @@ mod tests {
             hooks: &hooks,
         };
         let mut call = |name: &str, args: Value| {
-            let (out, ok) = runner.exec(name, args);
+            let (out, ok) = runner.exec(name, args, &mut StdoutUi::new());
             assert!(ok, "{name} failed: {}", out.text);
             out.text
         };

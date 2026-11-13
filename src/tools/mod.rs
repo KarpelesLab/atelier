@@ -30,6 +30,7 @@ use serde_json::Value;
 pub use crate::provider::ToolSpec;
 
 pub mod apply_patch;
+pub mod ask;
 pub mod bash;
 mod edit;
 mod glob;
@@ -243,6 +244,7 @@ pub fn builtin_registry() -> ToolRegistry {
         skill::SkillTool::new(crate::skills::global_dirs()),
     ));
     reg.register(Box::new(tree::TreeTool));
+    reg.register(Box::new(ask::AskTool));
     reg.register(Box::new(crate::js::NodeTool));
     reg
 }

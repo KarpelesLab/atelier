@@ -97,7 +97,9 @@ builds) pass `background: true`, then `bash_output` to read new output or \
 wait for it to finish or print a pattern (`wait_ms`, `until`) — instead of \
 Monitor — and `bash_kill` to stop it. \
 - `grep`, `glob`, `ls`, `tree` to search and explore; `web_fetch` instead \
-of WebFetch; `todo` for a task list; `node` for sandboxed JavaScript.";
+of WebFetch; `todo` for a task list; `node` for sandboxed JavaScript. \
+- `ask` instead of AskUserQuestion, to put a question with options to the \
+user.";
 
 /// claude's built-ins that atelier's tools replace, switched off when those
 /// are offered (unless the user keeps them). Names from several claude
@@ -119,6 +121,7 @@ const REPLACED_BUILTINS: &[&str] = &[
     "LS",
     "WebFetch",
     "TodoWrite",
+    "AskUserQuestion",
 ];
 
 /// Delivered (preempting the running turn) when the user presses Ctrl-C.

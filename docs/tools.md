@@ -16,6 +16,7 @@ model verbatim as the tool result.
 | `ls`        | auto     | yes |
 | `tree`      | auto     | yes |
 | `todo`      | auto     | yes |
+| `ask`       | auto (it only talks to you) | n/a |
 | `memory`    | auto     | to the memory directories (the project's `.atelier/memory/` and the user-global one) |
 | `skill`     | auto     | to the skill directories (read-only; a skill's files only from inside that skill's directory) |
 | `notebook_edit` | auto | yes |
@@ -323,6 +324,57 @@ work across turns (and across compaction).
 
 Renders as `[x] 1. done` / `[ ] 2. pending` with a count summary. Confined and
 auto-approved.
+
+## `ask`
+
+Put a question to the user, with a few options to choose from, and wait for
+the answer — instead of guessing, or ending the turn with a question in
+prose.
+
+| Param          | Type    | Required | Meaning |
+|----------------|---------|----------|---------|
+| `question`     | string  | yes      | The question |
+| `options`      | array   | yes      | 2 to 6 choices, each `{ "label": "…", "description": "…" }` (`description` optional; a bare string is taken as a label). Labels must be distinct |
+| `multi_select` | boolean | no       | Several options may be chosen (default `false`) |
+| `allow_other`  | boolean | no       | The user may type an answer of their own instead (default `true`) |
+
+Nothing pops up. The question is printed like any other output and answered
+on the input line:
+
+```
+? Which database should the cache use?
+  1. SQLite — one file, no server
+  2. Postgres — already runs in production
+  3. Plain files
+  (answer with a number, or type your own answer)
+› 2
+```
+
+While it waits, the status strip reads `? waiting for your answer` and the
+line you submit is the answer rather than a queued message. What you can
+type:
+
+- a number (`2`), or for a multi-select question several: `1 3`, `1,3`, a
+  range `2-4`;
+- a label, or the start of one if no other label starts the same way
+  (`post`, or `sqlite, plain` for several) — case doesn't matter;
+- anything else is your own answer where `allow_other` is on — including a
+  number past the last option. Where it is off, an answer that isn't an
+  option prints the hint again and the question keeps waiting.
+
+Ctrl-C on an empty line dismisses the question: the turn goes on and the
+model is told you declined to answer.
+
+The result says which it was, with labels and text quoted, so a typed
+answer is never taken for an option: `The user chose the option
+"Postgres".`, `The user chose 2 options: "SQLite", "Plain files".`, or `The
+user chose none of the options and answered in their own words: "…"`.
+
+Where there is no one to ask — `--print`, except with `stream-json` both
+ways, where the parent process answers
+([Questions](headless.md#questions)) — the call fails with `cannot ask:
+this is a non-interactive session…` and the model is told to decide for
+itself and state its assumption. Auto-approved: it only talks to you.
 
 ## `memory`
 
