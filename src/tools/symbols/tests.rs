@@ -306,6 +306,16 @@ fn a_server_that_is_still_loading_is_waited_for_and_then_given_up_on() {
     // Start it, then have it say it is busy and never that it is done.
     run(&tool, &root, &config, outline.clone());
     server.tell("experimental/serverStatus", json!({ "quiescent": false }));
+    // The notification is read by the client's own thread: until it has
+    // been, the server still counts as ready and is asked. Wait for the
+    // first call that finds it busy before counting what it is asked.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !run(&tool, &root, &config, outline.clone()).starts_with("textual approximation") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the client never saw the server's status"
+        );
+    }
     let asked = server.methods().len();
     let out = run(&tool, &root, &config, outline);
     assert!(
