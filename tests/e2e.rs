@@ -3755,3 +3755,210 @@ fn doctor_reports_the_setup_and_fails_on_a_broken_config() {
     let out = run_atelier(&mock.base_url(), &dir, &["doctor", "--fix"], None);
     assert_eq!(out.status.code(), Some(2), "{out:?}");
 }
+
+/// What opens the goal judge's system prompt.
+const JUDGE_MARKER: &str = "You judge whether a coding agent has reached a goal";
+
+/// A mock for a session with a goal: the agent's requests are answered
+/// `answer`, the judge's with `verdicts` in turn (the last one repeating).
+fn goal_mock(answer: &'static str, verdicts: &'static [&'static str]) -> Mock {
+    let asked = AtomicUsize::new(0);
+    Mock::by_body(Arc::new(move |body| {
+        if system_message(body).contains(JUDGE_MARKER) {
+            let n = asked.fetch_add(1, Ordering::SeqCst);
+            text_response(verdicts[n.min(verdicts.len() - 1)])
+        } else {
+            text_response(answer)
+        }
+    }))
+}
+
+/// The requests the mock received, split into the agent's and the judge's.
+fn goal_requests(mock: &Mock) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let all = (0..mock.requests()).map(|n| request(&mock.body(n)));
+    all.partition(|r| !messages_of(r, "system")[0].contains(JUDGE_MARKER))
+}
+
+/// Goal 1 — `--goal`: when the turn ends, a judge is asked whether the
+/// condition holds — one request, no tools, the goal and the end of the
+/// transcript. Its "not met" sends the reason back as the next user message
+/// and the agent works on; its "met" ends the run with success.
+#[test]
+fn goal_sends_the_agent_back_until_the_judge_is_satisfied() {
+    let mock = goal_mock(
+        "I am done.",
+        &[
+            r#"{"met": false, "reason": "the changelog has no entry yet"}"#,
+            "```json\n{\"met\": true, \"reason\": \"the entry is there\"}\n```",
+        ],
+    );
+    let dir = unique_dir("goal");
+
+    let args = ["--print", "--goal", "the changelog has an entry", "add it"];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("↻ goal not yet met: the changelog has no entry yet"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ goal met: the entry is there"),
+        "{stderr}"
+    );
+
+    let (agent, judge) = goal_requests(&mock);
+    assert_eq!((agent.len(), judge.len()), (2, 2));
+    // The judge: the goal and what the agent last said, and no tools.
+    assert!(judge[0].get("tools").is_none());
+    let asked = &messages_of(&judge[0], "user")[0];
+    assert!(
+        asked.starts_with("Goal: the changelog has an entry"),
+        "{asked}"
+    );
+    assert!(asked.contains("user: add it") && asked.contains("assistant: I am done."));
+    // The agent: sent back with the reason, in the same conversation.
+    let users = messages_of(&agent[1], "user");
+    assert_eq!(users.len(), 2);
+    assert!(users[0].ends_with("add it"));
+    assert_eq!(
+        users[1],
+        "[goal not yet met] the changelog has no entry yet"
+    );
+}
+
+/// Goal 2 — the bounds. With `goals.max_rounds = 2` and a judge that is
+/// never satisfied, the agent is sent back twice and the run then ends with
+/// exit status 6 and a `goal_unmet` result naming the bound and the reason.
+/// `goals.max_tokens` ends it the same way, on the output tokens spent.
+#[test]
+fn goal_stops_at_its_bounds_with_exit_6() {
+    let mock = goal_mock(
+        "Still at it.",
+        &[r#"{"met": false, "reason": "tests fail"}"#],
+    );
+    let dir = unique_dir("goal-bound");
+    std::fs::write(dir.join("atelier.toml"), "[goals]\nmax_rounds = 2\n").unwrap();
+
+    let args = [
+        "-p",
+        "--output-format",
+        "json",
+        "--goal=the tests pass",
+        "go",
+    ];
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(6), "{out:?}");
+    let (agent, judge) = goal_requests(&mock);
+    assert_eq!((agent.len(), judge.len()), (3, 3));
+    let result = &json_lines(&out)[0];
+    assert_eq!(result["subtype"], "goal_unmet");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(result["result"], "Still at it.");
+    // The judge's requests are not the agent's steps.
+    assert_eq!(result["num_steps"], 3);
+    let error = result["error"].as_str().unwrap();
+    assert_eq!(error, "the goal is not met after 2 round(s): tests fail");
+
+    // A token budget: each answer reports 40 output tokens, so the first
+    // check already finds the budget of 30 spent.
+    let spent = Mock::by_body(Arc::new(|body| {
+        if system_message(body).contains(JUDGE_MARKER) {
+            text_response(r#"{"met": false, "reason": "tests fail"}"#)
+        } else {
+            sse_response(&[
+                r#"{"choices":[{"index":0,"delta":{"content":"Still at it."}}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":40,"total_tokens":50}}"#,
+            ])
+        }
+    }));
+    std::fs::write(dir.join("atelier.toml"), "[goals]\nmax_tokens = 30\n").unwrap();
+    let out = run_atelier(&spent.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(6), "{out:?}");
+    assert_eq!(spent.requests(), 2);
+    let error = json_lines(&out)[0]["error"].as_str().unwrap().to_string();
+    assert!(
+        error.contains("within 30 output tokens (40 used)"),
+        "{error}"
+    );
+
+    // A judge that cannot be understood fails the run: neither verdict is
+    // guessed.
+    let vague = goal_mock("Done.", &["I think it is probably fine."]);
+    let out = run_atelier(&vague.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(vague.requests(), 2);
+    let error = json_lines(&out)[0]["error"].as_str().unwrap().to_string();
+    assert!(
+        error.contains("the judge's answer could not be used"),
+        "{error}"
+    );
+}
+
+/// Goal 3 — `/goal` in a session: set, shown, pursued by the next prompt,
+/// and cleared by itself once met; `/goal clear` removes one by hand. A
+/// prompt without a goal asks no judge.
+#[test]
+fn goal_command_sets_shows_and_clears() {
+    let mock = goal_mock("Shipped.", &[r#"{"met": true, "reason": "it shipped"}"#]);
+    let dir = unique_dir("goal-command");
+
+    let input = "/goal\n/goal ship  the thing\n/goal\nship it\n/goal\n\
+                 /goal something else\n/goal clear\n/goal clear\nagain\n";
+    let out = run_repl(&mock.base_url(), &dir, input);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "no goal set — /goal <condition> sets one",
+        "goal set: ship  the thing",
+        "goal: ship  the thing",
+        "at most 10 round(s) per prompt",
+        "✓ goal met: it shipped",
+        "goal set: something else",
+        "goal cleared",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    // Met, so gone: shown as unset again before the next one is set.
+    assert_eq!(stdout.matches("no goal set").count(), 3, "{stdout}");
+    // "ship it" and its check; "again" ran with no goal, so no judge.
+    let (agent, judge) = goal_requests(&mock);
+    assert_eq!((agent.len(), judge.len()), (2, 1));
+}
+
+/// Goal 4 — hooks first, then the goal. A `turn_end` hook that sends the
+/// agent back is obeyed before any judge is asked; the judge only sees an
+/// answer the hooks let stand.
+#[test]
+fn goal_is_checked_after_the_turn_end_hooks() {
+    let mock = goal_mock("Done.", &[r#"{"met": true, "reason": "all good"}"#]);
+    let dir = unique_dir("goal-hook");
+    let hooks = r#"
+[[hooks]]
+event = "turn_end"
+command = '''
+if [ ! -e .asked ]; then
+  touch .asked
+  echo '{"decision": "continue", "reason": "run the linter too"}'
+fi
+'''
+"#;
+    std::fs::write(dir.join("atelier.toml"), hooks).unwrap();
+    let args = ["--print", "--goal", "lint is clean", "go"];
+    let env = [("ATELIER_TRUST_HOOKS", "1")];
+    let out = run_atelier_env(&mock.base_url(), &dir, &args, None, &env);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // In order: the agent, the agent again (the hook), then the judge.
+    assert_eq!(mock.requests(), 3);
+    let is_judge = |n: usize| system_message(&mock.body(n)).contains(JUDGE_MARKER);
+    assert!(!is_judge(0) && !is_judge(1) && is_judge(2));
+    assert!(mock.body(1).contains("[turn_end hook] run the linter too"));
+    let asked = &messages_of(&request(&mock.body(2)), "user")[0];
+    assert!(
+        asked.contains("user: [turn_end hook] run the linter too"),
+        "{asked}"
+    );
+}

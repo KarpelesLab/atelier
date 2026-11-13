@@ -37,6 +37,10 @@
 //! the final answer and checked by [`crate::schema`], and a failing answer is
 //! sent back once with the reason before the run gives up.
 //!
+//! `--goal` gives the session a condition to work toward (see
+//! `agent::goal`); a prompt that reaches the goal's bounds with it unmet is
+//! not a success, and says so in its result and exit status.
+//!
 //! `atelier review` ([`review`]) is a headless run with its prompt, tools
 //! and answer shape decided for the caller; it is built on the pieces here.
 //! `atelier debug prompt` ([`debug_prompt`]) stops short of running at all.
@@ -62,6 +66,10 @@ pub const EXIT_MAX_TURNS: u8 = 3;
 /// Exit status: the answer didn't satisfy `--output-schema`, even after the
 /// retry.
 pub const EXIT_SCHEMA: u8 = 4;
+
+/// Exit status: `--goal`'s condition was still unmet when its bounds
+/// (`[goals]`) were reached.
+pub const EXIT_GOAL: u8 = 6;
 
 /// The most of a tool's output a `tool_end` event carries, in bytes. Tool
 /// results can be whole files; a consumer following along wants the gist,
@@ -94,6 +102,8 @@ pub struct Options {
     pub max_turns: Option<u32>,
     /// `--output-schema`: the JSON Schema the final answer must satisfy.
     pub schema: Option<Value>,
+    /// `--goal`: the condition the session works toward (see `agent::goal`).
+    pub goal: Option<String>,
     /// The prompt given as arguments; `None` reads it from stdin.
     pub prompt: Option<String>,
 }
@@ -108,10 +118,14 @@ pub struct Options {
 /// that work.
 pub fn run(mut session: Session, opts: Options) -> u8 {
     session.set_max_steps(opts.max_turns);
+    if opts.goal.is_some() {
+        session.set_goal(opts.goal);
+    }
     let mut ui = HeadlessUi {
         format: opts.output,
         structured: opts.schema.is_some(),
         answer: String::new(),
+        answered: false,
         asks: opts.output == OutputFormat::StreamJson && opts.input == InputFormat::StreamJson,
         questions: 0,
         backlog: VecDeque::new(),
@@ -314,6 +328,9 @@ enum End {
     MaxTurns,
     /// The answer doesn't satisfy `--output-schema`; the message says where.
     Schema(String),
+    /// The goal's bounds were reached with it unmet; the message says which
+    /// and why.
+    Goal(String),
 }
 
 impl End {
@@ -325,6 +342,7 @@ impl End {
             End::Input(_) => "input_error",
             End::MaxTurns => "max_turns",
             End::Schema(_) => "schema_error",
+            End::Goal(_) => "goal_unmet",
         }
     }
 
@@ -335,13 +353,14 @@ impl End {
             End::Input(_) => EXIT_USAGE,
             End::MaxTurns => EXIT_MAX_TURNS,
             End::Schema(_) => EXIT_SCHEMA,
+            End::Goal(_) => EXIT_GOAL,
         }
     }
 
     fn message(&self) -> Option<String> {
         match self {
             End::Success => None,
-            End::Error(m) | End::Input(m) => Some(m.clone()),
+            End::Error(m) | End::Input(m) | End::Goal(m) => Some(m.clone()),
             End::MaxTurns => Some(StepLimit.to_string()),
             End::Schema(m) => Some(format!("the answer does not satisfy the schema: {m}")),
         }
@@ -430,10 +449,15 @@ fn run_prompt(
 /// session's step count added to `steps`.
 fn send(session: &mut Session, ui: &mut HeadlessUi, text: &str, steps: &mut u32) -> End {
     ui.answer.clear();
+    ui.answered = false;
     let result = session.send(text, ui);
     *steps += session.steps();
     match result {
-        Ok(()) => End::Success,
+        // The model finished, but not the work it was given: see `--goal`.
+        Ok(()) => match session.goal_gave_up() {
+            Some(why) => End::Goal(why.to_string()),
+            None => End::Success,
+        },
         Err(e) if e.is::<StepLimit>() => End::MaxTurns,
         Err(e) => End::Error(format!("{e:#}")),
     }
@@ -561,6 +585,10 @@ struct HeadlessUi {
     /// The answer so far: the text since the last tool call. What the model
     /// says before calling a tool is commentary on the way, not the answer.
     answer: String,
+    /// The model has finished an answer. A prompt can go on past that — a
+    /// `turn_end` hook or the goal sends the agent back to work — and what
+    /// it writes then is a new answer, not more of the old one.
+    answered: bool,
     /// Events out and lines in (`stream-json` both ways): a parent process
     /// is following along and can answer the `ask` tool's questions.
     asks: bool,
@@ -579,6 +607,7 @@ impl HeadlessUi {
             format: OutputFormat::Text,
             structured: true,
             answer: String::new(),
+            answered: false,
             asks: false,
             questions: 0,
             backlog: VecDeque::new(),
@@ -627,6 +656,9 @@ impl Ui for HeadlessUi {
     }
 
     fn content(&mut self, text: &str) {
+        if std::mem::take(&mut self.answered) {
+            self.answer.clear();
+        }
         self.answer.push_str(text);
         match self.format {
             OutputFormat::StreamJson => emit(&json!({ "type": "text", "text": text })),
@@ -670,6 +702,7 @@ impl Ui for HeadlessUi {
     }
 
     fn turn_end(&mut self) {
+        self.answered = true;
         match self.format {
             OutputFormat::Text if !self.structured => {
                 println!();
@@ -840,6 +873,9 @@ mod tests {
         assert_eq!(End::Input(String::new()).exit_code(), EXIT_USAGE);
         assert_eq!(End::MaxTurns.exit_code(), EXIT_MAX_TURNS);
         assert_eq!(End::Schema(String::new()).exit_code(), EXIT_SCHEMA);
+        assert_eq!(End::Goal(String::new()).exit_code(), EXIT_GOAL);
+        assert_eq!(End::Goal("why".into()).subtype(), "goal_unmet");
+        assert_eq!(End::Goal("why".into()).message().as_deref(), Some("why"));
     }
 
     #[test]

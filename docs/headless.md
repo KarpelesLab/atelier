@@ -23,6 +23,7 @@ atelier -p -- "--verbose is ignored, why?"            # after --, nothing is an 
 | `--input-format text\|stream-json` | Where prompts come from (default `text`: arguments or stdin); see [Multi-turn input](#multi-turn-input) |
 | `--max-turns N` | Stop a prompt after N model requests; see [Step limit](#step-limit) |
 | `--output-schema FILE` | A JSON Schema the final answer must satisfy; see [Structured answers](#structured-answers) |
+| `--goal CONDITION` | Keep the agent working until the condition holds; see [Goals](#goals) |
 | `-c`, `--continue` | Resume this directory's saved session before running (see [Sessions](sessions.md)) |
 | `--` | End of options: everything after it is the prompt |
 
@@ -87,9 +88,9 @@ The last event of each prompt in `stream-json`, and the whole output in
 
 | Field | Meaning |
 |-------|---------|
-| `subtype` | How the prompt ended: `success`, `error`, `max_turns`, `schema_error`, `input_error` (table below) |
+| `subtype` | How the prompt ended: `success`, `error`, `max_turns`, `schema_error`, `goal_unmet`, `input_error` (table below) |
 | `is_error` | `true` for every subtype but `success` |
-| `result` | The final answer: the text the model wrote after its last tool call (what it says before calling a tool is commentary; the `text` events carry all of it). May be empty or partial when `is_error` |
+| `result` | The final answer: the text the model wrote after its last tool call (what it says before calling a tool is commentary; the `text` events carry all of it). When the agent was sent back to work after answering (a `turn_end` hook, a goal), the answer it ended on. May be empty or partial when `is_error` |
 | `error` | Present when `is_error`: what went wrong |
 | `structured` | Present with `--output-schema`, on success: the answer as a JSON value |
 | `num_steps` | Model requests the prompt took: one per batch of tool calls, plus the final answer |
@@ -110,6 +111,7 @@ Usage numbers are 0 when the endpoint doesn't report usage.
 | 4 | `schema_error` | The answer didn't satisfy `--output-schema`, even after the retry |
 
 | 5 | — | [`atelier review --fail-on`](#atelier-review) only: the review ran and reported a finding at or above that severity |
+| 6 | `goal_unmet` | [`--goal`](#goals): the condition still did not hold when the goal's bounds were reached |
 
 A denied tool call is not a failure by itself: the model sees the denial
 and the run ends however the model ends it.
@@ -125,6 +127,45 @@ result's `subtype` is `max_turns`, and the exit status is 3.
 ```sh
 atelier -p --max-turns 20 "fix the failing test" || echo "stopped: $?"
 ```
+
+## Goals
+
+`--goal CONDITION` gives the run a condition that must hold before it ends
+— the headless form of [`/goal`](goals.md). Each time the model finishes, a
+judge (one extra model request, no tools) is asked whether the condition
+holds given the end of the transcript; if not, its reason is sent back as
+the next message and the agent keeps working.
+
+```sh
+atelier -p --goal "cargo test passes" "fix the failing tests"
+case $? in
+  0) echo "done, and the tests pass" ;;
+  6) echo "gave up with the goal unmet" ;;
+  *) echo "failed" ;;
+esac
+```
+
+The pursuit is bounded by `[goals]` in `atelier.toml` (`max_rounds`, default
+10; `max_tokens`, default none — see [Goals](goals.md#bounds)). Reaching a
+bound with the condition unmet ends the run with `subtype: "goal_unmet"`
+and exit status 6; `error` names the bound and the judge's last reason, and
+`result` is the agent's last answer:
+
+```json
+{"type":"result","subtype":"goal_unmet","is_error":true,"result":"I fixed two of them.","error":"the goal is not met after 10 round(s): 1 test still fails","num_steps":37,"duration_ms":412000,"usage":{"context_tokens":7100,"output_tokens":9800}}
+```
+
+- Progress shows as `info` events (`↻ goal not yet met: …`, `✓ goal met:
+  …`), on stderr in the `text` and `json` formats.
+- `--max-turns` still caps the agent's requests across all rounds (status
+  3). The judge's requests are not steps and are not in `num_steps`; its
+  output tokens are in `usage.output_tokens`.
+- A judge reply that is not the JSON asked for is an `error` (status 1): no
+  verdict is guessed.
+- With `--input-format stream-json` the goal applies to the prompts in turn
+  until one meets it; it is then cleared for the rest of the session.
+- With `--output-schema`, the goal is pursued first, then the final answer
+  is checked against the schema.
 
 ## Structured answers
 
@@ -349,6 +390,9 @@ these differences:
   `usage.context_tokens` its input tokens at the last one.
 - `--output-schema` works the same way (prompt, extract, validate, retry);
   claude's own `--json-schema` is not used.
+- `--goal` applies, but the judge is claude itself, asked in the
+  conversation (see [Goals](goals.md#with-the-claude-backend)); those turns
+  count in `num_steps`.
 - A one-shot run waits for background work claude started (subagents,
   background shells) before printing the result. With `--input-format
   stream-json` each result is printed as soon as its prompt is done, so

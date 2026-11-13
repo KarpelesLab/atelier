@@ -62,6 +62,36 @@ pub struct Settings {
     /// Token prices, for the cost column of `atelier stats` and `/usage`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub price: Vec<PriceConfig>,
+    /// Bounds on the pursuit of a `/goal`.
+    #[serde(default, skip_serializing_if = "GoalSettings::is_unset")]
+    pub goals: GoalSettings,
+}
+
+/// `[goals]`: how far one prompt may go in pursuit of the session's goal
+/// (`/goal`, `--goal` — see `agent::goal`) before the turn ends with the
+/// goal unmet.
+///
+/// ```toml
+/// [goals]
+/// max_rounds = 5
+/// max_tokens = 50000
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GoalSettings {
+    /// Times the agent is sent back to work for one prompt (default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    /// Output tokens one prompt may generate while the goal is unmet
+    /// (default: no limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+}
+
+impl GoalSettings {
+    /// Nothing set: the table is left out when the settings are written.
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// One `[[provider]]`: an OpenAI-compatible endpoint with a name, addressed
@@ -488,6 +518,20 @@ cached = 0.3
         for table in ["provider", "models", "variant", "price"] {
             assert!(!plain.contains(table), "{plain}");
         }
+    }
+
+    #[test]
+    fn goal_bounds_parse_and_stay_out_of_the_file_when_unset() {
+        let settings: Settings =
+            tomlproc::serde::from_str("[goals]\nmax_rounds = 3\nmax_tokens = 50000\n").unwrap();
+        assert_eq!(settings.goals.max_rounds, Some(3));
+        assert_eq!(settings.goals.max_tokens, Some(50_000));
+        let text = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        let again: Settings = tomlproc::serde::from_str(&text).unwrap();
+        assert_eq!(again.goals, settings.goals);
+
+        let empty = tomlproc::serde::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!empty.contains("goals"), "{empty}");
     }
 
     #[test]

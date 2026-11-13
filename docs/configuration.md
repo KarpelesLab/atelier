@@ -408,6 +408,17 @@ model = "qwen3-coder:30b"    # optional; [models] review wins; defaults to the m
 | `enabled` | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
 | `model`   | string | Model for the reviewer (a [model address](#addressing-a-model)). `[models] review` is the newer spelling and wins; with neither, the reviewer uses the main model |
 
+## `[goals]`
+
+Bounds on the pursuit of a [`/goal`](goals.md) (or `--goal`): how far one
+prompt may go before the turn ends with the goal unmet.
+
+```toml
+[goals]
+max_rounds = 10      # times a prompt is sent back to work (default 10)
+max_tokens = 50000   # output tokens a prompt may generate (default: no limit)
+```
+
 ## `[[hooks]]`
 
 Commands run on lifecycle events — before and after tool calls, on a prompt,

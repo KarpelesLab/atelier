@@ -21,6 +21,7 @@
 
 mod batch;
 mod compact;
+mod goal;
 mod jobs;
 mod prompt;
 mod window;
@@ -211,6 +212,8 @@ const HELP: &[&str] = &[
     "                                        summarize older turns (instructions guide the summary)",
     "  /context                              show where the context window goes, in tokens",
     "  /usage                                this session's model requests, tokens and cost",
+    "  /goal [condition|clear]               keep the agent working until a condition holds:",
+    "                                        set it, show it (no argument), or clear it",
     "  /image <path>                         attach an image to your next message (vision)",
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
@@ -252,6 +255,13 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
     {
         let instructions = Some(rest.trim()).filter(|s| !s.is_empty());
         session.compact_now(instructions, ui);
+        return Dispatch::Handled;
+    }
+    // And `/goal`'s condition (see `goal`).
+    if let Some(rest) = trimmed.strip_prefix("/goal")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        session.goal_command(rest.trim(), ui);
         return Dispatch::Handled;
     }
     // File-defined commands take their arguments as typed (prose, where an
@@ -718,6 +728,9 @@ pub struct Session {
     /// atelier's. Such a session is not the project's conversation, and is
     /// never persisted as it.
     standalone: Option<String>,
+    /// The condition the user wants met before the work stops (`/goal`,
+    /// `--goal` — see [`goal`]).
+    goal: Option<goal::Goal>,
 }
 
 impl Session {
@@ -782,6 +795,7 @@ impl Session {
             peer_pending: Vec::new(),
             child: None,
             standalone: None,
+            goal: None,
         }
     }
 
@@ -1399,11 +1413,14 @@ impl Session {
     /// time the model stops, they may send it back to work with a reason,
     /// delivered as a new user message — at most [`hooks::MAX_CONTINUES`]
     /// times in a row, so a hook that is never satisfied can't loop forever.
+    /// An answer the hooks let stand is then held against the session's
+    /// goal, if it has one (see [`goal`]), which may send it back as well.
     /// Steps are counted (and limited) across the whole of it.
     fn run_turn(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
         self.steps = 0;
         let mut input = user_input.to_string();
         let mut continues = 0;
+        let mut pursuit = self.begin_pursuit();
         loop {
             self.run_once(&input, ui)?;
             // A turn the user stopped is not one to send back to work.
@@ -1418,7 +1435,13 @@ impl Session {
                 .hooks
                 .turn_end(&answer, continues, &mut |m| ui.notice(m));
             let Some(reason) = again else {
-                return Ok(());
+                // A round toward the goal is new work for the hooks to
+                // judge: their count starts over.
+                match self.pursue_goal(&mut pursuit, &answer, ui)? {
+                    Some(next) => (input, continues) = (next, 0),
+                    None => return Ok(()),
+                }
+                continue;
             };
             if continues == hooks::MAX_CONTINUES {
                 ui.notice(&format!(

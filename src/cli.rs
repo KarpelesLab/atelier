@@ -46,9 +46,10 @@ with --print:
                              {\"type\":\"user\",\"text\":\"...\"} per line on stdin
       --max-turns N          stop a prompt after N model requests
       --output-schema FILE   JSON Schema the final answer must satisfy
+      --goal CONDITION       keep working until CONDITION holds (see /goal)
 
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
-             4 answer failed --output-schema
+             4 answer failed --output-schema, 6 --goal not met in its bounds
 
 `atelier review --help`, `atelier debug --help` and `atelier doctor --help`
 describe those commands.";
@@ -81,6 +82,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut input = None;
     let mut max_turns = None;
     let mut schema = None;
+    let mut goal = None;
     let mut words: Vec<&str> = Vec::new();
 
     let mut it = args.iter().map(String::as_str);
@@ -112,6 +114,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--input-format" => input = Some(input_format(value()?)?),
             "--max-turns" => max_turns = Some(positive(flag, value()?)?),
             "--output-schema" => schema = Some(load_schema(Path::new(value()?))?),
+            "--goal" => goal = Some(condition(value()?)?),
             _ if inline.is_some() => return Err(format!("{flag} takes no value")),
             "--claude" => claude = true,
             "--continue" | "-c" => resume = true,
@@ -126,6 +129,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         ("--input-format", input.is_some()),
         ("--max-turns", max_turns.is_some()),
         ("--output-schema", schema.is_some()),
+        ("--goal", goal.is_some()),
     ];
     if !print && let Some((flag, _)) = headless_only.iter().find(|(_, set)| *set) {
         return Err(format!("{flag} only applies with --print"));
@@ -148,6 +152,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             input,
             max_turns,
             schema,
+            goal,
             prompt: (!words.is_empty()).then(|| words.join(" ")),
         }),
     })
@@ -243,6 +248,14 @@ fn input_format(v: &str) -> Result<InputFormat, String> {
     }
 }
 
+/// A `--goal` condition: some text.
+fn condition(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "" => Err("--goal: the condition is empty".to_string()),
+        text => Ok(text.to_string()),
+    }
+}
+
 fn positive(flag: &str, v: &str) -> Result<u32, String> {
     match v.parse::<u32>() {
         Ok(n) if n > 0 => Ok(n),
@@ -327,6 +340,24 @@ mod tests {
         assert_eq!(opts.output, OutputFormat::Json);
         assert_eq!(opts.max_turns, Some(3));
         assert_eq!(opts.prompt.as_deref(), Some("fix it"));
+        assert_eq!(opts.goal, None);
+    }
+
+    #[test]
+    fn goal_is_a_headless_option_with_a_condition() {
+        let opts = parse_ok(&["-p", "--goal", " the tests pass ", "fix them"])
+            .print
+            .unwrap();
+        assert_eq!(opts.goal.as_deref(), Some("the tests pass"));
+        assert_eq!(opts.prompt.as_deref(), Some("fix them"));
+        assert_eq!(
+            parse_err(&["-p", "--goal="]),
+            "--goal: the condition is empty"
+        );
+        assert_eq!(
+            parse_err(&["--goal", "x"]),
+            "--goal only applies with --print"
+        );
     }
 
     #[test]

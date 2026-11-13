@@ -100,7 +100,7 @@ first conversation, the REPL/TUI fallback).
 | Doc | Covers |
 |-----|--------|
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
-| [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, exit codes; `atelier review` (a read-only review of a change, for you or CI) |
+| [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, `--goal`, exit codes; `atelier review` (a read-only review of a change, for you or CI) |
 | [Troubleshooting](docs/troubleshooting.md) | `atelier doctor`: a checklist of the setup (config files, endpoint, model, instruction files, hooks, MCP, …); `atelier debug prompt`: the exact first request a prompt would make, without sending it |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
@@ -108,6 +108,7 @@ first conversation, the REPL/TUI fallback).
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |
 | [Skills](docs/skills.md) | `SKILL.md` directories the agent loads on demand: `.atelier/skills/` (also `.claude/skills/`, `.agents/skills/`), the `skill` tool, `/skills` |
+| [Goals](docs/goals.md) | `/goal <condition>` and `--goal`: keep the agent working until a condition holds, checked by a judge at each turn's end; `[goals]` bounds |
 | [Hooks](docs/hooks.md) | Commands run on events (before/after a tool call, on a prompt, at turn end) that can observe or decide: `[[hooks]]`, the stdin/stdout contract, trust, `/hooks`, examples |
 | [Subagents](docs/agents.md) | The `task` tool: `explore` and `general`, your own agents as Markdown files in `.atelier/agents/` (also `.claude/agents/`), the step cap, parallel runs, `/agents` |
 | [Permissions](docs/permissions.md) | The confinement/approval model, rules, modes (`plan`, `ask-edits`, `auto-edit`, `yolo`), risk signals |
