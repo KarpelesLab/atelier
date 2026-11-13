@@ -164,10 +164,15 @@ pub fn run(mut session: Session) -> Result<()> {
                 r.status = build_status(&session, turn);
                 r.refresh()?;
             }
-            agent::Dispatch::Prompt => {
+            outcome @ (agent::Dispatch::Prompt | agent::Dispatch::Expanded(_)) => {
+                // A file-defined command sends its expanded template.
+                let prompt = match &outcome {
+                    agent::Dispatch::Expanded(text) => text,
+                    _ => &trimmed,
+                };
                 turn += 1;
                 r.status = build_status(&session, turn);
-                run_turn(&mut session, &mut r, &trimmed)?;
+                run_turn(&mut session, &mut r, prompt)?;
                 // Usage counters moved; recompute the strip now that we can
                 // borrow the session again.
                 r.status = build_status(&session, turn);

@@ -131,6 +131,9 @@ pub enum Approval {
 pub enum Dispatch {
     /// Not a command — send it to the model as a prompt.
     Prompt,
+    /// A file-defined command (see [`crate::commands`]): send this text, the
+    /// expanded template, as the prompt instead of the line typed.
+    Expanded(String),
     /// A command that was handled in place.
     Handled,
     /// The user asked to quit.
@@ -188,6 +191,15 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         dispatch_peers(session, "/send", &[to, body.trim()], ui);
         return Dispatch::Handled;
     }
+    // File-defined commands take their arguments as typed (prose, where an
+    // apostrophe is not a quote), so they are looked up before the line is
+    // split into shell words. Built-ins always win.
+    let name = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    if !is_builtin(name)
+        && let Some(outcome) = dispatch_custom(session, trimmed, ui)
+    {
+        return outcome;
+    }
     let tokens = match crate::shlex::split(trimmed) {
         Ok(t) => t,
         Err(e) => {
@@ -208,6 +220,11 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         "/help" => {
             for l in HELP {
                 ui.info(l);
+            }
+            let global = crate::commands::global_dir();
+            let builtin = |name: &str| is_builtin(&format!("/{name}"));
+            for l in crate::commands::help(&session.root, global.as_deref(), &builtin) {
+                ui.info(&l);
             }
         }
         "/models" if session.is_claude() => {
@@ -316,6 +333,52 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),
     }
     Dispatch::Handled
+}
+
+/// Whether `cmd` (with its slash) is a built-in command, which a command
+/// file cannot replace. Read off [`HELP`] so a new built-in is covered as
+/// soon as it is documented there.
+fn is_builtin(cmd: &str) -> bool {
+    cmd == "/exit"
+        || HELP
+            .iter()
+            .any(|l| l.split_whitespace().next() == Some(cmd))
+}
+
+/// Run `line` as a file-defined command, if a file defines one by that name:
+/// expand its template into the prompt to send. `None` when there is no such
+/// command.
+///
+/// A template's `` !`command` `` lines run a shell on the say-so of a file in
+/// the repository, so each goes through the `bash` tool's approval: allowed
+/// outright only with auto-approve or when the user has always-allowed
+/// `bash`, otherwise asked, with the same risk signals.
+fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option<Dispatch> {
+    let (name, arguments) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let root = session.root.clone();
+    let global = crate::commands::global_dir();
+    let command = crate::commands::find(&root, global.as_deref(), name.strip_prefix('/')?)?;
+    let mut approve = |shell: &str| {
+        let mut runner = session.runner();
+        let arguments = serde_json::json!({ "command": shell }).to_string();
+        // `approve` passes tools it doesn't know; never run a shell on that.
+        runner.tools.get("bash").is_some() && runner.approve("bash", &arguments, ui)
+    };
+    let expanded = crate::commands::expand(&command, arguments.trim(), &root, &mut approve);
+    Some(match expanded {
+        Ok(prompt) => {
+            ui.info(&format!(
+                "{name} → expanded from {} ({} chars)",
+                command.path.display(),
+                prompt.chars().count()
+            ));
+            Dispatch::Expanded(prompt)
+        }
+        Err(e) => {
+            ui.info(&format!("{name}: {e}"));
+            Dispatch::Handled
+        }
+    })
 }
 
 /// The coordinator commands: `/peers`, `/send`, `/subscribe`, `/unsubscribe`.
@@ -1765,8 +1828,13 @@ pub fn repl(mut session: Session) -> Result<()> {
                 }
                 ui.info("(edit atelier.toml or use /model, /review; the TUI has a full editor)");
             }
-            Dispatch::Prompt => {
-                if let Err(e) = session.send(line, &mut ui) {
+            outcome @ (Dispatch::Prompt | Dispatch::Expanded(_)) => {
+                // A file-defined command sends its expanded template.
+                let prompt = match &outcome {
+                    Dispatch::Expanded(text) => text,
+                    _ => line,
+                };
+                if let Err(e) = session.send(prompt, &mut ui) {
                     eprintln!("error: {e:#}");
                 } else if let Some(s) = session.usage_summary() {
                     eprintln!("{DIM}[{s}]{RESET}");

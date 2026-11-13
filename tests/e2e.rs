@@ -878,3 +878,105 @@ fn usage_errors_and_dashed_prompts() {
     assert_eq!(result["subtype"], "error");
     assert!(result["error"].is_string());
 }
+
+/// Run the line REPL (what atelier is when stdin is a pipe) with `input` as
+/// everything typed, and return its output once it exits at end of input.
+/// Tools are *not* auto-approved, so approval prompts read their answer from
+/// `input` too.
+#[cfg(unix)]
+fn run_repl(base_url: &str, cwd: &Path, input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_atelier"))
+        .env("ATELIER_BASE_URL", base_url)
+        .env("ATELIER_MODEL", "mock")
+        .env("ATELIER_NO_COORDINATOR", "1")
+        // User-global files go next to the temp project, never the real home.
+        .env("XDG_DATA_HOME", cwd.with_extension("data"))
+        .env("XDG_CONFIG_HOME", cwd.with_extension("config"))
+        .env("HOME", cwd.with_extension("home"))
+        .env_remove("ATELIER_APPROVE")
+        .env_remove("ATELIER_BACKEND")
+        .env_remove("ATELIER_API_KEY")
+        .env_remove("ATELIER_TRACE")
+        .env_remove("ATELIER_DEBUG")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn atelier binary");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write the input");
+    child.wait_with_output().expect("collect child output")
+}
+
+/// Case 5 — a file-defined slash command. `/greet` is a template in the
+/// project; typing it sends the expanded template as the prompt: arguments
+/// substituted, and the `` !`command` `` replaced by its output once the user
+/// approves it (the same prompt as the `bash` tool). Built-ins can't be
+/// shadowed, `/help` lists the command, and a refusal sends nothing.
+#[cfg(unix)]
+#[test]
+fn custom_command_expands_into_the_prompt() {
+    let responder: Responder =
+        Arc::new(|_| sse_response(&[r#"{"choices":[{"index":0,"delta":{"content":"hello"}}]}"#]));
+    let mock = Mock::start(responder);
+    let dir = unique_dir("commands");
+    let commands = dir.join(".atelier/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("greet.md"),
+        "---\ndescription: say hello\nargument-hint: <who>\n---\n\
+         Greet $1 from !`cat who.txt`. Raw: $ARGUMENTS\n",
+    )
+    .unwrap();
+    std::fs::write(commands.join("help.md"), "shadowing a built-in").unwrap();
+    std::fs::write(dir.join("who.txt"), "the-file\n").unwrap();
+    let global = dir.with_extension("config").join("atelier/commands");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::write(global.join("standup.md"), "What changed yesterday?").unwrap();
+
+    // Refused: nothing reaches the model.
+    let out = run_repl(&mock.base_url(), &dir, "/greet you\nn\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("allow tool 'bash'"), "{stdout}");
+    assert!(
+        stdout.contains("/greet: not sent — `cat who.txt` was not approved"),
+        "{stdout}"
+    );
+    assert!(mock.bodies.lock().unwrap().is_empty());
+
+    // Approved: the expanded template is the prompt.
+    let out = run_repl(&mock.base_url(), &dir, "/greet it's me\ny\n/help\n/nope\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let bodies = mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "stdout: {stdout}\nstderr: {stderr}");
+    let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let prompt = request["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .map(|m| m["content"].to_string())
+        .unwrap_or_default();
+    assert!(
+        prompt.contains("Greet it's from the-file. Raw: it's me"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("/greet"), "{prompt}");
+    assert!(stdout.contains("/greet → expanded from"), "{stdout}");
+    assert!(stdout.contains("hello"), "{stdout}");
+
+    // `/help` is still the built-in, and lists both custom commands after it.
+    assert!(!bodies[0].contains("shadowing a built-in"));
+    let builtins = stdout.find("/quit ").expect("built-in help");
+    let custom = stdout.find("custom commands:").expect("custom section");
+    assert!(builtins < custom, "{stdout}");
+    assert!(stdout.contains("/greet <who>"), "{stdout}");
+    assert!(stdout.contains("say hello"), "{stdout}");
+    assert!(stdout.contains("/standup"), "{stdout}");
+    assert!(!stdout[custom..].contains("\n  /help"), "{stdout}");
+    assert!(stdout.contains("unknown command '/nope'"), "{stdout}");
+}

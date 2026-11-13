@@ -8,6 +8,7 @@ mod agent;
 mod auth;
 mod claude;
 mod cli;
+mod commands;
 mod config;
 mod context;
 mod coord;
