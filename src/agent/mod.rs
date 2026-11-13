@@ -102,6 +102,20 @@ pub trait Ui {
     }
 }
 
+/// The error a prompt ends with when it used up its step budget
+/// ([`Session::set_max_steps`]) before the model finished. Callers tell it
+/// from a failure by downcasting.
+#[derive(Debug)]
+pub struct StepLimit;
+
+impl std::fmt::Display for StepLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped: the step limit (--max-turns) was reached")
+    }
+}
+
+impl std::error::Error for StepLimit {}
+
 /// The user's answer to a tool-approval prompt.
 pub enum Approval {
     /// Run this once.
@@ -416,6 +430,10 @@ pub struct Session {
     /// size), and the cumulative completion tokens generated this session.
     usage_ctx: u32,
     usage_out: u64,
+    /// Model requests made for the current prompt, and the most a prompt may
+    /// make (`--max-turns`; `None` = no limit).
+    steps: u32,
+    max_steps: Option<u32>,
     /// Images (data URLs) staged by `/image`, attached to the next user turn.
     pending_images: Vec<String>,
     /// Last turn's context items (`title -> body`), for cross-turn dedup.
@@ -483,6 +501,8 @@ impl Session {
             auto_approve,
             usage_ctx: 0,
             usage_out: 0,
+            steps: 0,
+            max_steps: None,
             pending_images: Vec::new(),
             last_ctx: HashMap::new(),
             summary: None,
@@ -666,6 +686,28 @@ impl Session {
             return None;
         }
         Some(format!("{} ctx · {} out", self.usage_ctx, self.usage_out))
+    }
+
+    /// Token usage as numbers: the context size of the latest request and the
+    /// output tokens generated this session (both 0 until the endpoint
+    /// reports usage).
+    pub fn usage(&self) -> (u32, u64) {
+        (self.usage_ctx, self.usage_out)
+    }
+
+    /// Model requests the latest prompt took (a tool loop is one per batch
+    /// of tool calls, plus the final answer). With the Claude backend, the
+    /// assistant messages claude reported.
+    pub fn steps(&self) -> u32 {
+        self.steps
+    }
+
+    /// Cap the model requests a single prompt may make (`--max-turns`). A
+    /// prompt that would need more ends with a [`StepLimit`] error, its
+    /// history intact. With the Claude backend the cap is claude's own
+    /// `--max-turns`, applied when it is launched.
+    pub fn set_max_steps(&mut self, max: Option<u32>) {
+        self.max_steps = max;
     }
 
     pub fn config(&self) -> &Config {
@@ -907,6 +949,7 @@ impl Session {
     }
 
     fn run_turn(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
+        self.steps = 0;
         if self.is_claude() {
             return self.send_claude(user_input, ui);
         }
@@ -920,6 +963,14 @@ impl Session {
         let context_msg = self.gather_context();
 
         loop {
+            // The step budget is checked here, where the history is
+            // well-formed (a user message or a full batch of tool results),
+            // so the conversation can be continued afterwards.
+            if self.max_steps.is_some_and(|max| self.steps >= max) {
+                self.end_turn(ui)?;
+                return Err(StepLimit.into());
+            }
+            self.steps += 1;
             // Mid-turn steering: anything the user typed while we were busy is
             // delivered now, before the next model request. This sits right
             // after a batch of tool results (never between an assistant
@@ -1161,6 +1212,7 @@ impl Session {
                 model: model.as_deref(),
                 resume: self.claude_session.as_deref(),
                 keep_builtins: *keep_builtins,
+                max_turns: self.max_steps,
             };
             self.claude = Some(Bridge::spawn(
                 &launch,
@@ -1185,6 +1237,7 @@ impl Session {
         // Only relaunch (next turn, resuming) if the child actually died; a
         // live one may be running background work.
         let dead = !bridge.is_alive();
+        self.steps = bridge.take_steps();
         self.sync_claude();
         if dead {
             self.claude = None;

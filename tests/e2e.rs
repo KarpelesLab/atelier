@@ -16,7 +16,9 @@
 //! multi-step exchange (e.g. tool call on the first request, final answer on
 //! the second).
 //!
-//! Uses only `std` — no extra dependencies, and nothing outside `tests/`.
+//! The mock is `std` only; the headless-mode cases parse atelier's JSON
+//! output with `serde_json`, which the crate depends on anyway. No extra
+//! dependencies, and nothing outside `tests/`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -36,11 +38,11 @@ type Responder = Arc<dyn Fn(usize) -> Vec<u8> + Send + Sync>;
 /// exchange.
 struct Mock {
     port: u16,
+    /// The body of every request received so far, in order, so a test can
+    /// check what atelier actually sent.
+    bodies: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    /// The body of every request received so far, in order, for tests that
-    /// assert on what atelier sent.
-    bodies: Arc<Mutex<Vec<String>>>,
 }
 
 impl Mock {
@@ -78,9 +80,9 @@ impl Mock {
 
         Mock {
             port,
+            bodies,
             stop,
             handle: Some(handle),
-            bodies,
         }
     }
 
@@ -88,6 +90,15 @@ impl Mock {
     /// for `ATELIER_BASE_URL`.
     fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    /// The body of the Nth request (0-based) atelier sent.
+    fn body(&self, n: usize) -> String {
+        self.bodies.lock().unwrap()[n].clone()
+    }
+
+    fn requests(&self) -> usize {
+        self.bodies.lock().unwrap().len()
     }
 }
 
@@ -182,14 +193,20 @@ fn unique_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Spawn `atelier --print <prompt>` against `base_url` with `cwd`, wait for it
-/// to exit (killing it past a generous deadline so a hang can't wedge the
-/// suite), and return its captured output.
+/// Spawn `atelier --print <prompt>` against `base_url` with `cwd` and return
+/// its captured output.
 fn run_print(base_url: &str, cwd: &Path, prompt: &str) -> Output {
+    run_atelier(base_url, cwd, &["--print", prompt], None)
+}
+
+/// Spawn `atelier <args>` against `base_url` with `cwd`, feeding it `stdin`
+/// (closed right after; no stdin at all for `None`), wait for it to exit
+/// (killing it past a generous deadline so a hang can't wedge the suite),
+/// and return its captured output.
+fn run_atelier(base_url: &str, cwd: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let bin = env!("CARGO_BIN_EXE_atelier");
     let mut child = Command::new(bin)
-        .arg("--print")
-        .arg(prompt)
+        .args(args)
         .env("ATELIER_BASE_URL", base_url)
         .env("ATELIER_MODEL", "mock")
         .env("ATELIER_APPROVE", "all")
@@ -204,11 +221,20 @@ fn run_print(base_url: &str, cwd: &Path, prompt: &str) -> Output {
         .env_remove("ATELIER_TRACE")
         .env_remove("ATELIER_DEBUG")
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn atelier binary");
+    if let Some(text) = stdin {
+        // Small enough to fit the pipe buffer; dropping the handle is EOF.
+        let mut pipe = child.stdin.take().expect("child stdin");
+        pipe.write_all(text.as_bytes()).expect("write child stdin");
+    }
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -443,4 +469,412 @@ fn instruction_files_are_sent_root_first_and_nested_on_demand() {
     let last = bodies.last().unwrap();
     assert!(last.contains("ROOT-RULE-7f3a"));
     assert!(last.contains("page content") && last.contains("WEB-RULE-91cc"));
+}
+
+/// stdout as JSON lines: every non-empty line must parse, which is the
+/// `stream-json` contract (nothing else on stdout).
+fn json_lines(out: &Output) -> Vec<serde_json::Value> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| {
+                panic!(
+                    "stdout line is not JSON ({e}): {l:?}\n stderr: {:?}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+        })
+        .collect()
+}
+
+/// The events of `kind` among `events`.
+fn of_type<'a>(events: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+    events.iter().filter(|e| e["type"] == kind).collect()
+}
+
+/// A responder for the scripted `write` tool call followed by the answer
+/// `"done"` (with a usage chunk), as in case 2.
+fn write_then_done() -> Responder {
+    Arc::new(|n| {
+        if n == 0 {
+            sse_response(&[
+                r#"{"choices":[{"index":0,"delta":{"content":"on it"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write","arguments":"{\"path\":\"out.txt\",\"content\":\"written by tool\"}"}}]}}]}"#,
+            ])
+        } else {
+            sse_response(&[
+                r#"{"choices":[{"index":0,"delta":{"content":"do"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"content":"ne"}}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            ])
+        }
+    })
+}
+
+/// A responder that always answers with `text` as one content delta.
+fn always(text: &'static str) -> Responder {
+    Arc::new(move |_n| {
+        let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"content":text}}]});
+        sse_response(&[&chunk.to_string()])
+    })
+}
+
+/// A schema file in `dir` requiring `{"name": string, "count": integer}`.
+fn write_schema(dir: &Path) -> String {
+    let path = dir.join("schema.json");
+    std::fs::write(
+        &path,
+        r#"{"type":"object","properties":{"name":{"type":"string"},"count":{"type":"integer"}},"required":["name","count"],"additionalProperties":false}"#,
+    )
+    .expect("write schema");
+    path.to_string_lossy().into_owned()
+}
+
+/// Case 4 — `--output-format stream-json` over the tool-call loop: stdout is
+/// JSON lines only, opening with `init`, carrying the text deltas and the
+/// tool call's start/end, and closing with a `result` that holds the final
+/// answer (the text after the last tool call), step count and usage.
+#[test]
+fn stream_json_emits_events_for_a_tool_loop() {
+    let mock = Mock::start(write_then_done());
+    let dir = unique_dir("stream");
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "write the file"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let events = json_lines(&out);
+
+    let init = &events[0];
+    assert_eq!(init["type"], "system");
+    assert_eq!(init["subtype"], "init");
+    assert_eq!(init["model"], "mock");
+    assert!(init["version"].is_string() && init["cwd"].is_string());
+    assert!(
+        init["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "write"),
+        "init lists the tools: {init}"
+    );
+
+    let texts: Vec<&str> = of_type(&events, "text")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["on it", "do", "ne"]);
+
+    let starts = of_type(&events, "tool_start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["name"], "write");
+    // Arguments arrive parsed, not as the model's JSON string.
+    assert_eq!(starts[0]["arguments"]["path"], "out.txt");
+    let ends = of_type(&events, "tool_end");
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["name"], "write");
+    assert_eq!(ends[0]["ok"], true);
+    assert!(ends[0]["output"].is_string());
+
+    let result = events.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["subtype"], "success");
+    assert_eq!(result["is_error"], false);
+    assert_eq!(result["result"], "done");
+    assert_eq!(result["num_steps"], 2);
+    assert_eq!(result["usage"]["context_tokens"], 15);
+    assert_eq!(result["usage"]["output_tokens"], 5);
+    assert!(result["duration_ms"].is_u64());
+    assert_eq!(of_type(&events, "result").len(), 1);
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "written by tool"
+    );
+}
+
+/// Case 5 — `--output-format json`: stdout is exactly one JSON object, the
+/// result, with the whole answer in it.
+#[test]
+fn json_mode_prints_only_the_result() {
+    let mock = Mock::start(write_then_done());
+    let dir = unique_dir("json");
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["--print", "--output-format=json", "write the file"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let events = json_lines(&out);
+    assert_eq!(events.len(), 1, "one object on stdout: {events:?}");
+    assert_eq!(events[0]["type"], "result");
+    assert_eq!(events[0]["subtype"], "success");
+    assert_eq!(events[0]["result"], "done");
+    assert_eq!(events[0]["num_steps"], 2);
+    // Tool activity still shows on stderr for whoever watches the run.
+    assert!(String::from_utf8_lossy(&out.stderr).contains("write"));
+}
+
+/// Case 6 — `--max-turns`: a model that never stops calling tools is cut off
+/// after N requests, with exit status 3 and a `max_turns` result.
+#[test]
+fn max_turns_stops_the_loop_with_exit_3() {
+    let responder: Responder = Arc::new(|_n| {
+        sse_response(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}]}}]}"#,
+        ])
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("maxturns");
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--max-turns",
+            "2",
+            "--output-format",
+            "json",
+            "loop forever",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let events = json_lines(&out);
+    assert_eq!(events[0]["subtype"], "max_turns");
+    assert_eq!(events[0]["is_error"], true);
+    assert_eq!(events[0]["num_steps"], 2);
+    assert_eq!(mock.requests(), 2, "no request past the limit");
+
+    // The default text mode reports the same through the status and stderr.
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--max-turns=1", "loop forever"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--max-turns"));
+}
+
+/// Case 7 — `--output-schema`, satisfied: the schema rides along with the
+/// prompt, a fenced answer is accepted, and the parsed value is what comes
+/// out (`structured` in JSON modes, alone on stdout in text mode).
+#[test]
+fn output_schema_success() {
+    let mock = Mock::start(always(
+        "```json\n{\"name\": \"atelier\", \"count\": 3}\n```",
+    ));
+    let dir = unique_dir("schema-ok");
+    let schema = write_schema(&dir);
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--output-schema",
+            &schema,
+            "--output-format",
+            "json",
+            "describe",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let events = json_lines(&out);
+    assert_eq!(events[0]["subtype"], "success");
+    assert_eq!(
+        events[0]["structured"],
+        serde_json::json!({"name": "atelier", "count": 3})
+    );
+    assert_eq!(mock.requests(), 1);
+    assert!(
+        mock.body(0).contains("additionalProperties"),
+        "the schema is part of the prompt"
+    );
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-schema", &schema, "describe"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"count\":3,\"name\":\"atelier\"}\n"
+    );
+}
+
+/// Case 8 — `--output-schema`, violated: the model is told what is wrong
+/// once. A corrected answer succeeds; a second bad one exits 4 with a
+/// `schema_error` result naming the violation.
+#[test]
+fn output_schema_retries_once_then_fails() {
+    let responder: Responder = Arc::new(|n| {
+        let text = if n == 0 {
+            r#"{"name": "atelier"}"#
+        } else {
+            r#"{"name": "atelier", "count": 1}"#
+        };
+        let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"content":text}}]});
+        sse_response(&[&chunk.to_string()])
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("schema-retry");
+    let schema = write_schema(&dir);
+    let args = [
+        "-p",
+        "--output-schema",
+        &schema,
+        "--output-format",
+        "stream-json",
+        "describe",
+    ];
+
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(0));
+    let events = json_lines(&out);
+    let result = events.last().unwrap();
+    assert_eq!(result["subtype"], "success");
+    assert_eq!(result["structured"]["count"], 1);
+    assert_eq!(result["num_steps"], 2);
+    assert_eq!(
+        of_type(&events, "notice").len(),
+        1,
+        "the retry is announced"
+    );
+    assert!(
+        mock.body(1).contains("missing required property"),
+        "the retry prompt carries the validation error"
+    );
+
+    let mock = Mock::start(always(r#"{"name": "atelier", "count": "many"}"#));
+    let dir = unique_dir("schema-bad");
+    let out = run_atelier(&mock.base_url(), &dir, &args, None);
+    assert_eq!(out.status.code(), Some(4));
+    let events = json_lines(&out);
+    let result = events.last().unwrap();
+    assert_eq!(result["subtype"], "schema_error");
+    assert_eq!(result["is_error"], true);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("$.count: expected integer, got string")
+    );
+    assert!(result.get("structured").is_none());
+    assert_eq!(mock.requests(), 2, "one retry, no more");
+}
+
+/// Case 9 — `--input-format stream-json`: each stdin line is a turn in the
+/// same session (the second request carries the first exchange), each
+/// answered by its own result; EOF ends the run.
+#[test]
+fn stream_json_input_runs_several_turns() {
+    let responder: Responder = Arc::new(|n| {
+        let text = if n == 0 { "first" } else { "second" };
+        let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"content":text}}]});
+        sse_response(&[&chunk.to_string()])
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("multiturn");
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ],
+        Some(
+            "{\"type\":\"user\",\"text\":\"alpha question\"}\n\n{\"type\":\"user\",\"text\":\"beta question\"}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let events = json_lines(&out);
+    assert_eq!(of_type(&events, "system").len(), 1);
+    let results: Vec<&str> = of_type(&events, "result")
+        .iter()
+        .map(|e| e["result"].as_str().unwrap())
+        .collect();
+    assert_eq!(results, ["first", "second"]);
+    assert_eq!(mock.requests(), 2);
+    let second = mock.body(1);
+    assert!(second.contains("alpha question") && second.contains("beta question"));
+    assert!(second.contains("first"), "history carries the first answer");
+
+    // A line that isn't a user message ends the run as a usage error.
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ],
+        Some("not json\n"),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let events = json_lines(&out);
+    assert_eq!(events.last().unwrap()["subtype"], "input_error");
+}
+
+/// Case 10 — the command line: unknown options and bad values are usage
+/// errors (status 2, nothing sent), a provider failure is status 1, and
+/// `--` lets a prompt start with dashes.
+#[test]
+fn usage_errors_and_dashed_prompts() {
+    let mock = Mock::start(always("ok"));
+    let dir = unique_dir("usage");
+
+    for args in [
+        &["-p", "--frobnicate", "hi"][..],
+        &["-p", "--output-format", "yaml", "hi"],
+        &["-p", "--max-turns", "none", "hi"],
+        &["--max-turns", "3"],
+        &["-p", "--output-schema", "no-such-schema.json", "hi"],
+    ] {
+        let out = run_atelier(&mock.base_url(), &dir, args, None);
+        assert_eq!(out.status.code(), Some(2), "args: {args:?}");
+        assert!(out.stdout.is_empty(), "args: {args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+    }
+    assert_eq!(mock.requests(), 0);
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "json", "--", "--frobnicate", "it"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_lines(&out)[0]["result"], "ok");
+    assert!(mock.body(0).contains("--frobnicate it"));
+
+    // Nothing listens here: the request fails, which is a runtime error.
+    let out = run_atelier(
+        "http://127.0.0.1:1/v1",
+        &dir,
+        &["-p", "--output-format", "json", "hi"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let result = &json_lines(&out)[0];
+    assert_eq!(result["subtype"], "error");
+    assert!(result["error"].is_string());
 }

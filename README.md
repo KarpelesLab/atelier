@@ -86,7 +86,8 @@ cargo run                # launches in the current directory as project root
 Type a message, or `/help` for commands. Set `ATELIER_BASE_URL` /
 `ATELIER_MODEL` / `ATELIER_API_KEY` to point at your own endpoint. Add
 `--continue`/`-c` to resume a saved session, or `--print`/`-p "..."` for a
-non-interactive, scriptable one-shot run. See
+non-interactive, scriptable run (JSON output, step limits, schema-checked
+answers: [docs/headless.md](docs/headless.md)). See
 [docs/quickstart.md](docs/quickstart.md) for the full walkthrough (env vars,
 first conversation, the REPL/TUI fallback).
 
@@ -95,6 +96,7 @@ first conversation, the REPL/TUI fallback).
 | Doc | Covers |
 |-----|--------|
 | [Quickstart](docs/quickstart.md) | Build/run, first conversation, env vars, `--print`, `/image`, REPL vs. inline TUI |
+| [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, exit codes |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[review]`), instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
@@ -111,11 +113,13 @@ first conversation, the REPL/TUI fallback).
 
 ```
 src/
-├─ main.rs        entry: config, flags (--continue, --print), wiring, run loop
+├─ main.rs        entry: config, wiring, run loop, exit status
+├─ cli.rs         command-line flags (--continue, --print and its options)
 ├─ config.rs      env-based runtime config
 ├─ settings.rs    atelier.toml (MCP servers, permissions)
 ├─ session.rs     on-disk session persistence (.atelier/session.json)
-├─ headless.rs    --print: one-shot non-interactive mode
+├─ headless.rs    --print: non-interactive runs, JSON output, exit codes
+├─ schema.rs      the JSON Schema subset behind --output-schema
 ├─ provider/      OpenAI-compatible client: streaming chat, tool-calls, vision
 ├─ claude/        Claude backend: drives the `claude` CLI; serves it atelier's tools (mcp-serve)
 ├─ agent/         agent loop, conversation state, turn orchestration, compaction

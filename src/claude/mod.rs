@@ -131,6 +131,10 @@ where you stopped.";
 /// Keep this much of the child's stderr for error messages.
 const STDERR_TAIL: usize = 4096;
 
+/// The `result` subtype claude ends a turn with when `--max-turns` ran out
+/// (such a result carries no text, so the subtype is what gets reported).
+const MAX_TURNS_RESULT: &str = "error_max_turns";
+
 /// How often a waiting turn checks whether the user asked to stop.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -145,6 +149,9 @@ pub struct Launch<'a> {
     /// Keep claude's built-ins that overlap atelier's tools, instead of
     /// switching them off.
     pub keep_builtins: bool,
+    /// `--max-turns`: the most agentic turns claude takes per prompt before
+    /// ending it with an `error_max_turns` result.
+    pub max_turns: Option<u32>,
 }
 
 /// A running `claude` child speaking stream-json.
@@ -173,6 +180,9 @@ pub struct Bridge {
     context: u32,
     /// Output tokens not yet collected by [`Bridge::take_output`].
     output: u64,
+    /// Model requests (assistant messages reporting usage) not yet collected
+    /// by [`Bridge::take_steps`].
+    steps: u32,
 }
 
 /// Progress of the turn [`Bridge::turn`] is waiting on.
@@ -255,6 +265,9 @@ impl Bridge {
         }
         if let Some(id) = launch.resume {
             cmd.args(["--resume", id]);
+        }
+        if let Some(n) = launch.max_turns {
+            cmd.args(["--max-turns", &n.to_string()]);
         }
         let mut mcp = mcp_config(settings);
         // atelier's own tools, unless a configured server already took the
@@ -347,6 +360,7 @@ impl Bridge {
             background: 0,
             context: 0,
             output: 0,
+            steps: 0,
         })
     }
 
@@ -371,6 +385,11 @@ impl Bridge {
     /// Output tokens generated since the last call.
     pub fn take_output(&mut self) -> u64 {
         std::mem::take(&mut self.output)
+    }
+
+    /// Model requests claude made since the last call.
+    pub fn take_steps(&mut self) -> u32 {
+        std::mem::take(&mut self.steps)
     }
 
     /// Whether the child is still running.
@@ -410,6 +429,9 @@ impl Bridge {
         }
         ui.turn_end();
         match st.error {
+            // claude's own step limit (`--max-turns`), reported the way
+            // atelier's loop reports its own.
+            Some(e) if e == MAX_TURNS_RESULT => Err(crate::agent::StepLimit.into()),
             Some(e) => bail!("claude: {e}"),
             None => Ok(()),
         }
@@ -517,7 +539,10 @@ impl Bridge {
                 let name = self.tool_names.remove(&id).unwrap_or_default();
                 ui.tool_end(&name, &content, !is_error);
             }
-            Event::Context(n) => self.context = n,
+            Event::Context(n) => {
+                self.context = n;
+                self.steps += 1;
+            }
             Event::Background(n) => self.background = n,
             Event::Permission(req) => {
                 let answer = self.decide(&req, ui, host.auto_approve());
@@ -1222,6 +1247,7 @@ mod tests {
             model: Some("haiku"),
             resume: None,
             keep_builtins: false,
+            max_turns: None,
         };
         let mut b = Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()).unwrap();
         let mut ui = LiveUi {
@@ -1274,6 +1300,7 @@ mod tests {
             model: Some("haiku"),
             resume: None,
             keep_builtins: false,
+            max_turns: None,
         };
         let mut b = Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()).unwrap();
         let mut ui = LiveUi {

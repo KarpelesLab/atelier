@@ -7,6 +7,7 @@
 mod agent;
 mod auth;
 mod claude;
+mod cli;
 mod config;
 mod context;
 mod coord;
@@ -17,6 +18,7 @@ mod memory;
 mod provider;
 mod review;
 mod risk;
+mod schema;
 mod session;
 mod settings;
 mod shlex;
@@ -25,40 +27,75 @@ mod tools;
 mod tui;
 mod update;
 
+use std::process::ExitCode;
+
 use anyhow::Result;
 
 use config::Config;
 use settings::Settings;
 
-fn main() -> Result<()> {
+/// The exit status is part of the headless contract (see `headless`): 0 for
+/// success, 1 for a failure, 2 for a usage error, then one per way a
+/// `--print` run can end short of an answer.
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(headless::EXIT_ERROR)
+        }
+    }
+}
+
+fn run() -> Result<u8> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
-    // claude launch — a relay back to the atelier process that owns the
-    // session (see `claude::relay`). Nothing else runs in that mode.
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    // Anywhere among the options (what follows a bare `--` is a prompt).
+    if args
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--version" || a == "-V")
+    {
         println!("{}", update::version_line());
-        return Ok(());
+        return Ok(0);
     }
     // `atelier update`: install the latest release now (see `update`).
     if args.first().map(String::as_str) == Some("update") {
-        return update::run_command();
+        return update::run_command().map(|()| 0);
     }
     // `atelier coordinator [status|stop]`: the daemon that connects atelier
     // instances (they launch it themselves), or a word with it (see `coord`).
     if args.first().map(String::as_str) == Some("coordinator") {
-        return coord::run_command(&args[1..]);
+        return coord::run_command(&args[1..]).map(|()| 0);
     }
+    // `atelier mcp-serve <socket>`: the MCP server the Claude backend has
+    // claude launch — a relay back to the atelier process that owns the
+    // session (see `claude::relay`). Nothing else runs in that mode.
     #[cfg(unixlike)]
     if args.first().map(String::as_str) == Some("mcp-serve") {
         let socket = args
             .get(1)
             .ok_or_else(|| anyhow::anyhow!("usage: atelier mcp-serve <socket>"))?;
-        return claude::relay(socket);
+        return claude::relay(socket).map(|()| 0);
     }
-    // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
+    // Everything else is flags (see `cli`): `--continue`/`-c` resumes the
+    // saved session; `--print`/`-p` runs non-interactively and exits (see
+    // `headless::run`). The two combine (`--continue --print ...`) to resume
+    // history and then run a prompt against it.
+    let cli = match cli::parse(&args) {
+        Ok(cli) => cli,
+        Err(msg) => {
+            eprintln!("atelier: {msg}\n\n{}", cli::USAGE);
+            return Ok(headless::EXIT_USAGE);
+        }
+    };
+    if cli.help {
+        println!("{}", cli::USAGE);
+        return Ok(0);
+    }
     // Daily check for a newer release, in the background (official builds).
     update::spawn_background_check();
-    let mut cfg = Config::from_env(args.iter().any(|a| a == "--claude"));
+    // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
+    let mut cfg = Config::from_env(cli.claude);
     let claude = matches!(cfg.backend, config::Backend::Claude { .. });
     let root = std::env::current_dir()?;
     let settings = Settings::load(&root).unwrap_or_else(|e| {
@@ -75,13 +112,6 @@ fn main() -> Result<()> {
     {
         cfg.model = m.clone();
     }
-
-    // Minimal flag handling: `--continue`/`-c` resumes the saved session;
-    // `--print`/`-p` runs one prompt non-interactively and exits (see
-    // `headless::run`). The two combine (`--continue --print ...`) to resume
-    // history and then run a single prompt against it.
-    let resume = args.iter().any(|a| a == "--continue" || a == "-c");
-    let print_at = args.iter().position(|a| a == "--print" || a == "-p");
 
     let mut tools = tools::builtin_registry();
     // Join the other atelier instances on this machine, starting the
@@ -100,30 +130,26 @@ fn main() -> Result<()> {
     if !claude && let Some(tokens) = auth::load() {
         session.use_chatgpt(tokens, None);
     }
-    if resume {
+    if cli.resume {
         eprintln!("{}", session.resume());
     }
 
     // Handled before the interactive TUI/REPL branch below, and unconditional
     // on the `tui` feature, so `--print` works in both build configs.
-    if let Some(idx) = print_at {
-        let prompt = match headless::prompt_from_args(&args[idx + 1..]) {
-            Some(p) => p,
-            None => headless::read_stdin_prompt()?,
-        };
-        return finish(headless::run(session, &prompt));
+    if let Some(opts) = cli.print {
+        return Ok(finish(headless::run(session, opts)));
     }
 
     #[cfg(tui)]
     let result = tui::run(session);
     #[cfg(not(tui))]
     let result = agent::repl(session);
-    finish(result)
+    finish(result).map(|()| 0)
 }
 
 /// On the way out: stop the `bash` tool's background jobs, which would
 /// otherwise outlive atelier.
-fn finish(result: Result<()>) -> Result<()> {
+fn finish<T>(result: T) -> T {
     tools::bash::kill_all();
     result
 }

@@ -109,6 +109,7 @@ atelier --continue                       # or -c: resume the saved session
 atelier --print "summarize src/main.rs"  # or -p: one-shot, non-interactive
 atelier -p < prompt.txt                  # -p with no trailing args reads stdin
 atelier --continue --print "keep going"  # resume, then run one prompt headlessly
+atelier -p --output-format json "..."    # machine-readable result (see below)
 ```
 
 `--print`/`-p` runs a single prompt to completion and exits instead of
@@ -119,6 +120,15 @@ approval prompt in this mode, tool calls that need approval are denied
 automatically unless `ATELIER_APPROVE=all` is set (see
 [Permissions](permissions.md)). See [Sessions](sessions.md) for what
 `--continue` restores and how compaction keeps long conversations bounded.
+
+For programs rather than people, `--print` takes more flags —
+`--output-format json|stream-json` (a result object, or a stream of JSON
+events), `--input-format stream-json` (several prompts over stdin),
+`--max-turns N`, `--output-schema FILE` — and its exit status tells success
+(0) from failure (1), a usage error (2), the step limit (3) and a schema
+mismatch (4). Flags may come before or after the prompt; a prompt that
+starts with a dash goes after `--`. [Headless runs](headless.md) has the
+event reference and examples.
 
 ## The REPL vs. the inline TUI
 
