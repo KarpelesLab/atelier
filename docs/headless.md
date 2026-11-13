@@ -401,4 +401,7 @@ these differences:
 - A one-shot run waits for background work claude started (subagents,
   background shells) before printing the result. With `--input-format
   stream-json` each result is printed as soon as its prompt is done, so
-  events from background work may follow the last result.
+  events from background work may follow the last result. (atelier's own
+  loop does the opposite with its [background
+  agents](agents.md#in-the-background): those still running when the last
+  prompt is answered are stopped, their reports undelivered.)

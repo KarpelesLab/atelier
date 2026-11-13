@@ -45,6 +45,8 @@ pub struct TaskCall {
     pub prompt: String,
     /// A few words for the transcript.
     pub description: String,
+    /// Start it and go on, instead of waiting for its report.
+    pub background: bool,
 }
 
 impl TaskCall {
@@ -85,10 +87,15 @@ impl TaskCall {
                 }
             }
         };
+        // `run_in_background` is what Claude models know it as.
+        let background = ["background", "run_in_background"]
+            .iter()
+            .any(|k| args.get(*k).and_then(Value::as_bool) == Some(true));
         Ok(Self {
             agent: agent.clone(),
             prompt: prompt.to_string(),
             description,
+            background,
         })
     }
 }
@@ -123,7 +130,12 @@ impl Tool for TaskTool {
             matters. Use it to keep long searches and side investigations out of your own \
             context, and to do independent pieces of work at once: several `task` calls \
             in one step run in parallel. Do not use it for something one or two tool \
-            calls would settle. Subagents cannot start subagents.\n\nAgents:"
+            calls would settle. Subagents cannot start subagents.\n\nWith `background: true` \
+            the call returns at once with the agent's id and the agent works on while you \
+            do: you are told when it ends (a <subagent> block carrying its report), so do \
+            not wait for it or poll. A background agent has no user to ask: a call that \
+            would need the user's approval is refused to it, so use it for work the \
+            permission rules already allow — reading and searching above all.\n\nAgents:"
             .to_string();
         for a in &found.agents {
             description.push_str(&format!("\n- {}: {}", a.name, a.description));
@@ -147,6 +159,10 @@ impl Tool for TaskTool {
                     "description": {
                         "type": "string",
                         "description": "The task in 3-6 words, shown to the user while it runs."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Start the agent and return its id immediately; its report arrives later as a notification (default false)."
                     }
                 },
                 "required": ["agent", "prompt"]
@@ -197,7 +213,13 @@ mod tests {
 
         // Without a description, the prompt's first line stands in.
         let call = TaskCall::parse(r#"{"agent":"general","prompt":"Fix it.\nMore."}"#, &found);
-        assert_eq!(call.ok().unwrap().description, "Fix it.");
+        let call = call.ok().unwrap();
+        assert_eq!(call.description, "Fix it.");
+        assert!(!call.background);
+        for key in ["background", "run_in_background"] {
+            let args = format!(r#"{{"agent":"explore","prompt":"x","{key}":true}}"#);
+            assert!(TaskCall::parse(&args, &found).ok().unwrap().background);
+        }
 
         let err = |args: &str| TaskCall::parse(args, &found).err().unwrap();
         assert!(err(r#"{"agent":"nope","prompt":"x"}"#).contains("available: explore, general"));

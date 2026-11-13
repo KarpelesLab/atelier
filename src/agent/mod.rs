@@ -249,7 +249,9 @@ const HELP: &[&str] = &[
     "                                        rules, hooks), as it is now",
     "  /trust show                           list those settings and whether they are in effect",
     "  /trust revoke                         stop trusting this project",
-    "  /agents                               list the subagents the `task` tool can run",
+    "  /agents                               list the subagents the `task` tool can run, and",
+    "                                        the ones running in the background",
+    "  /agents stop <id>                     stop a background agent",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
     "  /subscribe <topic>                    receive what instances publish to a topic",
@@ -501,15 +503,7 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 ui.info(&l);
             }
         }
-        "/agents" => {
-            if session.is_claude() {
-                ui.info("Claude backend: claude runs subagents of its own; these are not offered to it.");
-            }
-            let global = crate::agents::global_dir();
-            for l in crate::agents::command(&session.root, global.as_deref()) {
-                ui.info(&l);
-            }
-        }
+        "/agents" => session.agents_command(&args, ui),
         "/hooks" => session.hooks_command(&args, ui),
         "/trust" => session.trust_command(&args, ui),
         "/context" => {
@@ -841,6 +835,9 @@ pub struct Session {
     /// The condition the user wants met before the work stops (`/goal`,
     /// `--goal` — see [`goal`]).
     goal: Option<goal::Goal>,
+    /// The subagents this session started in the background (see
+    /// [`subagent`]); they are stopped when it is dropped.
+    background: subagent::Background,
 }
 
 impl Session {
@@ -914,6 +911,7 @@ impl Session {
             child: None,
             standalone: None,
             goal: None,
+            background: subagent::Background::default(),
         }
     }
 
@@ -925,10 +923,10 @@ impl Session {
 
     /// Show the messages other instances sent since the last look; they
     /// are kept for the model's next turn. Returns whether any arrived.
-    /// Background jobs that ended are shown on the same occasion (see
-    /// `jobs`).
+    /// Background jobs and agents that ended are shown on the same occasion
+    /// (see `jobs`).
     pub fn poll_peers(&mut self, ui: &mut dyn Ui) -> bool {
-        let ended = jobs::announce(ui);
+        let ended = jobs::announce(&self.roster(), ui);
         let Some(coord) = &self.coord else {
             return ended;
         };
@@ -1026,17 +1024,26 @@ impl Session {
     }
 
     /// Whether exiting may proceed. Exiting ends claude and any background
-    /// work in it, so with work running the first attempt only warns; asking
-    /// again confirms.
+    /// work in it, and stops the subagents running in the background, so
+    /// with work running the first attempt only warns; asking again
+    /// confirms.
     pub fn confirm_quit(&mut self, ui: &mut dyn Ui) -> bool {
         let n = self.background_tasks();
-        if n == 0 || self.quit_warned {
+        let agents = self.background_agents();
+        if (n == 0 && agents == 0) || self.quit_warned {
             return true;
         }
         self.quit_warned = true;
-        ui.info(&format!(
-            "claude has {n} background task(s) running; quitting would stop them."
-        ));
+        if n > 0 {
+            ui.info(&format!(
+                "claude has {n} background task(s) running; quitting would stop them."
+            ));
+        }
+        if agents > 0 {
+            ui.info(&format!(
+                "{agents} background agent(s) are running; quitting would stop them."
+            ));
+        }
         ui.info("quit again to quit anyway");
         false
     }
@@ -1525,10 +1532,14 @@ impl Session {
             return self.run_turn(user_input, ui);
         }
         let user_input = &self.hook_prompt(user_input, ui)?;
-        // Background jobs that ended: the ones since the last turn lead the
-        // prompt, the ones that end during this turn join what is queued.
-        let user_input = &jobs::lead(user_input, ui);
-        let ui = &mut jobs::JobsUi { inner: ui };
+        // A warning about quitting was about the moment it was given.
+        self.quit_warned = false;
+        // Background jobs and agents that ended: the ones since the last
+        // turn lead the prompt, the ones that end during this turn join
+        // what is queued.
+        let agents = &self.roster();
+        let user_input = &jobs::lead(agents, user_input, ui);
+        let ui = &mut jobs::JobsUi { inner: ui, agents };
         let Some(coord) = self.coord.clone() else {
             return self.run_turn(user_input, ui);
         };

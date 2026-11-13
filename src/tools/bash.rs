@@ -402,7 +402,7 @@ impl Notice {
 }
 
 /// A duration as `42s` or `3m07s`.
-fn runtime(d: Duration) -> String {
+pub fn runtime(d: Duration) -> String {
     match d.as_secs() {
         s if s < 60 => format!("{s}s"),
         s => format!("{}m{:02}s", s / 60, s % 60),

@@ -41,9 +41,21 @@
 //! as dim one-liners while it runs, one line when it ends. Never its text or
 //! reasoning: its answer is the tool result, for the parent model to relay.
 //!
-//! Not here yet (see ROADMAP.md, M18): background agents, worktree
-//! isolation, and running a child as another atelier instance through the
-//! coordinator.
+//! # In the background
+//!
+//! A `task` call with `background: true` does not wait: the child gets a
+//! thread that outlives the turn, an id, and a place in the session's
+//! [`Roster`]; the call's result is the id. Everything a child's thread
+//! holds is its own — a [`Session`] built from clones, a [`Link`] — so the
+//! only thing that changes is who is at the other end of the link: not the
+//! parent's thread waiting on a channel, but the roster, with the permission
+//! rules deciding its calls where a foreground child's are put to the user.
+//! See the `background` module for that and for how its report comes back.
+//!
+//! Not here yet (see ROADMAP.md, M18): worktree isolation, and running a
+//! child as another atelier instance through the coordinator.
+
+mod background;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -59,6 +71,9 @@ use crate::context;
 use crate::permissions::DENIED;
 use crate::provider::ToolCall;
 use crate::tools::task::TaskCall;
+
+pub(super) use background::{Background, NOTICE_OPEN, Roster};
+use background::{Rules, Seat};
 
 /// Added to every agent's system prompt: what being a subagent means.
 const SUBAGENT_NOTE: &str = "\
@@ -80,24 +95,44 @@ pub(super) struct Child {
     pub(super) link: Link,
 }
 
-/// A child's line to its parent's thread.
+/// A child's line to the session that started it.
 #[derive(Clone)]
 pub(super) struct Link {
-    /// Which of the calls running together this child is.
-    index: usize,
-    events: Sender<Event>,
-    /// Set when the user stopped the parent's turn.
+    /// Set when the child is to stop: the user stopped the parent's turn,
+    /// or — in the background — this agent.
     stop: Arc<AtomicBool>,
+    to: Parent,
+}
+
+/// Who is at the other end of a [`Link`].
+#[derive(Clone)]
+enum Parent {
+    /// The parent's thread, waiting in [`Session::run_tasks`] for what this
+    /// child has to say.
+    Waiting {
+        /// Which of the calls running together this child is.
+        index: usize,
+        events: Sender<Event>,
+    },
+    /// Nobody is waiting: the child runs in the background. What it does
+    /// and how it ends go to its seat in the roster; its calls are decided
+    /// by the rules alone.
+    Detached { seat: Arc<Seat>, rules: Arc<Rules> },
 }
 
 impl Link {
-    /// Have the parent decide whether this child may make a call — by the
-    /// parent's rules, asking the parent's user. `Err` is the tool result
-    /// for a refused call.
+    /// Whether this child may make a call. In the foreground the parent
+    /// decides — by its rules, asking its user; in the background the rules
+    /// decide alone (see `background`). `Err` is the tool result for a
+    /// refused call.
     pub(super) fn approve(&self, tool: &str, arguments: &str) -> Result<(), String> {
+        let (index, events) = match &self.to {
+            Parent::Waiting { index, events } => (*index, events),
+            Parent::Detached { rules, .. } => return rules.decide(tool, arguments),
+        };
         let (reply, verdict) = mpsc::channel();
-        let asked = self.events.send(Event::Approve {
-            index: self.index,
+        let asked = events.send(Event::Approve {
+            index,
             tool: tool.to_string(),
             arguments: arguments.to_string(),
             reply,
@@ -107,6 +142,40 @@ impl Link {
             (Ok(()), Ok(verdict)) => verdict,
             _ => Err(DENIED.to_string()),
         }
+    }
+
+    /// A line of the child's progress.
+    fn activity(&self, text: String) {
+        match &self.to {
+            Parent::Waiting { index, events } => {
+                let _ = events.send(Event::Activity {
+                    index: *index,
+                    text,
+                });
+            }
+            Parent::Detached { seat, .. } => seat.activity(text),
+        }
+    }
+
+    /// The child is finished. Always the last thing it says.
+    fn done(&self, outcome: Outcome) {
+        match &self.to {
+            Parent::Waiting { index, events } => {
+                let _ = events.send(Event::Done {
+                    index: *index,
+                    outcome,
+                });
+            }
+            Parent::Detached { seat, .. } => seat.finish(outcome),
+        }
+    }
+
+    /// Whether the child was told to stop and runs in the background —
+    /// where that is an end of its own, with a report saying so. (A
+    /// foreground child stopped with its parent's turn just ends: the turn
+    /// it would report to is over.)
+    fn stopped_in_background(&self) -> bool {
+        matches!(self.to, Parent::Detached { .. }) && self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -127,20 +196,66 @@ enum Event {
 
 /// How a child ended.
 struct Outcome {
-    /// The tool result for the parent model.
+    status: Status,
+    /// Model requests it made.
+    steps: u32,
+    /// Its report: the tool result for the parent model, or — from the
+    /// background — the body of its notice.
     text: String,
-    ok: bool,
     /// The line shown to the user.
     line: String,
     /// Output tokens the child generated, for the session's count.
     tokens_out: u64,
 }
 
+impl Outcome {
+    /// The end of a child whose thread died without a word.
+    fn crashed(label: &str) -> Self {
+        Self {
+            status: Status::Failed,
+            steps: 0,
+            text: CRASHED.to_string(),
+            line: format!("⤶ {label}: crashed"),
+            tokens_out: 0,
+        }
+    }
+}
+
+/// The report of a child that panicked.
+const CRASHED: &str = "error: the subagent crashed";
+
+/// The ways a child ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Status {
+    /// It answered.
+    Done,
+    /// It used up its steps, and its answer is the wrap-up it was asked for.
+    WrappedUp,
+    /// Its conversation failed (the endpoint errored), or its thread died.
+    Failed,
+    /// It was stopped, in the background, before it answered.
+    Stopped,
+}
+
+impl Status {
+    /// As a background agent's notice states it.
+    fn word(self) -> &'static str {
+        match self {
+            Status::Done => "done",
+            Status::WrappedUp => "wrapped-up",
+            Status::Failed => "failed",
+            Status::Stopped => "stopped",
+        }
+    }
+}
+
 /// Where one call of a batch stands.
 enum Slot {
-    /// Never started: refused by a rule or the user, or malformed. Holds
-    /// its tool result.
-    Refused(String),
+    /// Has its result already, and its `tool_end` was shown: never started
+    /// (refused by a rule or the user, malformed, over a limit), or started
+    /// in the background, where the result is the agent's id. Holds the
+    /// result.
+    Settled(String),
     Running,
     /// The child's tool result, and whether it succeeded.
     Done(String, bool),
@@ -148,9 +263,8 @@ enum Slot {
 
 /// One child ready to run.
 struct Job {
-    index: usize,
-    /// How it is named on screen: the agent's name, numbered when several
-    /// run together.
+    /// How it is named on screen: the agent's name — numbered when several
+    /// run together, followed by its id in the background.
     label: String,
     agent: Agent,
     prompt: String,
@@ -185,16 +299,38 @@ impl Job {
             ));
         }
         footer.push(']');
+        let last = self.session.last_answer();
         let outcome = match result {
+            // Told to stop, it ended without the report it was asked for.
+            Ok(()) if self.link.stopped_in_background() => {
+                let said = match last.trim() {
+                    "" => "It had said nothing yet.".to_string(),
+                    text => format!("The last thing it said:\n\n{text}"),
+                };
+                Outcome {
+                    status: Status::Stopped,
+                    steps: count,
+                    text: format!(
+                        "(The agent was stopped before it finished; this is not a report.) \
+                         {said}\n\n{footer}"
+                    ),
+                    line: format!("⤶ {label}: stopped ({steps})"),
+                    tokens_out,
+                }
+            }
             Ok(()) => {
-                let answer = self.session.last_answer();
-                let answer = match answer.trim() {
+                let answer = match last.trim() {
                     "" => "(the subagent ended without a final message)",
                     text => text,
                 };
                 Outcome {
+                    status: if capped {
+                        Status::WrappedUp
+                    } else {
+                        Status::Done
+                    },
+                    steps: count,
                     text: format!("{answer}\n\n{footer}"),
-                    ok: true,
                     line: if capped {
                         format!("⤶ {label}: done ({steps} — wrapped up at its step cap)")
                     } else {
@@ -204,16 +340,14 @@ impl Job {
                 }
             }
             Err(e) => Outcome {
+                status: Status::Failed,
+                steps: count,
                 text: format!("error: the subagent failed: {e:#}\n\n{footer}"),
-                ok: false,
                 line: format!("⤶ {label}: failed after {steps} — {e:#}"),
                 tokens_out,
             },
         };
-        let _ = self.link.events.send(Event::Done {
-            index: self.index,
-            outcome,
-        });
+        self.link.done(outcome);
     }
 }
 
@@ -245,19 +379,30 @@ impl Session {
                 .approve(&call.name, &call.arguments, ui)
                 .and_then(|()| TaskCall::parse(&call.arguments, &found));
             match checked {
+                // Started and left: the call's result is the agent's id.
+                Ok(task) if task.background => {
+                    ui.tool_start(&call.name, &call.arguments);
+                    let started = self.start_background(task, ui);
+                    let ok = started.is_ok();
+                    let text = started.unwrap_or_else(|refusal| refusal);
+                    ui.tool_end(&call.name, &text, ok);
+                    slots.push(Slot::Settled(text));
+                }
                 Ok(task) => {
                     ui.tool_start(&call.name, &call.arguments);
                     let link = Link {
-                        index,
-                        events: events.clone(),
                         stop: Arc::clone(&stop),
+                        to: Parent::Waiting {
+                            index,
+                            events: events.clone(),
+                        },
                     };
-                    jobs.push((self.child(&task.agent, link.clone()), task, link));
+                    jobs.push((index, self.child(&task.agent, link.clone()), task, link));
                     slots.push(Slot::Running);
                 }
                 Err(msg) => {
                     ui.tool_end(&call.name, &msg, false);
-                    slots.push(Slot::Refused(msg));
+                    slots.push(Slot::Settled(msg));
                 }
             }
         }
@@ -270,16 +415,15 @@ impl Session {
         let jobs: Vec<Job> = jobs
             .into_iter()
             .enumerate()
-            .map(|(n, (session, task, link))| {
+            .map(|(n, (index, session, task, link))| {
                 let label = if several {
                     format!("{}#{}", task.agent.name, n + 1)
                 } else {
                     task.agent.name.clone()
                 };
                 ui.info(&format!("⤷ {label}: {}", task.description));
-                labels[link.index] = label.clone();
+                labels[index] = label.clone();
                 Job {
-                    index: link.index,
                     label,
                     agent: task.agent,
                     prompt: task.prompt,
@@ -320,7 +464,8 @@ impl Session {
                     Ok(Event::Done { index, outcome }) => {
                         ui.info(&outcome.line);
                         self.usage_out += outcome.tokens_out;
-                        slots[index] = Slot::Done(outcome.text, outcome.ok);
+                        let ok = outcome.status != Status::Failed;
+                        slots[index] = Slot::Done(outcome.text, ok);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -341,16 +486,114 @@ impl Session {
             .zip(&calls[..batch])
             .map(|(slot, call)| {
                 let (text, ok) = match slot {
-                    // Its `tool_end` was shown when it was refused.
-                    Slot::Refused(text) => return text,
+                    // Its `tool_end` was shown when it got its result.
+                    Slot::Settled(text) => return text,
                     Slot::Done(text, ok) => (text, ok),
                     // Its thread ended without a word: it panicked.
-                    Slot::Running => ("error: the subagent crashed".to_string(), false),
+                    Slot::Running => (CRASHED.to_string(), false),
                 };
                 ui.tool_end(&call.name, &text, ok);
                 text
             })
             .collect()
+    }
+
+    /// Start `task` in the background: a child on a thread of its own, which
+    /// this turn does not wait for. `Ok` is the call's result — the agent's
+    /// id and what to expect — and `Err` the reason it was not started.
+    fn start_background(&mut self, task: TaskCall, ui: &mut dyn Ui) -> Result<String, String> {
+        let max = self.settings.agents.max_background;
+        let roster = self.background.roster();
+        let seat = roster.start(
+            max.unwrap_or(background::DEFAULT_MAX),
+            &task.agent.name,
+            &task.description,
+        )?;
+        let seat = Arc::new(seat);
+        let (id, name) = (seat.id(), task.agent.name.clone());
+        // Nobody will be there to ask: its calls are decided by the rules
+        // and the mode as they are now (see `background`).
+        let rules = Rules {
+            // Only the rules in effect: an untrusted project's own allow
+            // rules don't count (see `trust`), least of all for an agent
+            // that runs with nobody to ask.
+            permissions: self.trust.permissions(&self.settings.permissions),
+            mode: self.mode,
+            root: self.root.clone(),
+            tools: self.tools.filtered(|tool| task.agent.allows(tool)),
+        };
+        let link = Link {
+            stop: seat.stop_flag(),
+            to: Parent::Detached {
+                seat: Arc::clone(&seat),
+                rules: Arc::new(rules),
+            },
+        };
+        let job = Job {
+            label: format!("{name} {id}"),
+            session: self.child(&task.agent, link.clone()),
+            agent: task.agent,
+            prompt: task.prompt,
+            link,
+        };
+        let thread = std::thread::Builder::new().name(id.clone());
+        if let Err(e) = thread.spawn(move || job.run()) {
+            seat.withdraw();
+            return Err(format!("error: could not start the agent's thread: {e}"));
+        }
+        ui.info(&format!(
+            "⤷ {name} {id}: {} (in the background)",
+            task.description
+        ));
+        Ok(format!(
+            "started background agent {id} ({name}). It works on its own from here: you will \
+             be notified when it ends, and its report arrives then as a <subagent> block. Do \
+             not wait for it and do not poll — go on with other work, or end your turn if \
+             there is nothing else to do."
+        ))
+    }
+
+    /// `/agents`: the agents that can be run and the ones running in the
+    /// background; `/agents stop <id>` stops one of those.
+    pub(super) fn agents_command(&mut self, args: &[&str], ui: &mut dyn Ui) {
+        let roster = self.background.roster();
+        match args {
+            [] => {
+                if self.is_claude() {
+                    ui.info(
+                        "Claude backend: claude runs subagents of its own; these are not offered to it.",
+                    );
+                }
+                let global = agents::global_dir();
+                for line in agents::command(&self.root, global.as_deref()) {
+                    ui.info(&line);
+                }
+                let running = roster.listing();
+                if !running.is_empty() {
+                    ui.info("in the background (/agents stop <id> stops one):");
+                }
+                for line in running {
+                    ui.info(&line);
+                }
+            }
+            ["stop", id] => ui.info(&roster.stop(id)),
+            _ => ui.info("usage: /agents [stop <id>]"),
+        }
+    }
+
+    /// How many background agents are running.
+    pub(super) fn background_agents(&self) -> usize {
+        self.background.roster().running()
+    }
+
+    /// The session's background agents, for a turn (or an idle look) that
+    /// is about to collect their reports. Whoever asks is the session
+    /// looking, so the output tokens of the agents that ended join its
+    /// count here.
+    pub(super) fn roster(&mut self) -> Roster {
+        let roster = self.background.roster();
+        self.usage_out += roster.take_tokens_out();
+        roster
     }
 
     /// A session for one run of `agent`, reporting through `link`. See the
@@ -391,10 +634,7 @@ struct ChildUi {
 
 impl ChildUi {
     fn report(&self, text: String) {
-        let _ = self.link.events.send(Event::Activity {
-            index: self.link.index,
-            text,
-        });
+        self.link.activity(text);
     }
 }
 
@@ -416,9 +656,10 @@ impl Ui for ChildUi {
         self.report(text.to_string());
     }
     fn ask_approval(&mut self, _tool: &str, _arguments: &str) -> Approval {
-        // Not reached: a child's calls are approved on the parent's thread
-        // (`Link::approve`), which is where the user is asked. Should a
-        // prompt ever come this way, nobody is here to answer it.
+        // Not reached: a child's calls are decided through its link
+        // (`Link::approve`) — on the parent's thread, which is where the
+        // user is asked, or by the rules alone. Should a prompt ever come
+        // this way, nobody is here to answer it.
         Approval::Deny
     }
     fn notice(&mut self, text: &str) {
@@ -496,7 +737,212 @@ fn clip(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::agent::{Dispatch, dispatch};
+    use crate::config::Config;
+    use crate::settings::Settings;
+    use crate::tools::{FileState, ToolCtx, builtin_registry};
+
+    /// A [`Ui`] that keeps the lines it is shown.
+    #[derive(Default)]
+    struct Lines(Vec<String>);
+
+    impl Ui for Lines {
+        fn reasoning(&mut self, _: &str) {}
+        fn content(&mut self, _: &str) {}
+        fn tool_start(&mut self, _: &str, _: &str) {}
+        fn tool_end(&mut self, _: &str, _: &str, _: bool) {}
+        fn info(&mut self, text: &str) {
+            self.0.push(text.to_string());
+        }
+        fn ask_approval(&mut self, _: &str, _: &str) -> Approval {
+            Approval::Deny
+        }
+        fn notice(&mut self, _: &str) {}
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("atl-subagent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn session(root: &std::path::Path) -> Session {
+        Session::new(
+            Config::from_env(false),
+            root.to_path_buf(),
+            builtin_registry(),
+            Vec::new(),
+            Settings::default(),
+            crate::trust::testing::open(root),
+        )
+    }
+
+    fn done(text: &str) -> Outcome {
+        Outcome {
+            status: Status::Done,
+            steps: 3,
+            text: text.to_string(),
+            line: "⤶ explore agent-1: done (3 steps)".to_string(),
+            tokens_out: 40,
+        }
+    }
+
+    /// The session's side of a background agent, from its start to its
+    /// report: listed and stoppable while it runs, a reason to confirm
+    /// quitting, then one line for the user at the idle look and the block
+    /// in front of the next prompt — and its tokens in the session's count.
+    #[test]
+    fn a_session_lists_stops_and_collects_its_background_agents() {
+        let root = scratch("lifecycle");
+        let mut session = session(&root);
+        let mut ui = Lines::default();
+        assert_eq!(session.background_agents(), 0);
+        assert!(session.confirm_quit(&mut ui));
+
+        let roster = session.background.roster();
+        let seat = roster.start(4, "explore", "find the parser").unwrap();
+        assert_eq!(session.background_agents(), 1);
+
+        // Quitting: a warning first, then it goes ahead.
+        assert!(!session.confirm_quit(&mut ui));
+        assert_eq!(
+            ui.0,
+            [
+                "1 background agent(s) are running; quitting would stop them.",
+                "quit again to quit anyway"
+            ]
+        );
+        assert!(session.confirm_quit(&mut ui));
+
+        // `/agents` lists it after the agents that can be run.
+        ui.0.clear();
+        assert!(matches!(
+            dispatch(&mut session, "/agents", &mut ui),
+            Dispatch::Handled
+        ));
+        let at = ui.0.iter().position(|l| l.starts_with("in the background"));
+        let at = at.expect("a section for the running agents");
+        assert!(
+            ui.0[at + 1].starts_with("  agent-1  explore — find the parser · running "),
+            "{:?}",
+            ui.0
+        );
+
+        // `/agents stop` reaches that agent's flag; anything else is usage.
+        ui.0.clear();
+        dispatch(&mut session, "/agents stop agent-1", &mut ui);
+        dispatch(&mut session, "/agents halt", &mut ui);
+        assert!(
+            ui.0[0].starts_with("stopping agent-1 (explore)"),
+            "{:?}",
+            ui.0
+        );
+        assert_eq!(ui.0[1], "usage: /agents [stop <id>]");
+        assert!(seat.stop_flag().load(Ordering::Relaxed));
+
+        // It ends while the session is idle: the user is shown its line at
+        // the next look, once, and nothing is left to confirm at a quit.
+        seat.finish(done("REPORT"));
+        ui.0.clear();
+        let (_, before) = session.usage();
+        assert!(session.poll_peers(&mut ui));
+        assert_eq!(ui.0, ["⤶ explore agent-1: done (3 steps)"]);
+        assert_eq!(session.usage().1, before + 40);
+        assert!(!session.poll_peers(&mut ui));
+        assert!(session.confirm_quit(&mut ui));
+
+        // The model has not had the block: it leads the next prompt.
+        ui.0.clear();
+        let agents = session.roster();
+        let prompt = crate::agent::jobs::lead(&agents, "what now?", &mut ui);
+        assert!(
+            prompt.starts_with("<subagent id=\"agent-1\" agent=\"explore\" status=\"done\""),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("\n\nwhat now?"), "{prompt}");
+        // The user saw the line already; and the block goes out once.
+        assert!(ui.0.is_empty(), "{:?}", ui.0);
+        assert_eq!(crate::agent::jobs::lead(&agents, "again", &mut ui), "again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Dropping the session stops the agents it started.
+    #[test]
+    fn a_dropped_session_stops_its_background_agents() {
+        let root = scratch("drop");
+        let session = session(&root);
+        let seat = session
+            .background
+            .roster()
+            .start(4, "general", "long work")
+            .unwrap();
+        let stop = seat.stop_flag();
+        // An agent that ends as soon as it is told to.
+        let agent = std::thread::spawn(move || {
+            while !seat.stop_flag().load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            seat.finish(done("partial"));
+        });
+        drop(session);
+        assert!(stop.load(Ordering::Relaxed));
+        agent.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A child has its own read tracking, so two conversations editing one
+    /// file collide where the docs say they do: the parent's edit of a file
+    /// a child changed after the parent read it is rejected as stale, not
+    /// applied over the child's change.
+    #[test]
+    fn a_parents_edit_of_a_file_a_child_changed_since_is_rejected_as_stale() {
+        let root = scratch("stale");
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        let tools = builtin_registry();
+        let (mut parent, mut child) = (FileState::new(), FileState::new());
+        let call = |fstate: &mut FileState, tool: &str, args: Value| {
+            let mut ctx = ToolCtx {
+                project_root: &root,
+                fstate,
+                approved: true,
+            };
+            tools.get(tool).unwrap().call(&mut ctx, args)
+        };
+        let read = serde_json::json!({"path": "f.txt"});
+        let edit = |old: &str, new: &str| serde_json::json!({"path": "f.txt", "old_string": old, "new_string": new});
+
+        call(&mut parent, "read", read.clone()).unwrap();
+        // The child must read before it edits, whatever the parent read.
+        let unread = call(&mut child, "edit", edit("one", "two")).unwrap_err();
+        assert!(unread.to_string().contains("has not been read"), "{unread}");
+        call(&mut child, "read", read.clone()).unwrap();
+        call(&mut child, "edit", edit("one", "two")).unwrap();
+
+        let stale = call(&mut parent, "edit", edit("one", "three")).unwrap_err();
+        assert!(
+            stale
+                .to_string()
+                .contains("has changed on disk since it was last read; re-read it before editing"),
+            "{stale}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "two\n"
+        );
+
+        // Re-read, the parent edits what is there now.
+        call(&mut parent, "read", read).unwrap();
+        call(&mut parent, "edit", edit("two", "three")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "three\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn tool_calls_are_summarized_in_a_line() {

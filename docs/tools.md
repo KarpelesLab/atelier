@@ -544,12 +544,22 @@ their descriptions.
 | `agent`       | string | yes      | Which agent runs it: `explore`, `general`, or one defined in `.atelier/agents/` |
 | `prompt`      | string | yes      | The complete task — goal, known facts and paths, what to report |
 | `description` | string | no       | The task in 3–6 words, shown while it runs (default: the prompt's first line) |
+| `background`  | boolean | no      | Start the agent and return its id at once instead of waiting for its report (default false; `run_in_background` is accepted too) |
 
 The result is the subagent's final message followed by a footer,
 `[explore: 7 steps · 412 output tokens]`. A subagent that reaches its step
 cap is made to wrap up without tools, and its report says so. An unknown
 agent is an error that lists the available ones; a subagent that fails (the
 endpoint errored) is an error result with the cause.
+
+With `background: true` the result is the agent's id (`started background
+agent agent-1 (explore). …`), and the report arrives later as a
+`<subagent id="agent-1" …>` block — between two steps of a running turn, or
+in front of your next prompt — exactly as a finished background job's notice
+does. A background agent has no user to ask, so a call the permission rules
+would ask about is denied to it; see [in the
+background](agents.md#in-the-background) for that, `/agents stop`, and the
+limit of 4 running at once.
 
 `task` calls that follow one another in one step run at the same time; their
 results come back in call order. Subagents have every limit the caller has —

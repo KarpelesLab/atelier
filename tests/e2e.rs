@@ -4600,3 +4600,585 @@ done
     assert!(server.exists(), "{stderr}");
     assert!(!stderr.contains("project trust"), "{stderr}");
 }
+
+/// What opens a background agent's report in a request. (The `task` tool's
+/// description mentions the tag too, without attributes.)
+const AGENT_NOTICE: &str = "<subagent id=";
+
+/// How long a test waits for something that should happen at once.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// Block until `done` holds, failing the test if it does not within
+/// [`PATIENCE`].
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// An interactive `atelier` (the line REPL) whose output the test can watch
+/// while it runs: what it printed so far is kept as it comes, so a test can
+/// wait for a line before typing the next one.
+struct LiveRepl {
+    child: std::process::Child,
+    stdout: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl LiveRepl {
+    fn start(base_url: &str, cwd: &Path) -> LiveRepl {
+        let mut child = atelier(base_url, cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn atelier binary");
+        let collect = |pipe: Box<dyn Read + Send>| {
+            let text = Arc::new(Mutex::new(String::new()));
+            let sink = Arc::clone(&text);
+            let reader = thread::spawn(move || {
+                let mut pipe = pipe;
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    // Decoded as a whole each time: a read may end inside
+                    // a character.
+                    bytes.extend_from_slice(&buf[..n]);
+                    *sink.lock().unwrap() = String::from_utf8_lossy(&bytes).into_owned();
+                }
+            });
+            (text, reader)
+        };
+        let (stdout, out_reader) = collect(Box::new(child.stdout.take().expect("stdout")));
+        let (stderr, err_reader) = collect(Box::new(child.stderr.take().expect("stderr")));
+        LiveRepl {
+            child,
+            stdout,
+            stderr,
+            readers: vec![out_reader, err_reader],
+        }
+    }
+
+    /// Type one line at the prompt.
+    fn line(&mut self, text: &str) {
+        writeln!(self.child.stdin.as_mut().expect("stdin open"), "{text}").expect("write a line");
+    }
+
+    fn stdout(&self) -> String {
+        self.stdout.lock().unwrap().clone()
+    }
+
+    /// Wait until `needle` has been printed.
+    fn wait_for(&self, needle: &str) {
+        wait_until(needle, || self.stdout().contains(needle));
+    }
+
+    /// Type `line` again and again until `needle` has been printed: for
+    /// what the REPL only shows when it comes back to its prompt.
+    fn type_until(&mut self, line: &str, needle: &str) {
+        let deadline = Instant::now() + PATIENCE;
+        while !self.stdout().contains(needle) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {needle:?}; stdout:\n{}\nstderr:\n{}",
+                self.stdout(),
+                self.stderr.lock().unwrap()
+            );
+            self.line(line);
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// End the input and collect everything printed (stdout, stderr).
+    fn finish(mut self) -> (String, String) {
+        drop(self.child.stdin.take());
+        let deadline = Instant::now() + PATIENCE;
+        while self.child.try_wait().expect("try_wait").is_none() {
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!("atelier did not exit; stdout:\n{}", self.stdout());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        (self.stdout(), self.stderr.lock().unwrap().clone())
+    }
+}
+
+/// What opens the built-in `general` agent's system prompt.
+const GENERAL_MARKER: &str = "general-purpose agent";
+
+/// A `bash` call that says it started (`started`) and then waits for the
+/// test to let it go on (`go`): how a test holds a background agent in
+/// place without guessing at times.
+#[cfg(unix)]
+fn gated_bash(id: &str) -> Vec<u8> {
+    json_tool_call(
+        id,
+        "bash",
+        serde_json::json!({
+            "command": "echo > started; while [ ! -e go ]; do sleep 0.02; done; echo released"
+        }),
+    )
+}
+
+/// One more step of other work for a parent that waits on a background
+/// agent's report — a `read` of `busy.txt`, paced — for as long as the
+/// agent can possibly need; past that, an answer that fails the test.
+fn busy_step(since: Instant, n: usize) -> Vec<u8> {
+    if since.elapsed() > PATIENCE {
+        return text_response("the agent never reported");
+    }
+    thread::sleep(Duration::from_millis(10));
+    json_tool_call(
+        &format!("call_busy_{n}"),
+        "read",
+        serde_json::json!({"path": "busy.txt"}),
+    )
+}
+
+/// Background agents 1 — within a turn. `task` with `background: true`
+/// returns at once with the agent's id, and the parent goes on with other
+/// work (here: reads, one step after the other, for as long as the agent
+/// has not reported). When the agent ends, its report arrives between two
+/// steps as a user message: the marked block and the line saying it is the
+/// harness speaking. Once, however many steps follow, and the user is shown
+/// one line for its start and one for its end.
+#[test]
+fn a_background_agent_reports_later_in_the_same_turn_exactly_once() {
+    let started = Instant::now();
+    let mock = Mock::by_body(Arc::new(move |body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(EXPLORE_MARKER) {
+            return match results {
+                0 => json_tool_call(
+                    "call_read",
+                    "read",
+                    serde_json::json!({"path": "notes.txt"}),
+                ),
+                _ => text_response("CHILD-REPORT: notes.txt:1 holds the marker"),
+            };
+        }
+        let told = body.contains(AGENT_NOTICE);
+        match results {
+            0 => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "explore",
+                    "prompt": "CHILD-TASK: say what notes.txt holds",
+                    "description": "inspect the notes",
+                    "background": true,
+                }),
+            ),
+            _ if told && body.contains("AFTER-THE-NOTICE") => text_response("parent done"),
+            _ if told => json_tool_call(
+                "call_after",
+                "read",
+                serde_json::json!({"path": "after.txt"}),
+            ),
+            n => busy_step(started, n),
+        }
+    }));
+    let dir = unique_dir("bg-agent");
+    std::fs::write(dir.join("notes.txt"), "MARKER-IN-FILE\n").unwrap();
+    std::fs::write(dir.join("busy.txt"), "busy\n").unwrap();
+    std::fs::write(dir.join("after.txt"), "AFTER-THE-NOTICE\n").unwrap();
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &[
+            "-p",
+            "--output-format",
+            "stream-json",
+            "look into the notes",
+        ],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let events = json_lines(&out);
+    assert_eq!(
+        events.last().unwrap()["result"],
+        "parent done",
+        "{events:?}"
+    );
+
+    // The call returned before the agent had reported: its result is the
+    // id, in the request that follows the call.
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = messages_of(&parent[1], "tool");
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].starts_with("started background agent agent-1 (explore)."),
+        "{results:?}"
+    );
+    assert!(results[0].contains("do not poll"), "{results:?}");
+
+    // The agent ran as any `explore` does.
+    let child = requests_with_system(&mock, EXPLORE_MARKER);
+    assert_eq!(child.len(), 2);
+    assert!(messages_of(&child[1], "tool")[0].contains("MARKER-IN-FILE"));
+
+    // Its report: once in the whole conversation, as the last request holds
+    // it, in a user message.
+    let last = mock.body(mock.requests() - 1);
+    assert_eq!(last.matches(AGENT_NOTICE).count(), 1, "{last}");
+    let users = messages_of(&request(&last), "user");
+    let notice = users
+        .iter()
+        .find(|m| m.contains(AGENT_NOTICE))
+        .expect("the report is a user message");
+    assert!(
+        notice.starts_with(
+            "<subagent id=\"agent-1\" agent=\"explore\" status=\"done\" steps=\"2\">\n\
+             CHILD-REPORT: notes.txt:1 holds the marker\n\n[explore agent-1: 2 steps"
+        ),
+        "{notice}"
+    );
+    assert!(notice.contains("]\n</subagent>\n"), "{notice}");
+    assert!(notice.contains("not a message from your user"), "{notice}");
+
+    // The user: a line when it starts, a line when it ends, and no echo of
+    // the block as something they typed.
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .filter_map(|e| e["text"].as_str())
+        .filter(|t| t.contains("agent-1"))
+        .collect();
+    assert_eq!(
+        info,
+        [
+            "⤷ explore agent-1: inspect the notes (in the background)",
+            "⤶ explore agent-1: done (2 steps)"
+        ]
+    );
+    assert_eq!(of_type(&events, "tool_end")[0]["ok"], true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches("<subagent id").count(), 0, "{stdout}");
+}
+
+/// A mock for one background `general` agent held at a gate (see
+/// [`gated_bash`]): the parent starts it and answers `started`; a prompt
+/// containing `second prompt` is answered `seen`. The agent reports
+/// `CHILD-REPORT: released` once let go.
+#[cfg(unix)]
+fn gated_agent_mock() -> Mock {
+    Mock::by_body(Arc::new(|body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(GENERAL_MARKER) {
+            return match results {
+                0 => gated_bash("call_gate"),
+                _ => text_response("CHILD-REPORT: released"),
+            };
+        }
+        let users = messages_of(&req, "user");
+        match results {
+            _ if users.last().unwrap().contains("second prompt") => text_response("seen"),
+            0 => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "CHILD-TASK",
+                    "run_in_background": true,
+                }),
+            ),
+            _ => text_response("started"),
+        }
+    }))
+}
+
+/// Wait for the gated agent's `bash` to be running.
+#[cfg(unix)]
+fn wait_for_gate(dir: &Path) {
+    let started = dir.join("started");
+    wait_until("the agent's bash call", || started.exists());
+}
+
+/// Background agents 2 — between turns. An agent that ends while the
+/// session is idle does not wake the model: the user is shown one line when
+/// the session next looks, nothing is requested until their next prompt,
+/// and that prompt carries the report in front of it. Meanwhile `/agents`
+/// lists the agent with what it is doing.
+#[cfg(unix)]
+#[test]
+fn a_background_agent_that_ends_between_turns_leads_the_next_prompt() {
+    let mock = gated_agent_mock();
+    let dir = unique_dir("bg-agent-idle");
+    let mut repl = LiveRepl::start(&mock.base_url(), &dir);
+
+    repl.line("first prompt");
+    // The turn ends while the agent is still at its gate.
+    repl.wait_for("started");
+    wait_for_gate(&dir);
+    repl.line("/agents");
+    repl.wait_for("in the background (/agents stop <id> stops one):");
+    repl.wait_for("  agent-1  general — CHILD-TASK · running ");
+    repl.wait_for("s · bash echo > started; while");
+
+    // Let it finish; the REPL shows its line when it is next at the prompt.
+    std::fs::write(dir.join("go"), "").unwrap();
+    repl.type_until("/agents", "⤶ general agent-1: done (2 steps)");
+    // Nobody was asked anything on its account: the parent's two requests
+    // and the agent's two are all there is.
+    assert_eq!(mock.requests(), 4);
+    assert!((0..4).all(|n| !mock.body(n).contains(AGENT_NOTICE)));
+
+    repl.line("second prompt");
+    let (stdout, stderr) = repl.finish();
+    assert_eq!(mock.requests(), 5, "stdout: {stdout}\nstderr: {stderr}");
+    let last = mock.body(4);
+    assert_eq!(last.matches(AGENT_NOTICE).count(), 1, "{last}");
+    let users = messages_of(&request(&last), "user");
+    // (After the turn's project context, which opens the message.)
+    let prompt = users.last().unwrap();
+    assert!(
+        prompt.contains(
+            "<subagent id=\"agent-1\" agent=\"general\" status=\"done\" steps=\"2\">\n\
+             CHILD-REPORT: released\n\n[general agent-1: 2 steps"
+        ),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("second prompt"), "{prompt}");
+    assert_eq!(
+        stdout.matches("⤶ general agent-1: done").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stdout.contains("seen"), "{stdout}");
+}
+
+/// Background agents 3 — `/agents stop`. Stopping is cooperative: the agent
+/// ends after the call it is in, without another request, and what comes
+/// back is marked as stopped rather than as a report.
+#[cfg(unix)]
+#[test]
+fn agents_stop_ends_a_background_agent_at_its_next_step() {
+    let mock = gated_agent_mock();
+    let dir = unique_dir("bg-agent-stop");
+    let mut repl = LiveRepl::start(&mock.base_url(), &dir);
+
+    repl.line("first prompt");
+    repl.wait_for("started");
+    wait_for_gate(&dir);
+    repl.line("/agents stop agent-7");
+    repl.wait_for("no background agent agent-7");
+    repl.line("/agents stop agent-1");
+    repl.wait_for("stopping agent-1 (general)");
+    // Still in its call: it has not ended yet.
+    assert!(!repl.stdout().contains("⤶ general agent-1"));
+
+    std::fs::write(dir.join("go"), "").unwrap();
+    repl.type_until("/agents", "⤶ general agent-1: stopped (1 step)");
+    // It never sent the result of that call.
+    assert_eq!(requests_with_system(&mock, GENERAL_MARKER).len(), 1);
+    repl.line("/agents stop agent-1");
+    repl.wait_for("agent-1 has already ended");
+
+    repl.line("second prompt");
+    let (stdout, stderr) = repl.finish();
+    let last = mock.body(mock.requests() - 1);
+    let users = messages_of(&request(&last), "user");
+    let prompt = users.last().unwrap();
+    assert!(
+        prompt
+            .contains("<subagent id=\"agent-1\" agent=\"general\" status=\"stopped\" steps=\"1\">"),
+        "{prompt}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(prompt.contains("stopped before it finished"), "{prompt}");
+    assert!(!prompt.contains("CHILD-REPORT"), "{prompt}");
+}
+
+/// Background agents 4 — leaving. With an agent running, the first `/quit`
+/// only warns; the second goes ahead, and the agent is stopped with the
+/// session.
+#[cfg(unix)]
+#[test]
+fn quitting_with_a_background_agent_running_warns_first() {
+    let mock = gated_agent_mock();
+    let dir = unique_dir("bg-agent-quit");
+    let mut repl = LiveRepl::start(&mock.base_url(), &dir);
+
+    repl.line("first prompt");
+    repl.wait_for("started");
+    wait_for_gate(&dir);
+    repl.line("/quit");
+    repl.wait_for("1 background agent(s) are running; quitting would stop them.");
+    repl.wait_for("quit again to quit anyway");
+    repl.line("/quit");
+    // More input, which a session that quit never reads.
+    repl.line("second prompt");
+    // The agent is let out of its call, so that atelier finds it stopped
+    // on the way out instead of giving up on it.
+    std::fs::write(dir.join("go"), "").unwrap();
+    let (stdout, _stderr) = repl.finish();
+    assert_eq!(
+        stdout.matches("quitting would stop them").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("seen"), "{stdout}");
+}
+
+/// Background agents 5 — the limit. With `[agents] max_background = 1`, the
+/// second of two background calls in one step is refused with an error
+/// result; the first runs.
+#[cfg(unix)]
+#[test]
+fn background_agents_past_the_limit_are_refused() {
+    let dir = unique_dir("bg-agent-limit");
+    let go = dir.join("go");
+    let mock = Mock::by_body(Arc::new(move |body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(GENERAL_MARKER) {
+            return match results {
+                0 => gated_bash("call_gate"),
+                _ => text_response("CHILD-REPORT"),
+            };
+        }
+        let task = |prompt: &str| serde_json::json!({"agent": "general", "prompt": prompt, "background": true});
+        match results {
+            0 => tool_calls_response(&[
+                ("call_a", "task", task("TASK-ALPHA")),
+                ("call_b", "task", task("TASK-BETA")),
+            ]),
+            _ => {
+                // Both calls have their results: the first agent may go.
+                std::fs::write(&go, "").unwrap();
+                text_response("parent done")
+            }
+        }
+    }));
+    std::fs::write(dir.join("atelier.toml"), "[agents]\nmax_background = 1\n").unwrap();
+
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "do both"],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = tool_results(&parent[1]);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "call_a");
+    assert!(
+        results[0].1.starts_with("started background agent agent-1"),
+        "{results:?}"
+    );
+    assert_eq!(results[1].0, "call_b");
+    assert!(
+        results[1]
+            .1
+            .starts_with("error: 1 background agents are running already, which is the limit"),
+        "{results:?}"
+    );
+    let events = json_lines(&out);
+    let ok: Vec<&serde_json::Value> = of_type(&events, "tool_end")
+        .iter()
+        .map(|e| &e["ok"])
+        .collect();
+    assert_eq!(ok, [&serde_json::json!(true), &serde_json::json!(false)]);
+    // Only the first ever ran.
+    let child = requests_with_system(&mock, GENERAL_MARKER);
+    assert!(
+        child
+            .iter()
+            .all(|r| messages_of(r, "user") == ["TASK-ALPHA"])
+    );
+}
+
+/// Background agents 6 — approvals. A background agent has no user to ask:
+/// without auto-approve, its `bash` call — which would prompt in the
+/// foreground — is refused with a result that says why and what to do, the
+/// command does not run, and nobody is prompted. What the rules let through
+/// without asking (a write inside the project) still runs.
+#[test]
+fn a_background_agents_call_that_would_ask_is_denied() {
+    let started = Instant::now();
+    let mock = Mock::by_body(Arc::new(move |body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(GENERAL_MARKER) {
+            return match results {
+                0 => json_tool_call(
+                    "call_bash",
+                    "bash",
+                    serde_json::json!({"command": "echo made > made.txt"}),
+                ),
+                1 => json_tool_call(
+                    "call_write",
+                    "write",
+                    serde_json::json!({"path": "written.txt", "content": "by the agent"}),
+                ),
+                _ => text_response("CHILD-REPORT: I needed bash to make made.txt"),
+            };
+        }
+        match results {
+            0 => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "make the files",
+                    "background": true,
+                }),
+            ),
+            _ if body.contains(AGENT_NOTICE) => text_response("parent done"),
+            n => busy_step(started, n),
+        }
+    }));
+    let dir = unique_dir("bg-agent-approval");
+    std::fs::write(dir.join("busy.txt"), "busy\n").unwrap();
+
+    let out = run_atelier_setenv(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "go"],
+        None,
+        &[("ATELIER_APPROVE", None)],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let events = json_lines(&out);
+    assert_eq!(
+        events.last().unwrap()["result"],
+        "parent done",
+        "{events:?}"
+    );
+
+    let child = requests_with_system(&mock, GENERAL_MARKER);
+    assert_eq!(child.len(), 3);
+    let results = messages_of(&child[2], "tool");
+    assert!(
+        results[0].contains("you are running in the background, where there is no user to ask"),
+        "{results:?}"
+    );
+    assert!(
+        results[0].contains("say in your final report"),
+        "{results:?}"
+    );
+    assert!(!dir.join("made.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("written.txt")).unwrap(),
+        "by the agent"
+    );
+    // The report reached the parent, and no prompt was put to anyone.
+    let last = mock.body(mock.requests() - 1);
+    assert!(last.contains("CHILD-REPORT: I needed bash"), "{last}");
+    assert!(of_type(&events, "approval").is_empty(), "{events:?}");
+}

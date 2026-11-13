@@ -71,6 +71,9 @@ pub struct Settings {
     /// More instruction files to load.
     #[serde(default, skip_serializing_if = "InstructionSettings::is_unset")]
     pub instructions: InstructionSettings,
+    /// Limits on subagents (see `agent::subagent`).
+    #[serde(default, skip_serializing_if = "AgentSettings::is_empty")]
+    pub agents: AgentSettings,
 }
 
 /// `[sandbox]`: run the `bash` tool's commands inside nixvm (see
@@ -149,6 +152,21 @@ impl GoalSettings {
     /// Nothing set: the table is left out when the settings are written.
     fn is_unset(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// `[agents]`: limits on the subagents the `task` tool runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentSettings {
+    /// The most background agents running at once; a `task` call past it
+    /// is refused. Unset means the built-in default (4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_background: Option<usize>,
+}
+
+impl AgentSettings {
+    fn is_empty(&self) -> bool {
+        self.max_background.is_none()
     }
 }
 

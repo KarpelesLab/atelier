@@ -324,6 +324,12 @@ the same prompt (after a line naming the agent that asks), the same
 itself is a tool like any other in rules: `deny = ["task"]` switches
 subagents off.
 
+A subagent started [in the background](agents.md#in-the-background) cannot
+prompt anyone: the rules and the mode — as they were when it started —
+decide alone, and a call they would **ask** about is **denied**, with a
+result telling the agent to report what it needed. Nothing it does is saved
+as an "always" rule.
+
 ## The Claude backend
 
 Atelier's own tools reach claude as `mcp__atelier__<tool>` and run through

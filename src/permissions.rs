@@ -1151,6 +1151,29 @@ pub(crate) fn approve_with(
     }
 }
 
+/// [`approve`] with nobody to ask — a subagent running in the background:
+/// the rules and the `mode` decide alone, nothing is prompted and nothing is
+/// saved. A call they would put to the user is refused, with `nobody` as
+/// the tool result. (A `permission_request` hook answers in the user's
+/// place at a prompt; there is none here, so it is not consulted.)
+pub fn approve_unattended(
+    policy: &Policy,
+    root: &Path,
+    mode: Mode,
+    req: &Request,
+    nobody: &str,
+) -> Result<(), String> {
+    let args: Value = serde_json::from_str(req.arguments).unwrap_or(Value::Null);
+    let (ruling, verdict) = judge(policy, mode, req, &args, root);
+    match ruling {
+        Ruling::Run => Ok(()),
+        Ruling::Denied => Err(deny_refusal(&verdict, root)),
+        Ruling::Planning => Err(plan_refusal(req.tool)),
+        Ruling::Ask if req.hook_allowed => Ok(()),
+        Ruling::Ask => Err(nobody.to_string()),
+    }
+}
+
 /// "Always": save the rules that let this call through, and say which — or
 /// say that none fits and the call ran once.
 #[allow(clippy::too_many_arguments)]

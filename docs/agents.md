@@ -18,7 +18,8 @@ model). Two are built in; you define more as Markdown files.
 | `general` | every tool the session has, except `task` | A self-contained multi-step task: research, an isolated change, running and fixing something |
 
 `/agents` lists every agent available, where each is defined, its tools and
-its step cap.
+its step cap — and, below them, the agents [running in the
+background](#in-the-background).
 
 ## Agents as files
 
@@ -119,6 +120,9 @@ exactly as for the main agent.
 A rule can also govern `task` itself: `deny = ["task"]` switches subagents
 off, `ask = ["task"]` asks before each one starts.
 
+An agent started [in the background](#in-the-background) is the exception to
+"asks you": nobody is asked on its behalf, and what would ask is denied.
+
 ## The step cap
 
 Each model request a subagent makes is a step. When it has used `max_steps`
@@ -156,7 +160,8 @@ reasoning, which the main agent summarizes for you:
 ```
 
 When several run together they are numbered (`explore#1`, `explore#2`) and
-every line says whose it is. Ctrl-C stops the turn and the subagents with it.
+every line says whose it is. Ctrl-C stops the turn and the subagents with it
+— the ones the turn is waiting for, not those in the background.
 
 In [headless](headless.md) `stream-json` output these lines are ordinary
 `info` events between the `task` call's `tool_start` and `tool_end`.
@@ -164,6 +169,111 @@ In [headless](headless.md) `stream-json` output these lines are ordinary
 The tool result the main agent gets is the subagent's final message and a
 footer: `[explore: 3 steps · 412 output tokens]`. A subagent's output tokens
 are added to the session's count.
+
+## In the background
+
+With `background: true`, `task` does not wait. The call returns at once with
+an id, and the agent works on while the main agent does — and after its turn
+has ended:
+
+```
+⚙ task {"agent":"explore","prompt":"…","description":"map the parser","background":true}
+⤷ explore agent-1: map the parser (in the background)
+✓ started background agent agent-1 (explore). It works on its own from here: …
+```
+
+When it ends, its report comes back **as a notification**, the way a finished
+[`bash` background job](tools.md#bash) does:
+
+- You see one line: `⤶ explore agent-1: done (7 steps)`.
+- The model gets the report in a marked block, followed by a line saying it
+  is the harness speaking and not you:
+
+  ```
+  <subagent id="agent-1" agent="explore" status="done" steps="7">
+  The parser is in src/parse/ …
+
+  [explore agent-1: 7 steps · 412 output tokens]
+  </subagent>
+  ```
+
+  During a turn it arrives between two steps, like a message you typed
+  mid-turn. If the agent ends while the session is idle, **the model is not
+  woken**: the block leads your next prompt. Each report is delivered once.
+
+`status` is `done`, `wrapped-up` (it reached its [step cap](#the-step-cap)),
+`failed` (the endpoint errored) or `stopped`.
+
+### Nobody is asked
+
+A foreground subagent's call that needs approval is put to you while the main
+agent waits for it. A background agent has no such moment — a prompt popping
+up in the middle of whatever you are typing would be answered by accident —
+so **nobody is asked on its behalf**. Its calls are decided by the
+[permission rules](permissions.md) and the mode alone:
+
+| The rules and the mode say | In the background |
+|---|---|
+| run (an `allow` rule, a confined tool, `yolo`) | runs |
+| refuse (a `deny` rule, plan mode) | refused, as everywhere |
+| **ask** | **denied** — the agent is told it runs in the background with no user to ask, not to retry, and to say in its report what it needed |
+
+So a background agent is useful for what your rules already permit: read-only
+agents such as `explore`, edits inside the project in the default mode,
+commands covered by `allow` rules (`bash(cargo test*)`), or anything in
+`yolo`. Without such rules `bash` and MCP tools are simply unavailable to it
+— start the agent in the foreground when it needs them. The rules and the
+mode are the ones in force **when the agent starts**; `/mode` afterwards does
+not reach an agent already running (`/agents stop` does). `permission_request`
+hooks are not consulted either: they answer a prompt, and there is none.
+
+### Listing and stopping
+
+```
+› /agents
+…
+in the background (/agents stop <id> stops one):
+  agent-1  explore — map the parser · running 42s · grep fn parse
+› /agents stop agent-1
+stopping agent-1 (explore) — it ends at its next step and reports where it got to
+```
+
+- `/agents stop <id>` is cooperative: the agent finishes the tool call it is
+  in, makes no further request, and comes back with `status="stopped"` and
+  the last thing it said instead of a report.
+- **Ctrl-C** stops the turn in the foreground and never a background agent
+  (the same rule as for [claude's background work](claude.md#stopping-a-turn-and-background-agents)).
+- **Quitting** stops them. With agents running, the first `/quit` (or
+  Ctrl-D) only warns; the second goes ahead. atelier then waits a few
+  seconds for them to wind down; an agent deep in a long command is left
+  behind, and that command is not killed. A [headless](headless.md) run
+  ends when its last prompt is answered, and stops what is still running
+  then: an agent's report has nobody to go to once the conversation is
+  over.
+- `/new` does not stop them: a report that arrives afterwards lands in the
+  new conversation.
+
+At most 4 background agents run at once (`[agents] max_background` in
+[`atelier.toml`](configuration.md#agents)); a `task` call past that is an
+error result telling the model to wait or to run the task in the foreground.
+Background agents cannot start agents either.
+
+### Two conversations, one directory
+
+A background agent works in the same project directory as the main agent,
+at the same time. Each has its own read tracking, so the stale-edit check
+does catch the collision: if the agent changes a file after the main agent
+read it, the main agent's `edit` (and `multiedit`, `apply_patch`,
+`notebook_edit`) of that file is rejected with *"has changed on disk since
+it was last read; re-read it before editing"*, and the other way round. It
+catches, it does not merge — and it does not cover everything: `write`
+replaces a whole file whatever is there, and `bash` does what it does. Use
+background agents to read and investigate, or give a background writer
+files nobody else will touch.
+
+A background agent's output tokens are added to the session's count when
+its end is noticed; `/usage` and the usage log count its requests like any
+others.
 
 ## With the Claude backend
 
@@ -176,7 +286,6 @@ it. `/agents` still lists what atelier would run.
 
 Planned under the same roadmap item (M18), not in this version:
 
-- **Background agents** — started and left to report when done.
 - **Worktree isolation** — an agent working in its own git worktree, its diff
   handed back, so parallel writers cannot collide.
 - **Subagents over the coordinator** — a child as another atelier instance

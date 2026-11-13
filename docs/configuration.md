@@ -205,6 +205,18 @@ default is 8192; `0` never defers.
 step [run at the same time](tools.md#read-only-calls-run-in-parallel); `false`
 runs every call one after the other.
 
+## `[agents]`
+
+Limits on [subagents](agents.md):
+
+```toml
+[agents]
+max_background = 4   # background agents running at once (the default)
+```
+
+A `task` call with `background: true` past `max_background` running agents
+is refused with an error result; `0` switches background agents off.
+
 ## `[[provider]]` — named endpoints
 
 The environment describes one endpoint (`ATELIER_BASE_URL`,
