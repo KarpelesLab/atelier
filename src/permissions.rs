@@ -833,6 +833,11 @@ pub struct Request<'a> {
     /// The tool's own default for this call
     /// ([`Tool::requires_approval_in`](crate::tools::Tool::requires_approval_in)).
     pub needs_approval: bool,
+    /// A `pre_tool` hook approved the call: nobody is asked, but deny rules
+    /// still refuse.
+    pub hook_allowed: bool,
+    /// The hooks whose `permission_request` may answer in the user's place.
+    pub hooks: Option<&'a crate::hooks::Hooks>,
 }
 
 /// Whether `req` may run: applies the rules, and prompts through `ui` when
@@ -883,7 +888,7 @@ fn approve_with(
         }
         Decision::Allow => return Ok(()),
         Decision::Default if !req.needs_approval => return Ok(()),
-        Decision::Ask | Decision::Default if auto_approve => return Ok(()),
+        Decision::Ask | Decision::Default if auto_approve || req.hook_allowed => return Ok(()),
         Decision::Ask | Decision::Default => {}
     }
     if let Some(by) = &verdict.by {
@@ -895,6 +900,15 @@ fn approve_with(
     }
     for signal in crate::risk::signals(req.tool, req.arguments) {
         ui.info(&format!("⚠ {signal}"));
+    }
+    // Hooks: `permission_request` may answer in the user's place.
+    let hooked = req
+        .hooks
+        .and_then(|h| h.permission_request(req.tool, &args, &mut |m| ui.notice(m)));
+    match hooked {
+        Some(true) => return Ok(()),
+        Some(false) => return Err(DENIED.to_string()),
+        None => {}
     }
     match ui.ask_approval(req.tool, req.arguments) {
         Approval::Once => Ok(()),
@@ -1873,6 +1887,8 @@ mod tests {
                 tool,
                 arguments: &arguments,
                 needs_approval,
+                hook_allowed: false,
+                hooks: None,
             };
             approve_with(
                 &policy,
@@ -2012,6 +2028,34 @@ mod tests {
         assert_eq!(ui.asked, 2);
     }
 
+    /// A `pre_tool` hook's approval spares the user the prompt, also past
+    /// an ask rule, but never overrides a deny rule.
+    #[test]
+    fn a_hooks_approval_does_not_override_deny() {
+        let mut gate = Gate::new("hookallow", Permissions::default());
+        let mut ui = Scripted::new(|| Approval::Deny);
+        let policy = policy(&[], &["bash(make *)"], &["bash(rm *)"]);
+        let mut call = |command: &str, ui: &mut Scripted| {
+            let arguments = json!({ "command": command }).to_string();
+            let req = Request {
+                tool: "bash",
+                arguments: &arguments,
+                needs_approval: true,
+                hook_allowed: true,
+                hooks: None,
+            };
+            approve_with(&policy, &mut gate.settings, &gate.dir, false, req, ui)
+        };
+        assert!(call("cargo build", &mut ui).is_ok());
+        assert!(call("make all", &mut ui).is_ok());
+        assert!(
+            call("rm -rf x", &mut ui)
+                .unwrap_err()
+                .contains("permission rule")
+        );
+        assert_eq!(ui.asked, 0);
+    }
+
     #[test]
     fn defaults_apply_when_no_rule_matches() {
         let mut gate = Gate::new("default", perms(&["bash(ls *)"], &[], &[]));
@@ -2024,6 +2068,8 @@ mod tests {
             tool: "bash",
             arguments: "{not json",
             needs_approval: true,
+            hook_allowed: false,
+            hooks: None,
         };
         let policy = policy(&["bash(ls *)"], &[], &[]);
         assert!(approve_with(&policy, &mut gate.settings, &gate.dir, false, req, &mut ui).is_err());

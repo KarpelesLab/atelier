@@ -22,6 +22,7 @@ use crate::claude::{self, Bridge};
 use crate::config::{Backend, Config};
 use crate::context::{ContextItem, ContextProvider};
 use crate::coord;
+use crate::hooks::{self, Hooks};
 use crate::mcp::{self, HttpServer, StdioServer};
 use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpServerConfig, Settings};
@@ -164,6 +165,8 @@ const HELP: &[&str] = &[
     "  /memory                               list what the agent remembers, and where it is kept",
     "  /memory forget <name>                 delete one memory",
     "  /skills                               list the skills the agent can load, and where they are",
+    "  /hooks                                list configured hooks and whether they run",
+    "  /hooks trust                          approve this project's hooks as they are now",
     "  /peers                                list the atelier instances running on this machine",
     "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
     "  /subscribe <topic>                    receive what instances publish to a topic",
@@ -334,6 +337,7 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
                 ui.info(&l);
             }
         }
+        "/hooks" => session.hooks_command(&args, ui),
         "/peers" | "/subscribe" | "/unsubscribe" => dispatch_peers(session, cmd, &args, ui),
         "/clear" => ui.info("(scrollback is append-only — nothing to clear)"),
         other => ui.info(&format!("unknown command '{other}' — /help for commands")),
@@ -539,6 +543,14 @@ pub struct Session {
     /// Messages from other instances that arrived (and were shown) while
     /// idle; the model gets them with the next prompt.
     peer_pending: Vec<coord::Message>,
+    /// The configured hooks (see [`hooks`]); `hooks_started` once
+    /// `session_start` has run, so `session_end` pairs with it.
+    hooks: Hooks,
+    hooks_started: bool,
+    /// Context `session_start` hooks supplied, waiting for the first prompt.
+    hook_context: Option<String>,
+    /// Claude backend: the last turn's final answer, for `turn_end` hooks.
+    claude_answer: Option<String>,
 }
 
 impl Session {
@@ -564,7 +576,12 @@ impl Session {
             Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
             Err(_) => settings.review.enabled,
         };
+        let hooks = Hooks::load(&root, &settings.hooks, hooks::Paths::from_env());
         Self {
+            hooks,
+            hooks_started: false,
+            hook_context: None,
+            claude_answer: None,
             cfg,
             root,
             tools,
@@ -1000,6 +1017,8 @@ impl Session {
     /// since the last turn lead the prompt, and those that arrive during
     /// the turn are delivered the way messages typed mid-turn are.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
+        // Hooks: `user_prompt` may block the prompt or add context to it.
+        let user_input = &self.hook_prompt(user_input, ui)?;
         let Some(coord) = self.coord.clone() else {
             return self.run_turn(user_input, ui);
         };
@@ -1020,8 +1039,42 @@ impl Session {
         result
     }
 
+    /// One prompt to its end, which `turn_end` hooks have a say in: each
+    /// time the model stops, they may send it back to work with a reason,
+    /// delivered as a new user message — at most [`hooks::MAX_CONTINUES`]
+    /// times in a row, so a hook that is never satisfied can't loop forever.
+    /// Steps are counted (and limited) across the whole of it.
     fn run_turn(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
         self.steps = 0;
+        let mut input = user_input.to_string();
+        let mut continues = 0;
+        loop {
+            self.run_once(&input, ui)?;
+            // A turn the user stopped is not one to send back to work.
+            if ui.interrupted() {
+                return Ok(());
+            }
+            let answer = self.last_answer();
+            let again = self
+                .hooks
+                .turn_end(&answer, continues, &mut |m| ui.notice(m));
+            let Some(reason) = again else {
+                return Ok(());
+            };
+            if continues == hooks::MAX_CONTINUES {
+                ui.notice(&format!(
+                    "a turn_end hook still asks for more work after {continues} rounds; stopping here"
+                ));
+                return Ok(());
+            }
+            continues += 1;
+            ui.info(&format!("↻ turn_end hook: {reason}"));
+            input = format!("[turn_end hook] {reason}");
+        }
+    }
+
+    /// One pass of the loop: from a user message to the model's answer.
+    fn run_once(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
         if self.is_claude() {
             return self.send_claude(user_input, ui);
         }
@@ -1142,7 +1195,26 @@ impl Session {
                         .push(Message::tool_result(call.id.clone(), msg));
                     continue;
                 }
-                if let Err(msg) = self.runner().approve(&call.name, &call.arguments, ui) {
+                // Hooks: `pre_tool` may refuse the call, rewrite its
+                // arguments, or approve it in the user's place (never past
+                // a deny rule).
+                let pre = self
+                    .hooks
+                    .pre_tool(&call.name, &call.arguments, &mut |m| ui.notice(m));
+                if let Some(msg) = pre.deny {
+                    ui.tool_end(&call.name, &msg, false);
+                    self.history
+                        .push(Message::tool_result(call.id.clone(), msg));
+                    continue;
+                }
+                let call = &provider::ToolCall {
+                    arguments: pre.arguments,
+                    ..call.clone()
+                };
+                if let Err(msg) =
+                    self.runner()
+                        .approve_hooked(&call.name, &call.arguments, pre.allow, ui)
+                {
                     ui.tool_end(&call.name, &msg, false);
                     self.history
                         .push(Message::tool_result(call.id.clone(), msg));
@@ -1150,6 +1222,10 @@ impl Session {
                 }
                 ui.tool_start(&call.name, &call.arguments);
                 let (out, ok) = self.runner().exec_json(&call.name, &call.arguments);
+                // Hooks: `post_tool` may append to what the model sees.
+                let out = self
+                    .runner()
+                    .post_tool(&call.name, &call.arguments, out, ok, ui);
                 ui.tool_end(&call.name, &out.text, ok);
                 images.extend(
                     out.images
@@ -1308,7 +1384,10 @@ impl Session {
         // Only relaunch (next turn, resuming) if the child actually died; a
         // live one may be running background work.
         let dead = !bridge.is_alive();
-        self.steps = bridge.take_steps();
+        // Added up: a `turn_end` hook may run several turns for one prompt.
+        let (steps, answer) = (bridge.take_steps(), bridge.take_answer());
+        self.steps += steps;
+        self.claude_answer = answer;
         self.sync_claude();
         if dead {
             self.claude = None;
@@ -1346,6 +1425,7 @@ impl Session {
                 fstate: &mut self.fstate,
                 settings: &mut self.settings,
                 auto_approve: self.auto_approve,
+                hooks: &self.hooks,
             },
         )
     }
@@ -1359,9 +1439,17 @@ impl Session {
         let Some(split) = self.compact_split_point() else {
             return;
         };
+        // Hooks: `pre_compact` and `post_compact` watch (see docs/hooks.md).
+        let fields = serde_json::json!({ "messages": split });
+        self.hooks
+            .observe(hooks::Event::PreCompact, fields.clone(), &mut |m| {
+                ui.notice(m)
+            });
         let excerpt = render_excerpt(self.summary.as_deref(), &self.history[..split]);
         match self.summarize(&excerpt) {
             Ok(summary) => {
+                self.hooks
+                    .observe(hooks::Event::PostCompact, fields, &mut |m| ui.notice(m));
                 self.summary = Some(summary);
                 self.history.drain(0..split);
                 // Nested instruction files arrived in tool results that may
@@ -1426,6 +1514,94 @@ impl Session {
     }
 }
 
+/// The session's side of the hooks (see [`hooks`]) that aren't about a tool
+/// call: startup, the prompt, the final answer, `/hooks`.
+impl Session {
+    /// Called once the session is set up, before the first prompt: returns
+    /// what to tell the user about the configured hooks (problems, project
+    /// hooks awaiting approval), and runs `session_start`.
+    pub fn start_hooks(&mut self, interactive: bool) -> Vec<String> {
+        self.describe_to_hooks();
+        let mut lines = self.hooks.startup(interactive);
+        self.hook_context = self.hooks.session_start(&mut |m| lines.push(m.to_string()));
+        self.hooks_started = true;
+        lines
+    }
+
+    /// Keep the `session` object hooks receive current (`/model`, `/login`).
+    fn describe_to_hooks(&mut self) {
+        let backend = match (self.is_claude(), &self.chatgpt) {
+            (true, _) => "claude",
+            (false, Some(_)) => "chatgpt",
+            (false, None) => "openai",
+        };
+        let model = match &self.chatgpt {
+            Some(cg) => cg.model.clone(),
+            None => self.cfg.model.clone(),
+        };
+        self.hooks.set_session(backend, &model);
+    }
+
+    /// Run the `user_prompt` hooks on a prompt: an error if one blocks it,
+    /// else the prompt as the model should get it — followed by whatever
+    /// context they (and, before the first prompt, `session_start`) added.
+    fn hook_prompt(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<String> {
+        self.describe_to_hooks();
+        let added = self
+            .hooks
+            .user_prompt(prompt, &mut |m| ui.notice(m))
+            .map_err(|why| anyhow::anyhow!("prompt blocked by a user_prompt hook: {why}"))?;
+        let context: Vec<String> = self.hook_context.take().into_iter().chain(added).collect();
+        if context.is_empty() {
+            return Ok(prompt.to_string());
+        }
+        let block = hooks::context_block(&context.join("\n\n"));
+        Ok(format!("{prompt}\n\n{block}"))
+    }
+
+    /// The final answer of the turn that just ended, for `turn_end` hooks.
+    fn last_answer(&mut self) -> String {
+        if self.is_claude() {
+            return self.claude_answer.take().unwrap_or_default();
+        }
+        let last = self.history.iter().rev().find(|m| m.role == "assistant");
+        last.map(|m| m.content.clone()).unwrap_or_default()
+    }
+
+    /// `/hooks` (list) and `/hooks trust` (approve the project's set).
+    fn hooks_command(&mut self, args: &[&str], ui: &mut dyn Ui) {
+        if !matches!(args, [] | ["trust"]) {
+            ui.info("usage: /hooks [trust]");
+            return;
+        }
+        // Approving shows the list first: it is what is being approved.
+        for l in self.hooks.list() {
+            ui.info(&l);
+        }
+        if args == ["trust"] {
+            match self.hooks.trust() {
+                Ok(()) => ui.info(
+                    "approved: this project's hooks run from now on, until they change \
+                     (session_start hooks: from the next session)",
+                ),
+                Err(e) => ui.info(&format!("error: {e:#}")),
+            }
+        }
+    }
+}
+
+/// `session_end` hooks run as the session goes away — whichever interface
+/// drove it and however it ended, short of the process being killed.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.hooks_started {
+            let fields = serde_json::json!({});
+            self.hooks
+                .observe(hooks::Event::SessionEnd, fields, &mut |m| eprintln!("{m}"));
+        }
+    }
+}
+
 /// Runs tool calls against the session: approval policy (prompting through
 /// the caller's [`Ui`]), then execution confined to the project root. Used by
 /// atelier's own loop, and — as the [`ToolHost`](claude::ToolHost) — for
@@ -1436,6 +1612,7 @@ struct ToolRunner<'a> {
     fstate: &'a mut FileState,
     settings: &'a mut Settings,
     auto_approve: bool,
+    hooks: &'a Hooks,
 }
 
 impl ToolRunner<'_> {
@@ -1444,6 +1621,19 @@ impl ToolRunner<'_> {
     /// tools ask: `bash`, MCP tools) — say so. `Err` is the tool result for a
     /// refused call. See [`crate::permissions`].
     fn approve(&mut self, name: &str, arguments: &str, ui: &mut dyn Ui) -> Result<(), String> {
+        self.approve_hooked(name, arguments, false, ui)
+    }
+
+    /// [`approve`](Self::approve) for a call the `pre_tool` hooks have seen:
+    /// `hook_allowed` when one of them approved it, which spares the user
+    /// the prompt but never overrides a deny rule.
+    fn approve_hooked(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        hook_allowed: bool,
+        ui: &mut dyn Ui,
+    ) -> Result<(), String> {
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         let needs_approval = self
             .tools
@@ -1453,6 +1643,8 @@ impl ToolRunner<'_> {
             tool: name,
             arguments,
             needs_approval,
+            hook_allowed,
+            hooks: Some(self.hooks),
         };
         crate::permissions::approve(self.settings, self.root, self.auto_approve, req, ui)
     }
@@ -1501,6 +1693,27 @@ impl ToolRunner<'_> {
             Err(e) => (ToolOutput::text(format!("error: {e:#}")), false),
         }
     }
+
+    /// Run the `post_tool` hooks on a finished call. What they report (a
+    /// formatter's or linter's output) is appended to the result, marked
+    /// as theirs.
+    fn post_tool(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        mut out: ToolOutput,
+        ok: bool,
+        ui: &mut dyn Ui,
+    ) -> ToolOutput {
+        let report = self
+            .hooks
+            .post_tool(name, arguments, ok, &out.text, &mut |m| ui.notice(m));
+        if let Some(report) = report {
+            out.text.push_str("\n\n");
+            out.text.push_str(&hooks::context_block(&report));
+        }
+        out
+    }
 }
 
 impl claude::ToolHost for ToolRunner<'_> {
@@ -1509,10 +1722,19 @@ impl claude::ToolHost for ToolRunner<'_> {
     }
 
     fn call(&mut self, name: &str, arguments: Value, ui: &mut dyn Ui) -> (ToolOutput, bool) {
-        if let Err(msg) = self.approve(name, &arguments.to_string(), ui) {
+        // The same hooks as in atelier's own loop, in the same order:
+        // `pre_tool`, the approval, the call, `post_tool`.
+        let pre = self
+            .hooks
+            .pre_tool(name, &arguments.to_string(), &mut |m| ui.notice(m));
+        if let Some(msg) = pre.deny {
             return (ToolOutput::text(msg), false);
         }
-        self.exec(name, arguments)
+        if let Err(msg) = self.approve_hooked(name, &pre.arguments, pre.allow, ui) {
+            return (ToolOutput::text(msg), false);
+        }
+        let (out, ok) = self.exec_json(name, &pre.arguments);
+        (self.post_tool(name, &pre.arguments, out, ok, ui), ok)
     }
 }
 
@@ -2045,12 +2267,14 @@ mod tests {
         let tools = crate::tools::builtin_registry();
         let mut fstate = FileState::new();
         let mut settings = Settings::default();
+        let hooks = Hooks::load(&root, &[], hooks::Paths::default());
         let mut runner = ToolRunner {
             tools: &tools,
             root: &root,
             fstate: &mut fstate,
             settings: &mut settings,
             auto_approve: true,
+            hooks: &hooks,
         };
         let mut call = |name: &str, args: Value| {
             let (out, ok) = runner.exec(name, args);

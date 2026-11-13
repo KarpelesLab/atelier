@@ -16,6 +16,16 @@ piece is `[permissions]`, also read from
 `$XDG_CONFIG_HOME/atelier/atelier.toml` (see [`[permissions]`](#permissions)).
 `Config`'s environment variables have no `atelier.toml` equivalent.
 
+  always-allow permission list, `[defaults]`, `[review]`, and `[[hooks]]`.
+  Read at startup and rewritten whenever it changes (`/mcp add`/`/mcp
+  remove`, granting "always" on a tool approval, `/review [on|off]`, or the
+  `/config` editor).
+
+There is currently no project-vs-user-global precedence: `atelier.toml` is
+read only from the current project root, and `Config`'s environment variables
+have no `atelier.toml` equivalent. The one exception is [`[[hooks]]`](#hooks),
+which is also read from a user-global `atelier.toml`.
+
 ## Environment variables
 
 | Variable                  | Default                          | Read by | Meaning |
@@ -29,6 +39,7 @@ piece is `[permissions]`, also read from
 | `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session (headless/CI, also implied by `--print` unless set — see [Permissions](permissions.md)) |
 | `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
+| `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `hooks::Paths::from_env` | `1` runs the project's [hooks](hooks.md) without your stored approval — for headless runs (`--print`), which never ask and otherwise skip unapproved project hooks. Only for checkouts you control |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000). Non-numeric or `<= 0` values are ignored and the default is used |
 | `ATELIER_NO_UPDATE`       | *(unset)*                        | `update::spawn_background_check` | Any non-empty value other than `0` turns off release builds' daily background update check (`atelier update` still works) |
 | `ATELIER_UPDATE_API`      | `https://api.github.com`         | `update` | GitHub API base the update check queries (for a mirror, or testing) |
@@ -146,6 +157,37 @@ model = "qwen3-coder:30b"    # optional; defaults to the main model
 |-----------|--------|---------|
 | `enabled` | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
 | `model`   | string | Model override for the reviewer; unset reuses the active model |
+
+## `[[hooks]]`
+
+Commands run on lifecycle events — before and after tool calls, on a prompt,
+when a turn ends. See [Hooks](hooks.md) for the events, what a hook receives
+and how it answers, and worked examples.
+
+```toml
+[[hooks]]
+event = "post_tool"            # session_start, session_end, user_prompt, pre_tool,
+                               # post_tool, permission_request, pre_compact,
+                               # post_compact, turn_end
+match = "edit|write|multiedit" # optional: regex on the whole tool name
+command = "rustfmt --edition 2024 \"$ATELIER_FILE\""
+timeout_secs = 30              # optional, default 60
+```
+
+| Field          | Type    | Meaning |
+|----------------|---------|---------|
+| `event`        | string  | The event the hook runs on |
+| `match`        | string  | Regex the whole tool name must match; tool events only (`pre_tool`, `post_tool`, `permission_request`) |
+| `command`      | string  | Shell command (`sh -c`), run in the project root with the event as JSON on stdin |
+| `timeout_secs` | integer | Seconds before the command is killed (default 60) |
+
+`[[hooks]]` is read from two files: the project's `atelier.toml`, and your
+own `$XDG_CONFIG_HOME/atelier/atelier.toml` (`~/.config/atelier/atelier.toml`
+when that variable is unset), of which only this table is read. Your own
+hooks always run. A project's run only after you approve them with `/hooks
+trust`, and need approving again whenever they change; approvals are kept in
+`$XDG_STATE_HOME/atelier/trust.json` (`~/.local/state/atelier/trust.json`).
+`/hooks` lists what is configured and whether it runs.
 
 ## Instruction files
 

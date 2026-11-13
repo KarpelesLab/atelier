@@ -204,9 +204,25 @@ fn run_print(base_url: &str, cwd: &Path, prompt: &str) -> Output {
 /// (killing it past a generous deadline so a hang can't wedge the suite),
 /// and return its captured output.
 fn run_atelier(base_url: &str, cwd: &Path, args: &[&str], stdin: Option<&str>) -> Output {
+    run_atelier_env(base_url, cwd, args, stdin, &[])
+}
+
+/// [`run_atelier`] with extra environment variables for the child.
+fn run_atelier_env(
+    base_url: &str,
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    env: &[(&str, &str)],
+) -> Output {
     let bin = env!("CARGO_BIN_EXE_atelier");
     let mut child = Command::new(bin)
         .args(args)
+        // Hook approvals (see the hooks cases) are neither read from nor
+        // written to the real home.
+        .env("XDG_STATE_HOME", cwd.with_extension("state"))
+        .env_remove("ATELIER_TRUST_HOOKS")
+        .envs(env.iter().copied())
         .env("ATELIER_BASE_URL", base_url)
         .env("ATELIER_MODEL", "mock")
         .env("ATELIER_APPROVE", "all")
@@ -1061,4 +1077,145 @@ fn skills_are_advertised_and_loaded_on_demand() {
         "the file arrives when asked for: {}",
         bodies[2]
     );
+}
+
+/// Write `hooks` (TOML `[[hooks]]` tables) as the project's `atelier.toml`
+/// and run `--print` there. `trusted` sets `ATELIER_TRUST_HOOKS=1`, the
+/// only way a headless run takes a project's hooks.
+fn run_with_hooks(mock: &Mock, dir: &Path, hooks: &str, trusted: bool) -> Output {
+    std::fs::write(dir.join("atelier.toml"), hooks).expect("write atelier.toml");
+    let env: &[(&str, &str)] = if trusted {
+        &[("ATELIER_TRUST_HOOKS", "1")]
+    } else {
+        &[]
+    };
+    run_atelier_env(&mock.base_url(), dir, &["--print", "go"], None, env)
+}
+
+/// Hooks 1 — a `pre_tool` hook that exits 2 stops the call: the tool does
+/// not run, and the model gets a tool error carrying the hook's reason.
+#[test]
+fn pre_tool_hook_denies_a_call_with_its_reason() {
+    let mock = Mock::start(write_then_done());
+    let dir = unique_dir("hook-deny");
+    let hooks = r#"
+[[hooks]]
+event = "pre_tool"
+match = "write|edit"
+command = "echo 'no writes here' >&2; exit 2"
+"#;
+    let out = run_with_hooks(&mock, &dir, hooks, true);
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!dir.join("out.txt").exists(), "the denied write ran");
+    assert_eq!(mock.requests(), 2);
+    let followup = mock.body(1);
+    assert!(
+        followup.contains("error: blocked by a pre_tool hook: no writes here"),
+        "{followup}"
+    );
+}
+
+/// Hooks 2 — a `post_tool` hook's `context` is appended to the tool result
+/// the model sees; the call itself ran. The hook also proves the event's
+/// environment: it reports the file the call named.
+#[test]
+fn post_tool_hook_context_is_appended_to_the_result() {
+    let mock = Mock::start(write_then_done());
+    let dir = unique_dir("hook-post");
+    let hooks = r#"
+[[hooks]]
+event = "post_tool"
+match = "write"
+command = '''printf '{"context": "formatted %s"}' "$(basename "$ATELIER_FILE")"'''
+timeout_secs = 10
+"#;
+    let out = run_with_hooks(&mock, &dir, hooks, true);
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "written by tool"
+    );
+    let followup = mock.body(1);
+    assert!(followup.contains("<hook-context>"), "{followup}");
+    assert!(followup.contains("formatted out.txt"), "{followup}");
+}
+
+/// Hooks 3 — a `turn_end` hook that answers `continue` sends the agent back
+/// to work: another model request, with the reason as a user message. (The
+/// hook relents the second time.) A `session_start` hook's output rides
+/// along with the first prompt.
+#[test]
+fn turn_end_hook_continue_produces_another_request() {
+    let mock = Mock::start(always("done"));
+    let dir = unique_dir("hook-continue");
+    let hooks = r#"
+[[hooks]]
+event = "session_start"
+command = "echo 'the branch is main'"
+
+[[hooks]]
+event = "turn_end"
+command = '''
+if [ ! -e .asked ]; then
+  touch .asked
+  echo '{"decision": "continue", "reason": "tests are failing"}'
+fi
+'''
+"#;
+    let out = run_with_hooks(&mock, &dir, hooks, true);
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(mock.requests(), 2);
+    assert!(mock.body(0).contains("the branch is main"));
+    assert!(!mock.body(0).contains("tests are failing"));
+    let second = mock.body(1);
+    assert!(
+        second.contains("[turn_end hook] tests are failing"),
+        "{second}"
+    );
+}
+
+/// Hooks 4 — a `turn_end` hook that is never satisfied is cut off: three
+/// continues for one prompt, then the run ends normally with a notice.
+#[test]
+fn turn_end_hook_continues_are_capped() {
+    let mock = Mock::start(always("done"));
+    let dir = unique_dir("hook-cap");
+    let hooks = r#"
+[[hooks]]
+event = "turn_end"
+command = "echo 'never good enough' >&2; exit 2"
+"#;
+    let out = run_with_hooks(&mock, &dir, hooks, true);
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(mock.requests(), 4);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("after 3 rounds"), "{stderr}");
+}
+
+/// Hooks 5 — a headless run never asks: without `ATELIER_TRUST_HOOKS=1` an
+/// unapproved project's hooks are skipped, with one notice on stderr.
+#[test]
+fn unapproved_project_hooks_are_skipped_headless() {
+    let mock = Mock::start(write_then_done());
+    let dir = unique_dir("hook-untrusted");
+    let hooks = r#"
+[[hooks]]
+event = "pre_tool"
+command = "exit 2"
+"#;
+    let out = run_with_hooks(&mock, &dir, hooks, false);
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(dir.join("out.txt").exists(), "the hook ran unapproved");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("project hook(s) skipped").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("ATELIER_TRUST_HOOKS=1"), "{stderr}");
 }

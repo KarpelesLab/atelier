@@ -13,6 +13,7 @@ mod config;
 mod context;
 mod coord;
 mod headless;
+mod hooks;
 mod js;
 mod mcp;
 mod memory;
@@ -140,6 +141,11 @@ fn run() -> Result<u8> {
     }
     if cli.resume {
         eprintln!("{}", session.resume());
+    }
+    // Hooks: say which of the project's are waiting for approval (a headless
+    // run can't ask, so it skips them), then run `session_start`.
+    for line in session.start_hooks(cli.print.is_none()) {
+        eprintln!("{line}");
     }
 
     // Handled before the interactive TUI/REPL branch below, and unconditional

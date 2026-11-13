@@ -183,6 +183,9 @@ pub struct Bridge {
     /// Model requests (assistant messages reporting usage) not yet collected
     /// by [`Bridge::take_steps`].
     steps: u32,
+    /// The final answer of the last turn that completed, until collected by
+    /// [`Bridge::take_answer`] (for `turn_end` hooks).
+    answer: Option<String>,
 }
 
 /// Progress of the turn [`Bridge::turn`] is waiting on.
@@ -361,6 +364,7 @@ impl Bridge {
             context: 0,
             output: 0,
             steps: 0,
+            answer: None,
         })
     }
 
@@ -390,6 +394,11 @@ impl Bridge {
     /// Model requests claude made since the last call.
     pub fn take_steps(&mut self) -> u32 {
         std::mem::take(&mut self.steps)
+    }
+
+    /// The awaited turn's final answer, if it completed since the last call.
+    pub fn take_answer(&mut self) -> Option<String> {
+        self.answer.take()
     }
 
     /// Whether the child is still running.
@@ -579,6 +588,8 @@ impl Bridge {
                     Some(st) if st.started => {
                         if is_error {
                             st.error = Some(text.unwrap_or_else(|| "turn failed".into()));
+                        } else {
+                            self.answer = text;
                         }
                     }
                     // Another turn ended: one we preempted, or claude

@@ -2,8 +2,8 @@
 //!
 //! Distinct from [`Config`](crate::config::Config), which is ephemeral
 //! connection info from the environment. `Settings` is durable state the user
-//! manages — MCP servers, permissions, defaults, diagnostics checkers — read
-//! at startup and written back when changed interactively (e.g. `/mcp add`).
+//! manages — MCP servers, permissions, defaults, diagnostics checkers, hooks —
+//! read at startup and written back when changed interactively (e.g. `/mcp add`).
 //!
 //! Example `atelier.toml`:
 //! ```toml
@@ -45,6 +45,9 @@ pub struct Settings {
     /// Which provider the `web_search` tool queries.
     #[serde(default)]
     pub search: SearchSettings,
+    /// Commands run on lifecycle events (see [`crate::hooks`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<HookConfig>,
 }
 
 /// `[search]`: the `web_search` tool's provider. Each field is overridden by
@@ -87,6 +90,31 @@ pub struct DiagnosticCheck {
 /// A minute: what `cargo check` was always given.
 fn default_diagnostic_timeout() -> u64 {
     60
+}
+
+/// One `[[hooks]]` table: a command to run when `event` happens. Kept as
+/// written — the event name is checked by the hook engine, so a typo there
+/// costs that one hook a warning rather than the whole file its settings.
+///
+/// ```toml
+/// [[hooks]]
+/// event = "post_tool"
+/// match = "edit|write|multiedit"
+/// command = "rustfmt --edition 2024 \"$ATELIER_FILE\""
+/// timeout_secs = 30
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookConfig {
+    /// The event's name (`pre_tool`, `turn_end`, …).
+    pub event: String,
+    /// Regex the tool name must match in full (tool events only).
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// Run with `sh -c` in the project root.
+    pub command: String,
+    /// Seconds before the command is killed (default 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// The background reviewer ("subconscious"): a parallel, read-only pass that
