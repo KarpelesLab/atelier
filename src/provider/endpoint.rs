@@ -31,6 +31,8 @@ pub const ENV_PROVIDER: &str = "env";
 
 /// The name of the provider that is the local model server.
 pub const LOCAL_PROVIDER: &str = "local";
+/// How long the local server may stay silent on a request.
+const LOCAL_TIMEOUT_MS: u64 = 3_600_000;
 
 /// A named OpenAI-compatible endpoint.
 #[derive(Debug)]
@@ -103,7 +105,10 @@ impl Provider {
             base_url,
             key: KeySource::Fixed(key),
             headers: Vec::new(),
-            timeout_ms: None,
+            // The server answers once the prompt is read, and on a CPU a
+            // long prompt takes minutes. Giving up sooner would send the
+            // request again on top of the one still being worked on.
+            timeout_ms: Some(LOCAL_TIMEOUT_MS),
         }
     }
 

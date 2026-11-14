@@ -47,6 +47,9 @@ const TRACE_ENV_VAR: &str = "ATELIER_TRACE";
 /// local/self-hosted model server can be slow to accept a connection under
 /// load.
 const DEFAULT_CHAT_TIMEOUT_MS: u64 = 60_000;
+/// The shortest silence a streaming response is given up after, whatever the
+/// connect timeout: a provider set to connect quickly may still think long.
+const MIN_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default connect timeout for `GET /models`: a cheap, quick call, so a
 /// shorter default fails fast.
 const DEFAULT_LIST_MODELS_TIMEOUT_MS: u64 = 15_000;
@@ -801,7 +804,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// the transport error).
 ///
 /// `headers` are sent in addition to the bearer token; `timeout` is the
-/// connect timeout.
+/// connect timeout, and the longest silence on the stream (60 s at least).
 fn send_reader_retrying(
     url: &str,
     body: &[u8],
@@ -814,6 +817,9 @@ fn send_reader_retrying(
         let mut req = rsurl::Request::new("POST", url)
             .context("building request")?
             .connect_timeout(timeout)
+            // Also the longest silence allowed on the open stream: a server
+            // that is still reading a long prompt sends nothing meanwhile.
+            .read_timeout(Some(timeout.max(MIN_READ_TIMEOUT)))
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             // Fresh connection per request: reusing a pooled keep-alive
