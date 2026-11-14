@@ -29,6 +29,7 @@ mod init;
 mod jobs;
 mod loops;
 mod prompt;
+mod query;
 mod transcript;
 mod window;
 
@@ -236,62 +237,134 @@ impl From<String> for Expansion {
     }
 }
 
-const HELP: &[&str] = &[
-    "commands:",
-    "  /help                                 show this help",
-    "  /models                               list the models each provider offers",
-    "  /model [provider/model#variant]       show or switch the active model",
-    "  /effort [low|medium|high|off]         reasoning effort (or another variant) of the model",
-    "  /providers                            list the configured providers and the model per role",
-    "  /login                                sign in with ChatGPT (use your ChatGPT plan)",
-    "  /logout                               sign out of ChatGPT",
-    "  /local                                run a model on this machine (oxinfer): no key, no",
-    "                                        subscription; downloads what it needs, after asking",
-    "  /tools                                list available tools",
-    "  /review [on|off]                      the parallel reviewer (\"subconscious\")",
-    "  /config                               open the settings screen (full-screen in the TUI)",
-    "  /mcp                                  list configured MCP servers",
-    "  /mcp add <name> <command> [args...]   add a stdio MCP server",
-    "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server",
-    "  /mcp remove <name>                    remove an MCP server",
-    "  /mcp login <name>                     sign in to an HTTP MCP server (OAuth, in your browser)",
-    "  /mcp logout <name>                    forget that sign-in",
-    "  /permissions                          list the permission rules in force, by source",
-    "  /mode [plan|ask-edits|auto-edit|yolo] show or switch how much runs without asking",
-    "  /new [force]                          start a fresh conversation (clear saved session);",
-    "                                        force: even if claude has background tasks running",
-    "  /compact [instructions]               shrink the conversation now: prune old tool output,",
-    "                                        summarize older turns (instructions guide the summary)",
-    "  /context                              show where the context window goes, in tokens",
-    "  /usage                                this session's model requests, tokens and cost",
-    "  /goal [condition|clear]               keep the agent working until a condition holds:",
-    "                                        set it, show it (no argument), or clear it",
-    "  /init [guidance]                      have the agent write (or improve) this repository's",
-    "                                        AGENTS.md, from a look at the project",
-    "  /loop [<interval> <prompt>]           re-send a prompt every 30s, 5m, 1h… while idle;",
-    "                                        no argument lists the loops; /loop stop [n|all]",
-    "  /image <path>                         attach an image to your next message (vision)",
-    "  /memory                               list what the agent remembers, and where it is kept",
-    "  /memory forget <name>                 delete one memory",
-    "  /skills                               list the skills the agent can load, and where they are",
-    "  /hooks                                list configured hooks and whether they run",
-    "  /hooks trust                          the same as /trust",
-    "  /trust                                accept what this project's atelier.toml runs and",
-    "                                        grants (MCP servers, checkers, providers, allow",
-    "                                        rules, hooks), as it is now",
-    "  /trust show                           list those settings and whether they are in effect",
-    "  /trust revoke                         stop trusting this project",
-    "  /agents                               list the subagents the `task` tool can run, and",
-    "                                        the ones running in the background",
-    "  /agents stop <id>                     stop a background agent",
-    "  /agents clean [id]                    remove the worktrees agents left: the unchanged",
-    "                                        ones, or the one named whatever it holds",
-    "  /peers                                list the atelier instances running on this machine",
-    "  /send <name|*|#topic> <message>       message another instance, all of them, or a topic",
-    "  /subscribe <topic>                    receive what instances publish to a topic",
-    "  /unsubscribe <topic>                  stop receiving a topic",
-    "  /clear                                (no-op: scrollback is append-only)",
-    "  /quit                                 exit (also Ctrl-D on an empty input)",
+/// The built-in commands: what to type, and what it does (a line break
+/// continues the description on the next line of `/help`). The one source
+/// for `/help`'s text ([`help_lines`]), for which names are built in
+/// ([`is_builtin`]) and for the list an interface is given as data
+/// ([`builtin_commands`]).
+const HELP: &[(&str, &str)] = &[
+    ("/help", "show this help"),
+    ("/models", "list the models each provider offers"),
+    (
+        "/model [provider/model#variant]",
+        "show or switch the active model",
+    ),
+    (
+        "/effort [low|medium|high|off]",
+        "reasoning effort (or another variant) of the model",
+    ),
+    (
+        "/providers",
+        "list the configured providers and the model per role",
+    ),
+    ("/login", "sign in with ChatGPT (use your ChatGPT plan)"),
+    ("/logout", "sign out of ChatGPT"),
+    (
+        "/local",
+        "run a model on this machine (oxinfer): no key, no\nsubscription; downloads what it needs, after asking",
+    ),
+    ("/tools", "list available tools"),
+    (
+        "/review [on|off]",
+        "the parallel reviewer (\"subconscious\")",
+    ),
+    (
+        "/config",
+        "open the settings screen (full-screen in the TUI)",
+    ),
+    ("/mcp", "list configured MCP servers"),
+    (
+        "/mcp add <name> <command> [args...]",
+        "add a stdio MCP server",
+    ),
+    (
+        "/mcp add <name> <http(s)://url> [H: V]",
+        "add an HTTP MCP server",
+    ),
+    ("/mcp remove <name>", "remove an MCP server"),
+    (
+        "/mcp login <name>",
+        "sign in to an HTTP MCP server (OAuth, in your browser)",
+    ),
+    ("/mcp logout <name>", "forget that sign-in"),
+    (
+        "/permissions",
+        "list the permission rules in force, by source",
+    ),
+    (
+        "/mode [plan|ask-edits|auto-edit|yolo]",
+        "show or switch how much runs without asking",
+    ),
+    (
+        "/new [force]",
+        "start a fresh conversation (clear saved session);\nforce: even if claude has background tasks running",
+    ),
+    (
+        "/compact [instructions]",
+        "shrink the conversation now: prune old tool output,\nsummarize older turns (instructions guide the summary)",
+    ),
+    ("/context", "show where the context window goes, in tokens"),
+    ("/usage", "this session's model requests, tokens and cost"),
+    (
+        "/goal [condition|clear]",
+        "keep the agent working until a condition holds:\nset it, show it (no argument), or clear it",
+    ),
+    (
+        "/init [guidance]",
+        "have the agent write (or improve) this repository's\nAGENTS.md, from a look at the project",
+    ),
+    (
+        "/loop [<interval> <prompt>]",
+        "re-send a prompt every 30s, 5m, 1h… while idle;\nno argument lists the loops; /loop stop [n|all]",
+    ),
+    (
+        "/image <path>",
+        "attach an image to your next message (vision)",
+    ),
+    (
+        "/memory",
+        "list what the agent remembers, and where it is kept",
+    ),
+    ("/memory forget <name>", "delete one memory"),
+    (
+        "/skills",
+        "list the skills the agent can load, and where they are",
+    ),
+    ("/hooks", "list configured hooks and whether they run"),
+    ("/hooks trust", "the same as /trust"),
+    (
+        "/trust",
+        "accept what this project's atelier.toml runs and\ngrants (MCP servers, checkers, providers, allow\nrules, hooks), as it is now",
+    ),
+    (
+        "/trust show",
+        "list those settings and whether they are in effect",
+    ),
+    ("/trust revoke", "stop trusting this project"),
+    (
+        "/agents",
+        "list the subagents the `task` tool can run, and\nthe ones running in the background",
+    ),
+    ("/agents stop <id>", "stop a background agent"),
+    (
+        "/agents clean [id]",
+        "remove the worktrees agents left: the unchanged\nones, or the one named whatever it holds",
+    ),
+    (
+        "/peers",
+        "list the atelier instances running on this machine",
+    ),
+    (
+        "/send <name|*|#topic> <message>",
+        "message another instance, all of them, or a topic",
+    ),
+    (
+        "/subscribe <topic>",
+        "receive what instances publish to a topic",
+    ),
+    ("/unsubscribe <topic>", "stop receiving a topic"),
+    ("/clear", "(no-op: scrollback is append-only)"),
+    ("/quit", "exit (also Ctrl-D on an empty input)"),
 ];
 
 /// Interpret one line of input: run it if it is a slash command (rendering
@@ -381,8 +454,8 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             }
         }
         "/help" => {
-            for l in HELP {
-                ui.info(l);
+            for l in help_lines() {
+                ui.info(&l);
             }
             let global = crate::commands::global_dir();
             let builtin = |name: &str| is_builtin(&format!("/{name}"));
@@ -575,7 +648,20 @@ fn is_builtin(cmd: &str) -> bool {
     cmd == "/exit"
         || HELP
             .iter()
-            .any(|l| l.split_whitespace().next() == Some(cmd))
+            .any(|(usage, _)| usage.split_whitespace().next() == Some(cmd))
+}
+
+/// `/help`'s list of the built-in commands: a heading, then each command in
+/// two columns, a long description continuing under the second.
+fn help_lines() -> Vec<String> {
+    let mut out = vec!["commands:".to_string()];
+    for (usage, description) in HELP {
+        let mut lines = description.lines();
+        let first = lines.next().unwrap_or("");
+        out.push(format!("  {usage:<37} {first}"));
+        out.extend(lines.map(|line| format!("{:40}{line}", "")));
+    }
+    out
 }
 
 /// Run `line` as a file-defined command, if a file defines one by that name:
@@ -698,12 +784,13 @@ fn dispatch_peers(session: &mut Session, cmd: &str, args: &[&str], ui: &mut dyn 
     };
     let outcome = match (cmd, args) {
         ("/peers", _) => {
-            ui.info(&coord.link_status());
-            coord.list().map(|list| {
+            let peers = query::Peers::of(&coord);
+            ui.info(&peers.link);
+            peers.instances.map(|list| {
                 for l in coord::tools::render_instances(&list) {
                     ui.info(&format!("  {l}"));
                 }
-                for l in coord::tools::render_locks(&coord.locks()) {
+                for l in coord::tools::render_locks(&peers.locks) {
                     ui.info(&l);
                 }
             })
@@ -852,6 +939,10 @@ pub struct Session {
     mcp_catalog: mcp::Catalog,
     /// Where OAuth tokens for remote MCP servers are kept.
     mcp_tokens: mcp::oauth::TokenStore,
+    /// Why a configured server is not connected, by its name: it wants a
+    /// sign-in, or connecting it failed (see [`query`]). Gone once it
+    /// connects, or is removed.
+    mcp_problems: HashMap<String, query::McpProblem>,
     settings: Settings,
     /// How much runs without asking (see [`crate::permissions`]); `yolo` is
     /// `ATELIER_APPROVE=all`.
@@ -989,6 +1080,7 @@ impl Session {
             context,
             mcp_catalog,
             mcp_tokens: mcp::oauth::TokenStore::user(),
+            mcp_problems: HashMap::new(),
             settings,
             mode,
             usage_ctx: 0,
@@ -1546,9 +1638,13 @@ impl Session {
                 }
                 // Said, not acted on: a browser never opens unasked.
                 Err(e) if needs_login(&e) => {
+                    self.mcp_problem(name, &e);
                     format!("mcp: '{name}' needs sign-in — run /mcp login {name}")
                 }
-                Err(e) => format!("mcp: failed to connect '{name}': {e:#}"),
+                Err(e) => {
+                    self.mcp_problem(name, &e);
+                    format!("mcp: failed to connect '{name}': {e:#}")
+                }
             });
         }
         if let Some(d) = self.mcp_defer() {
@@ -1572,6 +1668,7 @@ impl Session {
     /// Take in a server that just connected: its tools join the registry,
     /// the rest goes to the catalog. Returns how many tools it brought.
     fn mcp_register(&mut self, name: &str, connection: mcp::Connection) -> usize {
+        self.mcp_problems.remove(name);
         self.mcp_catalog.insert(name, &connection);
         let n = connection.tools.len();
         for t in connection.tools {
@@ -1582,21 +1679,8 @@ impl Session {
 
     /// One display line per configured MCP server (stdio and HTTP).
     pub fn mcp_list(&self) -> Vec<String> {
-        let off = |o: &McpOptions| if o.enabled { "" } else { " (disabled)" };
-        let stdio = self.settings.mcp.iter().map(|m| {
-            let off = off(&m.options);
-            if m.args.is_empty() {
-                format!("{} → {}{off}", m.name, m.command)
-            } else {
-                format!("{} → {} {}{off}", m.name, m.command, m.args.join(" "))
-            }
-        });
-        let http = self
-            .settings
-            .mcp_http
-            .iter()
-            .map(|m| format!("{} → {} (http){}", m.name, m.url, off(&m.options)));
-        stdio.chain(http).collect()
+        let configured = self.mcp_servers().into_iter().filter(|s| s.configured);
+        configured.map(|s| s.line()).collect()
     }
 
     /// Whether any configured MCP server (stdio or HTTP) already uses `name`.
@@ -1650,6 +1734,7 @@ impl Session {
             // The server is there and wants a sign-in: keep it, so that
             // `/mcp login` has something to sign in to.
             Err(e) if needs_login(&e) => {
+                self.mcp_problem(name, &e);
                 self.settings.mcp_http.push(cfg);
                 self.settings.save(&self.root)?;
                 return Err(e);
@@ -1672,6 +1757,7 @@ impl Session {
         if self.settings.mcp.len() + self.settings.mcp_http.len() == before {
             return Ok(false);
         }
+        self.mcp_problems.remove(name);
         if self.is_claude() {
             return self.claude_mcp_changed().map(|_| true);
         }
@@ -1716,6 +1802,8 @@ impl Session {
         if !self.mcp_tokens.remove(&cfg.url)? {
             return Ok(false);
         }
+        self.mcp_problems
+            .insert(name.to_string(), query::McpProblem::NeedsLogin);
         self.mcp_disconnect(name);
         self.mcp_defer();
         Ok(true)
@@ -3106,6 +3194,29 @@ pub fn repl(mut session: Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/help` is laid out from the table: two columns, a long description
+    /// continued under the second, and a usage too long for the first
+    /// pushing its description along.
+    #[test]
+    fn help_is_laid_out_in_two_columns() {
+        let lines = help_lines();
+        assert_eq!(lines[0], "commands:");
+        assert_eq!(
+            lines[1],
+            "  /help                                 show this help"
+        );
+        let at = |start: &str| lines.iter().position(|l| l.starts_with(start)).unwrap();
+        assert_eq!(
+            lines[at("  /new ") + 1],
+            "                                        force: even if claude has background tasks running"
+        );
+        assert_eq!(
+            lines[at("  /mcp add <name> <http")],
+            "  /mcp add <name> <http(s)://url> [H: V] add an HTTP MCP server"
+        );
+        assert!(is_builtin("/mcp") && is_builtin("/exit") && !is_builtin("/fix"));
+    }
 
     #[test]
     fn merge_queued_joins_paragraphs() {

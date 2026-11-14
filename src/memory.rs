@@ -223,6 +223,18 @@ impl Store {
             .collect()
     }
 
+    /// What `/memory` lists: each scope that has a directory — the project's
+    /// first — with where it is kept and its notes.
+    pub fn scopes(&self) -> Vec<(Scope, PathBuf, Vec<Memory>)> {
+        let mut out = Vec::new();
+        for scope in [Scope::Project, Scope::Global] {
+            if let Some(dir) = self.dir(scope) {
+                out.push((scope, dir, self.list_scope(scope)));
+            }
+        }
+        out
+    }
+
     /// Every note, project scope first, each sorted by name.
     pub fn list(&self) -> Vec<(Scope, Memory)> {
         [Scope::Project, Scope::Global]
@@ -508,12 +520,12 @@ pub fn command(store: &Store, args: &[&str]) -> Vec<String> {
     match args {
         [] => {
             let mut out = Vec::new();
+            // The notes may have been edited by hand since the index was
+            // written.
             for scope in [Scope::Project, Scope::Global] {
                 store.sync_index(scope);
-                let Some(dir) = store.dir(scope) else {
-                    continue;
-                };
-                let memories = store.list_scope(scope);
+            }
+            for (scope, dir, memories) in store.scopes() {
                 out.push(format!(
                     "{scope} memory — {} ({} saved)",
                     dir.display(),

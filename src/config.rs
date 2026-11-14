@@ -425,6 +425,16 @@ impl Config {
         &self.providers
     }
 
+    /// The provider a model addressed without one is on.
+    pub fn default_provider(&self) -> &Provider {
+        &self.providers[self.default_provider]
+    }
+
+    /// The request options each known variant stands for, by name.
+    pub fn variants(&self) -> &BTreeMap<String, Map<String, Value>> {
+        &self.variants
+    }
+
     /// `[[price]]` entries in force.
     pub fn prices(&self) -> &[PriceConfig] {
         &self.prices
@@ -436,8 +446,8 @@ impl Config {
         let mut out = vec!["providers:".to_string()];
         let width = self.providers.iter().map(|p| p.name.len()).max();
         let width = width.unwrap_or(0);
-        for (i, p) in self.providers.iter().enumerate() {
-            let default = if i == self.default_provider {
+        for p in &self.providers {
+            let default = if p.name == self.default_provider().name {
                 "  (default)"
             } else {
                 ""

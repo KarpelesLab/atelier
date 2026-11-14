@@ -88,7 +88,7 @@ use crate::provider::ToolCall;
 use crate::tools::change::FileChange;
 use crate::tools::task::TaskCall;
 
-pub(super) use background::{Background, NOTICE_OPEN, Roster};
+pub(super) use background::{AgentInfo, Background, NOTICE_OPEN, Roster};
 use background::{Rules, Seat};
 use worktree::Worktree;
 

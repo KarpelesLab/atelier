@@ -77,6 +77,25 @@ impl Catalog {
         self.state().entries.retain(|e| e.server != server);
     }
 
+    /// The names of the connected servers, in connection order.
+    pub fn servers(&self) -> Vec<String> {
+        let state = self.state();
+        state.entries.iter().map(|e| e.server.clone()).collect()
+    }
+
+    /// The tools of the connected server `server`, in its order: each one's
+    /// registered name and what the server said about it. `None` when no
+    /// server of that name is connected.
+    pub fn tools_of(&self, server: &str) -> Option<Vec<(String, Annotations)>> {
+        let state = self.state();
+        let entry = state.entries.iter().find(|e| e.server == server)?;
+        let described = |tool: &String| {
+            let annotations = entry.annotations.get(tool).cloned().unwrap_or_default();
+            (tool.clone(), annotations)
+        };
+        Some(entry.tools.iter().map(described).collect())
+    }
+
     /// The registered name of every connected server's every tool, in
     /// registration order.
     pub fn tool_names(&self) -> Vec<String> {

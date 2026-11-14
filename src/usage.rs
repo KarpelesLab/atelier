@@ -366,11 +366,10 @@ pub fn session_report(
             format!("  output this session:           {output} tokens"),
         ];
     }
-    let session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-    if session.is_empty() {
+    let stats = session_stats(prices);
+    if stats.total.requests == 0 {
         return vec!["no model requests made yet this session".to_string()];
     }
-    let stats = summarize(&session, prices);
     let mut out = table("model", &stats.by_model);
     if stats.by_model.len() > 1 {
         let total = BTreeMap::from([("total".to_string(), stats.total.clone())]);
@@ -382,6 +381,39 @@ pub fn session_report(
         stats.total.duration_ms as f64 / 1000.0
     ));
     out
+}
+
+/// This process's model requests, summed.
+fn session_stats(prices: &[PriceConfig]) -> Stats {
+    let session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    summarize(&session, prices)
+}
+
+/// What `/usage` reports ([`session_report`]), as data: the session's
+/// requests per model and in total, with cost where a price is known, next
+/// to the token counts the session keeps (`context` at its latest request,
+/// `output` over the session). With the Claude backend there are only
+/// those: claude makes the requests, and `by_model` is empty.
+pub fn session_data(prices: &[PriceConfig], claude: bool, context: u32, output: u64) -> Value {
+    let stats = match claude {
+        true => Stats::default(),
+        false => session_stats(prices),
+    };
+    let by_model: Vec<Value> = stats
+        .by_model
+        .iter()
+        .map(|(model, totals)| {
+            let mut row = totals.to_json();
+            row["model"] = json!(model);
+            row
+        })
+        .collect();
+    json!({
+        "context_tokens": context,
+        "output_tokens": output,
+        "by_model": by_model,
+        "total": stats.total.to_json(),
+    })
 }
 
 /// What `atelier stats` was asked.

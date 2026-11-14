@@ -258,6 +258,7 @@ impl Client {
             .env_remove("ATELIER_MODE")
             .env_remove("ATELIER_PARALLEL_TOOLS")
             .env_remove("ATELIER_SEARCH_KEY")
+            .env_remove("ATELIER_TRUST_PROJECT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -314,6 +315,12 @@ impl Client {
     /// A served session past its handshake.
     fn ready(mock: &Mock, cwd: &Path, args: &[&str]) -> Client {
         Client::ready_env(mock, cwd, args, &[])
+    }
+
+    /// [`ready`](Self::ready), with `env` added to the child's environment.
+    fn ready_with(mock: &Mock, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Client {
+        let env: Vec<(&str, Option<&str>)> = env.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        Client::ready_env(mock, cwd, args, &env)
     }
 
     /// [`ready`](Self::ready), with the environment changed as
@@ -1569,4 +1576,377 @@ fn settings_that_cannot_be_set_are_refused() {
     client.turn_ended(&turn);
     assert!(!dir.join("atelier.toml").exists());
     assert_eq!(client.ok("settings/set", set)["applies"], "now");
+}
+
+// ------------------------------------------------------------- the queries
+
+/// The answer of a `GET /models`: the ids, as an OpenAI-compatible server
+/// lists them.
+fn model_list(ids: &[&str]) -> Vec<u8> {
+    let data: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+    let body = json!({"object": "list", "data": data}).to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// The element of the array `list` whose `key` is `value`.
+fn entry<'a>(list: &'a Value, key: &str, value: &str) -> &'a Value {
+    let found = list.as_array().and_then(|all| {
+        all.iter()
+            .find(|e| e[key].as_str().is_some_and(|v| v == value))
+    });
+    found.unwrap_or_else(|| panic!("no entry with {key} = {value} in {list}"))
+}
+
+/// The queries are advertised in the handshake, and each needs the session
+/// idle: while a turn runs they are refused like `command/run` (a bad
+/// parameter still being a bad parameter). Between turns `jobs/list` says
+/// nothing runs in the background, and `usage/get` counts the requests the
+/// turn made.
+#[test]
+fn queries_are_advertised_and_wait_for_the_session_to_be_idle() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call("call_1", "bash", json!({"command": "echo one > a.txt"})),
+        _ => answer("done"),
+    });
+    let dir = unique_dir("queries");
+    let mut client = Client::spawn(&mock, &dir, &[]);
+    let hello = client.ok("initialize", json!({}));
+    let queries = &hello["capabilities"]["queries"];
+    assert_eq!(
+        queries,
+        &json!([
+            "models/list",
+            "mcp/list",
+            "peers/list",
+            "usage/get",
+            "memory/list",
+            "commands/list",
+            "jobs/list"
+        ])
+    );
+
+    let usage = client.ok("usage/get", json!({}));
+    assert_eq!(usage["backend"], "openai");
+    assert_eq!(usage["by_model"], json!([]));
+    assert_eq!(usage["total"]["requests"], 0);
+
+    // The approval prompt holds the turn still.
+    let turn = client.start_turn("run it");
+    let asked = client.asked("approval/request");
+    for method in queries.as_array().unwrap() {
+        let refused = client.err(method.as_str().unwrap(), json!({}), TURN_RUNNING);
+        assert_eq!(refused["data"]["turn"], turn, "{refused}");
+    }
+    client.err("models/list", json!({"fetch": "no"}), INVALID_PARAMS);
+    assert_eq!(client.ok("session/status", json!({}))["busy"], true);
+    client.reply(&asked, json!({"decision": "deny"}));
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+
+    let jobs = client.ok("jobs/list", json!({}));
+    assert_eq!(
+        jobs,
+        json!({"jobs": [], "agents": [], "claude_background": 0})
+    );
+    let usage = client.ok("usage/get", json!({}));
+    let model = entry(&usage["by_model"], "model", "env/mock");
+    assert_eq!(model["requests"], 2, "{usage}");
+    assert_eq!(usage["total"]["requests"], 2);
+    // No `[[price]]` names the model.
+    assert_eq!(usage["total"]["cost"], Value::Null);
+    assert_eq!(usage["total"]["priced_requests"], 0);
+    assert_eq!(mock.requests(), 2);
+    // A query leaves the session free for the next thing.
+    assert_eq!(client.ok("session/status", json!({}))["busy"], false);
+}
+
+/// `models/list`: the model in use, each provider with the models it offers
+/// (or why it could not be asked) and where its key comes from — never the
+/// key — the model per role and the variants. `fetch: false` leaves the
+/// providers alone, and `/model` shows in the next answer.
+#[test]
+fn models_list_describes_providers_roles_and_variants() {
+    let mock = Mock::scripted(|_, body| match body.is_empty() {
+        true => model_list(&["alpha", "beta"]),
+        false => answer("unused"),
+    });
+    let dir = unique_dir("models");
+    let user = dir.join(".no-user-config/atelier");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(
+        user.join("atelier.toml"),
+        "[[provider]]\nname = \"second\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\
+         api_key_env = \"SERVE_TEST_KEY\"\n\
+         headers = { \"x-extra\" = \"header-secret\" }\n\n\
+         [models]\nsmall = \"second/tiny#high\"\n\n\
+         [variant.fast]\ntemperature = 0.25\n",
+    )
+    .unwrap();
+    let env = [("SERVE_TEST_KEY", "sk-very-secret")];
+    let mut client = Client::ready_with(&mock, &dir, &[], &env);
+
+    let models = client.ok("models/list", json!({}));
+    assert_eq!(models["backend"], "openai");
+    assert_eq!(
+        models["current"],
+        json!({"label": "mock", "model": "mock", "provider": "env", "id": "mock",
+               "variant": null, "options": {}})
+    );
+    let first = entry(&models["providers"], "name", "env");
+    assert_eq!(first["models"], json!(["alpha", "beta"]));
+    assert_eq!(first["error"], Value::Null);
+    assert_eq!(first["default"], true);
+    assert_eq!(first["base_url"], mock.base_url());
+    assert_eq!(first["key"], "none");
+    let second = entry(&models["providers"], "name", "second");
+    assert_eq!(second["models"], Value::Null);
+    assert!(second["error"].is_string(), "{second}");
+    assert_eq!(second["default"], false);
+    assert_eq!(second["key"], "$SERVE_TEST_KEY (set)");
+
+    let main = entry(&models["roles"], "role", "main");
+    assert_eq!(main["provider"], "env");
+    assert_eq!(main["id"], "mock");
+    let small = entry(&models["roles"], "role", "small");
+    assert_eq!(
+        small,
+        &json!({"role": "small", "model": "second/tiny#high", "provider": "second",
+                "id": "tiny", "options": {"reasoning_effort": "high"}, "own": true})
+    );
+    // Not set: it follows the role it falls back to.
+    let summary = entry(&models["roles"], "role", "summary");
+    assert_eq!(summary["id"], "tiny");
+    assert_eq!(entry(&models["roles"], "role", "subagent")["own"], false);
+    let fast = entry(&models["variants"], "name", "fast");
+    assert_eq!(fast["options"], json!({"temperature": 0.25}));
+    entry(&models["variants"], "name", "high");
+
+    let text = models.to_string();
+    assert!(!text.contains("sk-very-secret"), "{text}");
+    assert!(!text.contains("header-secret"), "{text}");
+
+    // Without asking the providers: the same, less what they offer.
+    let asked = mock.requests();
+    client.ok("command/run", json!({"line": "/model second/tiny#fast"}));
+    let models = client.ok("models/list", json!({"fetch": false}));
+    assert_eq!(mock.requests(), asked);
+    assert_eq!(
+        models["current"],
+        json!({"label": "second/tiny#fast", "model": "second/tiny#fast",
+               "provider": "second", "id": "tiny", "variant": "fast",
+               "options": {"temperature": 0.25}})
+    );
+    let first = entry(&models["providers"], "name", "env");
+    assert_eq!(first["models"], Value::Null);
+    assert_eq!(first["error"], Value::Null);
+}
+
+/// `mcp/list`: each configured server with where it stands — connected
+/// (and its tools), disabled, failed and why — and how it is reached,
+/// without the headers it is sent. In a project that is not trusted no
+/// server is started, and the list says so.
+#[test]
+fn mcp_list_reports_each_server_and_its_tools() {
+    let mock = Mock::scripted(|_, _| answer("unused"));
+    let dir = unique_dir("mcp");
+    // atelier itself is the server: its own tools over MCP (`atelier mcp`).
+    let atelier = env!("CARGO_BIN_EXE_atelier");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        format!(
+            "[[mcp]]\nname = \"self\"\ncommand = '{atelier}'\nargs = [\"mcp\"]\n\n\
+             [[mcp]]\nname = \"broken\"\ncommand = '{}'\n\n\
+             [[mcp]]\nname = \"off\"\ncommand = \"never-run\"\nenabled = false\n\n\
+             [[mcp_http]]\nname = \"remote\"\nurl = \"http://127.0.0.1:1/mcp\"\n\
+             headers = [\"Authorization: Bearer sk-header-secret\"]\n",
+            dir.join("no-such-server").display()
+        ),
+    )
+    .unwrap();
+
+    let trusted = [("ATELIER_TRUST_PROJECT", "1")];
+    let mut client = Client::ready_with(&mock, &dir, &[], &trusted);
+    let listed = client.ok("mcp/list", json!({}));
+    let servers = &listed["servers"];
+    assert_eq!(servers.as_array().unwrap().len(), 4, "{listed}");
+
+    let own = entry(servers, "name", "self");
+    assert_eq!(own["status"], "connected", "{own}");
+    assert_eq!(own["error"], Value::Null);
+    assert_eq!(own["transport"], "stdio");
+    assert_eq!(own["command"], atelier);
+    assert_eq!(own["args"], json!(["mcp"]));
+    assert_eq!(own["enabled"], true);
+    assert_eq!(own["configured"], true);
+    let read = entry(&own["tools"], "name", "mcp__self__read");
+    assert_eq!(read["tool"], "read");
+    // Whether they are advertised one by one depends on how many there are.
+    assert!(read["deferred"].is_boolean(), "{read}");
+    assert!(!read["description"].as_str().unwrap().is_empty(), "{read}");
+
+    let broken = entry(servers, "name", "broken");
+    assert_eq!(broken["status"], "failed", "{broken}");
+    assert!(broken["error"].is_string(), "{broken}");
+    assert_eq!(broken["tools"], json!([]));
+    let off = entry(servers, "name", "off");
+    assert_eq!(off["status"], "disabled");
+    assert_eq!(off["enabled"], false);
+    let remote = entry(servers, "name", "remote");
+    assert_eq!(remote["status"], "failed", "{remote}");
+    assert_eq!(remote["transport"], "http");
+    assert_eq!(remote["url"], "http://127.0.0.1:1/mcp");
+    assert!(!listed.to_string().contains("sk-header-secret"), "{listed}");
+
+    // `/mcp` prints the same servers, as it always did.
+    client.ok("command/run", json!({"line": "/mcp"}));
+    let line = format!("  self → {atelier} mcp");
+    client.take("the server's line", |m| {
+        m["params"]["text"] == line.as_str()
+    });
+    client.ok("shutdown", json!({}));
+    assert!(client.exited().success());
+
+    let mut client = Client::ready(&mock, &dir, &[]);
+    let listed = client.ok("mcp/list", json!({}));
+    for name in ["self", "broken", "remote"] {
+        let server = entry(&listed["servers"], "name", name);
+        assert_eq!(server["status"], "untrusted", "{server}");
+        assert_eq!(server["tools"], json!([]));
+    }
+    assert_eq!(
+        entry(&listed["servers"], "name", "off")["status"],
+        "disabled"
+    );
+}
+
+/// `memory/list`, `commands/list` and `peers/list`: the notes and the
+/// instruction files, the commands and the skills — each with the file it
+/// comes from — and, with the coordinator off, no peers.
+#[test]
+fn memory_commands_and_peers_are_listed_as_data() {
+    let mock = Mock::scripted(|_, _| answer("unused"));
+    let dir = unique_dir("lists");
+    let write = |path: &str, text: &str| {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("AGENTS.md", "Use tabs.\n");
+    write(
+        ".atelier/memory/build.md",
+        "---\nname: build\ndescription: how to build it\ntype: reference\n---\nRun make.\n",
+    );
+    write(
+        ".atelier/commands/fix.md",
+        "---\ndescription: fix an issue\nargument-hint: <issue>\nmodel: big\n---\nFix $1.\n",
+    );
+    // A file cannot replace a built-in command, so it is not one to list.
+    write(".atelier/commands/help.md", "Never reached.\n");
+    write(
+        ".atelier/skills/deploy/SKILL.md",
+        "---\nname: deploy\ndescription: ship a release\n---\nSteps.\n",
+    );
+    write(".atelier/skills/empty/SKILL.md", "no front matter\n");
+    let mut client = Client::ready(&mock, &dir, &[]);
+
+    let memory = client.ok("memory/list", json!({}));
+    let project = entry(&memory["scopes"], "scope", "project");
+    assert!(
+        Path::new(project["dir"].as_str().unwrap()).ends_with(".atelier/memory"),
+        "{project}"
+    );
+    let notes = project["memories"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "{project}");
+    assert_eq!(notes[0]["name"], "build");
+    assert_eq!(notes[0]["type"], "reference");
+    assert_eq!(notes[0]["description"], "how to build it");
+    assert!(Path::new(notes[0]["path"].as_str().unwrap()).ends_with(".atelier/memory/build.md"));
+    let global = entry(&memory["scopes"], "scope", "global");
+    assert_eq!(global["memories"], json!([]));
+    let files = memory["instruction_files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{memory}");
+    assert!(Path::new(files[0]["path"].as_str().unwrap()).ends_with("AGENTS.md"));
+    // Asking writes nothing (`/memory` brings the index file up to date).
+    assert!(!dir.join(".atelier/memory/MEMORY.md").exists());
+
+    let commands = client.ok("commands/list", json!({}));
+    let model = entry(
+        &commands["builtin"],
+        "usage",
+        "/model [provider/model#variant]",
+    );
+    assert_eq!(model["name"], "model");
+    assert_eq!(model["description"], "show or switch the active model");
+    // One entry per form of a command; a description is one line.
+    entry(&commands["builtin"], "usage", "/mcp remove <name>");
+    let new = entry(&commands["builtin"], "name", "new");
+    assert!(
+        !new["description"].as_str().unwrap().contains('\n'),
+        "{new}"
+    );
+    let custom = commands["custom"].as_array().unwrap();
+    assert_eq!(custom.len(), 1, "{commands}");
+    assert_eq!(custom[0]["name"], "fix");
+    assert_eq!(custom[0]["description"], "fix an issue");
+    assert_eq!(custom[0]["argument_hint"], "<issue>");
+    assert_eq!(custom[0]["model"], "big");
+    assert!(Path::new(custom[0]["path"].as_str().unwrap()).ends_with(".atelier/commands/fix.md"));
+    assert_eq!(commands["prompts"], json!([]));
+    let skills = commands["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1, "{commands}");
+    assert_eq!(skills[0]["name"], "deploy");
+    assert_eq!(skills[0]["description"], "ship a release");
+    assert_eq!(skills[0]["global"], false);
+    assert!(Path::new(skills[0]["path"].as_str().unwrap()).ends_with(".atelier/skills/deploy"));
+    assert_eq!(commands["skipped_skills"].as_array().unwrap().len(), 1);
+
+    // The tests run with the coordinator switched off.
+    let peers = client.ok("peers/list", json!({}));
+    assert_eq!(
+        peers,
+        json!({"enabled": false, "name": null, "link": null, "error": null,
+               "instances": [], "locks": []})
+    );
+    assert_eq!(mock.requests(), 0);
+}
+
+/// `jobs/list` shows a `bash` job the model left running in the
+/// background, and the job is stopped when the session is shut down.
+#[cfg(unix)]
+#[test]
+fn jobs_list_shows_a_background_job() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call(
+            "call_1",
+            "bash",
+            json!({"command": "sleep 30", "background": true}),
+        ),
+        _ => answer("started"),
+    });
+    let dir = unique_dir("jobs");
+    let mut client = Client::ready(&mock, &dir, &[]);
+
+    let turn = client.start_turn("start it");
+    let asked = client.asked("approval/request");
+    client.reply(&asked, json!({"decision": "once"}));
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+
+    let listed = client.ok("jobs/list", json!({}));
+    let jobs = listed["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1, "{listed}");
+    let job = &jobs[0];
+    assert_eq!(job["id"], "job-1");
+    assert_eq!(job["command"], "sleep 30");
+    assert_eq!(job["state"], "running");
+    assert_eq!(job["status"], "running");
+    assert_eq!(job["exit_code"], Value::Null);
+    assert!(job["runtime_ms"].is_u64(), "{job}");
+    assert_eq!(listed["agents"], json!([]));
+
+    client.ok("shutdown", json!({}));
+    assert!(client.exited().success());
 }

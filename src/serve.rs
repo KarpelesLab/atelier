@@ -22,11 +22,11 @@
 //!
 //! - The **session thread** (the caller of [`run`]) owns the [`Session`]. It
 //!   takes [`Job`]s off a channel one at a time — the handshake, a turn, a
-//!   slash command, the shutdown — and, between jobs, polls for what the
-//!   session produces on its own (messages from other instances, background
-//!   jobs that ended), as the TUI's idle prompt does. Everything a job
-//!   reports goes through [`ServeUi`], which writes one notification per
-//!   [`Ui`] callback.
+//!   slash command, a query (see [`query`]), the shutdown — and, between
+//!   jobs, polls for what the session produces on its own (messages from
+//!   other instances, background jobs that ended), as the TUI's idle prompt
+//!   does. Everything a job reports goes through [`ServeUi`], which writes
+//!   one notification per [`Ui`] callback.
 //! - The **reader thread** owns stdin. It answers at once whatever needs no
 //!   session — a turn's id, `turn/steer` (a shared queue the turn drains
 //!   between steps, like lines typed mid-turn), `turn/interrupt` (a flag the
@@ -75,6 +75,8 @@ use crate::tools::ask::{Answer, Question};
 use crate::tools::change::FileChange;
 
 mod history;
+
+mod query;
 
 /// The protocol version this build speaks (`initialize` reports it).
 const PROTOCOL: u64 = 1;
@@ -162,6 +164,10 @@ enum Job {
     History {
         id: Id,
         page: history::Page,
+    },
+    Query {
+        id: Id,
+        query: query::Query,
     },
     Shutdown {
         id: Id,
@@ -465,10 +471,26 @@ impl Shared {
                     ..Accepted::default()
                 })
             }
-            _ => Err(Failure::new(
-                rpc::code::METHOD_NOT_FOUND,
-                format!("unknown method '{method}'"),
-            )),
+            _ => {
+                let Some(query) = query::Query::parse(method, params)? else {
+                    return Err(Failure::new(
+                        rpc::code::METHOD_NOT_FOUND,
+                        format!("unknown method '{method}'"),
+                    ));
+                };
+                // Like a command: it needs the session, which a turn has.
+                if let Some(running) = state.running {
+                    return Err(busy(running));
+                }
+                state.running = Some(Running::Command);
+                Ok(Accepted {
+                    job: Some(Job::Query {
+                        id: id.clone(),
+                        query,
+                    }),
+                    ..Accepted::default()
+                })
+            }
         }
     }
 }
@@ -508,6 +530,11 @@ impl Server {
                     self.shared.wire.respond(&id, page.of(&self.session));
                 }
                 Ok(Job::Settings { id, set, params }) => self.settings(&id, set, &params),
+                Ok(Job::Query { id, query }) => {
+                    let result = query.answer(&self.session);
+                    self.release();
+                    self.shared.wire.respond(&id, result);
+                }
                 Ok(Job::Shutdown { id, force }) => {
                     if self.shutdown(&id, force) {
                         return;
@@ -583,6 +610,7 @@ impl Server {
                 "commands": true,
                 "history": true,
                 "file_changes": true,
+                "queries": query::METHODS,
                 "approval_timeout": self.shared.approval_timeout.map(|t| t.as_secs()),
             },
         });

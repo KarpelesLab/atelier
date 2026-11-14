@@ -139,6 +139,27 @@ struct Ended {
     announced: bool,
 }
 
+/// A background agent as a listing shows it (see [`Roster::agents`]).
+pub(in crate::agent) struct AgentInfo {
+    /// `agent-3`.
+    pub(in crate::agent) id: String,
+    /// The definition it runs (`explore`).
+    pub(in crate::agent) agent: String,
+    /// What it was asked to do, in the words of the call that started it.
+    pub(in crate::agent) description: String,
+    /// Since it was started.
+    pub(in crate::agent) runtime: Duration,
+    /// The last thing it did, as its activity line.
+    pub(in crate::agent) activity: String,
+    /// Where it works, when that is a worktree of its own.
+    pub(in crate::agent) worktree: Option<PathBuf>,
+    /// How it ended (`done`, `wrapped-up`, `failed`, `stopped`); `None`
+    /// while it runs.
+    pub(in crate::agent) ended: Option<&'static str>,
+    /// The model requests it made, once it has ended.
+    pub(in crate::agent) steps: Option<u32>,
+}
+
 /// `agent-3`.
 fn id_of(number: u32) -> String {
     format!("agent-{number}")
@@ -241,19 +262,34 @@ impl Roster {
     /// `/agents`: one line per agent that is running, or has ended and not
     /// yet reported to the model. Empty when there is none.
     pub(super) fn listing(&self) -> Vec<String> {
-        let state = self.lock();
-        let lines = state.agents.iter().map(|(number, e)| {
-            let state = match &e.ended {
-                None => format!("running {} · {}", runtime(e.started.elapsed()), e.activity),
-                Some(ended) => format!(
-                    "{} — its report goes to the model with your next message",
-                    ended.outcome.status.word()
-                ),
+        let lines = self.agents().into_iter().map(|a| {
+            let state = match a.ended {
+                None => format!("running {} · {}", runtime(a.runtime), a.activity),
+                Some(status) => {
+                    format!("{status} — its report goes to the model with your next message")
+                }
             };
-            let (id, agent, what) = (id_of(*number), &e.agent, &e.description);
+            let (id, agent, what) = (a.id, a.agent, a.description);
             format!("  {id}  {agent} — {what} · {state}")
         });
         lines.collect()
+    }
+
+    /// The agents that are running, or have ended and not yet reported to
+    /// the model, in the order they were started.
+    pub(in crate::agent) fn agents(&self) -> Vec<AgentInfo> {
+        let state = self.lock();
+        let info = |(number, e): (&u32, &Entry)| AgentInfo {
+            id: id_of(*number),
+            agent: e.agent.clone(),
+            description: e.description.clone(),
+            runtime: e.started.elapsed(),
+            activity: e.activity.clone(),
+            worktree: e.worktree.clone(),
+            ended: e.ended.as_ref().map(|ended| ended.outcome.status.word()),
+            steps: e.ended.as_ref().map(|ended| ended.outcome.steps),
+        };
+        state.agents.iter().map(info).collect()
     }
 
     /// `/agents stop <id>`: ask a running agent to stop. The line to show.

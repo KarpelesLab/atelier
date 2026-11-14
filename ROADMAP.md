@@ -665,10 +665,12 @@ a `/release` routine) live in its repository and apply to whoever opens it.
 still has to guess at, or cannot do, comes next — the interface itself stays
 out of this repository:
 
-- **Data, not prose**: methods that answer with structured results where a
+- ✅ **Data, not prose**: methods that answer with structured results where a
   slash command prints lines — the models and roles, MCP servers and their
   tools, peers and locks, usage, memory, the commands and skills there are,
-  background jobs.
+  background jobs (`models/list`, `mcp/list`, `peers/list`, `usage/get`,
+  `memory/list`, `commands/list`, `jobs/list`: see
+  [the protocol](docs/protocol.md#queries)).
 - ✅ **The conversation so far**: `session/history`, so a client that resumes
   a session can show it.
 - ✅ **Edits as diffs**: `event/file_change`, carrying the file and what

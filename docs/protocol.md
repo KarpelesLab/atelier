@@ -43,10 +43,10 @@ files, hooks, MCP servers — is configured as for any other run (see
   atelier's request ids are numbers it chooses; the client's may be numbers
   or strings.
 - Requests are handled in the order they arrive. Those that need the
-  session idle (`turn/start`, `command/run`, `settings/get`,
-  `settings/set`, `shutdown`) are refused while
-  it is busy rather than queued; the others are answered at once, even in
-  the middle of a turn.
+  session idle (`turn/start`, `command/run`, `session/history`,
+  `settings/get`, `settings/set`, the [queries](#queries), `shutdown`) are
+  refused while it is busy rather than queued; the others are answered at
+  once, even in the middle of a turn.
 - **End of input is a shutdown.** When stdin closes, atelier stops what is
   running and exits (status 0).
 
@@ -66,6 +66,7 @@ client                                   atelier
   │ command/run, session/status ────────────▶│   between turns
   │ session/history ────────────────────────▶│
   │ settings/get, settings/set ─────────────▶│
+  │ models/list, mcp/list, … ───────────────▶│
   │ shutdown ───────────────────────────────▶│
   │◀──────────────────────────────── result  │   then atelier exits
 ```
@@ -96,7 +97,9 @@ Result:
             "tools":["apply_patch","ask","bash","…"]},
  "capabilities":{"steer":true,"interrupt":true,"approvals":true,"questions":true,
                  "images":true,"commands":true,"history":true,"file_changes":true,
-                 "approval_timeout":null}}
+                 "approval_timeout":null,
+                 "queries":["models/list","mcp/list","peers/list","usage/get",
+                            "memory/list","commands/list","jobs/list"]}}
 ```
 
 - `protocol` is the version atelier speaks — `1`. It answers with its own
@@ -112,6 +115,9 @@ Result:
   `null`. `history` and `file_changes` say this build has
   [`session/history`](#sessionhistory) and sends
   [`event/file_change`](#eventfile_change).
+- `capabilities.queries` names the [queries](#queries) this build answers.
+  A server from before they existed has no such field, and answers them
+  with `-32601`.
 
 ### `turn/start`
 
@@ -454,6 +460,249 @@ Params: `{"force": false}` (optional).
 A forced shutdown, like end of input, does not wait forever for a turn
 that will not stop: after 5 seconds the process exits regardless.
 
+## Queries
+
+Methods that answer with data where a slash command prints lines: what an
+interface needs to build a model picker, a list of MCP servers, a panel of
+background jobs — without running `/models` or `/mcp` through
+[`command/run`](#commandrun) and reading `event/info` text. Each returns
+what the slash command of the same subject shows, from the same source.
+
+- **They need the session idle**, like `command/run`: while a turn or a
+  command runs they fail with `-32001`. (They read the session the turn is
+  using, the disk, and for `models/list` the providers — unlike
+  [`session/status`](#sessionstatus), which answers from a snapshot.) Ask
+  before a turn, or after its `turn/ended`.
+- They change nothing: no event is sent, nothing is written.
+- **No result carries a credential.** A provider is described by where its
+  key comes from, an MCP server without the headers it is sent.
+- `initialize` lists them in `capabilities.queries`; a server that predates
+  one answers `-32601`.
+- Fields are only ever added. Unless a table says otherwise, a field is
+  always present, `null` when there is nothing to say.
+
+### `models/list`
+
+The model in use, the providers and the models each offers, the model per
+role and the variants — what `/model`, `/models`, `/providers` and `/effort`
+show (see [Addressing a model](configuration.md#addressing-a-model)).
+
+| Param | | |
+|-------|-|-|
+| `fetch` | optional | `false`: do not ask the providers which models they offer (`providers[].models` is then `null`). Default `true`: one `GET /models` per provider, each waiting for as long as an unreachable endpoint takes to fail |
+
+```json
+{"backend":"openai",
+ "current":{"label":"local/qwen3-coder#high","model":"local/qwen3-coder#high",
+            "provider":"local","id":"qwen3-coder","variant":"high",
+            "options":{"reasoning_effort":"high"}},
+ "providers":[
+   {"name":"env","base_url":"http://192.168.0.50:11400/v1","key":"ATELIER_API_KEY",
+    "default":false,"models":null,"error":"sending request: connection refused"},
+   {"name":"local","base_url":"http://127.0.0.1:8080/v1","key":"none",
+    "default":true,"models":["qwen3-coder","qwen3-small"],"error":null}],
+ "roles":[
+   {"role":"main","model":"local/qwen3-coder#high","provider":"local","id":"qwen3-coder",
+    "options":{"reasoning_effort":"high"},"own":true},
+   {"role":"small","model":"qwen3-small","provider":"local","id":"qwen3-small",
+    "options":{},"own":true},
+   {"role":"subagent","model":"local/qwen3-coder#high","provider":"local","id":"qwen3-coder",
+    "options":{"reasoning_effort":"high"},"own":false},
+   "…"],
+ "variants":[{"name":"high","options":{"reasoning_effort":"high"}},
+             {"name":"low","options":{"reasoning_effort":"low"}},
+             {"name":"medium","options":{"reasoning_effort":"medium"}}]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `backend` | As in `initialize`: `openai`, `chatgpt` or `claude` |
+| `current.model` | The main model as addressed (`provider/model#variant`, or any part of it): what `/model` takes |
+| `current.label` | The same as `session/status`'s `model` (`chatgpt:<model>` when signed in with ChatGPT) |
+| `current.provider`, `current.id` | The provider that serves it and the id it is sent as. `provider` is `null` when signed in with ChatGPT, which is its own endpoint |
+| `current.variant`, `current.options` | The variant it is addressed with, or `null`, and the request fields that variant adds |
+| `providers[]` | The configured endpoints, the environment's (`env`) first |
+| `providers[].key` | Where the key comes from, never the key: `none`, `ATELIER_API_KEY`, `$VAR (set)` / `$VAR (not set)`, `from a command` |
+| `providers[].default` | A model addressed without a provider is on this one |
+| `providers[].models` | The ids it advertises; write one as `<name>/<id>` for `/model`. `null` when it was not asked, or could not be — then `error` says why |
+| `roles[]` | `main`, `small`, `subagent`, `review`, `summary`: the model serving each, as addressed and resolved |
+| `roles[].own` | The role has a model of its own, rather than falling back towards the main one |
+| `variants[]` | The known variants (`low`, `medium`, `high` and the `[variant.*]` tables) with the request fields each stands for |
+
+With the Claude backend, which picks and calls its own models, `providers`,
+`roles` and `variants` are empty and `current` has only `label` and `model`
+(the others `null`).
+
+### `mcp/list`
+
+The MCP servers and where each stands, with the tools of the connected
+ones — `/mcp`, plus what connecting them reported.
+
+```json
+{"servers":[
+  {"name":"github","transport":"stdio","command":"github-mcp","args":["--read-only"],
+   "enabled":true,"configured":true,"status":"connected","error":null,
+   "tools":[{"name":"mcp__github__search_issues","tool":"search_issues",
+             "description":"Search issues and pull requests","title":"Search issues",
+             "read_only":true,"destructive":null,"deferred":false}]},
+  {"name":"docs","transport":"http","url":"https://mcp.example.com/mcp",
+   "enabled":true,"configured":true,"status":"needs_login","error":null,"tools":[]},
+  {"name":"db","transport":"stdio","command":"db-mcp","args":[],
+   "enabled":true,"configured":true,"status":"failed",
+   "error":"starting MCP server 'db': No such file or directory (os error 2)","tools":[]}]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `transport` | `stdio` (then `command`, `args`) or `http` (then `url`); `null` for a server the client attached. An HTTP server's headers are never returned |
+| `enabled` | `false` for a server kept in `atelier.toml` with `enabled = false` |
+| `configured` | In `atelier.toml`, rather than attached for this session by the program driving it |
+| `status` | See below |
+| `error` | Why connecting failed, for `failed` |
+| `tools[].name` | The tool as the model calls it, `mcp__<server>__<tool>`; `tool` is the server's own name for it |
+| `tools[].title`, `read_only`, `destructive` | What the server says about the tool (its annotations); `null` where it says nothing |
+| `tools[].deferred` | The tool is reached through `mcp_search` / `mcp_call` rather than advertised to the model one by one |
+
+| `status` | Meaning |
+|----------|---------|
+| `connected` | Its tools are available |
+| `disabled` | `enabled = false` |
+| `needs_login` | An HTTP server that wants a sign-in: `/mcp login <name>` |
+| `failed` | Connecting it failed; `error` says how |
+| `untrusted` | The [project is not trusted](trust.md), so the server was not started |
+| `delegated` | The Claude backend: the server is handed to claude, which connects it itself |
+| `disconnected` | Not connected, for none of these reasons |
+
+### `peers/list`
+
+The other atelier instances on this machine and the advisory locks, as
+`/peers` shows them (see [Coordinator](coordinator.md)).
+
+```json
+{"enabled":true,"name":"atelier-2","link":"connected to coordinator 0.1.2 as 'atelier-2'","error":null,
+ "instances":[
+   {"name":"atelier","you":false,"status":"working","model":"qwen3-coder","cwd":"/home/me/project",
+    "pid":4021,"version":"0.1.2","since":1767225600,"topics":["build"]},
+   {"name":"atelier-2","you":true,"status":"idle","model":"qwen3-coder","cwd":"/home/me/project",
+    "pid":4188,"version":"0.1.2","since":1767225720,"topics":[]}],
+ "locks":[{"path":"/home/me/project/src/parser.rs","holder":"atelier","yours":false,
+           "note":"rewriting the tokenizer","since":1767225650}]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | This session has a coordinator link. `false` when it is switched off (`ATELIER_NO_COORDINATOR`) or on a platform without one (Windows): the lists are then empty, the rest `null` |
+| `name` | This instance's name among the others |
+| `link` | One line on the state of the link, as `/peers` prints it |
+| `error` | Why the coordinator could not be asked (the link is down); `instances` is then empty |
+| `instances[]` | Every connected instance, this one included (`you`): what it says of itself — `status` (`idle` / `working`), `model`, `cwd`, `pid`, `version` — when it connected (`since`, Unix seconds) and the `topics` it listens to |
+| `locks[]` | The paths instances say they are working on: absolute `path`, the `holder`'s name, whether it is this instance (`yours`), its `note`, and `since` (Unix seconds) |
+
+### `usage/get`
+
+This session's model requests, tokens and cost — `/usage`.
+
+```json
+{"backend":"openai","context_tokens":5210,"output_tokens":1873,
+ "by_model":[{"model":"env/qwen3-coder","requests":7,"prompt_tokens":31020,"completion_tokens":1873,
+              "cached_tokens":24100,"duration_ms":41250,"cost":0.0123,"priced_requests":7}],
+ "total":{"requests":7,"prompt_tokens":31020,"completion_tokens":1873,"cached_tokens":24100,
+          "duration_ms":41250,"cost":0.0123,"priced_requests":7}}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `context_tokens`, `output_tokens` | As in `session/status`'s `usage` |
+| `by_model[]` | One row per `provider/model` this process sent requests to — subagents', the reviewer's and summaries' included |
+| `requests`, `prompt_tokens`, `completion_tokens` | Summed over the row. `prompt_tokens` includes `cached_tokens`, the part the provider served from its cache |
+| `duration_ms` | Time spent waiting on the model |
+| `cost` | From the [`[[price]]`](configuration.md#usage-and-cost-price-atelier-stats-usage) tables; `null` when no request of the row has a price. With `priced_requests` < `requests` it is a lower bound |
+| `total` | The same sums over all rows |
+
+With the Claude backend, claude makes and bills the requests: `by_model` is
+empty and `total` all zeros; `context_tokens` and `output_tokens` are what
+claude reported.
+
+### `memory/list`
+
+What the agent remembers and where it is kept — `/memory` — and the
+instruction files the session loads up front (see [Memory](memory.md)).
+
+```json
+{"scopes":[
+   {"scope":"project","dir":"/home/me/project/.atelier/memory",
+    "memories":[{"name":"build","type":"reference","description":"how to build and test",
+                 "path":"/home/me/project/.atelier/memory/build.md"}]},
+   {"scope":"global","dir":"/home/me/.local/share/atelier/memory","memories":[]}],
+ "instruction_files":[{"path":"/home/me/.config/atelier/AGENTS.md"},
+                      {"path":"/home/me/project/AGENTS.md"}]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `scopes[]` | `project`, then `global` (left out when no home directory is known), each with its directory — which need not exist yet |
+| `memories[]` | The notes of the scope, by name: `type` is `user`, `feedback`, `project` or `reference`; `path` is the Markdown file, there to be read or edited |
+| `instruction_files[]` | The instruction files in the model's standing context, least specific first: the user's, then the project's, then those `[instructions] files` names |
+
+### `commands/list`
+
+What can be typed after a slash — `/help` — and the skills the agent can
+load — `/skills`.
+
+```json
+{"builtin":[{"name":"help","usage":"/help","description":"show this help"},
+            {"name":"model","usage":"/model [provider/model#variant]",
+             "description":"show or switch the active model"},
+            {"name":"mcp","usage":"/mcp","description":"list configured MCP servers"},
+            {"name":"mcp","usage":"/mcp remove <name>","description":"remove an MCP server"},
+            "…"],
+ "custom":[{"name":"fix","description":"fix an issue","argument_hint":"<issue>","model":null,
+            "path":"/home/me/project/.atelier/commands/fix.md"}],
+ "prompts":[{"name":"mcp:github:review","server":"github","prompt":"review",
+             "description":"Review a pull request","argument_hint":"<number>"}],
+ "skills":[{"name":"deploy","description":"ship a release",
+            "path":"/home/me/project/.atelier/skills/deploy","global":false}],
+ "skipped_skills":[".atelier/skills/broken/SKILL.md: no `name` in the front matter"]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `builtin[]` | The built-in commands, one entry per form (`/mcp`, `/mcp add …` are two): `name` without the slash, `usage` as typed, a one-line `description`. Some belong to the terminal (`/config`, `/quit`: see [`command/run`](#commandrun)) |
+| `custom[]` | The [command files](commands.md) of the project and the user, less those a built-in command shadows: `name` without the slash, `argument_hint` and `model` from the front matter, `path` of the file |
+| `prompts[]` | The prompts of the connected MCP servers, run as `/<name>`: `server`, the server's name for it (`prompt`), and what to type after it (`argument_hint`). One a command file shadows is left out |
+| `skills[]` | The [skills](skills.md) found: `path` is the skill's directory, `global` whether it is the user's rather than the project's |
+| `skipped_skills[]` | One line per `SKILL.md` that was skipped, saying why |
+
+Run any of the first three with `command/run`.
+
+### `jobs/list`
+
+The work running in the background: the `bash` jobs the model started with
+`background: true`, and the subagents `/agents` lists as running.
+
+```json
+{"jobs":[{"id":"job-1","command":"cargo watch -x test","state":"running","status":"running",
+          "exit_code":null,"runtime_ms":184220},
+         {"id":"job-2","command":"cargo build --release","state":"exited",
+          "status":"exit status: 0","exit_code":0,"runtime_ms":42010}],
+ "agents":[{"id":"agent-1","agent":"explore","description":"find the callers of parse()",
+            "state":"running","activity":"grep parse( src/","steps":null,
+            "runtime_ms":9120,"worktree":null}],
+ "claude_background":0}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `jobs[]` | Every background job of the process, in the order `bash_output` lists them; one that ended stays until the model removes it (`bash_kill`) |
+| `jobs[].state` | `running` or `exited`. `status` is the same in words (`exit status: 0`, or the signal that ended it); `exit_code` the code, `null` while it runs or when a signal ended it |
+| `jobs[].runtime_ms` | How long it ran, or has been running |
+| `agents[]` | The background subagents that are running, or have ended and not yet reported to the model (their report goes with the next prompt) |
+| `agents[].state` | `running`, or how it ended: `done`, `wrapped-up` (it ran out of steps), `failed`, `stopped` |
+| `agents[].activity` | The last thing it did |
+| `agents[].steps` | Model requests it made, once it has ended |
+| `agents[].worktree` | The git worktree it works in, when it has one of its own |
+| `claude_background` | As `session/status`'s `background`: tasks running in claude |
+
 ## Requests (atelier → client)
 
 The client **must answer** these: the turn that asked waits for the answer
@@ -626,7 +875,7 @@ codes are stable:
 | `-32601` | method not found | Unknown method |
 | `-32602` | invalid params | A required param is missing or of the wrong type; for `settings/set`, also a setting that does not exist or cannot be set |
 | `-32603` | internal error | A settings file could not be read or written (`settings/set`) |
-| `-32001` | turn running | `turn/start`, `command/run`, `session/history`, `settings/get`, `settings/set` or unforced `shutdown` while a turn or command runs. `data: {"turn": n}` for a turn |
+| `-32001` | turn running | `turn/start`, `command/run`, `session/history`, `settings/get`, `settings/set`, a [query](#queries) or unforced `shutdown` while a turn or command runs. `data: {"turn": n}` for a turn |
 | `-32002` | not initialized | A request other than `initialize` came first |
 | `-32003` | no turn running | `turn/steer` or `turn/interrupt` with nothing to act on |
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |
@@ -642,7 +891,7 @@ command asks.
 
 ```
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":{"name":"demo","version":"0.1"}}}
-← {"id":1,"jsonrpc":"2.0","result":{"atelier":{"version":"0.1.1"},"capabilities":{"approval_timeout":null,"approvals":true,"commands":true,"file_changes":true,"history":true,"images":true,"interrupt":true,"questions":true,"steer":true},"protocol":1,"session":{"backend":"openai","cwd":"/home/me/project","mode":"auto-edit","model":"qwen3-coder","tools":["apply_patch","ask","bash","…","write"]}}}
+← {"id":1,"jsonrpc":"2.0","result":{"atelier":{"version":"0.1.1"},"capabilities":{"approval_timeout":null,"approvals":true,"commands":true,"file_changes":true,"history":true,"images":true,"interrupt":true,"queries":["models/list","mcp/list","…"],"questions":true,"steer":true},"protocol":1,"session":{"backend":"openai","cwd":"/home/me/project","mode":"auto-edit","model":"qwen3-coder","tools":["apply_patch","ask","bash","…","write"]}}}
 → {"jsonrpc":"2.0","id":2,"method":"turn/start","params":{"text":"run the tests and fix what fails"}}
 ← {"id":2,"jsonrpc":"2.0","result":{"turn":1}}
 ← {"jsonrpc":"2.0","method":"event/reasoning","params":{"text":"I should run the suite first.","turn":1}}

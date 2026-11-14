@@ -473,14 +473,22 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<String> {
     rx
 }
 
+/// The command files that can be run: [`list`] without those a built-in
+/// command (`builtin`, given the name without its slash) shadows.
+pub fn reachable(
+    root: &Path,
+    global: Option<&Path>,
+    builtin: &dyn Fn(&str) -> bool,
+) -> Vec<Command> {
+    let commands = list(root, global).into_iter();
+    commands.filter(|c| !builtin(&c.name)).collect()
+}
+
 /// The lines `/help` adds for the custom commands, or nothing when there are
 /// none. `builtin` names the commands a file cannot define; such files are
 /// left out, since typing their name would never reach them.
 pub fn help(root: &Path, global: Option<&Path>, builtin: &dyn Fn(&str) -> bool) -> Vec<String> {
-    let commands: Vec<Command> = list(root, global)
-        .into_iter()
-        .filter(|c| !builtin(&c.name))
-        .collect();
+    let commands = reachable(root, global, builtin);
     if commands.is_empty() {
         return Vec::new();
     }

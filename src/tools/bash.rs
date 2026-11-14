@@ -524,6 +524,44 @@ pub fn notices(audience: Audience) -> Vec<Notice> {
     jobs().notices(audience, |_| true)
 }
 
+/// A background job as a listing shows it (see [`job_list`]).
+pub struct JobInfo {
+    /// `job-3`.
+    pub id: String,
+    /// The command, whole.
+    pub command: String,
+    /// `running`, or how it ended (`exit status: 0`, the signal).
+    pub status: String,
+    pub running: bool,
+    /// The exit code, once it has exited with one (not when a signal ended
+    /// it).
+    pub exit_code: Option<i32>,
+    /// How long it ran, or has been running.
+    pub runtime: Duration,
+}
+
+/// Every background job of this process, in the order `bash_output` lists
+/// them: the running ones, and the ended ones `bash_kill` has not removed.
+/// Asking tells nobody that a job ended (see [`notices`]).
+pub fn job_list() -> Vec<JobInfo> {
+    let mut jobs = jobs();
+    let info = |(id, job): (&String, &mut Job)| {
+        let running = !job.finished();
+        JobInfo {
+            id: id.clone(),
+            command: job.command.clone(),
+            status: job.status(),
+            running,
+            exit_code: match job.child.try_wait() {
+                Ok(Some(status)) => status.code(),
+                _ => None,
+            },
+            runtime: job.ended.unwrap_or_else(Instant::now) - job.started,
+        }
+    };
+    jobs.jobs.iter_mut().map(info).collect()
+}
+
 /// Note when the job `id` ends: look at it now and then until it has
 /// exited — or is gone from the registry, stopped by `bash_kill`.
 fn watch(id: String) {
@@ -697,13 +735,13 @@ impl Tool for BashOutputTool {
             })
             .flatten();
         let Some(id) = args.get("id").and_then(Value::as_str).or(latest.as_deref()) else {
-            let mut jobs = jobs();
-            if jobs.jobs.is_empty() {
+            let jobs = job_list();
+            if jobs.is_empty() {
                 return Ok("no background jobs".into());
             }
             let mut out = String::new();
-            for (id, job) in jobs.jobs.iter_mut() {
-                out.push_str(&format!("{id}  [{}]  {}\n", job.status(), job.command));
+            for job in jobs {
+                out.push_str(&format!("{}  [{}]  {}\n", job.id, job.status, job.command));
             }
             return Ok(out);
         };

@@ -25,6 +25,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -886,17 +887,17 @@ fn post_with_key(
 /// so in place of its models; with only the endpoint from the environment,
 /// the bare ids.
 pub fn model_listing(cfg: &Config) -> Vec<String> {
-    let providers = cfg.providers();
-    if let [only] = providers {
-        return match list_models(only) {
+    let mut offered = models_offered(cfg);
+    if offered.len() == 1 {
+        return match offered.remove(0).1 {
             Ok(models) if models.is_empty() => vec!["(no models returned)".to_string()],
             Ok(models) => models,
             Err(e) => vec![format!("error: {e:#}")],
         };
     }
     let mut out = Vec::new();
-    for provider in providers {
-        match list_models(provider) {
+    for (provider, models) in offered {
+        match models {
             Ok(models) if models.is_empty() => {
                 out.push(format!("{}: (no models returned)", provider.name));
             }
@@ -905,6 +906,15 @@ pub fn model_listing(cfg: &Config) -> Vec<String> {
         }
     }
     out
+}
+
+/// What each configured provider says it offers ([`list_models`]), in
+/// configuration order: the ids, or why they could not be had.
+pub fn models_offered(cfg: &Config) -> Vec<(Arc<Provider>, Result<Vec<String>>)> {
+    let providers = cfg.providers().iter();
+    providers
+        .map(|provider| (Arc::clone(provider), list_models(provider)))
+        .collect()
 }
 
 /// List model ids advertised by the endpoint (`GET /models`).
