@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/atelier/compare/v0.1.2...v0.1.3) - 2026-11-14
+
+### Added
+
+- atelier is a library its program consumes
+- serve --listen — the protocol on a Unix socket or loopback, a session per connection
+- serve — queries that answer with data where a slash command prints
+- settings over the protocol — settings/get and settings/set
+- serve — session/history and edits as diffs (event/file_change)
+- a model on this machine — atelier --local runs oxinfer
+- pre_tool hooks see a command file's shell lines before they run
+
+### Fixed
+
+- a slow local model no longer times out while it reads the prompt
+
+### Other
+
+- the 27B at 3 bits, for machines with less memory
+- roadmap — M24, a backend for other interfaces
+- the local model — why the 27B, and that smaller ones do poorly
+- wait for the client to read the server's status in the symbols test
+
 ## [0.1.2](https://github.com/KarpelesLab/atelier/compare/v0.1.1...v0.1.2) - 2026-11-13
 
 ### Added
