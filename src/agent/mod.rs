@@ -87,7 +87,7 @@ const MODE_NOTE: &str = "permission mode";
 /// Default context-size threshold (last request's total tokens) past which the
 /// conversation is compacted (see [`compact`]). Override with
 /// `ATELIER_CONTEXT_LIMIT`.
-const DEFAULT_CONTEXT_LIMIT: u32 = 8_000;
+pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 8_000;
 
 /// OpenAI API base for the Sign-in-with-ChatGPT (Responses API) backend.
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
@@ -1171,6 +1171,15 @@ impl Session {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+    /// The project's settings, to change in memory (`settings/set`):
+    /// [`save_settings`](Self::save_settings) writes them.
+    pub fn settings_mut(&mut self) -> &mut Settings {
+        &mut self.settings
+    }
+    /// Where the project stands, and so which of its settings count.
+    pub fn trust(&self) -> &Trust {
+        &self.trust
     }
     #[allow(dead_code)] // used by the /config screen
     pub fn auto_approve(&self) -> bool {

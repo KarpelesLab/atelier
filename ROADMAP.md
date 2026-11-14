@@ -673,8 +673,9 @@ out of this repository:
   a session can show it.
 - ✅ **Edits as diffs**: `event/file_change`, carrying the file and what
   changed as a unified diff, for every tool that writes.
-- **Settings**: read them with where each value comes from, and change the
-  user's own.
+- ✅ **Settings**: read them with where each value comes from, and change the
+  user's own — `settings/get` and `settings/set` (`docs/protocol.md`). What
+  can be set is what the `/config` screen edits; the rest is read-only.
 - **A transport a browser or a second process can reach**: `atelier serve`
   listening on a Unix socket or on loopback, with a token, one session per
   connection.

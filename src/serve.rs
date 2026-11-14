@@ -167,6 +167,12 @@ enum Job {
         id: Id,
         force: bool,
     },
+    /// `settings/get`, or `settings/set` (see [`crate::settings_api`]).
+    Settings {
+        id: Id,
+        set: bool,
+        params: Value,
+    },
     /// stdin ended: the client is gone.
     Eof,
 }
@@ -391,6 +397,22 @@ impl Shared {
                     ..Accepted::default()
                 })
             }
+            // The settings are the session's to read and to change: both
+            // wait for it to be idle, like a command.
+            "settings/get" | "settings/set" => {
+                if let Some(running) = state.running {
+                    return Err(busy(running));
+                }
+                state.running = Some(Running::Command);
+                Ok(Accepted {
+                    job: Some(Job::Settings {
+                        id: id.clone(),
+                        set: method == "settings/set",
+                        params: params.clone(),
+                    }),
+                    ..Accepted::default()
+                })
+            }
             "session/status" => {
                 let mut status = state.status.clone();
                 status["turn"] = match state.running {
@@ -485,6 +507,7 @@ impl Server {
                 Ok(Job::History { id, page }) => {
                     self.shared.wire.respond(&id, page.of(&self.session));
                 }
+                Ok(Job::Settings { id, set, params }) => self.settings(&id, set, &params),
                 Ok(Job::Shutdown { id, force }) => {
                     if self.shutdown(&id, force) {
                         return;
@@ -676,6 +699,21 @@ impl Server {
         };
         self.release();
         self.shared.wire.respond(id, result);
+    }
+
+    /// `settings/get` and `settings/set`.
+    fn settings(&mut self, id: &Id, set: bool, params: &Value) {
+        let root = &self.shared.cwd;
+        let result = if set {
+            crate::settings_api::set(&mut self.session, root, params)
+        } else {
+            Ok(crate::settings_api::get(&self.session, root))
+        };
+        self.release();
+        match result {
+            Ok(result) => self.shared.wire.respond(id, result),
+            Err(failure) => self.shared.wire.fail(id, failure),
+        }
     }
 
     /// `shutdown`: whether to leave. Exiting ends claude and the background

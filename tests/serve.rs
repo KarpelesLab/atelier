@@ -229,7 +229,14 @@ impl Client {
     /// of the outer environment or the real home leaking in. Auto-approve
     /// is off: approvals are the client's to answer.
     fn spawn(mock: &Mock, cwd: &Path, args: &[&str]) -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_atelier"))
+        Client::spawn_env(mock, cwd, args, &[])
+    }
+
+    /// [`spawn`](Self::spawn), with these variables set (`Some`) or taken
+    /// out (`None`) on top of the environment it gives the child.
+    fn spawn_env(mock: &Mock, cwd: &Path, args: &[&str], env: &[(&str, Option<&str>)]) -> Client {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_atelier"));
+        command
             .arg("serve")
             .args(args)
             .current_dir(cwd)
@@ -250,11 +257,17 @@ impl Client {
             .env_remove("ATELIER_REVIEW")
             .env_remove("ATELIER_MODE")
             .env_remove("ATELIER_PARALLEL_TOOLS")
+            .env_remove("ATELIER_SEARCH_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn atelier serve");
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        let mut child = command.spawn().expect("spawn atelier serve");
 
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, incoming) = mpsc::channel();
@@ -300,7 +313,13 @@ impl Client {
 
     /// A served session past its handshake.
     fn ready(mock: &Mock, cwd: &Path, args: &[&str]) -> Client {
-        let mut client = Client::spawn(mock, cwd, args);
+        Client::ready_env(mock, cwd, args, &[])
+    }
+
+    /// [`ready`](Self::ready), with the environment changed as
+    /// [`spawn_env`](Self::spawn_env) does.
+    fn ready_env(mock: &Mock, cwd: &Path, args: &[&str], env: &[(&str, Option<&str>)]) -> Client {
+        let mut client = Client::spawn_env(mock, cwd, args, env);
         client.ok(
             "initialize",
             json!({"client": {"name": "test", "version": "0"}}),
@@ -1225,4 +1244,329 @@ fn an_edit_and_a_new_file_are_reported_as_diffs() {
         .filter(|m| m["method"] == "event/tool_end" && m["params"]["ok"] == false)
         .collect();
     assert_eq!(failed.len(), 1, "{failed:?}");
+}
+
+// --------------------------------------------------------------- settings
+
+/// The user-global `atelier.toml` of a session served in `dir`: under the
+/// `XDG_CONFIG_HOME` the client gives it, never the real one.
+fn user_settings(dir: &Path) -> PathBuf {
+    dir.join(".no-user-config")
+        .join("atelier")
+        .join("atelier.toml")
+}
+
+/// The entry of `settings/get` for `key`.
+fn setting<'a>(settings: &'a Value, key: &str) -> &'a Value {
+    let list = settings["settings"].as_array().expect("a list of settings");
+    list.iter()
+        .find(|s| s["key"] == key)
+        .unwrap_or_else(|| panic!("no setting '{key}' in {settings}"))
+}
+
+/// The value in force and its source, of an entry of `settings/get`.
+fn held(entry: &Value) -> (Value, &str) {
+    (
+        entry["value"].clone(),
+        entry["source"].as_str().expect("a source"),
+    )
+}
+
+/// `settings/get` lists every setting with its value and where it comes
+/// from — a flag, the environment, the project's file, the user's, the
+/// built-in default — says which values do not count and why (an untrusted
+/// project's, a key in the wrong file), describes each setting well enough
+/// to draw a form, and lets no key through.
+#[test]
+fn settings_are_reported_with_where_each_value_comes_from() {
+    let mock = Mock::scripted(|_, _| answer("unused"));
+    let dir = unique_dir("settings-get");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        r#"
+[defaults]
+context_limit = 4000
+mode = "yolo"
+
+[[mcp_http]]
+name = "web"
+url = "http://127.0.0.1:1/mcp"
+headers = ["Authorization: Bearer sk-secret-header"]
+
+[local]
+model = "someone/elses-model"
+"#,
+    )
+    .unwrap();
+    let user = user_settings(&dir);
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::write(
+        &user,
+        r#"
+[models]
+small = "tiny"
+
+[[provider]]
+name = "hosted"
+base_url = "http://127.0.0.1:1/v1"
+api_key_command = "echo sk-secret-command"
+headers = { "X-Token" = "sk-secret-table" }
+"#,
+    )
+    .unwrap();
+    let env = [("ATELIER_API_KEY", Some("sk-secret-env"))];
+    let mut client = Client::ready_env(&mock, &dir, &[], &env);
+
+    let settings = client.ok("settings/get", json!({}));
+    assert_eq!(
+        settings["files"]["project"],
+        json!({"path": dir.join("atelier.toml"), "exists": true})
+    );
+    assert_eq!(
+        settings["files"]["user"],
+        json!({"path": user, "exists": true})
+    );
+    assert_eq!(
+        settings["trust"],
+        json!({"state": "untrusted", "active": false})
+    );
+
+    // The environment over everything.
+    let model = setting(&settings, "defaults.model");
+    assert_eq!(held(model), (json!("mock"), "env"));
+    assert_eq!(model["layers"][0]["name"], "ATELIER_MODEL");
+    let last = model["layers"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["source"], "default");
+    // The project's file, the user's, the default.
+    let limit = setting(&settings, "defaults.context_limit");
+    assert_eq!(held(limit), (json!(4000), "project"));
+    let small = setting(&settings, "models.small");
+    assert_eq!(held(small), (json!("tiny"), "user"));
+    let review = setting(&settings, "review.enabled");
+    assert_eq!(held(review), (json!(false), "default"));
+
+    // An untrusted project does not get to start in yolo, nor to contact
+    // its servers: the values are there, marked as not counting.
+    let mode = setting(&settings, "defaults.mode");
+    assert_eq!(held(mode), (json!("auto-edit"), "default"));
+    let ignored = &mode["layers"][0];
+    assert_eq!(ignored["source"], "project");
+    assert_eq!(ignored["value"], "yolo");
+    let why = ignored["ignored"].as_str().unwrap();
+    assert!(why.contains("not trusted"), "{mode}");
+    let servers = setting(&settings, "mcp_http");
+    assert!(servers["value"].is_null(), "{servers}");
+    assert!(servers["layers"][0]["ignored"].is_string(), "{servers}");
+    assert_eq!(
+        servers["layers"][0]["value"][0]["headers"],
+        json!(["Authorization"])
+    );
+    // What only the user's own file may say.
+    let local = setting(&settings, "local.model");
+    assert!(local["value"].is_null(), "{local}");
+    let why = local["layers"][0]["ignored"].as_str().unwrap();
+    assert!(why.contains("user-global file only"), "{local}");
+
+    // Enough to draw a form with.
+    assert_eq!(mode["type"], "string");
+    assert_eq!(
+        mode["values"],
+        json!(["plan", "ask-edits", "auto-edit", "yolo"])
+    );
+    assert_eq!(mode["settable"], false);
+    assert_eq!(limit["type"], "integer");
+    assert_eq!(limit["label"], "context limit");
+    assert_eq!(limit["settable"], true);
+    assert_eq!(limit["scopes"], json!(["project"]));
+    assert_eq!(model["scopes"], json!(["user", "project"]));
+    for entry in settings["settings"].as_array().unwrap() {
+        let described = entry["description"].as_str().is_some_and(|d| !d.is_empty());
+        assert!(described, "{entry}");
+        assert!(entry["settable"].is_boolean(), "{entry}");
+        assert!(entry["layers"].is_array(), "{entry}");
+    }
+
+    // Keys: that there is one, and where — never the key.
+    let provider = &setting(&settings, "provider")["value"][0];
+    assert_eq!(provider["api_key_command"], true);
+    assert_eq!(provider["headers"], json!(["X-Token"]));
+    let key = &settings["keys"][0];
+    assert_eq!(key["name"], "ATELIER_API_KEY");
+    assert_eq!(key["set"], true);
+    assert_eq!(key["source"], "env");
+    assert_eq!(settings["keys"][1]["set"], false);
+    assert!(!settings.to_string().contains("sk-secret"), "{settings}");
+
+    // A mode given on the command line is told from one configured.
+    drop(client);
+    let mut client = Client::ready(&mock, &dir, &["--mode", "plan"]);
+    let settings = client.ok("settings/get", json!({}));
+    assert_eq!(
+        held(setting(&settings, "defaults.mode")),
+        (json!("plan"), "flag")
+    );
+    // …and one switched during the session from both.
+    client.ok("command/run", json!({"line": "/mode ask-edits"}));
+    let settings = client.ok("settings/get", json!({}));
+    assert_eq!(
+        held(setting(&settings, "defaults.mode")),
+        (json!("ask-edits"), "session")
+    );
+}
+
+/// `settings/set` writes the user's own file by default and the project's
+/// when asked, puts the value into effect at once where it is the one that
+/// counts, and the next `settings/get` — and the next session — has it.
+#[test]
+fn a_setting_is_written_applied_and_read_back() {
+    let mock = Mock::scripted(|_, _| answer("unused"));
+    let dir = unique_dir("settings-set");
+    let user = user_settings(&dir);
+    // No ATELIER_MODEL: the files decide the model.
+    let env = [("ATELIER_MODEL", None)];
+    let mut client = Client::ready_env(&mock, &dir, &[], &env);
+    assert!(!user.exists());
+
+    // The user's file, created for the occasion; in effect at once.
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "defaults.model", "value": "next-model"}),
+    );
+    assert_eq!(set["scope"], "user");
+    assert_eq!(set["applies"], "now");
+    assert_eq!(set["file"], json!(user));
+    assert_eq!(set["setting"]["source"], "user");
+    let written = std::fs::read_to_string(&user).unwrap();
+    assert!(written.contains("model = \"next-model\""), "{written}");
+    assert!(!dir.join("atelier.toml").exists());
+    assert_eq!(
+        client.ok("session/status", json!({}))["model"],
+        "next-model"
+    );
+    let settings = client.ok("settings/get", json!({}));
+    assert_eq!(
+        held(setting(&settings, "defaults.model")),
+        (json!("next-model"), "user")
+    );
+
+    // The project's file, for what is read from there.
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "defaults.context_limit", "value": 1234, "scope": "project"}),
+    );
+    assert_eq!(set["scope"], "project");
+    assert_eq!(set["applies"], "now");
+    assert_eq!(set["file"], json!(dir.join("atelier.toml")));
+    let project = std::fs::read_to_string(dir.join("atelier.toml")).unwrap();
+    assert!(project.contains("context_limit = 1234"), "{project}");
+    // Applying the model did not carry it into the project's file.
+    assert!(!project.contains("next-model"), "{project}");
+    assert_eq!(
+        client.ok("session/status", json!({}))["context_limit"],
+        1234
+    );
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "review.enabled", "value": true, "scope": "project"}),
+    );
+    assert_eq!(set["setting"]["value"], true);
+    let settings = client.ok("settings/get", json!({}));
+    assert_eq!(
+        held(setting(&settings, "defaults.context_limit")),
+        (json!(1234), "project")
+    );
+    assert_eq!(setting(&settings, "review.enabled")["source"], "project");
+
+    // `null` takes the key out; the running session keeps what it has.
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "defaults.context_limit", "value": null, "scope": "project"}),
+    );
+    assert_eq!(set["applies"], "next_start");
+    let project = std::fs::read_to_string(dir.join("atelier.toml")).unwrap();
+    assert!(!project.contains("context_limit"), "{project}");
+    assert_eq!(set["setting"]["source"], "session");
+    assert_eq!(
+        client.ok("session/status", json!({}))["context_limit"],
+        1234
+    );
+
+    // The next session starts with what was written.
+    drop(client);
+    let mut client = Client::spawn_env(&mock, &dir, &[], &env);
+    let hello = client.ok("initialize", json!({}));
+    assert_eq!(hello["session"]["model"], "next-model");
+    let status = client.ok("session/status", json!({}));
+    assert_eq!(status["context_limit"], 8000);
+    drop(client);
+
+    // Where something stronger decides, the value is written and the
+    // answer says what stands in its way.
+    let mut client = Client::ready(&mock, &dir, &[]);
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "defaults.model", "value": "later-model"}),
+    );
+    assert_eq!(set["applies"], "overridden");
+    assert_eq!(set["by"]["source"], "env");
+    assert_eq!(set["by"]["name"], "ATELIER_MODEL");
+    assert_eq!(client.ok("session/status", json!({}))["model"], "mock");
+    let written = std::fs::read_to_string(&user).unwrap();
+    assert!(written.contains("later-model"), "{written}");
+}
+
+/// What `settings/set` refuses, each as invalid params and without a file
+/// written: a key that is none, a value of the wrong type, a setting that
+/// is not the client's to change — above all one gated by trust or reserved
+/// to the user's own file, at project scope — and a file the setting is not
+/// read from. And, like a command, both methods wait for the turn to end.
+#[test]
+fn settings_that_cannot_be_set_are_refused() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call("call_1", "bash", json!({"command": "echo hi"})),
+        _ => answer("done"),
+    });
+    let dir = unique_dir("settings-refused");
+    let mut client = Client::ready(&mock, &dir, &[]);
+
+    let refused = [
+        json!({"key": "no.such", "value": 1}),
+        json!({"value": 1}),
+        json!({"key": "defaults.model"}),
+        json!({"key": "defaults.model", "value": 7}),
+        json!({"key": "defaults.model", "value": ""}),
+        json!({"key": "defaults.model", "value": "m", "scope": "everywhere"}),
+        json!({"key": "defaults.context_limit", "value": "many", "scope": "project"}),
+        json!({"key": "defaults.context_limit", "value": 0, "scope": "project"}),
+        json!({"key": "review.enabled", "value": "yes", "scope": "project"}),
+        // Read from the project's file only: the user's would not count.
+        json!({"key": "defaults.context_limit", "value": 9000}),
+        json!({"key": "defaults.context_limit", "value": 9000, "scope": "user"}),
+        // Gated by trust, or the user's own file's alone: at no scope.
+        json!({"key": "defaults.approve", "value": true, "scope": "project"}),
+        json!({"key": "defaults.approve", "value": true}),
+        json!({"key": "defaults.mode", "value": "yolo", "scope": "project"}),
+        json!({"key": "local.model", "value": "x", "scope": "project"}),
+        json!({"key": "sandbox.root", "value": "/", "scope": "project"}),
+        json!({"key": "permissions.allow", "value": ["bash"], "scope": "project"}),
+        json!({"key": "provider", "value": [], "scope": "project"}),
+        json!({"key": "search.key_env", "value": "HOME"}),
+    ];
+    for params in refused {
+        let error = client.err("settings/set", params.clone(), INVALID_PARAMS);
+        assert!(error["message"].is_string(), "{params}: {error}");
+    }
+    assert!(!dir.join("atelier.toml").exists());
+    assert!(!user_settings(&dir).exists());
+
+    // A turn held at its approval prompt: the settings wait for it.
+    let turn = client.start_turn("run it");
+    let asked = client.asked("approval/request");
+    client.err("settings/get", json!({}), TURN_RUNNING);
+    let set = json!({"key": "review.enabled", "value": true, "scope": "project"});
+    client.err("settings/set", set.clone(), TURN_RUNNING);
+    client.reply(&asked, json!({"decision": "deny"}));
+    client.turn_ended(&turn);
+    assert!(!dir.join("atelier.toml").exists());
+    assert_eq!(client.ok("settings/set", set)["applies"], "now");
 }

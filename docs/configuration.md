@@ -768,6 +768,11 @@ prints a read-only text summary of the same settings. Either way it shows
 the active **backend** — the configured chat/completions endpoint, or
 `chatgpt:<model>` while [signed in with ChatGPT](chatgpt.md) via `/login`.
 
+A program driving atelier through [`atelier serve`](protocol.md) has no such
+screen: it reads the settings, with the file, variable or flag each value
+comes from, with [`settings/get`](protocol.md#settingsget), and changes the
+ones this screen edits with [`settings/set`](protocol.md#settingsset).
+
 ## `/login` and `/logout`
 
 `/login` runs [Sign in with ChatGPT](chatgpt.md) — OpenAI's OAuth flow for

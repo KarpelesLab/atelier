@@ -43,7 +43,8 @@ files, hooks, MCP servers — is configured as for any other run (see
   atelier's request ids are numbers it chooses; the client's may be numbers
   or strings.
 - Requests are handled in the order they arrive. Those that need the
-  session idle (`turn/start`, `command/run`, `shutdown`) are refused while
+  session idle (`turn/start`, `command/run`, `settings/get`,
+  `settings/set`, `shutdown`) are refused while
   it is busy rather than queued; the others are answered at once, even in
   the middle of a turn.
 - **End of input is a shutdown.** When stdin closes, atelier stops what is
@@ -64,6 +65,7 @@ client                                   atelier
   │◀──────────────────── turn/ended {turn:1} │
   │ command/run, session/status ────────────▶│   between turns
   │ session/history ────────────────────────▶│
+  │ settings/get, settings/set ─────────────▶│
   │ shutdown ───────────────────────────────▶│
   │◀──────────────────────────────── result  │   then atelier exits
 ```
@@ -173,7 +175,7 @@ Params: `{"line": "/mode plan"}`.
 | `prompt` | `false` | The line is not a command. `text` is the line: send it with `turn/start` if that is what was meant |
 | `expanded` | `false` | A custom command expanded into a prompt. `text` is the expanded prompt; atelier does not start the turn itself — the client decides. `model` is the model the command file asks for (`model:` in its front matter), or `null`: `turn/start` takes no model, so a client that honours it switches with `/model` before the turn and back after |
 | `quit` | `false` | `/quit`: leaving is the client's call (`shutdown`) |
-| `config` | `false` | `/config`: the settings screen belongs to the terminal interface; a client presents its own |
+| `config` | `false` | `/config`: the settings screen belongs to the terminal interface; a client presents its own, with [`settings/get`](#settingsget) and [`settings/set`](#settingsset) |
 
 Fails with `-32001` while a turn or another command runs. A command may
 itself ask for approval (a custom command's `` !`shell` `` lines do).
@@ -286,6 +288,153 @@ own store: atelier has no messages to return, so `items` is empty,
 `stored` is `false`, and `claude_session` names the Claude Code session
 (the one `--continue` resumes) for a client that wants to read that
 transcript itself.
+
+### `settings/get`
+
+The settings as a client needs them to show a settings view of its own:
+every setting with its value in force and **where that value comes from**,
+and enough about each to draw a form without knowing atelier's schema. No
+params. Like a command, it needs the session idle: `-32001` while a turn or
+a command runs.
+
+```json
+{"files":{"user":{"path":"/home/me/.config/atelier/atelier.toml","exists":true},
+          "project":{"path":"/home/me/project/atelier.toml","exists":true}},
+ "trust":{"state":"untrusted","active":false},
+ "settings":[
+   {"key":"defaults.context_limit","type":"integer","label":"context limit",
+    "description":"Tokens in a request past which older history is compacted into a summary",
+    "settable":true,"scopes":["project"],"env":"ATELIER_CONTEXT_LIMIT",
+    "value":4000,"source":"project",
+    "layers":[{"source":"project","value":4000},{"source":"default","value":8000}]},
+   {"key":"defaults.mode","type":"string","values":["plan","ask-edits","auto-edit","yolo"],
+    "description":"The permission mode sessions start in; `yolo` is honoured in a trusted project only",
+    "settable":false,"scopes":[],"env":"ATELIER_MODE",
+    "value":"auto-edit","source":"default",
+    "layers":[{"source":"project","value":"yolo",
+               "ignored":"the project is not trusted (untrusted): accept its settings with /trust"},
+              {"source":"default","value":"auto-edit"}]},
+   "…"],
+ "keys":[{"name":"ATELIER_API_KEY","description":"the bearer token of the `env` provider","set":true,"source":"env"},
+         {"name":"ATELIER_SEARCH_KEY","description":"the `web_search` provider's API key","set":false,"source":null}]}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `files.user`, `files.project` | The two `atelier.toml` files: `path` (`null` for the user's when there is no home directory), whether each `exists`, and `error` when it cannot be read as settings — then nothing of it is in force |
+| `trust` | Where the project stands (see [Project trust](trust.md)): `state` is `not-needed`, `trusted`, `trusted-by-environment`, `untrusted` or `changed`; `active` says whether its gated settings count |
+| `settings` | One entry per setting, see below |
+| `keys` | The keys the environment holds: whether each is `set`, never its value |
+
+An entry of `settings`:
+
+| Field | Meaning |
+|-------|---------|
+| `key` | The path in `atelier.toml`: `table.key`, or a table's name (`mcp`, `provider`, …) |
+| `type` | `boolean`, `integer`, `string`, `list` (strings), `tables` (an array of tables), `table` |
+| `values` | The allowed values, for an enumeration |
+| `description` | One line on what it is |
+| `label` | The setting's name on the terminal interface's `/config` screen, for the ones it shows |
+| `settable`, `scopes` | Whether [`settings/set`](#settingsset) can change it, and in which files: `user`, `project` |
+| `env` | The environment variable that overrides it, if there is one |
+| `value` | The value in force; `null` when nothing sets it and there is no default worth stating |
+| `source` | Where `value` comes from: `default`, `user` (the user-global file), `project`, `env`, `flag` (the command line) or `session` (changed since the session started: `/model`, `/mode`, `/review`, …) |
+| `combined` | `true` when the files' entries apply together (`permissions.allow`, `hooks`, `provider`, …): `value` is the project's entries followed by the user's, and `source` the first file that has any |
+| `layers` | Everything that says something about the setting, the strongest first: `source`, `value`, `name` (the variable or the flag), `key` (when the value sits under another key: `models.main` decides `defaults.model`), and `ignored` — the reason a value that is there does not count |
+
+A value is `ignored` when the project is not trusted and the setting is
+[gated](trust.md#what-is-gated-and-why) — an untrusted project's `yolo`
+default, its MCP servers, its allow rules — when it sits in a file the
+setting is not read from (`[local] model` or `[sandbox] root` in a project's
+file; `context_limit` in the user's), or when the variable holds something
+it does not understand.
+
+**No secret is returned.** `atelier.toml` names keys rather than holding
+them (`api_key_env`, `key_env`: reported as written). Where one can sit
+anyway it is left out: the headers of `[[mcp_http]]` and `[[provider]]` are
+reduced to their names, `api_key_command` to `true`. `ATELIER_API_KEY` and
+`ATELIER_SEARCH_KEY` appear under `keys` as set or not. Commands (`[[mcp]]`,
+`[[hooks]]`, `[[diagnostics]]`, `[[lsp]]`) are reported as written, as
+`/trust show` prints them.
+
+Where the sources are approximate:
+
+- The files are read **as they are on disk now**; the session read them when
+  it started. A file edited by hand since is reported with its new values,
+  which take effect at the next start.
+- `session` says the running session differs from its configuration, not
+  which command did it; it is worked out for the model, the mode,
+  auto-approve, the context limit and review mode. `flag` is `--mode` only.
+  With the [Claude backend](claude.md), claude picks its own model: the
+  model settings are reported as configured.
+- In an untrusted project, the allow rules saved with "always" during the
+  session count for it, though `permissions.allow` shows the project's rules
+  as ignored.
+- A `combined` value is the plain concatenation: an entry of the user's file
+  that the project replaces by name (`provider`) is still listed.
+- Checkers and language servers detected from the project's files are not
+  settings, and are not listed.
+
+### `settings/set`
+
+Change one setting in an `atelier.toml`, and put it into effect.
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"settings/set","params":{"key":"defaults.model","value":"qwen3-coder:30b"}}
+```
+
+| Param | | |
+|-------|-|-|
+| `key` | required | The setting's key path, as `settings/get` lists it |
+| `value` | required | The new value, of the setting's `type` (and among its `values`); `null` takes the key out of the file |
+| `scope` | optional | `user` (the default): the user-global file. `project`: the project's `atelier.toml`. A setting takes only the scopes `settings/get` lists for it |
+
+Result:
+
+```json
+{"key":"defaults.model","scope":"user","value":"qwen3-coder:30b",
+ "file":"/home/me/.config/atelier/atelier.toml","applies":"now",
+ "setting":{"key":"defaults.model","value":"qwen3-coder:30b","source":"user","…":"…"}}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `file` | The file that was written |
+| `applies` | `now`: the running session has the value. `next_start`: it is written, and the session keeps what it has — after `null`, or when a command changed the setting during the session. `overridden`: it is written, and something stronger decides, now and at the next start |
+| `by` | For `overridden`, the layer that decides (as in `settings/get`) |
+| `setting` | The setting's entry as `settings/get` now reports it |
+| `note` | A remark, when there is one (the Claude backend picks its own model) |
+
+What can be set is what the terminal interface's `/config` screen edits,
+written the way it writes:
+
+| Key | Scopes | |
+|-----|--------|-|
+| `defaults.model` | `user`, `project` | The main model. Written to the project's file it is in effect at once, as on the screen. Written to the user's, at once when that value is the one that counts: `ATELIER_MODEL`, `[models] main` and the project's `[defaults] model` win over it (`overridden`) |
+| `defaults.context_limit` | `project` | In effect at once |
+| `review.enabled` | `project` | In effect at once |
+
+- The user-global file is the default, and the place for the user's own
+  choices; but `context_limit` and `review.enabled` are read from the
+  project's file only, so that is the one scope they take. A scope the
+  setting is not read from is refused rather than written to no effect.
+- `defaults.approve` (the screen's auto-approve) cannot be set: in a
+  project's file it is a [gated setting](trust.md) — it switches every
+  approval prompt off — and the user-global file is not read for it. Switch
+  the session with `command/run` and `/mode yolo`. Nothing gated by trust,
+  and nothing honoured in the user-global file only (`[local] model`,
+  `[sandbox] root`), can be written to a project's file through this method.
+- **The file is rewritten whole** from the parsed settings, as `/config` and
+  `/mcp add` rewrite the project's: comments and the layout are not kept,
+  and tables come back in atelier's order. A user-global file that cannot be
+  read as settings is left alone (`-32603`).
+- A change to the project's file is the user's own edit: in a trusted
+  project the result stays trusted, in an untrusted one nothing is accepted
+  by it (see [atelier's own edits](trust.md#ateliers-own-edits)).
+- Fails with `-32602` for an unknown key, a value of the wrong type or not
+  among the allowed ones, a setting that is not settable, or a scope it does
+  not take; with `-32001` while a turn or a command runs — a setting does
+  not change under a turn.
 
 ### `shutdown`
 
@@ -475,8 +624,9 @@ codes are stable:
 | `-32700` | parse error | A line that is not JSON. Answered with `"id": null`; the session carries on |
 | `-32600` | invalid request | JSON, but not a request, notification or answer (an array, a missing or non-string `method`). `id` is the message's, or `null` |
 | `-32601` | method not found | Unknown method |
-| `-32602` | invalid params | A required param is missing or of the wrong type |
-| `-32001` | turn running | `turn/start`, `command/run`, `session/history` or unforced `shutdown` while a turn or command runs. `data: {"turn": n}` for a turn |
+| `-32602` | invalid params | A required param is missing or of the wrong type; for `settings/set`, also a setting that does not exist or cannot be set |
+| `-32603` | internal error | A settings file could not be read or written (`settings/set`) |
+| `-32001` | turn running | `turn/start`, `command/run`, `session/history`, `settings/get`, `settings/set` or unforced `shutdown` while a turn or command runs. `data: {"turn": n}` for a turn |
 | `-32002` | not initialized | A request other than `initialize` came first |
 | `-32003` | no turn running | `turn/steer` or `turn/interrupt` with nothing to act on |
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |

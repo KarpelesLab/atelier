@@ -35,6 +35,7 @@ mod schema;
 mod serve;
 mod session;
 mod settings;
+mod settings_api;
 mod shlex;
 mod skills;
 mod tools;
@@ -179,6 +180,10 @@ fn run() -> Result<u8> {
             return Ok(headless::EXIT_USAGE);
         }
     };
+    // `settings/get` tells a mode chosen here from one chosen later.
+    if let Some(mode) = cli.mode {
+        settings_api::mode_from_flag(mode);
+    }
     // Daily check for a newer release, in the background (official builds).
     update::spawn_background_check();
     // `atelier acp`: the Agent Client Protocol on stdin/stdout, for an editor

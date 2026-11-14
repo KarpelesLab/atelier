@@ -18,6 +18,7 @@ use super::term::{self, Event, Key};
 use anyhow::Result;
 
 use crate::agent::Session;
+use crate::settings_api::{self, Kind, Spec};
 
 /// Which setting a row edits. The order here is the on-screen order.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,18 +38,25 @@ impl Row {
         Row::ReviewMode,
     ];
 
+    /// The setting the row edits, in the table the protocol's
+    /// `settings/get` describes it from too (see [`crate::settings_api`]).
+    fn spec(self) -> &'static Spec {
+        let key = match self {
+            Row::Model => "defaults.model",
+            Row::AutoApprove => "defaults.approve",
+            Row::ContextLimit => "defaults.context_limit",
+            Row::ReviewMode => "review.enabled",
+        };
+        settings_api::find(key).expect("every row is a setting of the table")
+    }
+
     fn label(self) -> &'static str {
-        match self {
-            Row::Model => "model",
-            Row::AutoApprove => "auto-approve",
-            Row::ContextLimit => "context limit",
-            Row::ReviewMode => "review mode",
-        }
+        self.spec().label.unwrap_or(self.spec().key)
     }
 
     /// A bool row toggles in place; a value row opens an inline text editor.
     fn is_bool(self) -> bool {
-        matches!(self, Row::AutoApprove | Row::ReviewMode)
+        self.spec().kind == Kind::Bool
     }
 }
 
@@ -419,6 +427,14 @@ mod tests {
         assert_eq!(pad_to("ab", 5), "ab   ");
         assert_eq!(pad_to("abcdef", 3), "abc");
         assert_eq!(pad_to("x", 0), "");
+    }
+
+    #[test]
+    fn rows_are_the_screen_settings_of_the_table() {
+        let rows: Vec<_> = Row::ALL.iter().map(|r| r.spec().key).collect();
+        let table: Vec<_> = settings_api::screen().map(|s| s.key).collect();
+        assert_eq!(rows, table);
+        assert_eq!(Row::ContextLimit.label(), "context limit");
     }
 
     #[test]
