@@ -168,32 +168,42 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("coordinator.sock")
 }
 
-/// The socket in `dir`, as a path short enough to bind or connect to.
+/// The socket in `dir`, as a path short enough to bind or connect to (see
+/// [`short_socket`]).
+#[cfg(unixlike)]
+fn reachable_socket(dir: &Path) -> Result<(PathBuf, Option<std::fs::File>)> {
+    let socket = socket_path(dir);
+    short_socket(&socket).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is too long for a socket path; point {ENV_DIR} at a shorter directory",
+            socket.display()
+        )
+    })
+}
+
+/// `socket`, as a path short enough to bind or connect to; `None` when
+/// there is no such path here.
 ///
 /// A socket address holds about a hundred bytes of path. When the real path
 /// is longer (a deep home directory), Linux lets us name the socket through
 /// an open handle on its directory instead; the handle is returned and must
 /// outlive the bind/connect call.
 #[cfg(unixlike)]
-fn reachable_socket(dir: &Path) -> Result<(PathBuf, Option<std::fs::File>)> {
+pub(crate) fn short_socket(socket: &Path) -> Option<(PathBuf, Option<std::fs::File>)> {
     use std::os::fd::AsRawFd;
     const MAX: usize = 100;
-    let socket = socket_path(dir);
     if socket.as_os_str().len() <= MAX {
-        return Ok((socket, None));
+        return Some((socket.to_path_buf(), None));
     }
     // (fullrust is Linux under another `target_os`.)
     if cfg!(any(target_os = "linux", target_os = "fullrust"))
+        && let (Some(dir), Some(name)) = (socket.parent(), socket.file_name())
         && let Ok(handle) = std::fs::File::open(dir)
     {
-        let short = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-            .join(socket.file_name().expect("has a file name"));
-        return Ok((short, Some(handle)));
+        let short = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd())).join(name);
+        return Some((short, Some(handle)));
     }
-    anyhow::bail!(
-        "{} is too long for a socket path; point {ENV_DIR} at a shorter directory",
-        socket.display()
-    )
+    None
 }
 
 /// Connect to the coordinator serving `dir`.

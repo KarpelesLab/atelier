@@ -678,9 +678,13 @@ out of this repository:
 - ✅ **Settings**: read them with where each value comes from, and change the
   user's own — `settings/get` and `settings/set` (`docs/protocol.md`). What
   can be set is what the `/config` screen edits; the rest is read-only.
-- **A transport a browser or a second process can reach**: `atelier serve`
-  listening on a Unix socket or on loopback, with a token, one session per
-  connection.
+- ✅ **A transport a browser or a second process can reach**: `atelier serve
+  --listen` on a Unix socket (mode 0600, in a directory only the user can
+  enter) or on loopback TCP, where a connection presents a token first and
+  speaks JSON-RPC lines or WebSocket (a page's `Origin` must be on
+  `--allow-origin`). One session per connection, each an `atelier serve` of
+  its own, `--max-sessions` at once (`src/listen.rs`,
+  [docs/protocol.md](docs/protocol.md#listening-on-a-socket)).
 
 ### M22 — Models, context and the cache
 

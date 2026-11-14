@@ -20,6 +20,7 @@ mod events;
 mod headless;
 mod hooks;
 mod js;
+mod listen;
 mod local;
 mod lsp;
 mod mcp;
@@ -186,6 +187,11 @@ fn run() -> Result<u8> {
     }
     // Daily check for a newer release, in the background (official builds).
     update::spawn_background_check();
+    // `atelier serve --listen …`: sessions for whoever connects, each an
+    // `atelier serve` of its own (see `listen`). No session is opened here.
+    if let Some(opts) = cli.listen {
+        return listen::run(opts, listen::child_args(&args));
+    }
     // `atelier acp`: the Agent Client Protocol on stdin/stdout, for an editor
     // to drive (see `acp`). The session is opened when the editor asks for
     // one, in the directory it names — so not here.

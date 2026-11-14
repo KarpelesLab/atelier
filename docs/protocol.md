@@ -7,6 +7,7 @@ through this protocol.
 
 ```sh
 atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS]
+atelier serve --listen WHERE [--allow-origin ORIGIN]... [--max-sessions N] [the flags above]
 ```
 
 `atelier serve` runs one session in the current directory and speaks
@@ -27,6 +28,11 @@ slash commands.
 Everything else — the model, the endpoint, `atelier.toml`, instruction
 files, hooks, MCP servers — is configured as for any other run (see
 [Configuration](configuration.md)).
+
+A client that cannot launch atelier and hold its stdin and stdout — a web
+page, a program started separately — connects to `atelier serve --listen`
+instead: the same protocol on a Unix socket or on a loopback port, a session
+per connection. See [Listening on a socket](#listening-on-a-socket).
 
 ## Transport
 
@@ -880,6 +886,8 @@ codes are stable:
 | `-32003` | no turn running | `turn/steer` or `turn/interrupt` with nothing to act on |
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |
 | `-32005` | already initialized | A second `initialize` |
+| `-32020` | unauthorized | [`--listen`](#listening-on-a-socket) on TCP: the connection's first line was not the token. `"id": null`; the connection is closed |
+| `-32021` | too many sessions | [`--listen`](#listening-on-a-socket): `--max-sessions` connections are being served already. `"id": null`; the connection is closed |
 
 A turn that fails is not a JSON-RPC error — `turn/start` had already
 succeeded: it ends with `turn/ended` and `status: "error"`.
@@ -948,10 +956,149 @@ Write a front end for atelier against `serve`; point an existing ACP client
 at `acp`.
 
 **Another transport.** Nothing in the protocol depends on stdio beyond
-"lines in, lines out": the messages carry no transport state, and all of it
-is produced through one writer and consumed through one reader. A socket
-transport — a Unix socket of its own, or the
-[coordinator](coordinator.md)'s, which already carries line-delimited
-JSON-RPC between instances — is that pair of ends pointed elsewhere, plus
-what stdio gets for free: authenticating the peer, and deciding what a
-disconnect means for a session that could outlive it.
+"lines in, lines out": the messages carry no transport state. `atelier serve
+--listen`, below, is that pair of ends pointed at a socket, plus what stdio
+gets for free: knowing who is on the other end, and deciding what a
+disconnect means.
+
+## Listening on a socket
+
+```sh
+atelier serve --listen unix:/run/user/1000/atelier/ui.sock
+atelier serve --listen 127.0.0.1:8123 --allow-origin http://localhost:5173
+```
+
+`atelier serve --listen WHERE` runs no session of its own. It waits for
+connections and gives each one **a session of its own, in a process of its
+own**: for every connection it lets in it starts `atelier serve` — the same
+executable, in the listener's working directory, with the listener's other
+flags (`--mode`, `--claude`, `--approval-timeout`, …) — and carries the
+messages between the two. So everything above holds unchanged on a
+connection: `initialize` first, the same methods, events and error codes.
+Sessions share nothing but the project directory and what any two atelier
+processes there share (with `--continue`, every connection resumes — and
+saves over — the directory's one saved session).
+
+| Flag | Meaning |
+|------|---------|
+| `--listen unix:PATH` | A Unix domain socket (Unix-like systems). A value with a `/` in it is taken as a path without the prefix |
+| `--listen 127.0.0.1:PORT`, `[::1]:PORT`, `localhost:PORT` | A loopback TCP port; `0` lets the system pick one. `localhost` is `127.0.0.1`. **Any other address is refused**: whoever connects drives an agent with your files and your shell |
+| `--allow-origin ORIGIN` | A web origin (`scheme://host[:port]`) whose pages may connect over WebSocket. Repeatable; none by default |
+| `--max-sessions N` | How many connections are served at once (default 8) |
+
+On start the listener prints **one line on stdout** and nothing after it,
+for a program that launched it to read; what a person needs goes to stderr,
+as do the logs of every session.
+
+```json
+{"listening":{"transport":"tcp","address":"127.0.0.1:8123","ws":"ws://127.0.0.1:8123/","token_file":"/run/user/1000/atelier/serve-8123.token"}}
+{"listening":{"transport":"unix","path":"/run/user/1000/atelier/ui.sock"}}
+```
+
+### Who may connect
+
+**A Unix socket** is protected by the file system. It is created with mode
+`0600` in a directory no other user can enter: a directory that does not
+exist is created with mode `0700`, and one that is open to others (`/tmp`,
+say) is refused. There is no token. If the path is already a socket that a
+live listener answers on, the new one refuses to start; a socket nobody
+answers on is replaced; anything else at that path is left alone and
+refused.
+
+**A TCP port** on loopback can be reached by every user and every program
+on the machine, and by any web page your browser shows. So:
+
+- **A token comes first.** The listener makes one — 256 random bits,
+  base64url, 43 characters — and writes it to a file only you can read
+  (`serve-PORT.token` in `$XDG_RUNTIME_DIR/atelier`, else
+  `~/.local/state/atelier`; the path is `token_file` in the line above). Or
+  choose it yourself in the environment variable `ATELIER_SERVE_TOKEN` (16
+  to 512 characters of `A-Z a-z 0-9 - . _ ~`; `token_file` is then `null`).
+  The token is never taken from the command line, which other users can
+  read, and it is not passed on to the sessions' environment. It is compared
+  in constant time, and a connection has ten seconds to present it.
+- **A page's origin must be allowed.** A browser states where a page comes
+  from in the `Origin` header of a WebSocket handshake, and the page cannot
+  change it. A handshake with an `Origin` is refused (`403`) unless that
+  origin was given with `--allow-origin` — compared exactly, scheme and port
+  included — and this is checked before the token is looked at. A handshake
+  without an `Origin` is a program's, not a page's, and needs the token
+  only. `--allow-origin null` admits pages opened from files *and* every
+  sandboxed frame on any site; use it for development at most.
+
+### Framing
+
+The listener tells the two framings apart by a TCP connection's first line.
+
+**JSON-RPC lines** — for programs, and the only framing on a Unix socket.
+Exactly the stdio protocol: one message per line each way. On TCP the first
+line is the token, as `{"token": "…"}`; nothing answers it, and the
+protocol's lines follow. A wrong or missing token is answered with error
+`-32020` and the connection is closed.
+
+```sh
+# Unix socket
+socat - UNIX-CONNECT:/run/user/1000/atelier/ui.sock
+{"jsonrpc":"2.0","id":1,"method":"initialize"}
+
+# TCP: the token line first
+(printf '{"token":"%s"}\n' "$(cat "$XDG_RUNTIME_DIR/atelier/serve-8123.token")"; cat) | nc 127.0.0.1 8123
+{"jsonrpc":"2.0","id":1,"method":"initialize"}
+```
+
+**WebSocket** (RFC 6455, version 13) — for browsers, on the same TCP port.
+The first line is an HTTP `GET` with `Upgrade: websocket`; any path will do.
+Each JSON-RPC message is one **text** message, each way. The token travels
+in the handshake, in one of two places a browser can put it:
+
+- a subprotocol: offer `atelier` and `token.<TOKEN>` (the `Sec-WebSocket-Protocol`
+  header). The listener answers with `atelier`, never with the token. Prefer
+  this: the token stays out of URLs;
+- the query: `ws://127.0.0.1:8123/?token=<TOKEN>`.
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:8123/", ["atelier", "token." + token]);
+ws.onopen = () =>
+  ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize",
+                           params: { client: { name: "my-ui", version: "0.1" } } }));
+ws.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  if (m.method && m.id !== undefined) { /* a request to answer: approval/request, question/request */ }
+  else if (m.method) { /* a notification: event/*, turn/ended */ }
+  else { /* the response to the request with this id */ }
+};
+```
+
+with the listener started as `atelier serve --listen 127.0.0.1:8123
+--allow-origin http://localhost:5173` (the page's own origin). How the page
+learns the token is the front end's business — its own server reads the
+token file, or it starts the listener with `ATELIER_SERVE_TOKEN` set.
+
+The details: no extensions and no compression; fragmented messages are put
+back together; a ping is answered with a pong; binary messages are refused
+(close code `1003`), as are frames that are not masked (`1002`), text that
+is not UTF-8 (`1007`) and messages over 32 MiB (`1009`, the limit on a line
+too). A handshake that fails gets an HTTP error, which a page cannot see
+beyond the fact of it: `403` (the origin), `401` (the token), `426` (not a
+WebSocket upgrade, or not version 13 — this port serves no pages), `400`.
+
+### Connections and sessions
+
+- **A connection is a session**; a second one is another session. The
+  session's process starts with the connection's first message.
+- **A disconnect ends the session**, as the end of stdin ends a `serve`
+  launched directly: a running turn is interrupted, background work is
+  stopped, and the process exits (it is killed if it has not after ten
+  seconds). Nothing waits for the client to come back; a client that wants
+  the conversation again starts the listener with `--continue`.
+- **`shutdown` ends the connection**: after its answer the listener closes
+  the connection (a WebSocket with close code `1000`). If the session's
+  process ends any other way, the client is sent an error with `"id": null`
+  and code `-32603` first.
+- **`--max-sessions`** connections are served at once. One more is let in
+  as far as the token, answered with error `-32021` (`"id": null`) and
+  closed (a WebSocket with close code `1013`); it may try again later.
+- **The listener runs until it is killed.** Its sessions then end as on a
+  disconnect. It handles no signals, so the socket file and the token file
+  stay behind; both are harmless — the token opens nothing any more — and
+  the next listener on the same socket or port replaces them.

@@ -107,7 +107,7 @@ first conversation, the REPL/TUI fallback).
 | [Headless runs](docs/headless.md) | `--print` for scripts and CI: `--output-format json\|stream-json` and its events, `--input-format stream-json`, `--max-turns`, `--output-schema`, `--goal`, exit codes; `atelier review` (a read-only review of a change, for you or CI) |
 | [Troubleshooting](docs/troubleshooting.md) | `atelier doctor`: a checklist of the setup (config files, endpoint, model, instruction files, hooks, MCP, …); `atelier debug prompt`: the exact first request a prompt would make, without sending it |
 | [GitHub Action](docs/github-action.md) | `uses: KarpelesLab/atelier@v0`: review pull requests with inline comments, run a prompt on a schedule, answer `@atelier` in issue and pull request comments — inputs, example workflows, the safety model |
-| [Embedding protocol](docs/protocol.md) | `atelier serve`: the session as JSON-RPC 2.0 over stdio, for editors and other front ends — start, steer and interrupt turns, answer approvals and questions, run commands; events, error codes, how ACP maps onto it |
+| [Embedding protocol](docs/protocol.md) | `atelier serve`: the session as JSON-RPC 2.0 over stdio, for editors and other front ends — start, steer and interrupt turns, answer approvals and questions, run commands; events, error codes, how ACP maps onto it; `--listen`: the same on a Unix socket or on loopback (lines or WebSocket, behind a token), a session per connection |
 | [Editors (ACP)](docs/acp.md) | `atelier acp`: atelier as an [Agent Client Protocol](https://agentclientprotocol.com) agent for Zed and other ACP editors — setup, tool calls and diffs, permission requests, modes, slash commands, files through the editor; what is and isn't supported |
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`, `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
@@ -141,6 +141,8 @@ src/
 ├─ session.rs     on-disk session persistence (.atelier/session.json)
 ├─ headless.rs    --print: non-interactive runs, JSON output, exit codes
 ├─ serve.rs       serve: the embedding protocol (JSON-RPC 2.0 over stdio)
+├─ listen.rs      serve --listen: the protocol on a Unix socket or loopback TCP, a session per connection
+├─ listen/ws.rs   WebSocket frames and handshake, for a browser to connect
 ├─ acp.rs, acp/   acp: the Agent Client Protocol agent, for editors
 ├─ rpc.rs         JSON-RPC lines over stdio, under serve and acp
 ├─ events.rs      the event payloads --print's stream-json and serve share

@@ -31,6 +31,7 @@ usage: atelier [--claude | --local] [--continue] [--mode MODE]
        atelier debug prompt [prompt...]
        atelier doctor [--json] [--offline] [--mcp]
        atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS]
+                     [--listen WHERE [--allow-origin ORIGIN]... [--max-sessions N]]
        atelier acp [--claude] [--mode MODE] [--max-turns N]
        atelier update | coordinator [status|stop]
        atelier local [status|download|stop]
@@ -60,6 +61,14 @@ with --print:
 serve: the session as JSON-RPC 2.0 on stdin/stdout, for a program to drive
       --approval-timeout N   seconds an approval or a question waits for the
                              client's answer before it counts as a refusal
+      --listen WHERE         serve whoever connects instead, a session each:
+                             unix:PATH (a socket only you can open), or
+                             127.0.0.1:PORT, [::1]:PORT, localhost:PORT (0 picks
+                             one) — JSON-RPC lines or WebSocket, behind a token
+                             (written to a file, or taken from ATELIER_SERVE_TOKEN)
+      --allow-origin ORIGIN  a web page's origin that may connect (repeatable;
+                             none by default), like http://localhost:5173
+      --max-sessions N       connections served at once (default 8)
 
 acp: the Agent Client Protocol on stdin/stdout, for an editor to launch
       --max-turns N          stop a prompt after N model requests
@@ -89,6 +98,9 @@ pub struct Cli {
     /// `serve` as the first argument: speak the embedding protocol on
     /// stdin/stdout (see `serve`) instead of the interactive interface.
     pub serve: Option<crate::serve::Options>,
+    /// `serve --listen`: serve connections rather than stdin/stdout (see
+    /// `listen`).
+    pub listen: Option<crate::listen::Options>,
     /// `acp` as the first argument: speak the Agent Client Protocol on
     /// stdin/stdout (see `acp`) instead of the interactive interface.
     pub acp: Option<crate::acp::Options>,
@@ -109,6 +121,9 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut schema = None;
     let mut goal = None;
     let mut approval_timeout = None;
+    let mut listen = None;
+    let mut allow_origins = Vec::new();
+    let mut max_sessions = None;
     let mut words: Vec<&str> = Vec::new();
 
     // `serve` is a mode of the session like `--print`, so it shares the
@@ -147,6 +162,9 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--output-schema" => schema = Some(load_schema(Path::new(value()?))?),
             "--goal" => goal = Some(condition(value()?)?),
             "--approval-timeout" => approval_timeout = Some(positive(flag, value()?)?),
+            "--listen" => listen = Some(crate::listen::Where::parse(value()?)?),
+            "--allow-origin" => allow_origins.push(crate::listen::origin(value()?)?),
+            "--max-sessions" => max_sessions = Some(positive(flag, value()?)?),
             _ if inline.is_some() => return Err(format!("{flag} takes no value")),
             "--claude" => claude = true,
             "--local" => local = true,
@@ -170,6 +188,21 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     }
     if !serve && approval_timeout.is_some() {
         return Err("--approval-timeout only applies with serve".to_string());
+    }
+    if !serve && listen.is_some() {
+        return Err("--listen only applies with serve".to_string());
+    }
+    if listen.is_none() && !allow_origins.is_empty() {
+        return Err("--allow-origin only applies with serve --listen".to_string());
+    }
+    if listen.is_none() && max_sessions.is_some() {
+        return Err("--max-sessions only applies with serve --listen".to_string());
+    }
+    if matches!(listen, Some(crate::listen::Where::Unix(_))) && !allow_origins.is_empty() {
+        return Err(
+            "--allow-origin only applies to a TCP --listen: a Unix socket takes no WebSocket"
+                .to_string(),
+        );
     }
     if serve && print {
         return Err("serve and --print are two ways to run; pick one".to_string());
@@ -214,6 +247,11 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         }),
         serve: serve.then(|| crate::serve::Options {
             approval_timeout: approval_timeout.map(|secs| Duration::from_secs(secs.into())),
+        }),
+        listen: listen.map(|at| crate::listen::Options {
+            at,
+            allow_origins,
+            max_sessions: max_sessions.map_or(crate::listen::DEFAULT_MAX_SESSIONS, |n| n as usize),
         }),
         acp: acp.then_some(crate::acp::Options { max_turns }),
     })
@@ -427,6 +465,46 @@ mod tests {
         assert_eq!(opts.output, OutputFormat::Text);
         assert_eq!(opts.input, InputFormat::Text);
         assert_eq!(opts.max_turns, None);
+    }
+
+    #[test]
+    fn listen_is_serves_and_takes_its_own_flags() {
+        use crate::listen::{DEFAULT_MAX_SESSIONS, Where};
+        assert!(parse_ok(&["serve"]).listen.is_none());
+        let cli = parse_ok(&["serve", "--listen", "localhost:0"]);
+        assert!(cli.serve.is_some());
+        let opts = cli.listen.unwrap();
+        assert_eq!(opts.at, Where::Tcp("127.0.0.1:0".parse().unwrap()));
+        assert_eq!(opts.max_sessions, DEFAULT_MAX_SESSIONS);
+        assert!(opts.allow_origins.is_empty());
+        let opts = parse_ok(&[
+            "serve",
+            "--listen=[::1]:8123",
+            "--allow-origin",
+            "http://localhost:5173/",
+            "--allow-origin=https://ui.example",
+            "--max-sessions",
+            "2",
+        ])
+        .listen
+        .unwrap();
+        assert_eq!(opts.max_sessions, 2);
+        assert_eq!(
+            opts.allow_origins,
+            ["http://localhost:5173", "https://ui.example"]
+        );
+        assert!(parse_err(&["serve", "--listen", "0.0.0.0:80"]).contains("not a loopback"));
+        assert!(parse_err(&["--listen", "127.0.0.1:0"]).contains("only applies with serve"));
+        assert!(parse_err(&["serve", "--max-sessions", "2"]).contains("serve --listen"));
+        assert!(parse_err(&["serve", "--allow-origin", "http://a"]).contains("serve --listen"));
+        assert!(
+            parse_err(&["serve", "--listen", "127.0.0.1:0", "--allow-origin", "*"])
+                .contains("not an origin")
+        );
+        assert!(
+            parse_err(&["serve", "--listen", "127.0.0.1:0", "--max-sessions", "0"])
+                .contains("positive number")
+        );
     }
 
     #[test]
