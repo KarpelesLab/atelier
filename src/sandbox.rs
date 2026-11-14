@@ -298,7 +298,7 @@ pub struct Output {
 pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration) -> Result<Output> {
     let helper = match &setup.helper {
         Some(path) => path.clone(),
-        None => std::env::current_exe().context("locating the atelier executable")?,
+        None => crate::app::helper_exe().context("locating the atelier executable")?,
     };
     let status_path = status_path();
     let mut flags = Vec::new();
@@ -1289,7 +1289,7 @@ pub mod testing {
         // it runs any test: in the profile directory, some levels above the
         // test binary (how many depends on cargo's layout). It must have the
         // sandbox in it, which a binary left by another build may not.
-        let helper = std::env::current_exe().ok().and_then(|exe| {
+        let helper = crate::app::helper_exe().ok().and_then(|exe| {
             exe.ancestors()
                 .skip(1)
                 .take(6)

@@ -553,7 +553,7 @@ pub fn connect(bin: &Path, model: &Model, say: &mut dyn FnMut(&str)) -> Result<L
         "starting {} (it is loaded on the first request)…",
         model.source()
     ));
-    let exe = std::env::current_exe().context("locating the atelier executable")?;
+    let exe = crate::app::helper_exe().context("locating the atelier executable")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .write(true)

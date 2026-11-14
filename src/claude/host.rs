@@ -82,7 +82,7 @@ impl Host {
 
     /// The `--mcp-config` entry that makes claude launch the relay.
     pub fn mcp_entry(&self) -> Result<Value> {
-        let exe = std::env::current_exe().context("locating the atelier executable")?;
+        let exe = crate::app::helper_exe().context("locating the atelier executable")?;
         Ok(json!({
             "type": "stdio",
             "command": exe,

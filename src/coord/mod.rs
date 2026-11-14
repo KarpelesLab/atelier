@@ -235,7 +235,7 @@ pub fn start(root: &Path, model: &str) -> Option<Arc<Client>> {
         dir,
         // Resolved now: after a self-update replaces the binary, the running
         // process's own path no longer names a file.
-        exe: std::env::current_exe().ok(),
+        exe: crate::app::helper_exe().ok(),
         name,
         cwd: root.display().to_string(),
         model: model.to_string(),

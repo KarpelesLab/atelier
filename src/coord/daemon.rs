@@ -805,7 +805,7 @@ struct ExeWatch {
 
 impl ExeWatch {
     fn new() -> Option<Self> {
-        let path = std::env::current_exe().ok()?;
+        let path = crate::app::helper_exe().ok()?;
         let stamp = Self::stamp(&path)?;
         Some(Self { path, stamp })
     }

@@ -661,6 +661,9 @@ a `/release` routine) live in its repository and apply to whoever opens it.
 
 ### M24 — A backend for other interfaces
 
+atelier is a library (`src/lib.rs`) that its own program consumes: a Rust
+front end depends on it and implements `Ui` (✅ `docs/library.md`,
+`examples/embed.rs`). For a front end in another language or process,
 `atelier serve` already drives a whole session. What a graphical front end
 still has to guess at, or cannot do, comes next — the interface itself stays
 out of this repository:

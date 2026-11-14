@@ -201,7 +201,7 @@ pub fn child_args(args: &[String]) -> Vec<String> {
 /// each in a process of its own started with `child_args`. Returns only on
 /// a failure to start: once listening, it runs until killed.
 pub fn run(opts: Options, child_args: Vec<String>) -> Result<u8> {
-    let exe = std::env::current_exe().context("finding atelier's own executable")?;
+    let exe = crate::app::helper_exe().context("finding atelier's own executable")?;
     let listener = |token| {
         Arc::new(Listener {
             exe,

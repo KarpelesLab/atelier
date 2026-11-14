@@ -8,6 +8,8 @@ description = "A minimal-TUI AI coding harness over OpenAI-compatible APIs."
 license = "MIT"
 repository = "https://github.com/KarpelesLab/atelier"
 # Released as binaries on GitHub (see release-plz.toml), not on crates.io.
+# A library (src/lib.rs) and the program that consumes it (src/main.rs): see
+# docs/library.md for building on the library.
 publish = false
 
 [dependencies]
