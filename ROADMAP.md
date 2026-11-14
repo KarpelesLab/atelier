@@ -659,6 +659,26 @@ a `/release` routine) live in its repository and apply to whoever opens it.
   exists.
 - `atelier doctor`, and a way to print the exact prompt a turn would send.
 
+### M24 — A backend for other interfaces
+
+`atelier serve` already drives a whole session. What a graphical front end
+still has to guess at, or cannot do, comes next — the interface itself stays
+out of this repository:
+
+- **Data, not prose**: methods that answer with structured results where a
+  slash command prints lines — the models and roles, MCP servers and their
+  tools, peers and locks, usage, memory, the commands and skills there are,
+  background jobs.
+- **The conversation so far**: `session/history`, so a client that resumes
+  a session can show it.
+- **Edits as diffs**: an event carrying the file and what changed, for every
+  tool that writes.
+- **Settings**: read them with where each value comes from, and change the
+  user's own.
+- **A transport a browser or a second process can reach**: `atelier serve`
+  listening on a Unix socket or on loopback, with a token, one session per
+  connection.
+
 ### M22 — Models, context and the cache
 
 - **A model per role**: main, subagents, reviewer, a small one for titles,
