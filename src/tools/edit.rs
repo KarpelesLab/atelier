@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use super::change::Side;
 use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct EditTool;
@@ -101,6 +102,8 @@ impl Tool for EditTool {
 
         super::files::write(&resolved, &updated).with_context(|| format!("writing {path:?}"))?;
         ctx.fstate.record(&resolved, &updated);
+        ctx.fstate
+            .changed(&resolved, Side::text(&current), Side::text(&updated));
 
         let n = if replace_all { count } else { 1 };
         Ok(format!("replaced {n} occurrence(s) in {path}"))

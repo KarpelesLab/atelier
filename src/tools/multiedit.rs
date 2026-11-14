@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use super::change::Side;
 use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct MultiEditTool;
@@ -155,7 +156,7 @@ impl Tool for MultiEditTool {
 
         // Apply edits sequentially to an in-memory copy; abort without writing
         // if any of them fails.
-        let mut current = original;
+        let mut current = original.clone();
         for (i, op) in ops.iter().enumerate() {
             match apply_edit(&current, op) {
                 Ok((updated, _)) => current = updated,
@@ -167,6 +168,8 @@ impl Tool for MultiEditTool {
 
         super::files::write(&resolved, &current).with_context(|| format!("writing {path:?}"))?;
         ctx.fstate.record(&resolved, &current);
+        ctx.fstate
+            .changed(&resolved, Side::text(&original), Side::text(&current));
 
         Ok(format!("applied {} edit(s) to {path}", ops.len()))
     }

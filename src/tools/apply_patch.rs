@@ -13,6 +13,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use super::change::Side;
 use super::{Tool, ToolCtx, ToolSpec};
 
 /// One line inside a hunk.
@@ -542,6 +543,8 @@ impl Tool for ApplyPatchTool {
                     std::fs::write(resolved, content)
                         .with_context(|| format!("writing {display:?}"))?;
                     ctx.fstate.record(resolved, content);
+                    ctx.fstate
+                        .changed(resolved, Side::Absent, Side::text(content));
                     created += 1;
                     summary.push_str(&format!("\n  created  {display} (+{added})"));
                 }
@@ -552,9 +555,11 @@ impl Tool for ApplyPatchTool {
                     added,
                     removed,
                 } => {
+                    let before = Side::of(resolved);
                     std::fs::write(resolved, content)
                         .with_context(|| format!("writing {display:?}"))?;
                     ctx.fstate.record(resolved, content);
+                    ctx.fstate.changed(resolved, before, Side::text(content));
                     modified += 1;
                     summary.push_str(&format!("\n  modified {display} (+{added} -{removed})"));
                 }
@@ -563,8 +568,10 @@ impl Tool for ApplyPatchTool {
                     display,
                     removed,
                 } => {
+                    let before = Side::of(resolved);
                     std::fs::remove_file(resolved)
                         .with_context(|| format!("deleting {display:?}"))?;
+                    ctx.fstate.changed(resolved, before, Side::Absent);
                     deleted += 1;
                     summary.push_str(&format!("\n  deleted  {display} (-{removed})"));
                 }

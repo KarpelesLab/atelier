@@ -643,6 +643,15 @@ impl Ui for HeadlessUi {
         }
     }
 
+    fn file_change(&mut self, tool: &str, change: &crate::tools::change::FileChange) {
+        // The call's own line says enough to someone reading stderr.
+        if self.streaming() {
+            let root = std::env::current_dir().unwrap_or_default();
+            let event = events::file_change(tool, change, &root);
+            emit(&typed("file_change", event));
+        }
+    }
+
     fn turn_end(&mut self) {
         self.answered = true;
         match self.format {

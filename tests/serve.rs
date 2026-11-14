@@ -566,6 +566,7 @@ fn a_turn_streams_its_tool_call_and_answer_then_ends() {
         events,
         [
             "event/tool_start",
+            "event/file_change",
             "event/tool_end",
             "event/text",
             "turn/ended"
@@ -906,6 +907,8 @@ fn a_command_switches_to_plan_mode_and_the_next_write_is_refused() {
     assert!(!dir.join("out.txt").exists());
     let refused = client.notification("event/tool_end");
     assert_eq!(refused["ok"], false);
+    // Nothing was written, so nothing is said to have changed.
+    assert!(!client.methods().contains(&"event/file_change".to_string()));
     assert!(
         refused["output"].as_str().unwrap().contains("plan mode"),
         "{refused}"
@@ -1017,4 +1020,209 @@ fn images_are_attached_or_the_turn_fails() {
     let turn = with_images(&mut client, json!([picture]));
     assert_eq!(client.turn_ended(&turn)["status"], "completed");
     assert!(mock.body(1).contains(picture), "{}", mock.body(1));
+}
+
+/// `session/history` gives the conversation back as items — the prompt, each
+/// tool call with its result, the answer — without the context atelier put
+/// around them, a page at a time; it waits for the session to be idle; and
+/// a session resumed with `--continue` has the same history to show.
+#[test]
+fn history_is_the_conversation_so_far_and_survives_continue() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call(
+            "call_1",
+            "write",
+            json!({"path": "out.txt", "content": "written by tool"}),
+        ),
+        1 => answer("done"),
+        2 => tool_call("call_2", "bash", json!({"command": "echo hi"})),
+        _ => answer("as you wish"),
+    });
+    let dir = unique_dir("history");
+    let mut client = Client::ready(&mock, &dir, &[]);
+
+    // Nothing yet.
+    let empty = client.ok("session/history", json!({}));
+    assert_eq!(
+        empty,
+        json!({"items": [], "first": 0, "total": 0, "more": false, "stored": true})
+    );
+    client.err("session/history", json!({"limit": 0}), INVALID_PARAMS);
+    client.err("session/history", json!({"before": "x"}), INVALID_PARAMS);
+
+    let turn = client.start_turn("write the file");
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    let history = client.ok("session/history", json!({}));
+    let expected = json!([
+        {"index": 0, "type": "user", "text": "write the file", "images": 0},
+        {
+            "index": 1,
+            "type": "tool",
+            "id": "call_1",
+            "name": "write",
+            "arguments": {"path": "out.txt", "content": "written by tool"},
+            "ok": true,
+            "output": "wrote 15 bytes to out.txt",
+        },
+        {"index": 2, "type": "assistant", "text": "done"},
+    ]);
+    assert_eq!(history["items"], expected, "{history}");
+    assert_eq!(history["total"], 3);
+    assert_eq!(history["more"], false);
+    assert_eq!(history["stored"], true);
+
+    // A page is the end of the list; `before` walks back from it.
+    let last = client.ok("session/history", json!({"limit": 1}));
+    assert_eq!(last["items"], json!([expected[2]]));
+    assert_eq!(last["first"], 2);
+    assert_eq!(last["more"], true);
+    let earlier = client.ok("session/history", json!({"limit": 5, "before": 2}));
+    assert_eq!(earlier["items"], json!([expected[0], expected[1]]));
+    assert_eq!(earlier["more"], false);
+
+    // While a turn runs — here, waiting on an approval — the session is
+    // not there to be asked.
+    let turn = client.start_turn("run it");
+    let asked = client.asked("approval/request");
+    let busy = client.err("session/history", json!({}), TURN_RUNNING);
+    assert_eq!(busy["data"]["turn"], 2);
+    client.reply(&asked, json!({"decision": "deny"}));
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    let history = client.ok("session/history", json!({}));
+    assert_eq!(history["total"], 6, "{history}");
+    let refused = &history["items"][4];
+    assert_eq!(refused["name"], "bash");
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["output"].as_str().unwrap().contains("denied"),
+        "{refused}"
+    );
+
+    client.ok("shutdown", json!({}));
+    assert_eq!(client.exited().code(), Some(0));
+
+    // Another process, the same conversation.
+    let mut resumed = Client::ready(&mock, &dir, &["--continue"]);
+    let again = resumed.ok("session/history", json!({}));
+    assert_eq!(again, history);
+    // Without `--continue` the session starts empty.
+    drop(resumed);
+    let mut fresh = Client::ready(&mock, &dir, &[]);
+    assert_eq!(fresh.ok("session/history", json!({}))["total"], 0);
+}
+
+/// A tool that writes a file is followed by `event/file_change`: the file,
+/// what became of it, and the change as a unified diff — between the
+/// call's start and its end. A call that fails before it writes says
+/// nothing.
+#[test]
+fn an_edit_and_a_new_file_are_reported_as_diffs() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call("call_1", "read", json!({"path": "src/a.txt"})),
+        1 => tool_call(
+            "call_2",
+            "edit",
+            json!({"path": "src/a.txt", "old_string": "two", "new_string": "2"}),
+        ),
+        2 => tool_call(
+            "call_3",
+            "write",
+            json!({"path": "new.txt", "content": "fresh\n"}),
+        ),
+        // Not read first: refused by the tool, nothing written.
+        3 => tool_call(
+            "call_4",
+            "edit",
+            json!({"path": "other.txt", "old_string": "x", "new_string": "y"}),
+        ),
+        // The same text again: written, and nothing changed.
+        4 => tool_call(
+            "call_5",
+            "write",
+            json!({"path": "new.txt", "content": "fresh\n"}),
+        ),
+        _ => answer("done"),
+    });
+    let dir = unique_dir("diff");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(dir.join("other.txt"), "x\n").unwrap();
+    let mut client = Client::ready(&mock, &dir, &[]);
+
+    let turn = client.start_turn("change things");
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/a.txt")).unwrap(),
+        "one\n2\nthree\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("other.txt")).unwrap(),
+        "x\n"
+    );
+
+    let changes: Vec<Value> = client
+        .log
+        .iter()
+        .filter(|m| m["method"] == "event/file_change")
+        .map(|m| m["params"].clone())
+        .collect();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+
+    let edited = &changes[0];
+    assert_eq!(edited["turn"], 1);
+    assert_eq!(edited["tool"], "edit");
+    assert_eq!(edited["kind"], "modified");
+    assert_eq!(edited["relative_path"], "src/a.txt");
+    let path = Path::new(edited["path"].as_str().unwrap());
+    assert!(
+        path.is_absolute() && path.ends_with("src/a.txt"),
+        "{edited}"
+    );
+    assert_eq!(
+        edited["diff"],
+        "--- a/src/a.txt\n+++ b/src/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+2\n three\n"
+    );
+    assert_eq!(edited["added"], 1);
+    assert_eq!(edited["removed"], 1);
+    assert!(edited.get("truncated").is_none() && edited.get("binary").is_none());
+
+    let created = &changes[1];
+    assert_eq!(created["tool"], "write");
+    assert_eq!(created["kind"], "created");
+    assert_eq!(created["relative_path"], "new.txt");
+    assert_eq!(
+        created["diff"],
+        "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+fresh\n"
+    );
+
+    // Each change sits inside its call.
+    let methods = client.methods();
+    let around: Vec<&str> = methods
+        .iter()
+        .map(String::as_str)
+        .filter(|m| m.starts_with("event/tool_") || *m == "event/file_change")
+        .collect();
+    assert_eq!(
+        around,
+        [
+            "event/tool_start",
+            "event/tool_end",
+            "event/tool_start",
+            "event/file_change",
+            "event/tool_end",
+            "event/tool_start",
+            "event/file_change",
+            "event/tool_end",
+            "event/tool_start",
+            "event/tool_end",
+            "event/tool_start",
+            "event/tool_end",
+        ]
+    );
+    let failed: Vec<&Value> = client
+        .log
+        .iter()
+        .filter(|m| m["method"] == "event/tool_end" && m["params"]["ok"] == false)
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
 }

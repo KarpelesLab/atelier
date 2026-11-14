@@ -203,6 +203,9 @@ impl Ui for FromScript<'_> {
     fn tool_end(&mut self, name: &str, result: &str, ok: bool) {
         self.inner.tool_end(name, result, ok);
     }
+    fn file_change(&mut self, tool: &str, change: &crate::tools::change::FileChange) {
+        self.inner.file_change(tool, change);
+    }
     fn info(&mut self, text: &str) {
         self.inner.info(text);
     }

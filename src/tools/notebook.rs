@@ -9,6 +9,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
+use super::change::Side;
 use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct NotebookEditTool;
@@ -144,6 +145,8 @@ impl Tool for NotebookEditTool {
         std::fs::write(&resolved, &text)
             .map_err(|e| anyhow::anyhow!("failed to write {path:?}: {e}"))?;
         ctx.fstate.record(&resolved, &text);
+        ctx.fstate
+            .changed(&resolved, Side::text(&current), Side::text(&text));
         Ok(format!("{summary} in {path}"))
     }
 }

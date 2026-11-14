@@ -13,9 +13,12 @@
 //! take `{"labels": [...]}` or `{"text": "..."}` and hold them to the same
 //! rules.
 
+use std::path::Path;
+
 use serde_json::{Value, json};
 
 use crate::tools::ask::{Answer, Question};
+use crate::tools::change::{FileChange, Side};
 
 /// The most of a tool's output a `tool_end` event carries, in bytes. Tool
 /// results can be whole files; a consumer following along wants the gist,
@@ -44,6 +47,73 @@ pub fn tool_end(name: &str, result: &str, ok: bool) -> Value {
     let (output, truncated) = truncate(result, TOOL_OUTPUT_CAP);
     let mut event = json!({ "name": name, "ok": ok, "output": output });
     if truncated {
+        event["truncated"] = Value::Bool(true);
+    }
+    event
+}
+
+/// The most of a diff a `file_change` event carries, in bytes; a longer one
+/// is cut at the end of a line and the event says so (`"truncated": true`).
+const DIFF_CAP: usize = 64 * 1024;
+
+/// A tool call wrote, created or deleted a file: which, and what changed,
+/// as a unified diff. `root` is the project, for the relative path — left
+/// out for a file outside it (a subagent's worktree).
+///
+/// No diff for a file that is not text (`"binary": true`) or is too long to
+/// compare (`"truncated": true`, over
+/// [`TEXT_CAP`](crate::tools::change::TEXT_CAP)); the event still says the
+/// file changed.
+pub fn file_change(tool: &str, change: &FileChange, root: &Path) -> Value {
+    let absolute = change.path.display().to_string();
+    // With `/`, whatever the platform: the name a diff header carries.
+    let relative = change.path.strip_prefix(root).ok().map(|rel| {
+        let parts: Vec<_> = rel.iter().map(|part| part.to_string_lossy()).collect();
+        parts.join("/")
+    });
+    let mut event = json!({
+        "tool": tool,
+        "path": absolute,
+        "kind": change.kind().name(),
+    });
+    let name = relative.as_deref().unwrap_or(&absolute);
+    let name = name.trim_start_matches('/');
+    if let Some(relative) = &relative {
+        event["relative_path"] = Value::from(relative.as_str());
+    }
+    let text = |side: &Side| match side {
+        Side::Absent => Some(String::new()),
+        Side::Text(text) => Some(text.clone()),
+        Side::Binary | Side::Large => None,
+    };
+    let sides = [&change.before, &change.after];
+    if sides.contains(&&Side::Binary) {
+        event["binary"] = Value::Bool(true);
+    } else if let (Some(before), Some(after)) = (text(&change.before), text(&change.after)) {
+        let diff = crate::diff::unified(&before, &after);
+        let label = |side: &Side, prefix: &str| match side {
+            Side::Absent => "/dev/null".to_string(),
+            _ => format!("{prefix}/{name}"),
+        };
+        let full = format!(
+            "--- {}\n+++ {}\n{}",
+            label(&change.before, "a"),
+            label(&change.after, "b"),
+            diff.hunks
+        );
+        let (cut, truncated) = truncate(&full, DIFF_CAP);
+        // Whole lines: half a line of a diff reads as a different change.
+        let cut = match truncated {
+            true => &cut[..cut.rfind('\n').map_or(0, |end| end + 1)],
+            false => cut,
+        };
+        event["diff"] = Value::from(cut);
+        event["added"] = Value::from(diff.added);
+        event["removed"] = Value::from(diff.removed);
+        if truncated {
+            event["truncated"] = Value::Bool(true);
+        }
+    } else {
         event["truncated"] = Value::Bool(true);
     }
     event
@@ -145,5 +215,64 @@ mod tests {
         let cut = tool_end("read", &long, false);
         assert_eq!(cut["truncated"], true);
         assert_eq!(cut["output"].as_str().unwrap().len(), TOOL_OUTPUT_CAP);
+    }
+
+    #[test]
+    fn a_file_change_carries_its_paths_kind_and_diff() {
+        let root = std::env::temp_dir().join("atelier-events-root");
+        let change = |before: Side, after: Side| FileChange {
+            path: root.join("src").join("a.txt"),
+            before,
+            after,
+        };
+        let text = |s: &str| Side::Text(s.to_string());
+
+        let edited = file_change("edit", &change(text("one\ntwo\n"), text("one\n2\n")), &root);
+        assert_eq!(
+            edited,
+            json!({
+                "tool": "edit",
+                "path": root.join("src").join("a.txt").display().to_string(),
+                "relative_path": "src/a.txt",
+                "kind": "modified",
+                "diff": "--- a/src/a.txt\n+++ b/src/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+2\n",
+                "added": 1,
+                "removed": 1,
+            })
+        );
+
+        let created = file_change("write", &change(Side::Absent, text("new\n")), &root);
+        assert_eq!(created["kind"], "created");
+        assert_eq!(
+            created["diff"],
+            "--- /dev/null\n+++ b/src/a.txt\n@@ -0,0 +1 @@\n+new\n"
+        );
+        let deleted = file_change("apply_patch", &change(text("old\n"), Side::Absent), &root);
+        assert_eq!(deleted["kind"], "deleted");
+        assert_eq!(
+            deleted["diff"],
+            "--- a/src/a.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        );
+
+        // Not text, or too much of it: the change without a diff.
+        let binary = file_change("write", &change(Side::Binary, text("now text\n")), &root);
+        assert_eq!(binary["binary"], true);
+        assert!(binary.get("diff").is_none() && binary.get("truncated").is_none());
+        let large = file_change("write", &change(Side::Large, text("small\n")), &root);
+        assert_eq!(large["truncated"], true);
+        assert!(large.get("diff").is_none());
+
+        // A long diff is cut at the end of a line; the counts are the whole
+        // change's.
+        let long: String = (0..20_000).map(|n| format!("line {n}\n")).collect();
+        let cut = file_change("write", &change(Side::Absent, text(&long)), &root);
+        let diff = cut["diff"].as_str().unwrap();
+        assert!(diff.len() <= DIFF_CAP && diff.ends_with('\n'));
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["added"], 20_000);
+
+        // Outside the project: no relative path.
+        let elsewhere = file_change("edit", &change(text("a"), text("b")), Path::new("/nowhere"));
+        assert!(elsewhere.get("relative_path").is_none());
     }
 }

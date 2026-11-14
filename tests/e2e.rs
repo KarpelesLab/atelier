@@ -748,6 +748,19 @@ fn stream_json_emits_events_for_a_tool_loop() {
     assert_eq!(ends[0]["name"], "write");
     assert_eq!(ends[0]["ok"], true);
     assert!(ends[0]["output"].is_string());
+    // The file it wrote, as a diff, between the two.
+    let changes = of_type(&events, "file_change");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["tool"], "write");
+    assert_eq!(changes[0]["kind"], "created");
+    assert_eq!(changes[0]["relative_path"], "out.txt");
+    let diff = changes[0]["diff"].as_str().unwrap();
+    assert!(
+        diff.starts_with("--- /dev/null\n+++ b/out.txt\n@@ "),
+        "{diff}"
+    );
+    let at = |kind: &str| events.iter().position(|e| e["type"] == kind).unwrap();
+    assert!(at("tool_start") < at("file_change") && at("file_change") < at("tool_end"));
 
     let result = events.last().unwrap();
     assert_eq!(result["type"], "result");

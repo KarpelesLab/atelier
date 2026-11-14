@@ -63,6 +63,7 @@ client                                   atelier
   │ turn/steer, turn/interrupt ─────────────▶│   any time while it runs
   │◀──────────────────── turn/ended {turn:1} │
   │ command/run, session/status ────────────▶│   between turns
+  │ session/history ────────────────────────▶│
   │ shutdown ───────────────────────────────▶│
   │◀──────────────────────────────── result  │   then atelier exits
 ```
@@ -92,7 +93,8 @@ Result:
  "session":{"cwd":"/home/me/project","model":"qwen3-coder","backend":"openai","mode":"auto-edit",
             "tools":["apply_patch","ask","bash","…"]},
  "capabilities":{"steer":true,"interrupt":true,"approvals":true,"questions":true,
-                 "images":true,"commands":true,"approval_timeout":null}}
+                 "images":true,"commands":true,"history":true,"file_changes":true,
+                 "approval_timeout":null}}
 ```
 
 - `protocol` is the version atelier speaks — `1`. It answers with its own
@@ -105,7 +107,9 @@ Result:
   connected during `initialize`, and what connecting had to report follows
   as [`event/idle`](#eventidle) notifications.
 - `capabilities.approval_timeout` is `--approval-timeout` in seconds, or
-  `null`.
+  `null`. `history` and `file_changes` say this build has
+  [`session/history`](#sessionhistory) and sends
+  [`event/file_change`](#eventfile_change).
 
 ### `turn/start`
 
@@ -199,6 +203,90 @@ Answered at once, also in the middle of a turn.
 session was idle: while a turn runs, `usage` is from before it started (its
 own numbers come with `turn/ended`).
 
+### `session/history`
+
+The conversation so far, for a client that did not see it happen: one that
+resumed a session ([`atelier serve --continue`](sessions.md)), or reconnected
+to its own. Oldest first, as items ready to show.
+
+Params (both optional):
+
+| Param | | |
+|-------|-|-|
+| `limit` | default 200, at most 1000 | How many items to return |
+| `before` | default: the end | Return the items before this `index` |
+
+A page is the *last* `limit` items before `before`: ask without `before`
+for the end of the conversation, then with `before` set to the result's
+`first` for the page above it, while `more` is true.
+
+```json
+{"items":[
+   {"index":0,"type":"summary","text":"## Goal\nMake the parser tests pass…"},
+   {"index":1,"type":"user","text":"now fix the off-by-one","images":0},
+   {"index":2,"type":"assistant","text":"Looking at the parser."},
+   {"index":3,"type":"tool","id":"call_1","name":"read","arguments":{"path":"src/parser.rs"},
+    "ok":true,"output":"…"},
+   {"index":4,"type":"tool","id":"call_2","name":"edit",
+    "arguments":{"path":"src/parser.rs","old_string":"depth > 8","new_string":"depth >= 8"},
+    "ok":true,"output":"replaced 1 occurrence(s) in src/parser.rs"},
+   {"index":5,"type":"assistant","text":"Fixed the off-by-one in `parser::nested`."}],
+ "first":0,"total":6,"more":false,"stored":true}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `items` | The page, oldest first; each item has its `index` in the whole list |
+| `first` | The `index` of the first item returned (pass it as `before` for the page above) |
+| `total` | Items in the whole conversation |
+| `more` | There are items before `first` |
+| `stored` | Whether atelier keeps this session's conversation: `false` with the Claude backend (below) |
+| `claude_session` | Claude backend: the id of the Claude Code session, once there is one |
+
+The items:
+
+| `type` | Fields | |
+|--------|--------|-|
+| `summary` | `text` | What [compaction](sessions.md#compaction) made of the turns it replaced. Always the first item when there is one: the items after it are all that is kept word for word |
+| `user` | `text`, `images` | A prompt (or a `turn/steer` message, where it was delivered). `images` is how many images were attached: the count, never the images |
+| `assistant` | `text` | The model's text |
+| `tool` | `id`, `name`, `arguments`, `ok`?, `output`?, `truncated`?, `pruned`? | A tool call together with its result, as [`event/tool_end`](#notifications-atelier--client) reported it: `output` capped at 16 KiB, `truncated: true` when cut. `pruned: true` when compaction replaced an old result's body with a one-line stub (then `output` is that line). A call without a result yet has neither `ok` nor `output` |
+| `tool_images` | `images`, `pruned`? | Images the tool calls above returned (`read` on a picture): how many |
+
+What is in it, and what is not:
+
+- It is the conversation **as the model has it**, not a recording of the
+  events: text arrives whole rather than in chunks, and there are no
+  `info`, `notice`, `activity`, `review` or `file_change` items.
+- **Left out**: the system prompt (with the instruction files and the memory
+  index it carries), and the project context atelier attaches to each prompt
+  (git status, diagnostics, the plan-mode note). **Reasoning** is streamed
+  and not kept, so there is none.
+- **Kept, inside its own markers**: what the harness added to a message's
+  text — a hook's `<hook-context>…</hook-context>`, a `<peer-message>` from
+  another instance, the notice of a background job that ended, a
+  `[turn_end hook] …` prompt, a subdirectory's `<nested-instructions>` at
+  the end of a tool result. A `user` item's `text` is therefore what the
+  model was sent as the user's message, which can be more than was typed.
+- `ok` is not stored with a result; it is read back from it (`false` when
+  the result starts with `error:`, as every refusal and failure atelier
+  writes does).
+- `index` counts from the oldest item the session still has. It is stable
+  while the session is idle; a compaction shifts it (the oldest items
+  become one `summary`).
+
+It needs the session idle: while a turn or a command runs it fails with
+`-32001` — the running turn is being reported through its events, and the
+history is complete again at `turn/ended`.
+
+**Backends.** With an OpenAI-compatible endpoint or a ChatGPT sign-in the
+conversation is atelier's and this is all of it. With the
+[Claude backend](claude.md) the conversation is kept by Claude Code, in its
+own store: atelier has no messages to return, so `items` is empty,
+`stored` is `false`, and `claude_session` names the Claude Code session
+(the one `--continue` resumes) for a client that wants to read that
+transcript itself.
+
 ### `shutdown`
 
 Exit cleanly: the session is closed (`session_end` hooks run), `bash`
@@ -280,6 +368,7 @@ One per thing the session reports. Events of a turn carry its id as
 | `event/reasoning` | `turn`, `text` | A chunk of the model's reasoning ("thinking") |
 | `event/tool_start` | `turn`, `name`, `arguments` | A tool is about to run |
 | `event/tool_end` | `turn`, `name`, `ok`, `output`, `truncated`? | A tool finished. `output` is capped at 16 KiB (`truncated: true` when cut). A call that was refused ends without having started |
+| `event/file_change` | `turn`, `tool`, `path`, `relative_path`?, `kind`, `diff`?, `added`?, `removed`?, `truncated`?, `binary`? | A tool wrote a file: what changed, as a unified diff; see [below](#eventfile_change) |
 | `event/info` | `turn`?, `text` | Informational output: a command's, or the harness's during a turn |
 | `event/notice` | `turn`?, `text` | An out-of-band notice: a warning, something that went wrong |
 | `event/activity` | `turn`, `text` | A line of progress from a subagent |
@@ -291,8 +380,8 @@ One per thing the session reports. Events of a turn carry its id as
 | `request/cancelled` | `id`, `reason` | A request atelier made no longer needs an answer |
 
 The payloads are those of the [`stream-json` events](headless.md#events-stream-json)
-of the same name (`text`, `tool_start`, `tool_end`, …): the two interfaces
-share one vocabulary.
+of the same name (`text`, `tool_start`, `tool_end`, `file_change`, …): the
+two interfaces share one vocabulary.
 
 ### `turn/ended`
 
@@ -315,6 +404,46 @@ share one vocabulary.
 By the time the client reads `turn/ended` the session is idle: the next
 `turn/start` can follow immediately. A turn that ends in `error` or
 `max_turns` leaves the conversation intact; another turn can continue it.
+
+### `event/file_change`
+
+A tool call wrote, created or deleted a file. Sent once the write has
+happened, between the call's `event/tool_start` and its `event/tool_end` —
+so it describes what is on disk, and a call that was refused, or failed
+before it wrote, sends none.
+
+```json
+{"jsonrpc":"2.0","method":"event/file_change",
+ "params":{"turn":1,"tool":"edit","path":"/home/me/project/src/parser.rs","relative_path":"src/parser.rs",
+           "kind":"modified","added":1,"removed":1,
+           "diff":"--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -40,7 +40,7 @@\n fn nested(…\n-    if depth > 8 {\n+    if depth >= 8 {\n …"}}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `tool` | The tool that wrote: `write`, `edit`, `multiedit`, `apply_patch` or `notebook_edit` |
+| `path` | The file, absolute |
+| `relative_path` | The file relative to the project root, with `/` separators. Absent for a file outside it (a subagent working in a worktree of its own) |
+| `kind` | `created`, `modified` or `deleted` |
+| `diff` | The change as a unified diff of the whole file, three lines of context: `--- a/<path>` and `+++ b/<path>` (`/dev/null` for the side that does not exist), then the hunks. Capped at 64 KiB, cut at the end of a line |
+| `added`, `removed` | Lines added and removed — of the whole change, also when `diff` was cut |
+| `truncated` | `true` when `diff` was cut — or left out altogether, with `added` and `removed`, the file being over 1 MiB before or after |
+| `binary` | `true` when the file was not text (UTF-8) before the write: no `diff`, `added` or `removed` |
+
+- One event per file: an `apply_patch` over three files sends three, in the
+  patch's order. A patch that failed part-way reports the files it did
+  write before its `tool_end` with `ok: false`.
+- A write that leaves the file's text as it was sends nothing.
+- A [subagent](agents.md)'s edits are reported in its parent's turn, between
+  the `task` call's start and end — not those of an agent running in the
+  background.
+- With the [Claude backend](claude.md) the events come from atelier's tools,
+  which is what claude is given by default; edits made by claude's own
+  built-ins (`ATELIER_CLAUDE_BUILTINS=keep`) are not reported.
+- **Not covered**: files changed by a `bash` command or by a
+  [`node`](tools.md) script's `fs`, and atelier's own bookkeeping (`todo`,
+  `memory`, spilled tool output). A client that needs those watches the
+  directory.
 
 ### `event/idle`
 
@@ -347,7 +476,7 @@ codes are stable:
 | `-32600` | invalid request | JSON, but not a request, notification or answer (an array, a missing or non-string `method`). `id` is the message's, or `null` |
 | `-32601` | method not found | Unknown method |
 | `-32602` | invalid params | A required param is missing or of the wrong type |
-| `-32001` | turn running | `turn/start`, `command/run` or unforced `shutdown` while a turn or command runs. `data: {"turn": n}` for a turn |
+| `-32001` | turn running | `turn/start`, `command/run`, `session/history` or unforced `shutdown` while a turn or command runs. `data: {"turn": n}` for a turn |
 | `-32002` | not initialized | A request other than `initialize` came first |
 | `-32003` | no turn running | `turn/steer` or `turn/interrupt` with nothing to act on |
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |
@@ -363,7 +492,7 @@ command asks.
 
 ```
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":{"name":"demo","version":"0.1"}}}
-← {"id":1,"jsonrpc":"2.0","result":{"atelier":{"version":"0.1.1"},"capabilities":{"approval_timeout":null,"approvals":true,"commands":true,"images":true,"interrupt":true,"questions":true,"steer":true},"protocol":1,"session":{"backend":"openai","cwd":"/home/me/project","mode":"auto-edit","model":"qwen3-coder","tools":["apply_patch","ask","bash","…","write"]}}}
+← {"id":1,"jsonrpc":"2.0","result":{"atelier":{"version":"0.1.1"},"capabilities":{"approval_timeout":null,"approvals":true,"commands":true,"file_changes":true,"history":true,"images":true,"interrupt":true,"questions":true,"steer":true},"protocol":1,"session":{"backend":"openai","cwd":"/home/me/project","mode":"auto-edit","model":"qwen3-coder","tools":["apply_patch","ask","bash","…","write"]}}}
 → {"jsonrpc":"2.0","id":2,"method":"turn/start","params":{"text":"run the tests and fix what fails"}}
 ← {"id":2,"jsonrpc":"2.0","result":{"turn":1}}
 ← {"jsonrpc":"2.0","method":"event/reasoning","params":{"text":"I should run the suite first.","turn":1}}
@@ -375,6 +504,7 @@ command asks.
 ← {"jsonrpc":"2.0","method":"event/tool_end","params":{"name":"bash","ok":true,"output":"test parser::nested ... FAILED\n…","turn":1}}
 ← {"jsonrpc":"2.0","method":"event/delivered","params":{"text":"only the parser tests matter","turn":1}}
 ← {"jsonrpc":"2.0","method":"event/tool_start","params":{"arguments":{"new_string":"depth >= 8","old_string":"depth > 8","path":"src/parser.rs"},"name":"edit","turn":1}}
+← {"jsonrpc":"2.0","method":"event/file_change","params":{"added":1,"diff":"--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -40,7 +40,7 @@\n…","kind":"modified","path":"/home/me/project/src/parser.rs","relative_path":"src/parser.rs","removed":1,"tool":"edit","turn":1}}
 ← {"jsonrpc":"2.0","method":"event/tool_end","params":{"name":"edit","ok":true,"output":"replaced 1 occurrence(s) in src/parser.rs","turn":1}}
 ← {"jsonrpc":"2.0","method":"event/text","params":{"text":"Fixed the off-by-one in ","turn":1}}
 ← {"jsonrpc":"2.0","method":"event/text","params":{"text":"`parser::nested`.","turn":1}}
@@ -410,7 +540,9 @@ with the response held until `turn/ended` (`completed` → `end_turn`,
 `session/request_permission` is `approval/request` (`allow_once` /
 `allow_always` / `reject_once` being `once` / `always` / `deny`),
 `session/cancel` is `turn/interrupt`, and ACP's session modes are the
-permission modes. Where they differ, `serve` is the smaller and the more
+permission modes. An edit reaches an ACP client as the `diff` content of
+its tool call (old and new text, from the call's arguments) rather than as
+`event/file_change`. Where they differ, `serve` is the smaller and the more
 atelier's own: it has mid-turn steering (`turn/steer`), free-form questions
 (`question/request`) and `event/idle`, and no notion of an editor's files.
 Write a front end for atelier against `serve`; point an existing ACP client

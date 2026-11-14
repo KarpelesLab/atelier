@@ -43,6 +43,10 @@ atelier --continue --print "keep going"   # resume, then run one prompt headless
 (N message(s))` to stderr. Without the flag, every run starts with empty
 history (even if a session file exists — it is only loaded on request).
 
+A program driving the session (`atelier serve --continue`) has seen none of
+the resumed conversation's events; it asks for it with
+[`session/history`](protocol.md#sessionhistory).
+
 ## Starting over: `/new`
 
 The `/new` command (or a fresh run without `--continue`) discards the

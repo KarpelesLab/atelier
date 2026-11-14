@@ -170,7 +170,7 @@ fn call_label(call: &ToolCall) -> String {
 }
 
 /// Whether a tool result is already the stub [`prune_tool_output`] leaves.
-fn is_stub(content: &str) -> bool {
+pub(super) fn is_stub(content: &str) -> bool {
     content.starts_with("[output of ") && content.ends_with(", pruned]")
 }
 

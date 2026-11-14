@@ -300,6 +300,10 @@ impl Session {
                 }
                 (Plan::Run(arguments), Some(Ok((mut out, ok, reads)))) => {
                     self.fstate.merge(reads);
+                    // None, from tools that only read; said all the same.
+                    for change in self.fstate.take_changes() {
+                        ui.file_change(name, &change);
+                    }
                     // As in `ToolRunner::exec`: a subdirectory's own
                     // instruction file comes with the first result from
                     // under it.

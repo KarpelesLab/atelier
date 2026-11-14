@@ -33,6 +33,7 @@ pub use crate::provider::ToolSpec;
 pub mod apply_patch;
 pub mod ask;
 pub mod bash;
+pub mod change;
 mod edit;
 pub mod files;
 mod glob;
@@ -329,6 +330,9 @@ pub struct FileState {
     dirs: HashSet<PathBuf>,
     /// Those of `dirs` not yet handed out by [`take_new_dirs`](Self::take_new_dirs).
     new_dirs: Vec<PathBuf>,
+    /// The files written since the last [`take_changes`](Self::take_changes),
+    /// in the order they were written (see [`change`]).
+    changes: Vec<change::FileChange>,
 }
 
 impl FileState {
@@ -348,6 +352,24 @@ impl FileState {
             self.new_dirs.push(dir.to_path_buf());
         }
     }
+    /// Note that a tool wrote, created or deleted the file at `path` — after
+    /// the fact, so only what happened is noted — with what it held before
+    /// and holds now. A write that left the text as it was is not a change.
+    pub fn changed(&mut self, path: &Path, before: change::Side, after: change::Side) {
+        let change = change::FileChange {
+            path: path.to_path_buf(),
+            before,
+            after,
+        };
+        if !change.is_noop() {
+            self.changes.push(change);
+        }
+    }
+    /// The files written since the last call, for the interface to be told
+    /// (see [`change`]).
+    pub fn take_changes(&mut self) -> Vec<change::FileChange> {
+        std::mem::take(&mut self.changes)
+    }
     /// The directories first read or written under since the last call. Each
     /// is reported once per session (or once more after
     /// [`forget_dirs`](Self::forget_dirs)).
@@ -365,6 +387,7 @@ impl FileState {
     /// directory two of them entered is new exactly once, for the first.
     pub fn merge(&mut self, other: FileState) {
         self.seen.extend(other.seen);
+        self.changes.extend(other.changes);
         // `other` started empty, so `new_dirs` is every directory it knows,
         // in the order `record` met them.
         for dir in other.new_dirs {

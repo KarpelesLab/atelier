@@ -14,6 +14,7 @@ mod commands;
 mod config;
 mod context;
 mod coord;
+mod diff;
 mod doctor;
 mod events;
 mod headless;

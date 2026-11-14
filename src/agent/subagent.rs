@@ -85,6 +85,7 @@ use crate::agents::{self, Agent, Isolation, TASK_TOOL};
 use crate::context;
 use crate::permissions::{DENIED, reviewer};
 use crate::provider::ToolCall;
+use crate::tools::change::FileChange;
 use crate::tools::task::TaskCall;
 
 pub(super) use background::{Background, NOTICE_OPEN, Roster};
@@ -175,6 +176,17 @@ impl Link {
         }
     }
 
+    /// A file the child's tool call wrote. A background agent's go
+    /// unreported: nobody is listening when they happen.
+    fn file_change(&self, tool: &str, change: &FileChange) {
+        if let Parent::Waiting { events, .. } = &self.to {
+            let _ = events.send(Event::Change {
+                tool: tool.to_string(),
+                change: change.clone(),
+            });
+        }
+    }
+
     /// The child is finished. Always the last thing it says.
     fn done(&self, outcome: Outcome) {
         match &self.to {
@@ -201,6 +213,8 @@ impl Link {
 enum Event {
     /// A line of progress to show.
     Activity { index: usize, text: String },
+    /// A file one of its tool calls wrote.
+    Change { tool: String, change: FileChange },
     /// A call the child wants to make; the answer goes back through `reply`.
     Approve {
         index: usize,
@@ -488,6 +502,7 @@ impl Session {
                             ui.activity(&format!("  ⤷ {text}"));
                         }
                     }
+                    Ok(Event::Change { tool, change }) => ui.file_change(&tool, &change),
                     Ok(Event::Approve {
                         index,
                         tool,
@@ -752,6 +767,9 @@ impl Ui for ChildUi {
             let first = result.lines().next().unwrap_or("");
             self.report(clip(&format!("✗ {name}: {first}")));
         }
+    }
+    fn file_change(&mut self, tool: &str, change: &FileChange) {
+        self.link.file_change(tool, change);
     }
     fn info(&mut self, text: &str) {
         self.report(text.to_string());

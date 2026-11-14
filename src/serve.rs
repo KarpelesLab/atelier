@@ -40,6 +40,9 @@
 //! cancels it when the turn is interrupted. So a turn waiting on an answer
 //! can still be steered, interrupted, or asked for its status.
 //!
+//! What only the session can answer waits for it: `session/history` (see
+//! [`history`]) is a job, refused while a turn or a command runs.
+//!
 //! What is running ([`State::running`]) is decided by the reader thread
 //! when it accepts a request and cleared by the session thread *before* it
 //! reports the end (`turn/ended`, a command's result), so a client that has
@@ -69,6 +72,9 @@ use crate::permissions::{Decision, Policy};
 use crate::rpc::{self, Failure, Id, Reply, Scope as Asked, Why, Wire, lock};
 use crate::settings::Permissions;
 use crate::tools::ask::{Answer, Question};
+use crate::tools::change::FileChange;
+
+mod history;
 
 /// The protocol version this build speaks (`initialize` reports it).
 const PROTOCOL: u64 = 1;
@@ -151,6 +157,11 @@ enum Job {
     Command {
         id: Id,
         line: String,
+    },
+    /// `session/history`: a page of the conversation so far.
+    History {
+        id: Id,
+        page: history::Page,
     },
     Shutdown {
         id: Id,
@@ -393,6 +404,23 @@ impl Shared {
                     ..Accepted::default()
                 })
             }
+            "session/history" => {
+                let page = history::Page::parse(params)?;
+                // The session is the other thread's while it works, and a
+                // turn half done is not a history (see `history`). Queued
+                // without marking the session busy: it is answered before
+                // whatever the client starts next.
+                if let Some(running) = state.running {
+                    return Err(busy(running));
+                }
+                Ok(Accepted {
+                    job: Some(Job::History {
+                        id: id.clone(),
+                        page,
+                    }),
+                    ..Accepted::default()
+                })
+            }
             "shutdown" => {
                 let force = match &params["force"] {
                     Value::Null => false,
@@ -454,6 +482,9 @@ impl Server {
                     max_turns,
                 }) => self.turn(turn, &text, &images, max_turns),
                 Ok(Job::Command { id, line }) => self.command(&id, &line),
+                Ok(Job::History { id, page }) => {
+                    self.shared.wire.respond(&id, page.of(&self.session));
+                }
                 Ok(Job::Shutdown { id, force }) => {
                     if self.shutdown(&id, force) {
                         return;
@@ -527,6 +558,8 @@ impl Server {
                 "questions": true,
                 "images": true,
                 "commands": true,
+                "history": true,
+                "file_changes": true,
                 "approval_timeout": self.shared.approval_timeout.map(|t| t.as_secs()),
             },
         });
@@ -776,6 +809,11 @@ impl Ui for ServeUi<'_> {
 
     fn tool_end(&mut self, name: &str, result: &str, ok: bool) {
         self.emit("tool_end", events::tool_end(name, result, ok));
+    }
+
+    fn file_change(&mut self, tool: &str, change: &FileChange) {
+        let event = events::file_change(tool, change, &self.shared.cwd);
+        self.emit("file_change", event);
     }
 
     fn info(&mut self, text: &str) {

@@ -669,10 +669,10 @@ out of this repository:
   slash command prints lines — the models and roles, MCP servers and their
   tools, peers and locks, usage, memory, the commands and skills there are,
   background jobs.
-- **The conversation so far**: `session/history`, so a client that resumes
+- ✅ **The conversation so far**: `session/history`, so a client that resumes
   a session can show it.
-- **Edits as diffs**: an event carrying the file and what changed, for every
-  tool that writes.
+- ✅ **Edits as diffs**: `event/file_change`, carrying the file and what
+  changed as a unified diff, for every tool that writes.
 - **Settings**: read them with where each value comes from, and change the
   user's own.
 - **A transport a browser or a second process can reach**: `atelier serve`

@@ -365,6 +365,10 @@ impl Ui for Unseen<'_> {
     fn content(&mut self, _text: &str) {}
     fn tool_start(&mut self, _name: &str, _arguments: &str) {}
     fn tool_end(&mut self, _name: &str, _result: &str, _ok: bool) {}
+    // A file changed whether or not the call that did it is shown.
+    fn file_change(&mut self, tool: &str, change: &crate::tools::change::FileChange) {
+        self.0.file_change(tool, change);
+    }
     fn info(&mut self, _text: &str) {}
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> Approval {
         self.0.ask_approval(tool, arguments)

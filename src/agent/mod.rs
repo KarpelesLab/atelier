@@ -29,6 +29,7 @@ mod init;
 mod jobs;
 mod loops;
 mod prompt;
+mod transcript;
 mod window;
 
 use std::collections::{HashMap, VecDeque};
@@ -50,6 +51,7 @@ use crate::permissions::Mode;
 use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpOptions, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
+use crate::tools::change::FileChange;
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 use crate::trust::{self, Trust};
 
@@ -110,6 +112,11 @@ pub trait Ui {
     fn tool_start(&mut self, name: &str, arguments: &str);
     /// A tool finished; `ok` is false when it returned an error result.
     fn tool_end(&mut self, name: &str, result: &str, ok: bool);
+    /// A tool call wrote, created or deleted a file: told once the write
+    /// has happened, between the call's `tool_start` and its `tool_end`
+    /// (see [`crate::tools::change`]). Interfaces that speak events send
+    /// one, with the change as a diff; the others show the call itself.
+    fn file_change(&mut self, _tool: &str, _change: &FileChange) {}
     /// The turn is complete (one full assistant response).
     fn turn_end(&mut self) {}
     /// Informational output from a command (e.g. `/models`, `/mcp`): printed to
@@ -2629,7 +2636,13 @@ impl ToolRunner<'_> {
             fstate: self.fstate,
             approved: true,
         };
-        match tool.call_output(&mut ctx, args) {
+        let result = tool.call_output(&mut ctx, args);
+        // Whatever the call wrote, it wrote — also when it failed after
+        // (a patch that could not write its second file).
+        for change in self.fstate.take_changes() {
+            ui.file_change(name, &change);
+        }
+        match result {
             Ok(mut out) => {
                 if let Some(note) = locked {
                     out.text.push_str(&note);
@@ -2746,6 +2759,9 @@ impl Ui for PeerUi<'_> {
     }
     fn tool_end(&mut self, name: &str, result: &str, ok: bool) {
         self.inner.tool_end(name, result, ok);
+    }
+    fn file_change(&mut self, tool: &str, change: &FileChange) {
+        self.inner.file_change(tool, change);
     }
     fn turn_end(&mut self) {
         self.inner.turn_end();

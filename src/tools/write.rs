@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use super::change::Side;
 use super::{Tool, ToolCtx, ToolSpec, path_arg};
 
 pub struct WriteTool;
@@ -52,9 +53,12 @@ impl Tool for WriteTool {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent directories for {path:?}"))?;
         }
+        // What is there now, for the report of what this call changed.
+        let before = Side::of(&resolved);
         super::files::write(&resolved, content).with_context(|| format!("writing to {path:?}"))?;
 
         ctx.fstate.record(&resolved, content);
+        ctx.fstate.changed(&resolved, before, Side::text(content));
 
         Ok(format!("wrote {} bytes to {}", content.len(), path))
     }
