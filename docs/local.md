@@ -68,6 +68,20 @@ or, to keep it, in your user-global `~/.config/atelier/atelier.toml`:
 model = "Qwen/Qwen3.8-27B,quant=q8"
 ```
 
+**With less memory**, the same model at 3 bits is a 13 GB file, against 19 GB
+in memory for the default:
+
+```toml
+[local]
+model = "unsloth/Qwen3.8-27B-GGUF:UD-Q3_K_XL,mmproj=unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+```
+
+The `mmproj` part is what lets it read images (another 0.9 GB, fetched when
+the server starts). It calls tools and reads images as the default does; how
+much is lost to the coarser weights on long tasks we have not measured.
+oxinfer runs GGUF weights on Apple's GPU, not yet on an NVIDIA one, where
+this model therefore runs on the CPU.
+
 `oxinfer --models` lists what your machine can run, with estimated speeds.
 A project's `atelier.toml` cannot set this: what gets downloaded and loaded
 on your machine is yours to choose.
