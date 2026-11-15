@@ -83,16 +83,14 @@ impl Tool for BashTool {
         "bash"
     }
 
-    /// A foreground command the sandbox will run cannot leave the project,
-    /// like the file tools, so it runs unasked (deny and ask rules still
-    /// apply: they are judged before a tool's own default). Everything that
-    /// runs on the host asks: with the sandbox off, a background job, a
-    /// `"sandbox": false` request — and, so that nothing slips through, a
+    /// A command the sandbox will run, in the foreground or as a background
+    /// job, cannot leave the project, like the file tools, so it runs
+    /// unasked (deny and ask rules still apply: they are judged before a
+    /// tool's own default). Everything that runs on the host asks: with
+    /// the sandbox off, a `"sandbox": false` request — and, so that nothing slips through, a
     /// sandbox that is on but unavailable, which [`call`](Tool::call) refuses.
     fn requires_approval_in(&self, args: &Value, root: &Path) -> bool {
-        !(matches!(sandbox::state(root), sandbox::State::Ready(_))
-            && !wants_background(args)
-            && !wants_host(args))
+        !(matches!(sandbox::state(root), sandbox::State::Ready(_)) && !wants_host(args))
     }
 
     fn spec(&self) -> ToolSpec {
@@ -154,16 +152,29 @@ impl Tool for BashTool {
         let sandboxed = state != sandbox::State::Off;
         // With the sandbox on, the host is reached only through a call that
         // was approved as one (`requires_approval_in`).
-        if sandboxed && (wants_background(&args) || wants_host(&args)) && !ctx.approved {
+        if sandboxed && wants_host(&args) && !ctx.approved {
             bail!("running on the host while the sandbox is on needs approval");
         }
         if wants_background(&args) {
-            let started = start_job(command, ctx.project_root)?;
-            return Ok(if sandboxed {
-                format!("{started}\n[background jobs are not sandboxed: this one runs on the host]")
-            } else {
-                started
-            });
+            return match state {
+                sandbox::State::Ready(setup) if !wants_host(&args) => {
+                    let guest = sandbox::background(command, ctx.project_root, &setup)?;
+                    start_job(command, guest)
+                }
+                sandbox::State::Unavailable(why) if !wants_host(&args) => bail!(
+                    "the sandbox is enabled but cannot run commands: {why}. Nothing was \
+                     started. To run this on the host instead, call bash again with \
+                     \"sandbox\": false (the user will be asked to approve it)."
+                ),
+                _ => {
+                    let started = start_job(command, host_shell(command, ctx.project_root))?;
+                    Ok(if sandboxed {
+                        format!("{started}\n[ran on the host, not in the sandbox]")
+                    } else {
+                        started
+                    })
+                }
+            };
         }
         let timeout = Duration::from_millis(timeout_ms);
         match state {
@@ -583,7 +594,8 @@ fn jobs() -> MutexGuard<'static, Jobs> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn start_job(command: &str, root: &std::path::Path) -> Result<String> {
+/// `sh -c command` on the host, for a background job.
+fn host_shell(command: &str, root: &std::path::Path) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -591,6 +603,12 @@ fn start_job(command: &str, root: &std::path::Path) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd
+}
+
+/// Start `cmd` — the process that runs `command`, on the host or in a guest
+/// — as a background job.
+fn start_job(command: &str, mut cmd: Command) -> Result<String> {
     // Its own process group, so bash_kill reaches whatever it spawns.
     #[cfg(unixlike)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -1263,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_foreground_command_in_a_ready_sandbox_runs_unasked() {
+    fn only_what_a_ready_sandbox_runs_goes_unasked() {
         let root = Path::new("/project");
         let plain = json!({"command": "make test"});
         let background = json!({"command": "make serve", "run_in_background": true});
@@ -1279,7 +1297,7 @@ mod tests {
             assert!(
                 !BashTool.requires_approval_in(&json!({"command": "ls", "sandbox": true}), root)
             );
-            assert!(BashTool.requires_approval_in(&background, root));
+            assert!(!BashTool.requires_approval_in(&background, root));
             assert!(BashTool.requires_approval_in(&host, root));
         }
         // On but unable to run: nothing is waved through.
@@ -1363,23 +1381,26 @@ mod tests {
             fstate: &mut fstate,
             approved: false,
         };
-        for args in [
-            json!({"command": "echo ran > ran.txt", "sandbox": false}),
-            json!({"command": "echo ran > ran.txt", "background": true}),
-        ] {
-            let err = BashTool.call(&mut ctx, args).unwrap_err().to_string();
-            assert!(err.contains("needs approval"), "{err}");
-        }
+        let host = json!({"command": "echo ran > ran.txt", "sandbox": false});
+        let err = BashTool.call(&mut ctx, host).unwrap_err().to_string();
+        assert!(err.contains("needs approval"), "{err}");
+        // A background job goes to the guest (which this made-up sandbox
+        // cannot start), never to the host for want of one.
+        let job = json!({"command": "echo ran > ran.txt", "background": true});
+        assert!(BashTool.call(&mut ctx, job).is_err());
         std::thread::sleep(Duration::from_millis(100));
         assert!(!root.join("ran.txt").exists());
 
-        // Approved, a background job starts — on the host, and says so.
+        // Approved for the host, a background job starts there, and says so.
         ctx.approved = true;
         let started = BashTool
-            .call(&mut ctx, json!({"command": "true", "background": true}))
+            .call(
+                &mut ctx,
+                json!({"command": "true", "background": true, "sandbox": false}),
+            )
             .unwrap();
         assert!(started.contains("started background job"), "{started}");
-        assert!(started.contains("runs on the host"), "{started}");
+        assert!(started.contains("ran on the host"), "{started}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

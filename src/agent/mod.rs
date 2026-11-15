@@ -677,11 +677,15 @@ fn dispatch_custom(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Option
     let root = session.root.clone();
     let global = crate::commands::global_dir();
     let command = crate::commands::find(&root, global.as_deref(), name.strip_prefix('/')?)?;
-    // These lines run on the host (`commands::run_shell`), never in the
-    // sandbox. With the sandbox on, a plain `bash` call is one the sandbox
-    // would run and so needs no approval: ask about the call this is — one
-    // that runs on the host.
-    let sandboxed = crate::sandbox::state(&root) != crate::sandbox::State::Off;
+    // With the sandbox ready these lines run in a guest
+    // (`commands::run_shell`), like the `bash` call they are approved as.
+    // On but unavailable, they run on the host: ask about the call that
+    // is — one that runs on the host — since a plain `bash` call would
+    // pass as one the sandbox takes.
+    let sandboxed = matches!(
+        crate::sandbox::state(&root),
+        crate::sandbox::State::Unavailable(_)
+    );
     let mut approve = |shell: &str| {
         let mut runner = session.runner();
         let mut arguments = serde_json::json!({ "command": shell });
@@ -3651,11 +3655,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A command file's `` !`command` `` runs on the host. With the sandbox
-    /// on, `bash` calls the sandbox would run need no approval — which
-    /// must not carry over to a line that never goes near the sandbox.
+    /// With the sandbox on but unable to run, a command file's
+    /// `` !`command` `` runs on the host — and is asked about as that,
+    /// though a plain `bash` call (which a working sandbox would take) is
+    /// not.
     #[test]
-    fn a_command_files_shell_line_is_asked_about_though_the_sandbox_is_on() {
+    fn a_command_files_shell_line_is_asked_about_when_the_sandbox_cannot_run_it() {
         use crate::sandbox;
         let (mut session, root) = scratch_session("cmd-sandbox");
         session.set_mode(Mode::AutoEdit);
@@ -3666,7 +3671,7 @@ mod tests {
             "Look: !`touch ran-on-host`\n",
         )
         .unwrap();
-        let _reset = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
+        let ready = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
             rootfs: PathBuf::from("/nonexistent/rootfs"),
             memory_mb: 64,
             interp: false,
@@ -3678,6 +3683,8 @@ mod tests {
         let plain = r#"{"command": "touch x"}"#;
         assert!(session.runner().approve("bash", plain, &mut ui).is_ok());
         assert_eq!(ui.asked, 0);
+        drop(ready);
+        let _reset = sandbox::testing::set(sandbox::State::Unavailable("no root".into()));
         // …the command file's line is, and (refused here) does not run.
         assert!(matches!(
             dispatch(&mut session, "/sbx-probe", &mut ui),

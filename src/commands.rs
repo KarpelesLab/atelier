@@ -381,18 +381,32 @@ pub fn expand(
 /// The arguments reach the shell as `$1`… and `$ARGUMENTS`, never as text
 /// spliced into `line` (see the module docs).
 fn run_shell(line: &str, arguments: &str, words: &[String], root: &Path) -> String {
-    let spawned = Process::new("sh")
-        .arg("-c")
-        .arg(line)
-        // `$0`, then the positional parameters.
-        .arg("atelier-command")
-        .args(words)
-        .env("ARGUMENTS", arguments)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    // With the sandbox ready, in a guest like a `bash` call (which is what
+    // the line was approved as): the same shell, arguments and deadline.
+    let guest = match crate::sandbox::state(root) {
+        crate::sandbox::State::Ready(setup) => {
+            let wrapped = crate::sandbox::with_arguments(line, arguments, words);
+            // The guest's own limit is not what ends it here: the deadline
+            // below does, as on the host.
+            crate::sandbox::background(&wrapped, root, &setup).ok()
+        }
+        _ => None,
+    };
+    let mut process = guest.unwrap_or_else(|| {
+        let mut host = Process::new("sh");
+        host.arg("-c")
+            .arg(line)
+            // `$0`, then the positional parameters.
+            .arg("atelier-command")
+            .args(words)
+            .env("ARGUMENTS", arguments)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        host
+    });
+    let spawned = process.spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => return format!("[could not run `{line}`: {e}]"),

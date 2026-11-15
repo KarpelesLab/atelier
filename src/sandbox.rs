@@ -296,32 +296,8 @@ pub struct Output {
 /// `Err` is for not being able to start the helper process at all; a sandbox
 /// that started and failed is [`Outcome::Failed`].
 pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration) -> Result<Output> {
-    let helper = match &setup.helper {
-        Some(path) => path.clone(),
-        None => crate::app::helper_exe().context("locating the atelier executable")?,
-    };
     let status_path = status_path();
-    let mut flags = Vec::new();
-    if setup.interp {
-        flags.push("interp");
-    }
-    let child = Command::new(helper)
-        .arg(HELPER)
-        .arg(&status_path)
-        .arg(&setup.rootfs)
-        .arg(project_root)
-        .arg(timeout.as_millis().to_string())
-        .arg(setup.memory_mb.to_string())
-        .arg(flags.join(","))
-        .arg(command)
-        // Nothing of the host's environment reaches the helper, so none of
-        // nixvm's `NIXVM_*` switches (host networking among them) can be set
-        // from outside.
-        .env_clear()
-        .current_dir(project_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let child = helper_command(command, project_root, setup, timeout, &status_path)?
         .spawn()
         .context("starting the sandbox process")?;
     // The guest's own time limit ends it at `timeout`; the helper is only
@@ -358,6 +334,77 @@ pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration)
         outcome,
         report,
     })
+}
+
+/// In place of a status file's path: write none.
+const NO_STATUS: &str = "-";
+
+/// How long a background job's guest may live.
+const BACKGROUND_LIMIT: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The process that runs `command` in a guest for a background job: to be
+/// spawned and watched by the caller like any other job (stdout and stderr
+/// are pipes). The guest ends when that process does.
+pub fn background(command: &str, project_root: &Path, setup: &Setup) -> Result<Command> {
+    // Nobody reads a job's status file: its output and exit are the job's.
+    helper_command(
+        command,
+        project_root,
+        setup,
+        BACKGROUND_LIMIT,
+        Path::new(NO_STATUS),
+    )
+}
+
+/// `sh -c line` with `$1`… and `$ARGUMENTS` set, as one command line for
+/// the guest's shell, which is handed no environment and no arguments.
+pub fn with_arguments(line: &str, arguments: &str, words: &[String]) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let mut out = format!(
+        "ARGUMENTS={} sh -c {} atelier-command",
+        quote(arguments),
+        quote(line)
+    );
+    for word in words {
+        out.push(' ');
+        out.push_str(&quote(word));
+    }
+    out
+}
+
+fn helper_command(
+    command: &str,
+    project_root: &Path,
+    setup: &Setup,
+    timeout: Duration,
+    status_path: &Path,
+) -> Result<Command> {
+    let helper = match &setup.helper {
+        Some(path) => path.clone(),
+        None => crate::app::helper_exe().context("locating the atelier executable")?,
+    };
+    let mut flags = Vec::new();
+    if setup.interp {
+        flags.push("interp");
+    }
+    let mut cmd = Command::new(helper);
+    cmd.arg(HELPER)
+        .arg(status_path)
+        .arg(&setup.rootfs)
+        .arg(project_root)
+        .arg(timeout.as_millis().to_string())
+        .arg(setup.memory_mb.to_string())
+        .arg(flags.join(","))
+        .arg(command)
+        // Nothing of the host's environment reaches the helper, so none of
+        // nixvm's `NIXVM_*` switches (host networking among them) can be set
+        // from outside.
+        .env_clear()
+        .current_dir(project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Ok(cmd)
 }
 
 /// A fresh path for a helper's status file. In the temporary directory, not
@@ -563,6 +610,10 @@ pub fn helper_main(args: &[String]) -> u8 {
         rw_root: false,
     };
     let (outcome, report) = execute(&spec);
+    // A background job has no status file: its exit status is all.
+    if status_path == NO_STATUS {
+        return exit_status(&outcome);
+    }
     // `create_new`: never through a link someone left at that name.
     let written = std::fs::OpenOptions::new()
         .write(true)
@@ -754,11 +805,10 @@ pub const TOOL_NOTE: &str = " Commands run in a sandbox: a small Linux guest (it
     path and nothing else of this machine. There is no network; each command starts in a \
     fresh guest, so only files in the project persist between commands (not /tmp, not \
     installed packages); .git/hooks, .git/config and atelier.toml are read-only; programs \
-    installed on the host are not available unless the sandbox's image has them too, and \
-    `git add`, `git commit` and `cargo` do not work there yet (reading with git does). If a \
+    installed on the host are not available unless the sandbox's image has them too. If a \
     command cannot work there, the result says so: run it again with `sandbox: false` to \
-    use the host, which the user is asked to approve. Background jobs always run on the \
-    host.";
+    use the host, which the user is asked to approve. A background job runs in a guest of \
+    its own: a server started in one cannot be reached from another command.";
 
 #[cfg(sandbox)]
 mod guest {
@@ -1634,6 +1684,39 @@ mod tests {
             lines[0].contains("unavailable: no root filesystem"),
             "{lines:?}"
         );
+    }
+
+    /// A background job's guest, and a command file's line with its
+    /// arguments: both in the project, neither on the host.
+    #[test]
+    fn a_background_job_and_a_command_line_with_arguments_run_in_the_guest() {
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        let project =
+            std::env::temp_dir().join(format!("atelier-sandbox-test-bg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+
+        let line = with_arguments(
+            r#"echo "$1|$2|$ARGUMENTS"; ls /home"#,
+            "it's two",
+            &["it's".to_string(), "two".to_string()],
+        );
+        let out = background(&line, &project, &setup)
+            .unwrap()
+            .output()
+            .unwrap();
+        // The guest's /home is empty, whatever the host's holds.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "it's|two|it's two\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success());
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     /// What git does to every object it stores: create the file read-only,

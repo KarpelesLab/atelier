@@ -1,6 +1,7 @@
 # Sandboxed `bash` (experimental)
 
-With the sandbox on, the `bash` tool runs its commands inside
+With the sandbox on, the `bash` tool — foreground commands, background
+jobs — and the shell lines of command files run inside
 [nixvm](https://github.com/KarpelesLab/nixvm): a real Linux userland (Alpine,
 typically) whose system calls are served by nixvm's kernel, in Rust, inside
 atelier's own process tree — not by the host's. The guest sees the project
@@ -77,11 +78,13 @@ whether it is on, which root, which CPU backend, what is read-only — and
   unless an allow rule you wrote covers the command or approvals are
   switched off (`ATELIER_APPROVE=all`). The result ends with
   `[ran on the host, not in the sandbox]`.
-- **Background jobs run on the host**, and so ask as before; the result says
-  so. Each command gets a fresh guest, so a server started in one could not
-  be reached from the next.
-- **A [command file's](commands.md) `` !`command` `` lines run on the host**
-  too, and ask like a `"sandbox": false` call (the prompt shows it as one).
+- **Background jobs run in a guest of their own**, unasked like foreground
+  commands, until they end or `bash_kill` stops them. Each command gets a
+  fresh guest, so a server started in one cannot be reached from the next:
+  start the server and its client in the same command.
+- **A [command file's](commands.md) `` !`command` `` lines run in a guest**
+  too, with their arguments. (With the sandbox on but unavailable they run
+  on the host, and ask like a `"sandbox": false` call.)
 - **A failure that looks like the sandbox's doing says so**, e.g.
 
   ```
@@ -224,7 +227,6 @@ is the first thing to fix for the sandbox to ship in the release binaries.
   names; that is not written, and a filter that could be talked round is
   worse than none. The guest has no network at all, and a `network` list in
   `atelier.toml` is reported by `sandbox status` as ignored.
-- **Background jobs** in the guest.
 - **`[sandbox] root` from a project file** is ignored on purpose: the root is
   what the guest can read, and a cloned repository naming `/` would hand it
   the machine.
