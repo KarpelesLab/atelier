@@ -144,28 +144,28 @@ cannot wedge the session.
 
 ## What works in the guest, and what doesn't
 
-Measured with nixvm 0.0.5 (the version this is built on) and Alpine 3.20
-x86-64 on KVM; "HEAD" is nixvm's unreleased master at the time of writing.
+Measured with nixvm 0.0.7 (the version this is built on) and Alpine 3.22
+x86-64 on KVM.
 
 | | |
 |---|---|
 | busybox, `ls`/`find`/`grep -r`, `rg` over the project | works |
 | `git status`, `diff`, `log`, `checkout <file>` | works |
-| **`git add`, `git commit`** | **fails**: "unable to write loose object file: Permission denied". Git creates each object read-only (`0444`) and writes through the descriptor it still holds; nixvm's host-directory filesystem works by path and reopens the file, which the host refuses. Any program writing a file it created read-only hits this. Also at HEAD. |
+| `git add`, `git commit` | works. Git creates each object read-only (`0444`) and then fills it; the guest is root and may, so atelier lends the file its write bit for the write |
 | a linked git worktree, a submodule | git finds no repository: its data is outside the project |
 | `python3`, `node` (JIT included), subprocesses from both | works |
-| `gcc`, `make` | works; `make -j` fails on 0.0.5 ("init jobserver pipe"), works at HEAD or with `--jobserver-style=pipe` |
-| **`cargo`, `rustc`** | **fails** to start child processes: Rust's `posix_spawn` path asks for `socketpair(AF_UNIX, SOCK_SEQPACKET)`, which nixvm answers `EOPNOTSUPP`. `rustc --emit=obj` works; linking and anything through `cargo` does not. Also at HEAD. |
+| `gcc`, `make`, `make -j` | works |
+| `cargo build`, `cargo run`, `cargo test` | works, with the toolchain of the image (Alpine 3.22 has Rust 1.87) and crates already there: there is no network to fetch them |
 | the host's own toolchains (`~/.cargo`, `~/.rustup`, nvm, system compilers) | not there: they are outside the project, and glibc programs do not run on a musl root anyway |
 | `apk add`, `pip install`, `npm install`, `cargo fetch` | no network. (With the network, by hand: `apk add` works.) |
-| FIFOs in the project | `mkfifo f; rm f` wedges nixvm's kernel thread, past its own time limit; on 0.0.5 so does reading a FIFO already there (`grep -r` over it). atelier kills the process. |
+| FIFOs, sockets and device files in the project | refused (`mkfifo`: Operation not permitted): the host would open them, and block. They work in the guest's `/tmp`. Reading a FIFO that is already in the project ends the command ("every process is blocked") |
 
 The story for a project's own toolchain, today: it has to be in the image
-(`apk add`), in a version Alpine packages (Rust 1.78 in Alpine 3.20; this
-repository needs 1.95), and even then `cargo` does not run. In practice the
-commands an agent runs most — build, test, commit — still go to the host and
-still ask. What the sandbox takes off your hands now is the long tail of
-looking around: listing, searching, reading git state, running scripts.
+(`apk add`), in a version Alpine packages, and its dependencies have to be
+on disk already, since the guest has no network. A project whose toolchain
+and dependencies fit that builds, tests and commits in the sandbox; one that
+needs the host's `rustup` toolchain or a registry still goes to the host for
+those commands, and they still ask.
 
 ## Speed
 
@@ -199,7 +199,7 @@ for an image of the other architecture. atelier gives the guest one vCPU.
 
 ## Builds
 
-nixvm 0.0.5 as a library has no dependencies; the feature adds 3.4 MB to the
+nixvm as a library has no dependencies (measured with 0.0.5); the feature adds 3.4 MB to the
 release binary (18.3 → 21.8 MB; 15.0 → 17.8 MB stripped) and about 35 s to a
 release build. The default build is unchanged: the code that touches nixvm is
 compiled only with the feature, on `cfg(unix)`.
@@ -240,15 +240,15 @@ In the order that unblocks atelier, with what atelier does once each lands.
    suffices) and gated on something fullrust satisfies; the same for
    `vcpu::kvm`'s `target_os = "linux"` and `kernel::egress`'s `setsockopt`.
    *Then:* the `sandbox` feature can be in the release binaries.
-2. **Writing through a descriptor to a file the path no longer allows**
+2. *(Worked around in atelier, which lends the write bit for the write; still worth doing in nixvm, where an unlinked file cannot be helped.)* **Writing through a descriptor to a file the path no longer allows**
    (created `0444`, or since made read-only, or unlinked): the host-directory
    filesystem should keep the host file open for the life of the guest's
    descriptor instead of reopening by path. *Then:* `git add`/`git commit`
    work, and the commit flow stays in the sandbox.
-3. **`socketpair(AF_UNIX, SOCK_SEQPACKET)`** (and whatever is behind it once
+3. *(Done in nixvm 0.0.6: `cargo` builds and tests.)* **`socketpair(AF_UNIX, SOCK_SEQPACKET)`** (and whatever is behind it once
    that answers): *then* `cargo` and `rustc` can start their children, and
    an image with a Rust toolchain can build.
-4. **Never block the kernel thread on the host**: opening or removing a FIFO
+4. *(Worked around: atelier refuses special files in the project.)* **Never block the kernel thread on the host**: opening or removing a FIFO
    in a host directory hangs the VM with its wall-clock limit unenforced
    (`mkfifo f; rm f`). Either refuse special files in a host directory or
    open them non-blocking; and enforce `Limits::wall_time` from outside the

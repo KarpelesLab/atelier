@@ -34,7 +34,7 @@ globset = "0.4"
 # nixvm's kernel, loader and filesystem modules, which no 0.0.x release
 # promises to keep as they are. No default features: the library alone, which
 # has no dependencies of its own.
-nixvm = { version = "=0.0.5", default-features = false, optional = true }
+nixvm = { version = "=0.0.7", default-features = false, optional = true }
 
 [features]
 default = ["tui"]

@@ -769,6 +769,7 @@ mod guest {
     //! same pieces (mount table, loader, backend, kernel) itself.
 
     use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use nixvm::abi::Arch;
@@ -821,7 +822,7 @@ mod guest {
         mounts.mount(
             project.clone(),
             Box::new(Guarded::new(
-                Passthrough::new(spec.project),
+                spec.project,
                 &super::protected_paths(spec.project),
             )),
         );
@@ -1005,13 +1006,16 @@ mod guest {
     #[derive(Debug)]
     pub(super) struct Guarded {
         inner: Passthrough,
+        /// The host directory `inner` serves.
+        root: PathBuf,
         protected: Vec<Vec<String>>,
     }
 
     impl Guarded {
-        pub(super) fn new(inner: Passthrough, protected: &[String]) -> Self {
+        pub(super) fn new(root: &Path, protected: &[String]) -> Self {
             Self {
-                inner,
+                inner: Passthrough::new(root),
+                root: root.to_path_buf(),
                 protected: protected
                     .iter()
                     .map(|p| p.split('/').map(str::to_string).collect())
@@ -1053,6 +1057,37 @@ mod guest {
                 Place::Protected => Err(read_only()),
                 Place::Above | Place::Free => Ok(()),
             }
+        }
+
+        /// Do `op` on `rel` with the owner's write bit lent to it. The
+        /// guest is root, and a program there may write a file it holds
+        /// open whatever the file's mode says — git creates every object
+        /// `0444` and then fills it. The host directory is served by path
+        /// as the user, whom the host refuses; so the bit is set for the
+        /// one operation and taken back. Only for a regular file (never
+        /// through a link) inside the project.
+        fn lend_write<T>(
+            &mut self,
+            rel: &str,
+            op: impl FnOnce(&mut Passthrough) -> io::Result<T>,
+        ) -> io::Result<T> {
+            use std::os::unix::fs::PermissionsExt;
+            let denied = || io::Error::from_raw_os_error(13); // EACCES
+            let path = self.root.join(rel.trim_start_matches('/'));
+            let meta = std::fs::symlink_metadata(&path)?;
+            let inside = path
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .zip(self.root.canonicalize().ok())
+                .is_some_and(|(parent, root)| parent.starts_with(root));
+            let mode = meta.permissions().mode();
+            if !meta.is_file() || !inside || mode & 0o200 != 0 {
+                return Err(denied());
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o200))?;
+            let result = op(&mut self.inner);
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            result
         }
 
         /// Refuse to add, remove or replace the name `rel`.
@@ -1101,7 +1136,12 @@ mod guest {
         }
         fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
             self.writable(rel)?;
-            self.inner.write_at(rel, off, buf)
+            match self.inner.write_at(rel, off, buf) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    self.lend_write(rel, |inner| inner.write_at(rel, off, buf))
+                }
+                other => other,
+            }
         }
         fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
             self.movable(rel)?;
@@ -1113,6 +1153,14 @@ mod guest {
         }
         fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
             self.movable(rel)?;
+            // A FIFO, socket or device in a host directory is opened by the
+            // host, where a FIFO with no other end blocks nixvm's kernel
+            // thread for good. They belong in the guest's own /tmp.
+            const S_IFMT: u32 = 0o170_000;
+            const S_IFREG: u32 = 0o100_000;
+            if mode & S_IFMT != S_IFREG && mode & S_IFMT != 0 {
+                return Err(io::Error::from_raw_os_error(1)); // EPERM
+            }
             self.inner.mknod(rel, mode)
         }
         fn unlink(&mut self, rel: &str) -> io::Result<()> {
@@ -1125,7 +1173,12 @@ mod guest {
         }
         fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
             self.writable(rel)?;
-            self.inner.truncate(rel, len)
+            match self.inner.truncate(rel, len) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    self.lend_write(rel, |inner| inner.truncate(rel, len))
+                }
+                other => other,
+            }
         }
         fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
             self.writable(rel)?;
@@ -1185,7 +1238,7 @@ mod guest {
 
         fn guard(protected: &[&str]) -> Guarded {
             let protected: Vec<String> = protected.iter().map(|p| p.to_string()).collect();
-            Guarded::new(Passthrough::new("/nonexistent"), &protected)
+            Guarded::new(Path::new("/nonexistent"), &protected)
         }
 
         #[test]
@@ -1581,6 +1634,44 @@ mod tests {
             lines[0].contains("unavailable: no root filesystem"),
             "{lines:?}"
         );
+    }
+
+    /// What git does to every object it stores: create the file read-only,
+    /// then fill it through the descriptor it holds. The guest is root and
+    /// may; the host directory is the user's, where that needs the write
+    /// bit lent for the write. And a FIFO, which would block the kernel's
+    /// thread on the host, is refused in the project and fine in `/tmp`.
+    #[test]
+    fn the_guest_writes_a_file_it_made_read_only_and_makes_no_fifo_in_the_project() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        let project =
+            std::env::temp_dir().join(format!("atelier-sandbox-test-0444-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+        let out = run(
+            "(umask 0333; echo object > obj) && cat obj; \
+             mkfifo f 2>&1; test -e f || echo no-fifo; mkfifo /tmp/f && echo tmp-fifo",
+            &project,
+            &setup,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("object\n"), "{stdout}");
+        assert!(
+            stdout.contains("no-fifo") && stdout.contains("tmp-fifo"),
+            "{stdout}"
+        );
+        let obj = project.join("obj");
+        assert_eq!(std::fs::read_to_string(&obj).unwrap(), "object\n");
+        // The bit was lent, not left.
+        let mode = std::fs::metadata(&obj).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     /// The guest itself, through the helper process: needs the feature, a

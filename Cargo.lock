@@ -48,7 +48,7 @@ dependencies = [
  "kataan",
  "nixvm",
  "oxideav-pdf",
- "purecrypto",
+ "purecrypto 0.8.1",
  "regex",
  "rsurl",
  "serde",
@@ -728,9 +728,12 @@ dependencies = [
 
 [[package]]
 name = "nixvm"
-version = "0.0.5"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67e356172a2ec86b78417780739a68397bff7ba75504d2a979c6271c5917b926"
+checksum = "9b9e3c43ebfe53a20b09b6d274f4869277db02fec458b05fc55407dfb08132f5"
+dependencies = [
+ "purecrypto 0.10.6",
+]
 
 [[package]]
 name = "num-bigint-dig"
@@ -1019,6 +1022,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "purecrypto"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36f943243cf00add6222fc0decfc3a17f37942bd82e8465a9d354eeb13822263"
+dependencies = [
+ "compcol 0.8.0",
+]
+
+[[package]]
 name = "puremp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,7 +1045,7 @@ dependencies = [
  "compcol 0.6.11",
  "libc",
  "nix",
- "purecrypto",
+ "purecrypto 0.8.1",
  "zeroize",
 ]
 
@@ -1161,7 +1173,7 @@ dependencies = [
  "intl",
  "js-sys",
  "psl2",
- "purecrypto",
+ "purecrypto 0.8.1",
  "puressh",
  "wasm-bindgen",
  "wasm-bindgen-futures",
