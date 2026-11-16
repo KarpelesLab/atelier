@@ -16,6 +16,10 @@
 //! - `/tmp`, `/dev`, `/proc`, `/sys` of its own. No network. A small fixed
 //!   environment, none of the host's.
 //!
+//! - Where the project is a linked git worktree or a submodule, the git
+//!   directory its `.git` file leads to — once that directory has been
+//!   checked to name the project back ([`gitdirs`]).
+//!
 //! and nothing else of the host. Inside the project, what decides which
 //! programs run on the *host* later stays read-only ([`protected_paths`]):
 //! git's hooks and configuration, and `atelier.toml`.
@@ -52,6 +56,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::settings::{SandboxSettings, Settings};
+
+pub mod gitdirs;
 
 /// The hidden subcommand [`run`] starts atelier with.
 pub const HELPER: &str = "sandbox-exec";
@@ -463,17 +469,17 @@ fn parse_status(text: &str) -> Option<(Outcome, Report)> {
 /// to `project_root`: what decides which programs run on the host later.
 ///
 /// - `.git/hooks` and `.git/config` (hooks, `core.hooksPath`,
-///   `core.fsmonitor`, aliases, filters: all run by the user's next `git`).
+///   `core.fsmonitor`, aliases, filters: all run by the user's next `git`),
+///   with `.git/config.worktree` and `.git/commondir`, which adds to that
+///   configuration or names another directory to take it from.
 ///   Where `.git` is not a directory — a linked worktree's or a submodule's
 ///   pointer file, or nothing yet — it is protected whole, since rewriting
-///   it chooses the repository, hooks and all.
+///   it chooses the repository, hooks and all. The same of each
+///   submodule's git directory under `.git/modules`, and what ties each
+///   linked worktree to the repository ([`gitdirs`]).
 /// - `atelier.toml`: permission rules, hooks and the MCP servers to launch.
 pub fn protected_paths(project_root: &Path) -> Vec<String> {
-    let mut paths = if project_root.join(".git").is_dir() {
-        vec![".git/hooks".to_string(), ".git/config".to_string()]
-    } else {
-        vec![".git".to_string()]
-    };
+    let mut paths = gitdirs::plan(project_root).protected;
     paths.push(crate::settings::FILE_NAME.to_string());
     paths
 }
@@ -532,8 +538,9 @@ pub fn diagnose(output: &Output) -> Option<String> {
     }
     if said(&["Read-only file system", "EROFS"]) {
         why.push(
-            "the sandbox keeps .git/hooks, .git/config and atelier.toml read-only \
-             (in a linked worktree, all of .git)",
+            "the sandbox keeps .git/hooks, .git/config and atelier.toml read-only (in a \
+             linked worktree, the .git file, and all of the repository but its objects, \
+             refs and the worktree's own state)",
         );
     }
     // The guest runs as root, which is never refused for want of permission:
@@ -549,8 +556,8 @@ pub fn diagnose(output: &Output) -> Option<String> {
     }
     if said(&["not a git repository"]) {
         why.push(
-            "git's data for this checkout may be outside the project (a linked worktree, \
-             a submodule), where the sandbox cannot see it",
+            "if this is a linked worktree or a submodule, its git directory is outside the \
+             project and the sandbox did not mount it (`atelier sandbox status` says why)",
         );
     }
     if !output.report.unsupported.is_empty() {
@@ -792,6 +799,7 @@ fn status_lines(root: &Path) -> Vec<String> {
                 "read-only in the project: {}",
                 protected_paths(root).join(", ")
             ));
+            out.extend(gitdirs::status_lines(&gitdirs::plan(root)));
             out.push("network: none".to_string());
             out.extend(setup.notes.iter().map(|n| format!("note: {n}")));
         }
@@ -876,6 +884,13 @@ mod guest {
                 &super::protected_paths(spec.project),
             )),
         );
+        // The git directory of a linked worktree or a submodule, where the
+        // project's `.git` file says it is — if it names the project back.
+        if let Some(git) = super::gitdirs::plan(spec.project).mount {
+            mkdir_all(&mut mounts, &git.guest);
+            let guarded = Guarded::new(&git.host, &git.protected).only(git.writable.as_deref());
+            mounts.mount(git.guest, Box::new(guarded));
+        }
         for dir in ["/root", "/etc"] {
             mkdir_all(&mut mounts, dir);
         }
@@ -987,7 +1002,9 @@ mod guest {
 
     /// The guest's whole environment. `safe.directory`: the guest runs as
     /// root and the project's files belong to the host's user, which git
-    /// otherwise refuses to work with.
+    /// otherwise refuses to work with — everywhere (`*`), since a submodule
+    /// in the project is a repository of its own to git, and the guest
+    /// holds no repository but the project's.
     fn environment(project: &str) -> Vec<String> {
         vec![
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -998,7 +1015,7 @@ mod guest {
             format!("PWD={project}"),
             "GIT_CONFIG_COUNT=1".to_string(),
             "GIT_CONFIG_KEY_0=safe.directory".to_string(),
-            format!("GIT_CONFIG_VALUE_0={project}"),
+            "GIT_CONFIG_VALUE_0=*".to_string(),
         ]
     }
 
@@ -1044,7 +1061,8 @@ mod guest {
         Free,
     }
 
-    /// The project directory, with some paths under it kept read-only.
+    /// A host directory — the project, or a git directory outside it — with
+    /// some paths under it kept read-only.
     ///
     /// A read-only mount over them would not do: nixvm's mounts are found by
     /// path, so renaming a directory above one (`mv .git g`) takes its
@@ -1059,6 +1077,9 @@ mod guest {
         /// The host directory `inner` serves.
         root: PathBuf,
         protected: Vec<Vec<String>>,
+        /// If set, the only paths that may change at all (the protected
+        /// ones under them still may not).
+        writable: Option<Vec<Vec<String>>>,
     }
 
     impl Guarded {
@@ -1070,7 +1091,20 @@ mod guest {
                     .iter()
                     .map(|p| p.split('/').map(str::to_string).collect())
                     .collect(),
+                writable: None,
             }
+        }
+
+        /// Keep everything read-only but `writable` (`None`: no such
+        /// restriction).
+        pub(super) fn only(mut self, writable: Option<&[String]>) -> Self {
+            self.writable = writable.map(|paths| {
+                paths
+                    .iter()
+                    .map(|p| p.split('/').map(str::to_string).collect())
+                    .collect()
+            });
+            self
         }
 
         fn place(&self, rel: &str) -> Place {
@@ -1083,6 +1117,14 @@ mod guest {
                     ".." => return Place::Protected,
                     part => parts.push(part),
                 }
+            }
+            let within = |root: &Vec<String>| {
+                parts.len() >= root.len() && parts.iter().zip(root).all(|(a, b)| *a == b.as_str())
+            };
+            if let Some(writable) = &self.writable
+                && !writable.iter().any(within)
+            {
+                return Place::Protected;
             }
             let mut place = Place::Free;
             for protected in &self.protected {
@@ -1334,6 +1376,39 @@ mod guest {
             assert!(g.movable(".git/hooks").is_err());
             assert!(g.movable(".git/objects").is_ok());
             assert_eq!(g.movable(".git").unwrap_err().raw_os_error(), Some(30));
+        }
+
+        /// A linked worktree's repository: read-only but for what a commit
+        /// writes, and in that, what ties the worktree to it.
+        #[test]
+        fn only_the_listed_paths_are_writable() {
+            let writable = ["objects", "packed-refs", "worktrees/wt"].map(str::to_string);
+            let g = guard(&["worktrees/wt/commondir"]).only(Some(&writable));
+            for path in [
+                "objects/ab/cdef",
+                "objects",
+                "packed-refs",
+                "worktrees/wt/index.lock",
+                "worktrees/wt",
+            ] {
+                assert!(g.writable(path).is_ok(), "{path}");
+                assert!(g.movable(path).is_ok() || path == "worktrees/wt", "{path}");
+            }
+            for path in [
+                "",
+                "config",
+                "hooks/pre-commit",
+                "HEAD",
+                "objects2",
+                "packed-refs.new",
+                "worktrees",
+                "worktrees/other/HEAD",
+                "worktrees/wt/commondir",
+                "objects/../config",
+            ] {
+                assert!(g.writable(path).is_err(), "{path}");
+                assert!(g.movable(path).is_err(), "{path}");
+            }
         }
     }
 }
@@ -1601,7 +1676,13 @@ mod tests {
         std::fs::create_dir(dir.join(".git")).unwrap();
         assert_eq!(
             protected_paths(&dir),
-            [".git/hooks", ".git/config", "atelier.toml"]
+            [
+                ".git/hooks",
+                ".git/config",
+                ".git/commondir",
+                ".git/config.worktree",
+                "atelier.toml"
+            ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1850,6 +1931,8 @@ mod tests {
             "chmod 777 .git/config && echo x >> .git/config",
             "rm -rf .git/hooks && mkdir .git/hooks && echo x > .git/hooks/pre-commit",
             "cp seen.txt .git/config",
+            "echo ../elsewhere > .git/commondir",
+            "echo '[core]' > .git/config.worktree",
             "dd if=seen.txt of=.git/config conv=notrunc 2>/dev/null",
             "truncate -s 0 atelier.toml",
         ];
@@ -1874,6 +1957,12 @@ mod tests {
                 .unwrap_or_else(|e| panic!("after `{attempt}`: {e}"))
                 .collect();
             assert!(hooks.is_empty(), "after `{attempt}`: {hooks:?}");
+            for file in ["commondir", "config.worktree"] {
+                assert!(
+                    !project.join(".git").join(file).exists(),
+                    "after `{attempt}`"
+                );
+            }
         }
         // The rest of `.git` is ordinary.
         let (outcome, _, stderr, _) = run("echo ref > .git/HEAD && mkdir .git/objects");

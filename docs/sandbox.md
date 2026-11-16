@@ -116,26 +116,83 @@ whether it is on, which root, which CPU backend, what is read-only — and
 |---|---|
 | `/` | the root filesystem, read-only, under a writable layer in memory |
 | the project's own absolute path | the project, read-write; the working directory |
+| where the project's `.git` file points | in a linked worktree or a submodule: the git directory, and only that ([below](#linked-worktrees-and-submodules)) |
 | `/tmp`, `/dev`, `/proc`, `/sys` | the guest's own |
 
 The project is mounted where it is on the host, so paths in a command's
 output are the paths the other tools use. The directories above it exist in
 the guest as empty directories. Nothing else of the host is reachable: not
 your home, not `~/.ssh`, not the environment (the guest gets `PATH`, `HOME`,
-`USER`, `TERM`, `LANG`, `PWD` and a `safe.directory` entry for git), not the
-network. It runs as root in the guest, which is you on the host: files it
+`USER`, `TERM`, `LANG`, `PWD` and `safe.directory = *` for git, whose
+repositories there are the project's), not the network. It runs as root in the guest, which is you on the host: files it
 creates are yours.
 
 **Read-only inside the project**: `.git/hooks`, `.git/config` and
 `atelier.toml` — what decides which programs run on the host *later* (git
 hooks and `core.hooksPath`/`core.fsmonitor`/aliases; atelier's permission
-rules, hooks and MCP servers). Where `.git` is not a directory (a linked
-worktree, a submodule, no repository yet) all of `.git` is. They cannot be
+rules, hooks and MCP servers) — with `.git/config.worktree` and
+`.git/commondir`, two files git reads more configuration from, or the name
+of another directory to take all of it from. Where `.git` is not a directory (a linked
+worktree, a submodule, no repository yet) all of `.git` is. The same goes
+for the same four of each submodule whose git directory is under
+`.git/modules` when the command starts, and for what ties each linked
+worktree of the project to it (`.git/worktrees/<name>/commondir`, `gitdir`,
+`config.worktree`). They cannot be
 written, replaced, removed, or carried off by renaming a directory above
 them; the tests try twenty-odd routes, through links and `..` included.
 What is *not* covered: other files a later host command may run — a
 `Makefile`, `build.rs`, `package.json` scripts. That is the project's
-content, and the agent can edit it with `write` as well.
+content, and the agent can edit it with `write` as well. Nor is a
+repository the guest makes itself somewhere in the project: a new
+directory with a `.git` of its own has its own configuration and hooks,
+which `git` on the host obeys if you run it there (or from above, once that
+directory is recorded as a submodule).
+
+### Linked worktrees and submodules
+
+In a linked worktree (`git worktree add`) and in a submodule's checkout,
+`.git` is a one-line file, `gitdir: <path>`, and git's data is elsewhere:
+in the main repository's `.git` (the worktree's own part in
+`.git/worktrees/<name>`), or in the superproject's `.git/modules/<name>`.
+atelier mounts that git directory in the guest, at the path the file
+spells, so git works there as it does on the host.
+
+The `.git` file is part of the project, and a project you cloned or
+unpacked may say anything in it — `gitdir: /home/you/.ssh`, `gitdir: /`. So
+the file alone decides nothing. A directory is mounted only if **it names
+the project back**, in a file the project could not have written:
+
+- for a worktree, `<repository>/worktrees/<name>/gitdir` holds the path of
+  this project's `.git` (git writes it at `git worktree add`), the
+  directory's `commondir` leads exactly two levels up, and what is there
+  has a git directory's shape (`HEAD`, `objects`, `refs`);
+- for a submodule (or a `git init --separate-git-dir` checkout), the
+  directory has that shape and its `config` has `core.worktree` pointing at
+  this project.
+
+Whoever can write such a file outside the project already has the
+directory. A directory that contains the project, or that is inside it, is
+not mounted (the first would bring a checkout's files with it); anything
+else — no such directory, a repository that is someone else's, a worktree
+that was moved without `git worktree repair` — is not followed, git finds
+no repository in the guest as before, and `atelier sandbox status` says
+why.
+
+What is mounted is the git directory, never the checkout beside it: of the
+main repository the guest sees `<main>/.git` and not `<main>`'s files; of
+a superproject, `<super>/.git/modules/<name>` and nothing else of
+`<super>/.git`. In it:
+
+| | |
+|---|---|
+| a worktree's repository (`<main>/.git`) | **read-only**, except `objects`, `refs`, `logs/refs`, `packed-refs`, `reftable` and the worktree's own `worktrees/<name>` — what a commit writes. Its `config` and `hooks`, the main checkout's `HEAD` and index, and the other worktrees' directories can be read (git reads them, to know which branch is checked out where) and not changed. In `worktrees/<name>`, `commondir`, `gitdir` and `config.worktree` are read-only: they say which repository, and so whose hooks, the worktree uses |
+| a submodule's git directory | read-write, except its `config`, `config.worktree`, `hooks` and `commondir` (and those of its own submodules) |
+
+So in a worktree the guest can commit, branch, stash and reset, and it can
+move or delete the branches of the repository — as it can in an ordinary
+project — but `git config` and `git worktree add` are refused there as
+read-only. The repository's `config` is readable, as an ordinary
+project's is: a token written into a remote's URL is in it.
 
 Nothing persists between commands except what was written in the project:
 the next command starts in a fresh guest (`/tmp`, installed packages and
@@ -155,7 +212,9 @@ x86-64 on KVM.
 | busybox, `ls`/`find`/`grep -r`, `rg` over the project | works |
 | `git status`, `diff`, `log`, `checkout <file>` | works |
 | `git add`, `git commit` | works. Git creates each object read-only (`0444`) and then fills it; the guest is root and may, so atelier lends the file its write bit for the write |
-| a linked git worktree, a submodule | git finds no repository: its data is outside the project |
+| a linked git worktree: `git status`, `diff`, `log`, `add`, `commit`, `branch` | works: the repository's git directory is mounted ([how, and what of it](#linked-worktrees-and-submodules)). `git config` and `git worktree add` are refused |
+| a submodule's checkout as the project: the same | works, likewise |
+| a project with submodules: `git status`, `git submodule status`, `git add <submodule>`, `git -C <submodule> commit` | works (their git directories are in the project's `.git/modules`). `git -C <submodule> config` is refused |
 | `python3`, `node` (JIT included), subprocesses from both | works |
 | `gcc`, `make`, `make -j` | works |
 | `cargo build`, `cargo run`, `cargo test` | works, with the toolchain of the image (Alpine 3.22 has Rust 1.87) and crates already there: there is no network to fetch them |
