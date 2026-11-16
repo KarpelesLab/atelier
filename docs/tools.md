@@ -403,7 +403,20 @@ project has it:
 
 or when [`[[lsp]]`](configuration.md#lsp) in `atelier.toml` names one for the
 file's extension (which replaces the detected one). `search` asks every
-server the project has.
+server the project has, and lists the project's own symbols: what a server
+also knows of the standard library and the dependencies is counted on a last
+line, not listed (gopls is started with `symbolScope` set to `workspace` for
+the same reason). A server that has just started is first given one of the
+project's files — clangd has indexed nothing, and the TypeScript server has
+no project, until it is.
+
+`references` asks the server for every occurrence and takes out the
+definition itself, and the declaration the call was pointed at. Asked to
+leave the declaration out, servers do not agree on what that means (see
+[below](#tried-against)); this way the list is the same wherever the call
+points. Another declaration of the symbol — a C prototype when the body is
+the definition — stays in the list, labelled with its kind as in
+`definition`.
 
 A server is started the first time it is needed and kept for the session —
 indexing takes a while, and answers are fast only afterwards. A file is sent
@@ -442,6 +455,41 @@ absolute path and line, marked `outside the project, not read`; reading it is
 
 Diagnostics do not come from the language server — they come from the
 project's own [checkers](configuration.md#diagnostics).
+
+### Tried against
+
+The tool was written against rust-analyzer and a fake server. On 2026-11-17
+it was run against four more, on Linux, each on a project of three files in
+a directory whose name has a space and an accent, the symbol asked about
+sitting after `"é𝄞日本"` on its line, and the first call a `search` on a
+server just started:
+
+| Server | Version | What it showed |
+|--------|---------|----------------|
+| clangd | 22.1.8 | A first `search` found nothing: clangd indexes when a file is opened. `search` also listed `std::greater_equal` |
+| gopls | 0.23.0, Go 1.26.5 | `search` for `gree` returned 100 symbols, 96 of them the standard library's; a name gopls had qualified was qualified twice. Also run on a 30-file module (BurntSushi/toml 1.6.0): 49 references across its packages, cold, in under a second |
+| typescript-language-server | 6.1.0, TypeScript 5.9.3 | A first `search` failed with "No Project" and twenty lines of stack trace, which went into the note. `references` asked right after a file was first opened listed that file's only. The declaration was among the references unless asked at it. `search` placed a symbol at the start of its declaration, not at its name |
+| pyright-langserver | 1.1.414 | `references` "without the declaration" left out the place asked about and kept the declaration |
+
+All of that is fixed, with a test of each against the fake server; positions
+(UTF-16 units), escaped URIs, the servers' own requests
+(`workspace/configuration`, `window/workDoneProgress/create`), waiting for
+`$/progress` to end, a file edited between two calls, and stopping the
+server needed nothing. The runs are kept as tests that are ignored unless
+asked for, and that skip a server that is not installed:
+
+```sh
+cargo test --lib symbols::live -- --ignored --nocapture
+```
+
+Worth knowing: clangd writes its index to `.cache/clangd/` in the project.
+typescript-language-server 6.1 does not work with TypeScript 7 (there is no
+`tsserver` in it) and refuses to start; the tool says so and answers from
+the text.
+
+Not tried: pylsp; a project large enough that indexing outlasts the 20
+seconds a call waits; macOS and Windows. Of `[[lsp]]` entries, one naming
+gopls by its path was.
 
 Read-only, confined to the project root and auto-approved; available in
 `plan` mode and to the `explore` agent, and run in parallel with other

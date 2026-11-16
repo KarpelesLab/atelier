@@ -1017,4 +1017,6 @@ fn textual_hover(root: &Path, source: &Source, name: &str) -> String {
 }
 
 #[cfg(test)]
+mod live;
+#[cfg(test)]
 mod tests;
