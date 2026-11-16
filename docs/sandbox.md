@@ -5,7 +5,8 @@ jobs — and the shell lines of command files run inside
 [nixvm](https://github.com/KarpelesLab/nixvm): a real Linux userland (Alpine,
 typically) whose system calls are served by nixvm's kernel, in Rust, inside
 atelier's own process tree — not by the host's. The guest sees the project
-directory and a userland image, and nothing else of the machine. A command
+directory and a userland image, and nothing else of the machine; of the
+network, only the hosts you list, and none unless you list some. A command
 that cannot leave the project needs no approval, so `bash` stops prompting.
 
 This is a first implementation, **off by default and not in the release
@@ -55,6 +56,7 @@ and [what nixvm needs next](#what-nixvm-needs-next) for where this is going.
    [sandbox]
    enabled = true
    # memory_mb = 4096     # guest RAM ceiling
+   # network = ["crates.io", "*.crates.io"]   # hosts the guest may reach
    ```
 
    or `ATELIER_SANDBOX=1` (`0` turns it off whatever the files say).
@@ -62,10 +64,12 @@ and [what nixvm needs next](#what-nixvm-needs-next) for where this is going.
    `atelier.toml` the switch is a [gated setting](trust.md): it counts —
    on or off — once you have accepted it with `/trust`, so a repository
    cannot switch your sandbox off, or stop `bash` from asking, by itself.
+   The same goes for `network` ([below](#the-network)).
 
 `atelier sandbox status` says what will happen in the current directory —
-whether it is on, which root, which CPU backend, what is read-only — and
-`atelier sandbox run -- <command>` runs one command the way the tool would.
+whether it is on, which root, which CPU backend, what is read-only, which
+hosts can be reached — and `atelier sandbox run -- <command>` runs one
+command the way the tool would.
 
 ## What changes for `bash`
 
@@ -98,7 +102,9 @@ whether it is on, which root, which CPU backend, what is read-only — and
   ```
 
   Recognised: a missing program (status 126/127), name resolution and
-  unreachable-network errors, writes refused as read-only or for want of
+  unreachable-network errors — with a network allowlist, exactly what it
+  refused, by name ([the network](#the-network)) —, writes refused as
+  read-only or for want of
   permission, "not a git repository", system calls nixvm does not implement
   (its own ledger, and `ENOSYS`/`EOPNOTSUPP` in the output), crashes, a
   timeout on the software CPU, and the sandbox failing to start. An ordinary
@@ -124,8 +130,9 @@ output are the paths the other tools use. The directories above it exist in
 the guest as empty directories. Nothing else of the host is reachable: not
 your home, not `~/.ssh`, not the environment (the guest gets `PATH`, `HOME`,
 `USER`, `TERM`, `LANG`, `PWD` and `safe.directory = *` for git, whose
-repositories there are the project's), not the network. It runs as root in the guest, which is you on the host: files it
-creates are yours.
+repositories there are the project's), not the network beyond
+[the hosts you listed](#the-network). It runs as root in the guest, which is
+you on the host: files it creates are yours.
 
 **Read-only inside the project**: `.git/hooks`, `.git/config` and
 `atelier.toml` — what decides which programs run on the host *later* (git
@@ -202,6 +209,118 @@ Each command runs in a process of its own (`atelier sandbox-exec`), killed if
 it outlives its timeout by three seconds, so a guest that wedges the emulator
 cannot wedge the session.
 
+## The network
+
+None, unless you name hosts:
+
+```toml
+[sandbox]
+network = ["dl-cdn.alpinelinux.org", "crates.io", "*.crates.io"]
+```
+
+Then the guest can open TCP connections to those hosts, and to nothing else.
+With the list above, `apk add`, `cargo fetch` and `cargo build` of a project
+with dependencies run in the sandbox, unasked.
+
+**An entry** is one of:
+
+| Entry | Allows |
+|---|---|
+| `crates.io` | that name |
+| `*.crates.io` | every name under it, at any depth (`static.crates.io`, `a.b.crates.io`) — not `crates.io` itself: list both if you mean both |
+| `192.168.0.50`, `2001:db8::5` | connecting to that address — the only way to a private one (see below) |
+
+Names are compared without regard to case. There are no ports and no
+protocols in an entry: an allowed host is allowed on every TCP port. A URL,
+a name with a port, a bare `*`, the loopback address: not understood, allow
+nothing, and `atelier sandbox status` says which.
+
+**Where the list comes from.** Your user-global `atelier.toml` and the
+project's, together. The project's entries are a [gated
+setting](trust.md), like `enabled`: they count once you have accepted them
+with `/trust`, which shows the hosts, and stop counting — all of them — when
+the list changes, until you accept it again. A repository you just cloned
+cannot open the network for itself, and neither can the agent by editing
+`atelier.toml` (which the guest cannot write at all). The reason is the same
+as for `enabled`: sandboxed commands are not asked about, so a host on the
+list is somewhere they can send whatever they can read — the project — with
+nobody looking. List what the project's tools fetch from; think twice about
+hosts anyone can upload to.
+
+**How it works, and what it holds against.** nixvm passes every connection
+the guest makes to atelier, by IP address. atelier makes a list of names
+exact on top of that by being the guest's DNS (`src/sandbox/net.rs`):
+
+- The guest's `/etc/resolv.conf` names one server, `192.0.2.53` — an address
+  that belongs to nobody. A question sent there is answered by atelier:
+  for a name on the list, with what your machine's resolver says, and those
+  addresses are remembered; for any other name, with "no such name", at
+  once, and nothing is asked of anyone — so a name cannot be used to carry
+  data out through your resolver either.
+- A TCP connection goes through only to a remembered address (or one the
+  list names). Typing an address (`curl https://1.1.1.1/`), using another
+  resolver, DNS over TCP, DNS over HTTPS to a host that is not on the list:
+  each is a connection to an address no allowed name resolved to, and fails
+  with "Network unreachable".
+- No UDP leaves the machine: not other resolvers, not QUIC (clients fall
+  back to TCP), not NTP. No ICMP either: `ping` does not work.
+- An allowed name that resolves to a loopback, private (`10/8`, `172.16/12`,
+  `192.168/16`, `100.64/10`), link-local (`169.254/16`, where a cloud's
+  metadata service lives; `fe80::/10`), unique-local (`fc00::/7`) or
+  otherwise non-public address is **not** answered with it. Whoever runs an
+  allowed name's DNS would otherwise decide what of *your* network the guest
+  reaches (DNS rebinding). To reach a private server, list its address:
+  then that address, and a name that resolves to it, work. IPv4 addresses
+  wrapped in IPv6 ones (mapped, NAT64, 6to4) are judged as the IPv4 address.
+- IPv6 works where your machine has a route for it; where it has none, the
+  guest is not given `AAAA` answers.
+- The memory lasts one guest, which is one command.
+
+**What it does not hold against**, said plainly because it is a filter by
+address in the end:
+
+- *Hosts that share an address.* A name on a CDN resolves to addresses that
+  serve thousands of other sites; a program in the guest can connect to
+  that address and ask it for another site (another `Host:` header, another
+  TLS server name). Allowing `dl-cdn.alpinelinux.org` allows, to someone who
+  tries, whatever else Fastly serves from those addresses. Telling them
+  apart would take reading the TLS handshake of every connection, which
+  atelier does not do.
+- *What an allowed host does with what it is sent.* A host that accepts
+  uploads, or logs requests for someone to read, is a way out for data.
+  `*.github.com` or a paste site on the list is the network, in effect.
+- *Everything of a name is allowed*: every port, and every address the name
+  resolves to while the command runs.
+
+Also not there: record types other than `A` and `AAAA` (an allowed name has
+no `TXT`, `SRV` or `HTTPS` records in the guest), names only your
+`/etc/hosts` knows (the question goes to the resolver as an absolute name,
+without your search domains: `crates.io.corp.example` is not what was
+allowed), and listening for connections from outside.
+
+**When a command wanted more.** A failed command's result names what was
+refused, so the agent can tell you which host to add rather than guess:
+
+```
+[exit status: exit status: 1]
+[stderr]
+wget: bad address 'static.crates.io'
+[sandbox: the sandbox's network reaches only the hosts on its allowlist, and
+refused the name `static.crates.io`, which is not on the allowlist (a host
+is allowed by the user, who adds its name to `[sandbox] network` in their
+atelier.toml). If this command needs the host, call bash again with
+"sandbox": false and say why — the user will be asked to approve it.]
+```
+
+The same is said of a connection to an address without a name, of UDP, of
+an allowed name that resolves to a private address, and of an allowed name
+that does not resolve. A command that succeeds says nothing, whatever it
+was refused on the way. A background job and `atelier sandbox run` print
+the line on stderr.
+
+`atelier sandbox run --net` is something else: the host's whole network,
+unfiltered, for preparing the root filesystem by hand.
+
 ## What works in the guest, and what doesn't
 
 Measured with nixvm 0.0.7 (the version this is built on) and Alpine 3.22
@@ -217,17 +336,19 @@ x86-64 on KVM.
 | a project with submodules: `git status`, `git submodule status`, `git add <submodule>`, `git -C <submodule> commit` | works (their git directories are in the project's `.git/modules`). `git -C <submodule> config` is refused |
 | `python3`, `node` (JIT included), subprocesses from both | works |
 | `gcc`, `make`, `make -j` | works |
-| `cargo build`, `cargo run`, `cargo test` | works, with the toolchain of the image (Alpine 3.22 has Rust 1.87) and crates already there: there is no network to fetch them |
+| `cargo build`, `cargo run`, `cargo test` | works, with the toolchain of the image (Alpine 3.22 has Rust 1.87); crates are fetched if the registry's hosts are on the [network list](#the-network), and must be there already otherwise |
 | the host's own toolchains (`~/.cargo`, `~/.rustup`, nvm, system compilers) | not there: they are outside the project, and glibc programs do not run on a musl root anyway |
-| `apk add`, `pip install`, `npm install`, `cargo fetch` | no network. (With the network, by hand: `apk add` works.) |
+| `apk add`, `pip install`, `npm install`, `cargo fetch` | with their hosts on the [network list](#the-network); no network otherwise. Tried: `apk add jq` with `dl-cdn.alpinelinux.org` allowed (2 s); `apk add cargo git`, then `cargo run` of a crate with a crates.io dependency, with `crates.io` and `*.crates.io` (38 s in all). What they install is gone with the guest, except what lands in the project (`node_modules`, `target`, a virtualenv) |
+| `wget`, `curl`, `git clone` over HTTPS to an allowed host | works (tried: a clone from `github.com`) |
+| a host that is not on the list, an address typed in, another DNS server, `ping`, QUIC | refused: "bad address" or "Network unreachable", at once, and the result says what to ask for |
 | FIFOs, sockets and device files in the project | refused (`mkfifo`: Operation not permitted): the host would open them, and block. They work in the guest's `/tmp`. Reading a FIFO that is already in the project ends the command ("every process is blocked") |
 
 The story for a project's own toolchain, today: it has to be in the image
-(`apk add`), in a version Alpine packages, and its dependencies have to be
-on disk already, since the guest has no network. A project whose toolchain
-and dependencies fit that builds, tests and commits in the sandbox; one that
-needs the host's `rustup` toolchain or a registry still goes to the host for
-those commands, and they still ask.
+(`apk add`), in a version Alpine packages; its dependencies are fetched in
+the guest if you allow the registry's hosts, and have to be on disk already
+if you don't. A project whose toolchain fits that builds, tests and commits
+in the sandbox; one that needs the host's `rustup` toolchain still goes to
+the host for those commands, and they still ask.
 
 ## Speed
 
@@ -278,14 +399,12 @@ is the first thing to fix for the sandbox to ship in the release binaries.
 
 ## What is not done
 
-- **Network allowlist** (`[sandbox] network = ["host.example"]`). nixvm has
-  the hook — `Kernel::set_egress` takes an `Egress` whose `connect_tcp(ip,
-  port)` and `open_udp()` see every outside connection — but it is handed IP
-  addresses, not names. Allowing by host name needs atelier to answer the
-  guest's DNS itself and remember which addresses it gave out for allowed
-  names; that is not written, and a filter that could be talked round is
-  worse than none. The guest has no network at all, and a `network` list in
-  `atelier.toml` is reported by `sandbox status` as ignored.
+- **The network list is by address in the end** ([the
+  network](#the-network)): two names on one address cannot be told apart,
+  an entry has no port, and names have only addresses (no `SRV`, `TXT` or
+  `HTTPS` records). Telling names apart needs the name at connection time —
+  the TLS server name, or nixvm passing along what the guest resolved (see
+  below).
 - **`[sandbox] root` from a project file** is ignored on purpose: the root is
   what the guest can read, and a cloned repository naming `/` would hand it
   the machine.
@@ -340,9 +459,26 @@ In the order that unblocks atelier, with what atelier does once each lands.
    a read-only mount at `.git/hooks` is defeated by `mv .git g` (tested);
    atelier wraps `Passthrough` in a filter of its own instead. A
    `Passthrough::protect(paths)` would do.
-7. **Egress by name**: the guest's resolver answered by the embedder (or the
-   name passed to `Egress::connect_tcp`), so an allowlist of hosts can be
-   exact. *Then:* `[sandbox] network`.
+7. *(Done in atelier, as far as addresses go: it answers the guest's DNS
+   through `Egress::open_udp` and lets `connect_tcp` through to the
+   addresses it gave out.)* **Egress by name.** What the `Egress` trait of
+   0.0.7 does not give, and what each would buy:
+   - `connect_tcp(ip, v6, port)` knows no name. If the kernel kept, per
+     guest, which answer of the embedder's resolver an address came from and
+     passed that name along — or let the embedder peek at the first bytes a
+     connection sends before it is opened — a list could tell two names on
+     one CDN address apart (by the TLS server name) and carry ports per
+     name. Today whatever shares an address with an allowed name is
+     reachable.
+   - The resolver is reached by pretending to be a UDP peer: atelier writes
+     a `resolv.conf` naming an address nobody has and answers datagrams
+     sent to it. A resolver hook proper (`Kernel::set_resolver`, called
+     with the question) would spare the wire format and the fake address.
+   - `Egress::connect_tcp` has no way to say *why* it refused: every error
+     but a timeout and "unreachable" becomes `ECONNREFUSED`. atelier
+     answers "Network unreachable" and reports the refusal out of band.
+
+   *Then:* an allowlist exact by name rather than by address.
 8. **A released root image and a fetch that needs no C**: today the image is
    the user's to download and unpack. A pinned, digest-verified Alpine (plus
    a "dev" variant with git, make, a C compiler) that nixvm or atelier can

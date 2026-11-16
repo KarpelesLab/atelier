@@ -22,7 +22,8 @@ project's entries winning: [`[permissions]`](#permissions),
 [`[[hooks]]`](#hooks), and the model tables — `[[provider]]`, `[models]`,
 `[variant.*]`, `[[price]]`, and `[defaults]`' `model` and `provider`.
 [`[instructions]`](#instruction-files) is read from both, and both lists
-apply; so is [`[sandbox]`](#sandbox), whose `root` counts only there. The
+apply; so is [`[sandbox]`](#sandbox), whose `root` counts only there and
+whose `network` lists add up. The
 other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
 `[search]`, `[goals]`, the rest of `[defaults]`) are the project's alone.
 
@@ -71,7 +72,7 @@ the tables that run commands or grant access — `[[mcp]]`, `[[mcp_http]]`,
 `[[diagnostics]]` (and auto-detected checkers), `[[lsp]]` (and auto-detected
 language servers), `[[provider]]`,
 `[permissions] allow`, a `yolo` default, `[[hooks]]`, `[search] key_env` and
-`url`, `[sandbox] enabled` —
+`url`, `[sandbox] enabled` and `network` —
 take effect only once you have accepted them for the project with `/trust`
 (or `atelier trust accept`; `ATELIER_TRUST_PROJECT=1` for one run). See
 [Project trust](trust.md). Your user-global file is never gated.
@@ -749,6 +750,7 @@ and how to make its root filesystem.
 [sandbox]
 enabled = true
 memory_mb = 4096
+network = ["crates.io", "*.crates.io"]
 ```
 
 | Field       | Type    | Meaning |
@@ -756,7 +758,7 @@ memory_mb = 4096
 | `enabled`   | bool    | Route foreground `bash` commands through the sandbox. The project's file wins over the user-global one — once the project is [trusted](trust.md), not before; `ATELIER_SANDBOX` wins over both |
 | `root`      | string  | The guest's root filesystem. **User-global file only** — in a project's `atelier.toml` it is ignored, since it decides what of the host the guest can read. Default `$XDG_DATA_HOME/atelier/sandbox/rootfs`; `ATELIER_SANDBOX_ROOT` wins |
 | `memory_mb` | integer | Guest RAM ceiling in MiB (default 4096) |
-| `network`   | array   | Reserved for an allowlist of hosts. Not implemented: the guest has no network, and `atelier sandbox status` says a list here is ignored |
+| `network`   | array   | The hosts the guest may reach, over TCP; none when empty. An entry is a name (`crates.io`), `*.` and a name for everything under it (`*.crates.io`, which does not cover `crates.io`), or an IP address. The user-global list and the project's add up — the project's once the project is [trusted](trust.md), not before. What it holds against and what it does not: [the network](sandbox.md#the-network) |
 
 ## `/config`
 

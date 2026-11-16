@@ -150,8 +150,9 @@ pub struct SandboxSettings {
     /// guest can read of the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
-    /// Hosts the guest may reach. Not implemented yet: the guest has no
-    /// network, and a list here is reported as ignored.
+    /// Hosts the guest may reach, by name (`crates.io`, `*.crates.io`) or
+    /// address; none when empty. The user-global list and the project's
+    /// add up, the project's only once the project is trusted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network: Vec<String>,
     /// Guest RAM ceiling in MiB (default 4096).

@@ -13,9 +13,10 @@
 //! - The project directory, read-write, **at the same absolute path** as on
 //!   the host, so the paths a command prints are the paths every other tool
 //!   uses. The command starts there.
-//! - `/tmp`, `/dev`, `/proc`, `/sys` of its own. No network. A small fixed
-//!   environment, none of the host's.
-//!
+//! - `/tmp`, `/dev`, `/proc`, `/sys` of its own. A small fixed environment,
+//!   none of the host's.
+//! - No network, unless `[sandbox] network` lists hosts: then TCP to those,
+//!   by name, and nothing else ([`net`]).
 //! - Where the project is a linked git worktree or a submodule, the git
 //!   directory its `.git` file leads to — once that directory has been
 //!   checked to name the project back ([`gitdirs`]).
@@ -44,7 +45,8 @@
 //! # When the sandbox is in the way
 //!
 //! The guest has its own userland: the host's compilers and package managers
-//! are not in it, and neither is the network. [`diagnose`] recognises the
+//! are not in it, and neither is the network beyond the hosts the user
+//! listed. [`diagnose`] recognises the
 //! usual shapes of a command failing *because of* that, and the `bash` tool
 //! then says so and how to ask for a run on the host (`"sandbox": false`,
 //! which the user approves).
@@ -58,6 +60,7 @@ use anyhow::{Context, Result};
 use crate::settings::{SandboxSettings, Settings};
 
 pub mod gitdirs;
+pub mod net;
 
 /// The hidden subcommand [`run`] starts atelier with.
 pub const HELPER: &str = "sandbox-exec";
@@ -95,6 +98,9 @@ pub struct Setup {
     pub memory_mb: u64,
     /// Use nixvm's software CPU even where hardware virtualization is there.
     pub interp: bool,
+    /// The hosts the guest may reach, as [`net::Allowlist`] understands
+    /// them. Empty: no network.
+    pub network: Vec<String>,
     /// The executable to start as the helper; `None` is this one.
     pub helper: Option<PathBuf>,
     /// Things about the configuration the user should hear once
@@ -122,10 +128,12 @@ pub fn state(project_root: &Path) -> State {
 }
 
 /// `[sandbox]` of the project's `atelier.toml`, as it may be acted on: its
-/// `enabled` counts only in a project the user has trusted (see
-/// [`crate::trust`]). Switching the sandbox on stops `bash` from asking;
-/// switching it off undoes a sandbox the user turned on for themselves —
-/// neither is for a file that came with the repository to decide.
+/// `enabled` and its `network` count only in a project the user has trusted
+/// (see [`crate::trust`]). Switching the sandbox on stops `bash` from asking;
+/// switching it off undoes a sandbox the user turned on for themselves; a
+/// host on the list is somewhere commands nobody is asked about can send
+/// what they read — none of it is for a file that came with the repository
+/// to decide.
 ///
 /// The file is judged as it is on disk now, not as the session loaded it:
 /// an edit made since (the agent's file tools can write `atelier.toml`)
@@ -170,7 +178,9 @@ fn truthy(value: &str) -> Option<bool> {
 /// the user's. The root filesystem is `ATELIER_SANDBOX_ROOT`, else the
 /// user's `[sandbox] root`, else `default_root` — never the project's file:
 /// the root is what the guest can read, and a repository's `atelier.toml`
-/// naming `/` would hand it the host's files.
+/// naming `/` would hand it the host's files. The hosts the guest may reach
+/// are the user's and the project's together ([`network`]); `project` is
+/// what [`project_settings`] returned, so an untrusted project adds none.
 fn resolve(
     env: &dyn Fn(&str) -> Option<String>,
     project: &SandboxSettings,
@@ -193,12 +203,7 @@ fn resolve(
         Ok(dir) => dir,
         Err(why) => return State::Unavailable(why),
     };
-    let mut notes = Vec::new();
-    if !project.network.is_empty() || !user.network.is_empty() {
-        notes.push(
-            "`[sandbox] network` is not implemented yet: the guest has no network".to_string(),
-        );
-    }
+    let (network, mut notes) = network(project, user);
     if project.root.is_some() {
         notes.push(
             "`[sandbox] root` in the project's atelier.toml is ignored: set it in the \
@@ -216,9 +221,23 @@ fn resolve(
         interp: env("ATELIER_SANDBOX_INTERP")
             .and_then(|v| truthy(&v))
             .unwrap_or(false),
+        network,
         helper: None,
         notes,
     })
+}
+
+/// The hosts the guest may reach: the user's `[sandbox] network` and the
+/// project's, as one list — and a note for each entry that could not be
+/// understood, which allows nothing.
+fn network(project: &SandboxSettings, user: &SandboxSettings) -> (Vec<String>, Vec<String>) {
+    let entries: Vec<&String> = user.network.iter().chain(&project.network).collect();
+    let (list, rejected) = net::Allowlist::parse(&entries);
+    let notes = rejected
+        .into_iter()
+        .map(|why| format!("`[sandbox] network` entry ignored: {why}"))
+        .collect();
+    (list.entries(), notes)
 }
 
 /// The root filesystem to use, or why there is none.
@@ -284,6 +303,12 @@ pub struct Report {
     /// System calls (and `ioctl`-style subcommands) the guest made that
     /// nixvm does not implement, with how often.
     pub unsupported: Vec<String>,
+    /// The guest had the network of an allowlist (`[sandbox] network`),
+    /// rather than none.
+    pub filtered: bool,
+    /// What that allowlist refused: names asked about, addresses connected
+    /// to ([`net::Policy::refused`]).
+    pub refused: Vec<String>,
 }
 
 /// A sandboxed command's result.
@@ -344,6 +369,8 @@ pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration)
 
 /// In place of a status file's path: write none.
 const NO_STATUS: &str = "-";
+/// The helper's flag that carries the network allowlist, `+` between entries.
+const NET_FLAG: &str = "net=";
 
 /// How long a background job's guest may live.
 const BACKGROUND_LIMIT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -391,7 +418,11 @@ fn helper_command(
     };
     let mut flags = Vec::new();
     if setup.interp {
-        flags.push("interp");
+        flags.push("interp".to_string());
+    }
+    // No entry holds a `,` or a `+` ([`net::Allowlist::entries`]).
+    if !setup.network.is_empty() {
+        flags.push(format!("{NET_FLAG}{}", setup.network.join("+")));
     }
     let mut cmd = Command::new(helper);
     cmd.arg(HELPER)
@@ -438,6 +469,12 @@ fn format_status(outcome: &Outcome, report: &Report) -> String {
     for call in &report.unsupported {
         out.push_str(&format!("unsupported {call}\n"));
     }
+    if report.filtered {
+        out.push_str("network filtered\n");
+    }
+    for refusal in &report.refused {
+        out.push_str(&format!("refused {}\n", refusal.replace('\n', " ")));
+    }
     out.push_str(&match outcome {
         Outcome::Exited(code) => format!("exit {code}\n"),
         Outcome::TimedOut => "timeout\n".to_string(),
@@ -456,6 +493,8 @@ fn parse_status(text: &str) -> Option<(Outcome, Report)> {
         match key {
             "backend" => report.backend = Some(value.to_string()),
             "unsupported" => report.unsupported.push(value.to_string()),
+            "network" => report.filtered = value == "filtered",
+            "refused" => report.refused.push(value.to_string()),
             "exit" => outcome = Some(Outcome::Exited(value.trim().parse().ok()?)),
             "timeout" => outcome = Some(Outcome::TimedOut),
             "error" => outcome = Some(Outcome::Failed(value.to_string())),
@@ -521,19 +560,27 @@ pub fn diagnose(output: &Output) -> Option<String> {
              are not: the guest has its own userland)",
         );
     }
-    if said(&[
-        "Network unreachable",
-        "Network is unreachable",
-        "bad address",
-        "Could not resolve host",
-        "Couldn't resolve host",
-        "Temporary failure in name resolution",
-        "Name does not resolve",
-        "Name or service not known",
-        "failed to lookup address",
-        "EAI_AGAIN",
-        "ENETUNREACH",
-    ]) {
+    // With an allowlist, the network is to blame for what it refused and
+    // for nothing else: an allowed host that is down is not the sandbox's
+    // doing.
+    let refused = refusals(&output.report);
+    if let Some(refused) = &refused {
+        why.push(refused);
+    } else if !output.report.filtered
+        && said(&[
+            "Network unreachable",
+            "Network is unreachable",
+            "bad address",
+            "Could not resolve host",
+            "Couldn't resolve host",
+            "Temporary failure in name resolution",
+            "Name does not resolve",
+            "Name or service not known",
+            "failed to lookup address",
+            "EAI_AGAIN",
+            "ENETUNREACH",
+        ])
+    {
         why.push("the sandbox has no network");
     }
     if said(&["Read-only file system", "EROFS"]) {
@@ -584,6 +631,20 @@ pub fn diagnose(output: &Output) -> Option<String> {
     Some(text)
 }
 
+/// What the network allowlist refused during a run, as a clause naming each
+/// thing, and who can allow it. `None` if it refused nothing.
+fn refusals(report: &Report) -> Option<String> {
+    if report.refused.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the sandbox's network reaches only the hosts on its allowlist, and refused {} (a \
+         host is allowed by the user, who adds its name to `[sandbox] network` in their \
+         atelier.toml)",
+        report.refused.join("; ")
+    ))
+}
+
 /// `atelier sandbox-exec …`: the process [`run`] starts. Builds the guest,
 /// runs the command with its output on this process's stdout and stderr, and
 /// writes the outcome to the status file. Returns the exit status.
@@ -614,11 +675,18 @@ pub fn helper_main(args: &[String]) -> u8 {
         memory_mb: memory_mb.parse().unwrap_or(DEFAULT_MEMORY_MB),
         interp: flags.split(',').any(|f| f == "interp"),
         net: false,
+        allow: flags
+            .split(',')
+            .find_map(|f| f.strip_prefix(NET_FLAG))
+            .map(|list| list.split('+').map(str::to_string).collect())
+            .unwrap_or_default(),
         rw_root: false,
     };
     let (outcome, report) = execute(&spec);
-    // A background job has no status file: its exit status is all.
+    // A background job has no status file: its exit status is all, and what
+    // its network refused is said where its output goes.
     if status_path == NO_STATUS {
+        say_refusals(&outcome, &report);
         return exit_status(&outcome);
     }
     // `create_new`: never through a link someone left at that name.
@@ -634,6 +702,17 @@ pub fn helper_main(args: &[String]) -> u8 {
         return EXIT_FAILED;
     }
     exit_status(&outcome)
+}
+
+/// For a run nobody reads the report of — a background job, `atelier sandbox
+/// run` — say on stderr what the network allowlist refused, if the command
+/// failed.
+fn say_refusals(outcome: &Outcome, report: &Report) {
+    if !matches!(outcome, Outcome::Exited(0))
+        && let Some(refused) = refusals(report)
+    {
+        eprintln!("atelier: sandbox: {refused}");
+    }
 }
 
 fn exit_status(outcome: &Outcome) -> u8 {
@@ -658,6 +737,9 @@ struct Spec<'a> {
     /// Bridge guest sockets to the host's network. Only `atelier sandbox
     /// run --net`, which the user types: never a command of the agent's.
     net: bool,
+    /// Without `net`: the hosts the guest may reach ([`net::Allowlist`]).
+    /// Empty: no network.
+    allow: Vec<String>,
     /// Mount the root filesystem itself read-write, so what the command
     /// installs stays. Only `atelier sandbox run --rw-root`.
     rw_root: bool,
@@ -687,6 +769,7 @@ fn execute(spec: &Spec) -> (Outcome, Report) {
             spec.memory_mb,
             spec.interp,
             spec.net,
+            &spec.allow,
             spec.rw_root,
         );
         let why = unsupported_build().unwrap_or("no sandbox in this build");
@@ -698,9 +781,10 @@ const USAGE: &str = "usage: atelier sandbox status
        atelier sandbox run [--net] [--rw-root] [--interp] [--] <command…>
 
 `run` executes a shell command in the sandbox, in the current directory, as
-the `bash` tool would. Two switches are for preparing the root filesystem and
-are never used for the agent's commands: --rw-root mounts it read-write, so
-what the command installs stays, and --net gives the guest the host's network
+the `bash` tool would: with the network of `[sandbox] network`, if any. Two
+switches are for preparing the root filesystem and are never used for the
+agent's commands: --rw-root mounts it read-write, so what the command
+installs stays, and --net gives the guest the host's whole network
 (`atelier sandbox run --net --rw-root -- apk add git`).";
 
 /// `atelier sandbox …`: say what the sandbox would do here, or run a command
@@ -743,7 +827,12 @@ pub fn run_command(args: &[String]) -> Result<u8> {
             )
             .map_err(|why| anyhow::anyhow!(why))?;
             let command = words.join(" ");
-            let (outcome, _) = execute(&Spec {
+            let project = project_settings(&root, crate::trust::Store::from_env());
+            let (allow, notes) = network(&project, &user);
+            for note in notes {
+                eprintln!("atelier: sandbox: {note}");
+            }
+            let (outcome, report) = execute(&Spec {
                 rootfs: &rootfs,
                 project: &root,
                 command: &command,
@@ -751,8 +840,10 @@ pub fn run_command(args: &[String]) -> Result<u8> {
                 memory_mb: user.memory_mb.unwrap_or(DEFAULT_MEMORY_MB),
                 interp,
                 net,
+                allow,
                 rw_root,
             });
+            say_refusals(&outcome, &report);
             Ok(exit_status(&outcome))
         }
         _ => anyhow::bail!(USAGE),
@@ -761,15 +852,29 @@ pub fn run_command(args: &[String]) -> Result<u8> {
 
 /// What `atelier sandbox status` prints.
 fn status_lines(root: &Path) -> Vec<String> {
+    status_lines_with(root, crate::trust::Store::from_env())
+}
+
+fn status_lines_with(root: &Path, store: crate::trust::Store) -> Vec<String> {
     let mut out = Vec::new();
-    let written = Settings::load(root).map(|s| s.sandbox.enabled);
-    let store = crate::trust::Store::from_env();
-    if matches!(written, Ok(Some(_))) && project_settings(root, store).enabled.is_none() {
-        out.push(
-            "note: this project's `[sandbox] enabled` is not in effect — the project is not \
-             trusted (/trust, or `atelier trust accept`)"
-                .to_string(),
-        );
+    let written = Settings::load(root).map(|s| s.sandbox).unwrap_or_default();
+    let effective = project_settings(root, store);
+    for (name, withheld) in [
+        (
+            "enabled",
+            written.enabled.is_some() && effective.enabled.is_none(),
+        ),
+        (
+            "network",
+            !written.network.is_empty() && effective.network.is_empty(),
+        ),
+    ] {
+        if withheld {
+            out.push(format!(
+                "note: this project's `[sandbox] {name}` is not in effect — the project is \
+                 not trusted (/trust, or `atelier trust accept`)"
+            ));
+        }
     }
     match state(root) {
         State::Off => out.push(
@@ -800,23 +905,43 @@ fn status_lines(root: &Path) -> Vec<String> {
                 protected_paths(root).join(", ")
             ));
             out.extend(gitdirs::status_lines(&gitdirs::plan(root)));
-            out.push("network: none".to_string());
+            out.push(match setup.network.as_slice() {
+                [] => "network: none".to_string(),
+                hosts => format!(
+                    "network: TCP to {} — by name, answered by atelier's own DNS; whatever \
+                     shares an address with one of them is reachable too",
+                    hosts.join(", ")
+                ),
+            });
             out.extend(setup.notes.iter().map(|n| format!("note: {n}")));
         }
     }
     out
 }
 
-/// What the `bash` tool's description says about the sandbox while it is on.
-pub const TOOL_NOTE: &str = " Commands run in a sandbox: a small Linux guest (its own \
-    userland, typically Alpine with busybox) that sees the project directory at its usual \
-    path and nothing else of this machine. There is no network; each command starts in a \
-    fresh guest, so only files in the project persist between commands (not /tmp, not \
-    installed packages); .git/hooks, .git/config and atelier.toml are read-only; programs \
-    installed on the host are not available unless the sandbox's image has them too. If a \
-    command cannot work there, the result says so: run it again with `sandbox: false` to \
-    use the host, which the user is asked to approve. A background job runs in a guest of \
-    its own: a server started in one cannot be reached from another command.";
+/// What the `bash` tool's description says about the sandbox while it is
+/// on; `network` is [`Setup::network`].
+pub fn tool_note(network: &[String]) -> String {
+    let reach = match network {
+        [] => "There is no network".to_string(),
+        hosts => format!(
+            "The network reaches only these hosts, by name and over TCP: {} (another host \
+             is the user's to add)",
+            hosts.join(", ")
+        ),
+    };
+    format!(
+        " Commands run in a sandbox: a small Linux guest (its own \
+         userland, typically Alpine with busybox) that sees the project directory at its usual \
+         path and nothing else of this machine. {reach}; each command starts in a \
+         fresh guest, so only files in the project persist between commands (not /tmp, not \
+         installed packages); .git/hooks, .git/config and atelier.toml are read-only; programs \
+         installed on the host are not available unless the sandbox's image has them too. If a \
+         command cannot work there, the result says so: run it again with `sandbox: false` to \
+         use the host, which the user is asked to approve. A background job runs in a guest of \
+         its own: a server started in one cannot be reached from another command."
+    )
+}
 
 #[cfg(sandbox)]
 mod guest {
@@ -894,10 +1019,19 @@ mod guest {
         for dir in ["/root", "/etc"] {
             mkdir_all(&mut mounts, dir);
         }
-        if spec.net {
+        // The whole network of the host (`--net`), that of the allowlist, or
+        // none. An allowlist nothing of which was understood allows nothing.
+        let (allow, _) = super::net::Allowlist::parse(&spec.allow);
+        let filter = (!spec.net && !allow.is_empty()).then(|| super::net::Filter::new(allow));
+        let resolver = match &filter {
+            _ if spec.net => Some(resolv_conf()),
+            Some(_) => Some(super::net::resolv_conf()),
+            None => None,
+        };
+        if let Some(resolver) = resolver {
             let _ = mounts.create("/etc/resolv.conf", 0o644);
             let _ = mounts.truncate("/etc/resolv.conf", 0);
-            let _ = mounts.write_at("/etc/resolv.conf", 0, resolv_conf().as_bytes());
+            let _ = mounts.write_at("/etc/resolv.conf", 0, resolver.as_bytes());
         }
 
         let argv = vec![
@@ -955,8 +1089,11 @@ mod guest {
         kernel.set_cmdline(argv);
         kernel.set_heap(image.program_break, mid);
         kernel.set_mmap_area(image.stack_bottom, mid);
+        let policy = filter.as_ref().map(super::net::Filter::policy);
         if spec.net {
             kernel.set_egress(Box::new(nixvm::kernel::egress::HostEgress));
+        } else if let Some(filter) = filter {
+            kernel.set_egress(Box::new(filter));
         }
 
         let code = kernel.run(vcpu, mem).map_err(|e| e.to_string())?;
@@ -975,6 +1112,11 @@ mod guest {
         let report = Report {
             backend: Some(backend.name().to_string()),
             unsupported,
+            filtered: policy.is_some(),
+            refused: policy.map_or_else(Vec::new, |policy| {
+                let policy = policy.lock().unwrap_or_else(|e| e.into_inner());
+                policy.refused().to_vec()
+            }),
         };
         let outcome = if kernel.time_limit_reached() && code == KILLED {
             Outcome::TimedOut
@@ -1488,6 +1630,7 @@ pub mod testing {
             rootfs,
             memory_mb: 1024,
             interp: false,
+            network: Vec::new(),
             helper: Some(helper),
             notes: Vec::new(),
         })
@@ -1562,10 +1705,23 @@ mod tests {
             ..Store::default()
         };
         let file = root.join(crate::settings::FILE_NAME);
-        std::fs::write(&file, "[sandbox]\nenabled = false\nmemory_mb = 512\n").unwrap();
+        std::fs::write(
+            &file,
+            "[sandbox]\nenabled = false\nmemory_mb = 512\nnetwork = [\"evil.example\"]\n",
+        )
+        .unwrap();
         let read = project_settings(&root, store.clone());
         assert_eq!(read.enabled, None);
         assert_eq!(read.memory_mb, Some(512));
+        // Nor does a cloned repository open the network for itself.
+        assert!(read.network.is_empty());
+        let lines = status_lines_with(&root, store.clone());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`[sandbox] network` is not in effect")),
+            "{lines:?}"
+        );
         // With the user's sandbox on, the untrusted file does not turn it
         // off (in a build without the sandbox: asked for, not `Off`).
         assert_ne!(resolve(&env(&[]), &read, &on(), None), State::Off);
@@ -1573,10 +1729,20 @@ mod tests {
         let settings = Settings::load(&root).unwrap();
         let trust = Trust::load(&root, &settings, store.clone());
         trust.accept(&settings).unwrap();
-        assert_eq!(project_settings(&root, store.clone()).enabled, Some(false));
+        let read = project_settings(&root, store.clone());
+        assert_eq!(read.enabled, Some(false));
+        assert_eq!(read.network, ["evil.example"]);
 
-        std::fs::write(&file, "[sandbox]\nenabled = true\n").unwrap();
-        assert_eq!(project_settings(&root, store).enabled, None);
+        // A host added since (by a pull, or by the agent) is not allowed —
+        // and neither is the list that was.
+        std::fs::write(
+            &file,
+            "[sandbox]\nenabled = true\nnetwork = [\"evil.example\", \"more.example\"]\n",
+        )
+        .unwrap();
+        let read = project_settings(&root, store);
+        assert_eq!(read.enabled, None);
+        assert!(read.network.is_empty());
         for dir in [root, state] {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -1617,7 +1783,8 @@ mod tests {
         assert_eq!(setup.rootfs, good);
         assert_eq!(setup.memory_mb, 512);
         assert!(setup.notes.iter().any(|n| n.contains("root")));
-        assert!(setup.notes.iter().any(|n| n.contains("network")));
+        // Its hosts count (this is the project's file as trust left it).
+        assert_eq!(setup.network, ["crates.io"]);
         // The user's file and the environment are.
         let user = SandboxSettings {
             root: Some(good.to_str().unwrap().to_string()),
@@ -1632,11 +1799,63 @@ mod tests {
         assert!(matches!(state, State::Unavailable(why) if why.contains("/nonexistent/rootfs")));
     }
 
+    /// The guest's network is the user's list and the project's together,
+    /// as the helper process is told it; an entry that is not understood
+    /// allows nothing and is said.
+    #[cfg(sandbox)]
+    #[test]
+    fn the_network_is_the_users_hosts_and_the_projects() {
+        let good = fake_rootfs("network");
+        let none = SandboxSettings::default();
+        let State::Ready(setup) = resolve(&env(&[]), &on(), &none, Some(good.clone())) else {
+            panic!("expected ready");
+        };
+        assert!(setup.network.is_empty());
+        let user = SandboxSettings {
+            network: vec![
+                "Crates.io".to_string(),
+                "https://index.crates.io/".to_string(),
+            ],
+            ..Default::default()
+        };
+        let project = SandboxSettings {
+            enabled: Some(true),
+            network: vec!["*.crates.io".to_string(), "crates.io".to_string()],
+            ..Default::default()
+        };
+        let State::Ready(setup) = resolve(&env(&[]), &project, &user, Some(good)) else {
+            panic!("expected ready");
+        };
+        assert_eq!(setup.network, ["crates.io", "*.crates.io"]);
+        assert_eq!(setup.notes.len(), 1, "{:?}", setup.notes);
+        assert!(setup.notes[0].contains("https://index.crates.io/"));
+
+        let setup = Setup {
+            helper: Some(PathBuf::from("/nonexistent/atelier")),
+            interp: true,
+            ..setup
+        };
+        let command = helper_command(
+            "true",
+            Path::new("/"),
+            &setup,
+            Duration::from_secs(1),
+            Path::new(NO_STATUS),
+        )
+        .unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[6], "interp,net=crates.io+*.crates.io");
+        assert!(tool_note(&setup.network).contains("only these hosts"));
+        assert!(tool_note(&[]).contains("There is no network;"));
+    }
+
     #[test]
     fn the_status_file_round_trips() {
         let report = Report {
             backend: Some("kvm".to_string()),
             unsupported: vec!["syscall 53 ×2".to_string(), "ioctl 0x5401 ×1".to_string()],
+            filtered: true,
+            refused: vec!["the name `example.com`, which is not on the allowlist".to_string()],
         };
         for outcome in [
             Outcome::Exited(0),
@@ -1713,6 +1932,22 @@ mod tests {
         assert!(missing.contains("not in the sandbox's image"), "{missing}");
         let net = diagnose(&output(1, "wget: bad address 'example.com'")).unwrap();
         assert!(net.contains("no network"), "{net}");
+        // With an allowlist: what it refused, by name — and nothing when it
+        // refused nothing (an allowed host that is down is not the
+        // sandbox's doing), nor for a command that succeeded anyway.
+        let mut filtered = output(1, "wget: bad address 'example.com'");
+        filtered.report.filtered = true;
+        assert_eq!(diagnose(&filtered), None);
+        filtered.report.refused =
+            vec!["the name `example.com`, which is not on the allowlist".to_string()];
+        let net = diagnose(&filtered).unwrap();
+        assert!(!net.contains("no network"), "{net}");
+        assert!(
+            net.contains("refused the name `example.com`") && net.contains("[sandbox] network"),
+            "{net}"
+        );
+        filtered.outcome = Outcome::Exited(0);
+        assert_eq!(diagnose(&filtered), None);
         let ro = diagnose(&output(
             1,
             "error: could not lock config file .git/config: Read-only file system",
@@ -2007,6 +2242,140 @@ mod tests {
         );
         assert!(diagnose(&out).is_some());
 
+        std::fs::remove_dir_all(&project).unwrap();
+    }
+
+    /// The guest with a network allowlist, through the helper process: it
+    /// reaches what the list names, and nothing else by any of the ways
+    /// round — a name off the list, an address typed in, another resolver,
+    /// DNS over TCP — each refused at once and named in the diagnosis.
+    ///
+    /// None of that needs the internet: the allowed host is a server on
+    /// this machine's own address. With `ATELIER_SANDBOX_TEST_NET=1` the
+    /// real thing is tried too (`apk add` from Alpine's mirror).
+    #[test]
+    fn the_guest_reaches_the_hosts_it_is_allowed_and_no_others() {
+        use std::io::{Read, Write};
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        let project =
+            std::env::temp_dir().join(format!("atelier-sandbox-test-net-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+
+        // This machine's address on its network (connecting a UDP socket
+        // sends nothing): a private one, usually, which no name leads to and
+        // only an entry naming the address opens.
+        let lan = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| {
+                s.connect("192.0.2.1:9")?;
+                s.local_addr()
+            })
+            .map(|a| a.ip())
+            .ok()
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nreached!\n");
+            }
+        });
+
+        // `.invalid` never resolves (RFC 6761).
+        let mut network = vec!["allowed.invalid".to_string()];
+        network.extend(lan.map(|ip| ip.to_string()));
+        let setup = Setup { network, ..setup };
+        let run = |command: &str| {
+            let started = std::time::Instant::now();
+            let out = run(command, &project, &setup, Duration::from_secs(60)).unwrap();
+            assert!(out.report.filtered);
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+                started.elapsed(),
+                out,
+            )
+        };
+
+        match lan {
+            Some(lan) => {
+                let (stdout, stderr, _, out) =
+                    run(&format!("wget -q -T 5 -O- http://{lan}:{port}/"));
+                assert_eq!(stdout, "reached!\n", "{stderr}");
+                assert_eq!(out.outcome, Outcome::Exited(0));
+                assert!(out.report.refused.is_empty(), "{:?}", out.report.refused);
+            }
+            None => eprintln!("skipped the allowed connection: this machine has no network"),
+        }
+
+        // A name that is not on the list does not exist, and is said at once.
+        let (stdout, stderr, took, out) =
+            run("cat /etc/resolv.conf; wget -q -T 5 -O- http://example.com/");
+        assert_eq!(stdout, net::resolv_conf(), "{stderr}");
+        assert_eq!(out.outcome, Outcome::Exited(1), "{stderr}");
+        assert!(stderr.contains("bad address"), "{stderr}");
+        assert!(took < Duration::from_secs(4), "{took:?}");
+        let why = diagnose(&out).unwrap();
+        assert!(
+            why.contains("refused the name `example.com`, which is not on the allowlist"),
+            "{why}"
+        );
+
+        // The ways round: an address without a name, the resolver's own
+        // address over TCP, a resolver of the guest's choosing. Nothing
+        // leaves the machine for any of them.
+        let (stdout, stderr, _, out) = run(
+            "wget -q -T 5 -O- http://1.1.1.1/; nc -w 2 192.0.2.53 53 </dev/null; \
+             nslookup -timeout=1 -retry=1 example.com 1.1.1.1; ping -c 1 -W 1 1.1.1.1; \
+             nslookup allowed.invalid; exit 7",
+        );
+        assert!(stderr.contains("Network unreachable"), "{stderr}");
+        assert!(!stdout.contains("Name:"), "{stdout}");
+        let why = diagnose(&out).unwrap();
+        for refused in [
+            "a connection to 1.1.1.1 port 80",
+            "a connection to 192.0.2.53 port 53",
+            "UDP to 1.1.1.1 port 53",
+            "`allowed.invalid` is allowed, but did not resolve",
+        ] {
+            assert!(why.contains(refused), "no {refused:?} in: {why}");
+        }
+
+        // A background job has no report: it says so where its output goes.
+        let out = background("wget -q -T 5 -O- http://example.com/", &project, &setup)
+            .unwrap()
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("atelier: sandbox: the sandbox's network reaches only")
+                && stderr.contains("`example.com`"),
+            "{stderr}"
+        );
+
+        if std::env::var_os("ATELIER_SANDBOX_TEST_NET").is_some() {
+            let setup = Setup {
+                network: vec!["dl-cdn.alpinelinux.org".to_string()],
+                ..setup.clone()
+            };
+            let out = super::run(
+                "apk add --no-cache jq >/dev/null 2>&1 && jq --version; \
+                 wget -q -T 5 -O- https://example.com/",
+                &project,
+                &setup,
+                Duration::from_secs(120),
+            )
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.starts_with("jq-"), "{stdout}");
+            assert_eq!(out.outcome, Outcome::Exited(1));
+            assert!(diagnose(&out).unwrap().contains("`example.com`"));
+        }
         std::fs::remove_dir_all(&project).unwrap();
     }
 }

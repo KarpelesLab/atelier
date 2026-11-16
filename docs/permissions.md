@@ -579,5 +579,6 @@ signals at once (each category is reported at most once per call).
   unexamined: atelier does not check that they only read.
 - The approval reviewer's verdicts for a background subagent are shown as
   its activity lines, not as `approval` events.
-- A network allowlist for the [sandbox](sandbox.md) is the rest of roadmap
-  M17.
+- The [sandbox](sandbox.md)'s network list filters by address, not by
+  name: what shares an address with an allowed host can be reached
+  ([the network](sandbox.md#the-network)).

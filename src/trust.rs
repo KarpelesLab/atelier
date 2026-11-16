@@ -25,7 +25,9 @@
 //!   endpoint, and the endpoint itself — which is also sent the key the
 //!   user's own environment holds (`ATELIER_SEARCH_KEY`), and the queries;
 //! - `[sandbox] enabled`: on, sandboxed `bash` commands stop asking; off, a
-//!   sandbox the user switched on in their own file is switched off.
+//!   sandbox the user switched on in their own file is switched off;
+//! - `[sandbox] network`: hosts the sandboxed commands — which nobody is
+//!   asked about — can reach, and so send the project to.
 //!
 //! Everything else in the file applies as before, and so do `deny` and `ask`
 //! rules and the stricter modes: they only restrict. The user-global file is
@@ -210,6 +212,8 @@ enum Kind {
     Hook,
     Search,
     Sandbox,
+    /// `[sandbox] network`: the hosts the sandbox's guest may reach.
+    SandboxNetwork,
     /// `[permissions.reviewer]`, switched on.
     Reviewer,
 }
@@ -230,6 +234,7 @@ impl Kind {
             Kind::Hook => "hooks",
             Kind::Search => "search",
             Kind::Sandbox => "sandbox",
+            Kind::SandboxNetwork => "sandbox-network",
             Kind::Reviewer => "reviewer",
         }
     }
@@ -248,6 +253,7 @@ impl Kind {
             Kind::Hook => ("hook", "hooks"),
             Kind::Search => return "the search endpoint and key".to_string(),
             Kind::Sandbox => return "the sandbox switch".to_string(),
+            Kind::SandboxNetwork => return "the sandbox's network".to_string(),
             Kind::Reviewer => return "the approval reviewer".to_string(),
         };
         format!("{n} {}", if n == 1 { one } else { many })
@@ -529,6 +535,21 @@ fn items(root: &Path, settings: &Settings) -> Vec<Item> {
         };
         add(Kind::Sandbox, json!(on), line.to_string());
     }
+    // Where the commands the sandbox runs unasked can connect to — and so
+    // send what they can read, which is the project. (An item of its own,
+    // hashed apart from the switch: a project trusted with the switch alone
+    // is not asked again.)
+    if !settings.sandbox.network.is_empty() {
+        add(
+            Kind::SandboxNetwork,
+            json!(settings.sandbox.network),
+            format!(
+                "[sandbox] lets sandboxed commands, which are not asked about, reach these \
+                 hosts: {}",
+                settings.sandbox.network.join(", ")
+            ),
+        );
+    }
     out
 }
 
@@ -675,8 +696,9 @@ impl Trust {
         // sent to it. The provider's name stays, with its real endpoint.
         s.search.url = None;
         // Whether `bash` is sandboxed is then the user's to say (their own
-        // file, `ATELIER_SANDBOX`).
+        // file, `ATELIER_SANDBOX`), and so is where its guest can connect.
         s.sandbox.enabled = None;
+        s.sandbox.network.clear();
         // Without its providers, a model addressed on one of them would be
         // sent to the default endpoint under a name it doesn't know; such
         // choices fall back like unset ones, so the session still talks.
@@ -1245,6 +1267,54 @@ key_env = "GITHUB_TOKEN"
         );
         // A table that does not touch the switch needs no decision.
         assert!(hash(&root, "[sandbox]\nmemory_mb = 512\n").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `[sandbox] network` opens the network to commands nobody is asked
+    /// about: the list is shown, hashed entry by entry, and empty until the
+    /// project is trusted. It is an item of its own, so the switch's hash is
+    /// what it was before the list existed.
+    #[test]
+    fn the_sandbox_network_list_is_gated() {
+        let root = dir("sandbox-network");
+        let text = "[sandbox]\nenabled = true\nnetwork = [\"crates.io\", \"*.crates.io\"]\n";
+        let s = settings(text);
+        let list = items(&root, &s);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].kind, Kind::SandboxNetwork);
+        assert!(
+            list[1].line.ends_with("crates.io, *.crates.io"),
+            "{}",
+            list[1].line
+        );
+
+        let untrusted = Trust::load(&root, &s, Store::default());
+        assert_eq!(untrusted.state(), State::Untrusted);
+        assert!(untrusted.effective(&s).sandbox.network.is_empty());
+        let accepted = Store {
+            accept_all: true,
+            ..Store::default()
+        };
+        let trusted = Trust::load(&root, &s, accepted);
+        assert_eq!(
+            trusted.effective(&s).sandbox.network,
+            ["crates.io", "*.crates.io"]
+        );
+
+        // The list alone needs a decision; a host more is another decision.
+        let alone = hash(&root, "[sandbox]\nnetwork = [\"crates.io\"]\n");
+        assert!(alone.is_some());
+        assert_ne!(
+            alone,
+            hash(
+                &root,
+                "[sandbox]\nnetwork = [\"crates.io\", \"evil.example\"]\n"
+            )
+        );
+        assert_ne!(
+            hash(&root, text),
+            hash(&root, "[sandbox]\nenabled = true\n")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

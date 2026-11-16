@@ -31,6 +31,7 @@ wait for `/trust`.
 | `[[hooks]]` | Shell commands run on lifecycle events |
 | `[search] key_env`, `[search] url` | An environment variable of the file's choosing, sent as the key to a search endpoint — and the endpoint itself, which would also be sent the key in your own `ATELIER_SEARCH_KEY`, and the agent's queries |
 | `[sandbox] enabled` | Either way it is a say over the `bash` tool: `true` stops the commands the [sandbox](sandbox.md) can run from asking; `false` takes away a sandbox you switched on in your own file, so commands run on the host |
+| `[sandbox] network` | Hosts the sandbox's guest can [connect to](sandbox.md#the-network). Its commands are not asked about, so a host on the list is somewhere they can send the project |
 
 Not gated, because they only restrict or are harmless:
 
@@ -87,6 +88,9 @@ endpoint and model.
   from the file as it is on disk at each call, so an edit to it made during a
   session — the agent can write `atelier.toml` — does not take effect before
   you have accepted it.
+- The project's `[sandbox] network` allows nothing: the guest reaches the
+  hosts of your own file's list, or none. Read from the file at each call
+  like `enabled`.
 
 ## Accepting
 
@@ -145,7 +149,8 @@ accept anything. What goes into the hash, in the file's order:
 - whether `[defaults]` starts sessions in `yolo`;
 - each `[[hooks]]`: `event`, `match`, `command`, `timeout_secs`;
 - `[search]` `provider`, `url` and `key_env`, when `key_env` or `url` is set;
-- `[sandbox] enabled`, when it is set.
+- `[sandbox] enabled`, when it is set;
+- `[sandbox] network`, when it lists anything: every entry.
 
 So a `git pull` that edits a hook's command, or the agent editing
 `atelier.toml` to add an allow rule or rewriting the reviewer's policy file,

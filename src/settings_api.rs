@@ -470,7 +470,7 @@ pub const SPECS: &[Spec] = &[
     spec(
         "sandbox.network",
         Kind::List,
-        "Reserved: hosts the sandbox guest may reach (not implemented, the guest has no network)",
+        "Hosts the sandbox guest may reach (`name`, `*.name` or an address); a project's count once it is trusted",
     )
     .both()
     .combined(),

@@ -106,10 +106,12 @@ impl Tool for BashTool {
                 .to_string();
         // Only while the sandbox is on, so the description (which is part of
         // every request) is otherwise what it always was.
-        let sandboxed =
-            std::env::current_dir().is_ok_and(|root| sandbox::state(&root) != sandbox::State::Off);
-        if sandboxed {
-            description.push_str(sandbox::TOOL_NOTE);
+        match std::env::current_dir().map(|root| sandbox::state(&root)) {
+            Ok(sandbox::State::Ready(setup)) => {
+                description.push_str(&sandbox::tool_note(&setup.network));
+            }
+            Ok(sandbox::State::Unavailable(_)) => description.push_str(&sandbox::tool_note(&[])),
+            Ok(sandbox::State::Off) | Err(_) => {}
         }
         ToolSpec {
             name: self.name().to_string(),
@@ -1275,6 +1277,7 @@ mod tests {
             rootfs: PathBuf::from("/nonexistent/rootfs"),
             memory_mb: 64,
             interp: false,
+            network: Vec::new(),
             helper: Some(PathBuf::from("/nonexistent/atelier")),
             notes: Vec::new(),
         })

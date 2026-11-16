@@ -3675,6 +3675,7 @@ mod tests {
             rootfs: PathBuf::from("/nonexistent/rootfs"),
             memory_mb: 64,
             interp: false,
+            network: Vec::new(),
             helper: Some(PathBuf::from("/nonexistent/atelier")),
             notes: Vec::new(),
         }));
