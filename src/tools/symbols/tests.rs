@@ -98,7 +98,7 @@ fn fixture_server(root: &Path) -> FakeServer {
                 "targetSelectionRange": range(1, 7),
             }]),
             "textDocument/references" if on_greet_call => {
-                assert_eq!(params["context"]["includeDeclaration"], false);
+                assert_eq!(params["context"]["includeDeclaration"], true);
                 json!([
                     { "uri": lib, "range": range(9, 23) },
                     { "uri": main, "range": range(1, 24) },
@@ -229,6 +229,125 @@ fn every_action_round_trips_through_a_language_server() {
         run(&tool, &root, &config, nothing),
         "no hover information for `Greeter` at src/lib.rs:6:12 (fake)"
     );
+}
+
+/// What real servers do with `includeDeclaration: false` differs (pyright
+/// leaves out the place asked about, typescript-language-server keeps the
+/// declaration unless asked at it), so the declaration is asked for and
+/// taken out here: the list is the same wherever the call points.
+#[test]
+fn references_leave_the_declaration_out_wherever_they_are_asked() {
+    let root = project("declaration");
+    let lib = lsp::uri_of_path(&root.join("src/lib.rs"));
+    let main = lsp::uri_of_path(&root.join("src/main.rs"));
+    let at = |uri: &str, line: u64, character: u64| {
+        json!({
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": character },
+                "end": { "line": line, "character": character + 5 },
+            },
+        })
+    };
+    let (declaration, call, other) = (at(&lib, 1, 7), at(&lib, 9, 23), at(&main, 1, 24));
+    let server = FakeServer::new(move |method, params| {
+        let asked_at_declaration = params["position"]["line"] == 1;
+        Act::Reply(match method {
+            "textDocument/references" => {
+                json!([declaration.clone(), call.clone(), other.clone()])
+            }
+            // Asked at the declaration, this server has nowhere else to
+            // send the caller — as clangd, which answers a prototype with
+            // the body and the body with the prototype.
+            "textDocument/definition" if asked_at_declaration => json!([]),
+            "textDocument/definition" => json!([declaration.clone()]),
+            _ => Value::Null,
+        })
+    });
+    let tool = tool_on(&server);
+    let config = fake_config(10);
+    let expected = "references to `greet` (its declaration aside) — 2 locations (fake)\n\
+         src/lib.rs:10:23  — let s = \"é𝄞\"; greet(s)\n\
+         src/main.rs:2:25  — println!(\"{}\", lib::greet(\"x\"));";
+    for line in [10, 2] {
+        let args = json!({ "action": "references", "path": "src/lib.rs", "line": line, "symbol": "greet" });
+        assert_eq!(
+            run(&tool, &root, &config, args),
+            expected,
+            "asked at {line}"
+        );
+    }
+
+    // A server that cannot say where the definition is costs the removal
+    // and nothing else — and the declaring line says that it is one.
+    let (declaration, call) = (at(&lib, 1, 7), at(&lib, 9, 23));
+    let server = FakeServer::new(move |method, _| match method {
+        "textDocument/references" => Act::Reply(json!([declaration.clone(), call.clone()])),
+        "textDocument/definition" => Act::Error("not supported".to_string()),
+        _ => Act::Reply(Value::Null),
+    });
+    let args =
+        json!({ "action": "references", "path": "src/lib.rs", "line": 10, "symbol": "greet" });
+    assert_eq!(
+        run(&tool_on(&server), &root, &config, args),
+        "references to `greet` (its declaration aside) — 2 locations (fake)\n\
+         src/lib.rs:2:8  fn  greet  — pub fn greet(name: &str) -> String {\n\
+         src/lib.rs:10:23  — let s = \"é𝄞\"; greet(s)"
+    );
+}
+
+/// `search` as the first call: clangd has indexed nothing and
+/// typescript-language-server has "No Project" until a file is opened, and
+/// gopls and clangd list the standard library beside the project.
+#[test]
+fn search_shows_the_server_a_file_first_and_lists_the_project_only() {
+    let root = project("search");
+    std::fs::write(root.join("notes.md"), "greet\n").unwrap();
+    let lib = lsp::uri_of_path(&root.join("src/lib.rs"));
+    let whole_line = |uri: &str, line: u64| {
+        json!({
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": 0 },
+                "end": { "line": line + 2, "character": 1 },
+            },
+        })
+    };
+    let found = json!([
+        // Where the declaration starts, not where the name is.
+        { "name": "greet", "kind": 12, "location": whole_line(&lib, 1) },
+        // Qualified by the server and again by its container.
+        { "name": "lib.Greeter", "kind": 23, "containerName": "lib", "location": whole_line(&lib, 5) },
+        {
+            "name": "greater",
+            "kind": 12,
+            "containerName": "std",
+            "location": whole_line("file:///usr/include/c++/functional", 40),
+        },
+    ]);
+    let server = FakeServer::new(move |method, _| match method {
+        "workspace/symbol" => Act::Reply(found.clone()),
+        _ => Act::Reply(Value::Null),
+    });
+    let tool = tool_on(&server);
+    let config = fake_config(10);
+    let search = json!({ "action": "search", "query": "gre" });
+    let expected = "symbols matching `gre` — 2 symbols (fake)\n\
+         src/lib.rs:2:8  function  greet  — pub fn greet(name: &str) -> String {\n\
+         src/lib.rs:6:12  struct  lib.Greeter  — pub struct Greeter;\n\
+         (1 more outside the project — dependencies, the standard library — not listed)";
+    assert_eq!(run(&tool, &root, &config, search.clone()), expected);
+    // The first of the server's own files, before the question.
+    let methods = server.methods();
+    let position = |method: &str| methods.iter().position(|m| m == method).unwrap();
+    assert!(position("textDocument/didOpen") < position("workspace/symbol"));
+    let opened = server.params_of("textDocument/didOpen");
+    assert_eq!(opened["textDocument"]["uri"], lib.as_str());
+    assert_eq!(opened["textDocument"]["text"], LIB);
+    // Once: a server that has a file has its project.
+    assert_eq!(run(&tool, &root, &config, search), expected);
+    let opens = server.methods().into_iter();
+    assert_eq!(opens.filter(|m| m == "textDocument/didOpen").count(), 1);
 }
 
 #[test]

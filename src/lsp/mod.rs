@@ -144,6 +144,8 @@ pub(crate) struct ServerSpec {
     pub(crate) command: String,
     /// How long one call may wait for it.
     pub(crate) timeout: Duration,
+    /// The extensions of the files it serves, lower case, without the dot.
+    pub(crate) extensions: Vec<String>,
 }
 
 impl ServerSpec {
@@ -152,15 +154,25 @@ impl ServerSpec {
             name: config.name.clone(),
             command: config.command.clone(),
             timeout: Duration::from_secs(config.timeout_secs.max(1)),
+            extensions: (config.extensions.iter())
+                .map(|e| e.trim_start_matches('.').to_lowercase())
+                .collect(),
         }
     }
 
-    fn detected(command: &str) -> Self {
+    fn detected(known: &Known, command: &str) -> Self {
         Self {
             name: program(command).to_string(),
             command: command.to_string(),
             timeout: DEFAULT_TIMEOUT,
+            extensions: known.extensions.iter().map(|e| e.to_string()).collect(),
         }
+    }
+
+    /// Whether files with extension `ext` (lower case, no dot) are this
+    /// server's.
+    pub(crate) fn serves(&self, ext: &str) -> bool {
+        self.extensions.iter().any(|e| e == ext)
     }
 
     /// The `initializationOptions` the server is started with, by its
@@ -172,6 +184,10 @@ impl ServerSpec {
             // and hold the build directory's lock against the agent's own
             // builds — to produce diagnostics nobody here reads.
             Some("rust-analyzer") => json!({ "checkOnSave": false }),
+            // gopls would otherwise answer `workspace/symbol` from the
+            // standard library and every dependency as well, and spend its
+            // cap of 100 answers on those.
+            Some("gopls") => json!({ "symbolScope": "workspace" }),
             _ => Value::Null,
         }
     }
@@ -201,7 +217,7 @@ pub(crate) fn choose(
         ));
     }
     match known.commands.iter().find(|c| has(program(c))) {
-        Some(command) => Ok(ServerSpec::detected(command)),
+        Some(command) => Ok(ServerSpec::detected(known, command)),
         None => {
             let programs: Vec<&str> = known.commands.iter().map(|c| program(c)).collect();
             Err(format!("{} is not on PATH", programs.join(" or ")))
@@ -223,7 +239,7 @@ pub(crate) fn all(
             continue;
         }
         if let Some(command) = known.commands.iter().find(|c| has(program(c))) {
-            found.push(ServerSpec::detected(command));
+            found.push(ServerSpec::detected(known, command));
         }
     }
     found
@@ -589,6 +605,7 @@ mod tests {
                 name: "rust".to_string(),
                 command: "ra-multiplex --flag".to_string(),
                 timeout: Duration::from_secs(7),
+                extensions: vec!["rs".to_string()],
             }
         );
         // Written with its dot, as people do.
@@ -613,13 +630,15 @@ mod tests {
 
     #[test]
     fn rust_analyzer_is_told_not_to_run_cargo_check() {
-        let options = |command: &str| ServerSpec::detected(command).options();
+        let options = |command: &str| ServerSpec::detected(&KNOWN[0], command).options();
         assert_eq!(options("rust-analyzer"), json!({ "checkOnSave": false }));
         assert_eq!(
             options("/opt/bin/rust-analyzer --log-file x"),
             json!({ "checkOnSave": false })
         );
-        assert_eq!(options("gopls"), Value::Null);
+        // And gopls to keep `workspace/symbol` to the project.
+        assert_eq!(options("gopls"), json!({ "symbolScope": "workspace" }));
+        assert_eq!(options("clangd"), Value::Null);
     }
 
     #[test]
@@ -657,6 +676,7 @@ mod tests {
             name: "fake".to_string(),
             command: "fake-ls".to_string(),
             timeout,
+            extensions: Vec::new(),
         }
     }
 
@@ -776,6 +796,7 @@ mod tests {
             command: "sh -c 'sleep 300 & echo $$ $! > pids; pwd > cwd; cat > /dev/null'"
                 .to_string(),
             timeout: Duration::from_millis(1500),
+            extensions: Vec::new(),
         };
         let why = servers.with(&root, &spec, ping).unwrap_err();
         assert_eq!(why, "did not answer `initialize`");

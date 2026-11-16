@@ -352,24 +352,39 @@ pub(super) struct Hit {
 /// in a stable order, with their text. Ignored files, the directories
 /// `grep` leaves out, binary and oversized files are skipped.
 fn files(root: &Path, wanted: &dyn Fn(&str) -> bool, visit: &mut dyn FnMut(&Path, &str)) {
+    for (path, text) in sources(root, wanted) {
+        visit(&path, &text);
+    }
+}
+
+/// The first of those files, with its text: one to show a language server
+/// that knows no project until it is given a file of it.
+pub(super) fn first_file(root: &Path, wanted: &dyn Fn(&str) -> bool) -> Option<(PathBuf, String)> {
+    sources(root, wanted).next()
+}
+
+/// What [`files`] visits, read as it is asked for.
+fn sources<'a>(
+    root: &'a Path,
+    wanted: &'a dyn Fn(&str) -> bool,
+) -> impl Iterator<Item = (PathBuf, String)> + 'a {
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .filter_entry(spill::keep_in_walk(root))
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
-    for entry in walker.flatten() {
+    walker.flatten().filter_map(move |entry| {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
+            return None;
         }
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if !wanted(ext) || entry.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
-            continue;
+            return None;
         }
-        if let Ok(text) = std::fs::read_to_string(path) {
-            visit(path, &text);
-        }
-    }
+        let text = std::fs::read_to_string(path).ok()?;
+        Some((path.to_path_buf(), text))
+    })
 }
 
 /// What a project-wide search found: the first hits, and how many there

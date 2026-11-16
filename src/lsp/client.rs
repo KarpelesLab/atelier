@@ -282,6 +282,11 @@ impl Client {
         }
     }
 
+    /// Whether the server was given any file.
+    pub(crate) fn has_open(&self) -> bool {
+        !(self.docs.lock().unwrap_or_else(|e| e.into_inner())).is_empty()
+    }
+
     /// Wait until the server says it is not busy (see the module docs), or
     /// `deadline`. `false` when it is still busy then. A dead server is
     /// "ready": the request that follows reports the death.

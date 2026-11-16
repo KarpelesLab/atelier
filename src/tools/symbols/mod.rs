@@ -242,24 +242,36 @@ impl SymbolsTool {
                     "character": position::utf16_of_byte(line, target.byte),
                 },
             });
+            let at = params.clone();
             let method = match action {
                 "definition" => "textDocument/definition",
                 "hover" => "textDocument/hover",
                 _ => {
-                    params["context"] = json!({ "includeDeclaration": false });
+                    // The declaration is asked for and taken out here (see
+                    // `without`): what servers make of "not the
+                    // declaration" differs too much to rely on.
+                    params["context"] = json!({ "includeDeclaration": true });
                     "textDocument/references"
                 }
             };
             let answer = self.servers.with(root, &spec, |client, deadline| {
                 source.sync(client)?;
-                ask(client, deadline, method, params.clone())
+                let found = ask(client, deadline, method, params.clone())?;
+                let defined = match action {
+                    // No answer to this one costs nothing but the removal.
+                    "references" => client
+                        .request("textDocument/definition", at.clone(), deadline)
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                Ok((found, defined))
             });
             match answer {
-                Ok(value) => Ok((spec.name, value)),
+                Ok((found, defined)) => Ok((spec.name, found, defined)),
                 Err(why) => Err(format!("{} {why}", spec.name)),
             }
         });
-        let (server, value) = match answered {
+        let (server, value, defined) = match answered {
             Ok(answer) => answer,
             Err(why) => {
                 let body = match action {
@@ -283,14 +295,35 @@ impl SymbolsTool {
             };
         }
         let mut reader = Reader::new(root);
-        let places = places(&value);
+        let mut defined = places(&defined);
+        // Asked at a declaration, a server may name another as the
+        // definition (clangd: the prototype for the body, and the reverse).
+        // The one asked at is not a reference either.
+        let line = source.line(target.line);
+        let declared = textual::lang_of(&source.ext)
+            .and_then(|lang| lang.declaration(target.line, line))
+            .is_some_and(|decl| decl.byte == target.byte);
+        if action == "references" && declared {
+            // Spelled as given and with symlinks resolved, as servers do.
+            let canonical = std::fs::canonicalize(&source.abs).ok();
+            for path in [Some(&source.abs), canonical.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                defined.push(Place {
+                    uri: lsp::uri_of_path(path),
+                    line: target.line,
+                    character: position::utf16_of_byte(line, target.byte),
+                });
+            }
+        }
+        let places = without(places(&value), &defined);
         let total = places.len();
+        // A line that declares the name says what kind of thing it is: the
+        // definition, and a declaration that is still among the references
+        // (a C prototype, an overriding method).
         let entries: Vec<Entry> = (places.into_iter().take(MAX_ENTRIES))
-            .map(|p| {
-                // A definition's line says what kind of thing it is.
-                let named = (action == "definition").then_some(name.as_str());
-                reader.entry(&p, named)
-            })
+            .map(|p| reader.entry(&p, Some(name)))
             .collect();
         let what = match action {
             "definition" => format!("definition of `{name}`"),
@@ -371,6 +404,16 @@ impl SymbolsTool {
         for spec in specs.iter().filter(|_| why.is_none()) {
             let params = json!({ "query": query });
             let answer = self.servers.with(root, spec, |client, deadline| {
+                // Some servers know no project until they are given a file
+                // of it: clangd then finds nothing, tsserver answers "No
+                // Project". Any file of theirs will do.
+                if !client.has_open() {
+                    let theirs = |ext: &str| spec.serves(&ext.to_lowercase());
+                    if let Some((path, text)) = textual::first_file(root, &theirs) {
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        client.sync(&path, lsp::language_id(&ext.to_lowercase()), &text)?;
+                    }
+                }
                 ask(client, deadline, "workspace/symbol", params.clone())
             });
             match answer {
@@ -397,12 +440,22 @@ impl SymbolsTool {
             servers.push(*server);
             flatten(value, None, "", &mut symbols);
         }
-        let total = symbols.len();
+        // The project's own: a server also offers what it indexed of the
+        // standard library and the dependencies, by the hundred.
         let mut reader = Reader::new(root);
+        let found = symbols.len();
+        symbols.retain(|s| !reader.outside(&s.place.uri));
+        let total = symbols.len();
         let entries: Vec<Entry> = (symbols.iter().take(MAX_ENTRIES))
             .map(|s| reader.symbol(s))
             .collect();
         let mut out = render(&what, "symbol", &entries, total, Some(&servers.join(", ")));
+        if found > total {
+            out.push_str(&format!(
+                "\n({} more outside the project — dependencies, the standard library — not listed)",
+                found - total
+            ));
+        }
         for failure in failures {
             out.push_str(&format!("\nnot asked: {failure}"));
         }
@@ -646,10 +699,24 @@ fn places(value: &Value) -> Vec<Place> {
     }
 }
 
+/// `places` less those in `defined` — the references to a symbol, less
+/// where the server says it is defined. Asked to leave the declaration out,
+/// servers do three different things: pyright 1.1.414 leaves out the place
+/// *asked about* instead, typescript-language-server 6.1 leaves the
+/// declaration out only when asked at it, clangd and gopls do as told.
+fn without(places: Vec<Place>, defined: &[Place]) -> Vec<Place> {
+    let key = |p: &Place| (p.uri.clone(), p.line, p.character);
+    let kept = places.into_iter();
+    kept.filter(|p| !defined.iter().any(|d| key(d) == key(p)))
+        .collect()
+}
+
 /// A symbol in a server's answer to `documentSymbol` or `workspace/symbol`.
 struct Symbol {
     /// With what contains it: `Widget.draw`.
     name: String,
+    /// The last name in it as the server gave it: `draw`.
+    bare: String,
     kind: &'static str,
     place: Place,
 }
@@ -699,7 +766,13 @@ fn flatten(value: &Value, container: Option<&str>, uri: &str, out: &mut Vec<Symb
             continue;
         };
         let container = container.or_else(|| item["containerName"].as_str());
-        let name = match container.filter(|c| !c.is_empty()) {
+        let bare = last_name(name).to_string();
+        // gopls qualifies some names itself (`pkg.main`, in `pkg`).
+        let qualified = |c: &str| {
+            name.strip_prefix(c)
+                .is_some_and(|rest| rest.starts_with('.'))
+        };
+        let name = match container.filter(|c| !c.is_empty() && !qualified(c)) {
             Some(container) => format!("{container}.{name}"),
             None => name.to_string(),
         };
@@ -718,9 +791,23 @@ fn flatten(value: &Value, container: Option<&str>, uri: &str, out: &mut Vec<Symb
                 character: range["start"]["character"].as_u64().unwrap_or(0) as u32,
             },
             name: name.clone(),
+            bare,
         });
         flatten(&item["children"], Some(&name), uri, out);
     }
+}
+
+/// The last identifier in `name`: `Run` of gopls's `(Greeter).Run`.
+fn last_name(name: &str) -> &str {
+    let is_name = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let tail = name.trim_end_matches(|c| !is_name(c));
+    let start = tail
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_name(*c))
+        .last()
+        .map_or(tail.len(), |(i, _)| i);
+    &tail[start..]
 }
 
 /// The text of a `hover` answer — a `MarkupContent`, a `MarkedString` or a
@@ -771,9 +858,24 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Whether `uri` is a file that is not in the project.
+    fn outside(&self, uri: &str) -> bool {
+        let Some(path) = lsp::path_of_uri(uri) else {
+            return false;
+        };
+        let roots = [Some(self.root), self.canonical.as_deref()];
+        !roots.into_iter().flatten().any(|r| path.starts_with(r))
+    }
+
     /// The entry for `place`. With `named`, the entry is labelled when the
     /// line there declares that name.
     fn entry(&mut self, place: &Place, named: Option<&str>) -> Entry {
+        self.entry_at(place, named, None)
+    }
+
+    /// [`entry`](Self::entry); with `seek`, the place is moved along its
+    /// line to that name when it is not on it already.
+    fn entry_at(&mut self, place: &Place, named: Option<&str>, seek: Option<&str>) -> Entry {
         let Some(path) = lsp::path_of_uri(&place.uri) else {
             // Not a file (a server's virtual document): as it was given.
             return Entry {
@@ -813,7 +915,10 @@ impl<'a> Reader<'a> {
                 context: None,
             };
         };
-        let byte = position::byte_of_utf16(line, place.character);
+        let mut byte = position::byte_of_utf16(line, place.character);
+        if let Some(name) = seek.filter(|name| !line[byte..].starts_with(name)) {
+            byte += textual::find_word(&line[byte..], name).unwrap_or(0);
+        }
         let label = named.and_then(|name| {
             let decl = textual::lang_of(&ext)?.declaration(place.line, line)?;
             (decl.name == name).then(|| format!("{}  {}", decl.kind, decl.name))
@@ -825,11 +930,14 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// The entry for a symbol the server listed.
+    /// The entry for a symbol the server listed. Where the server gave the
+    /// start of the whole declaration (typescript-language-server does, in
+    /// `workspace/symbol`), the column is still the name's: it is what a
+    /// later call is pointed at.
     fn symbol(&mut self, symbol: &Symbol) -> Entry {
         Entry {
             label: Some(format!("{}  {}", symbol.kind, symbol.name)),
-            ..self.entry(&symbol.place, None)
+            ..self.entry_at(&symbol.place, None, Some(&symbol.bare))
         }
     }
 }
