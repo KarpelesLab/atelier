@@ -36,6 +36,7 @@ pub mod bash;
 pub mod change;
 mod edit;
 pub mod files;
+pub mod filter;
 mod glob;
 mod grep;
 mod ls;

@@ -21,6 +21,12 @@
 //! is what makes the reported runtime the job's own rather than the time
 //! until somebody looked.
 //!
+//! # Part of the output, without a pipe
+//!
+//! `tail`, `head` and `grep` are parameters of `bash` and `bash_output`,
+//! not something to pipe a command into: see [`filter`], which also says
+//! why, and how a filtered result is kept from hiding a failure.
+//!
 //! # The sandbox
 //!
 //! With the sandbox on ([`crate::sandbox`]), a foreground command runs in a
@@ -38,14 +44,15 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolSpec, spill};
+use super::filter::{self, Filter};
+use super::{Tool, ToolCtx, ToolSpec};
 use crate::sandbox;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Longest `bash_output` will block waiting.
 const MAX_WAIT_MS: u64 = 600_000;
 /// The most output, in bytes, a call returns; the rest goes to a file (see
-/// [`spill`]).
+/// [`super::spill`]).
 const MAX_OUTPUT_BYTES: usize = 20_000;
 /// How often the watchdog polls the child for exit while waiting for the
 /// timeout to elapse.
@@ -97,7 +104,14 @@ impl Tool for BashTool {
         let mut description = "Run a shell command (via `sh -c`) in the project root. Captures \
                 combined stdout/stderr and the exit status. Very long output comes back as its start and its end, with all of it saved \
                 to a file you can read or grep; \
-                the command is killed if it exceeds the timeout. With `background: true` it \
+                the command is killed if it exceeds the timeout. Never pipe a command into \
+                `tail`, `head` or `grep` to shorten its output: the pipe replaces the \
+                command's exit status with the filter's and throws away the rest of the \
+                output, which is how a failed run gets mistaken for a good one. Pass the \
+                `tail`, `head` or `grep` parameter instead: the command runs as it is, its \
+                own exit status is reported, and all of its output is kept, so you can look \
+                at another part of it afterwards (`bash_output` with the id the result \
+                names) without running it again. With `background: true` it \
                 starts as a job instead and returns its id at once. You are told when the \
                 job ends (a <background-job> block), so do not poll it: go on with other \
                 work. Read its output, or wait for it to print something, with \
@@ -113,10 +127,7 @@ impl Tool for BashTool {
             Ok(sandbox::State::Unavailable(_)) => description.push_str(&sandbox::tool_note(&[])),
             Ok(sandbox::State::Off) | Err(_) => {}
         }
-        ToolSpec {
-            name: self.name().to_string(),
-            description,
-            parameters: json!({
+        let mut parameters = json!({
                 "type": "object",
                 "properties": {
                     "command": {
@@ -137,7 +148,12 @@ impl Tool for BashTool {
                     }
                 },
                 "required": ["command"]
-            }),
+        });
+        with_filter(&mut parameters);
+        ToolSpec {
+            name: self.name().to_string(),
+            description,
+            parameters,
         }
     }
 
@@ -150,6 +166,7 @@ impl Tool for BashTool {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
+        let filter = Filter::from_args(&args)?;
         let state = sandbox::state(ctx.project_root);
         let sandboxed = state != sandbox::State::Off;
         // With the sandbox on, the host is reached only through a call that
@@ -182,7 +199,9 @@ impl Tool for BashTool {
         match state {
             sandbox::State::Ready(setup) if !wants_host(&args) => {
                 let out = sandbox::run(command, ctx.project_root, &setup, timeout)?;
-                return Ok(format_sandboxed(ctx.project_root, timeout_ms, out));
+                let mut out = format_sandboxed(ctx.project_root, timeout_ms, out, filter.as_ref());
+                append(&mut out, filter::pipe_note(command));
+                return Ok(out);
             }
             // Asked for and not there: refused, not run on the host instead,
             // so that turning the sandbox on never means less than it says.
@@ -209,14 +228,37 @@ impl Tool for BashTool {
             Some(status) => format!("[exit status: {status}]\n"),
             None => "[exit status: unknown]\n".to_string(),
         };
-        let mut out = format_result(ctx.project_root, status, done.stdout, done.stderr);
+        let failed = !done.status.is_some_and(|s| s.success());
+        let output = combine(done.stdout, done.stderr);
+        let mut out = format_result(ctx.project_root, status, output, filter.as_ref(), failed);
+        append(&mut out, filter::pipe_note(command));
         if sandboxed {
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str("[ran on the host, not in the sandbox]");
+            append(
+                &mut out,
+                Some("[ran on the host, not in the sandbox]".into()),
+            );
         }
         Ok(out)
+    }
+}
+
+/// Add the output filter's parameters to a tool's schema.
+fn with_filter(parameters: &mut Value) {
+    let Value::Object(filter) = filter::schema() else {
+        return;
+    };
+    if let Some(properties) = parameters["properties"].as_object_mut() {
+        properties.extend(filter);
+    }
+}
+
+/// Add `note`, if there is one, to a result as a line of its own.
+fn append(out: &mut String, note: Option<String>) {
+    if let Some(note) = note {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&note);
     }
 }
 
@@ -276,7 +318,12 @@ fn timed_out_line(timeout_ms: u64) -> String {
 /// The result of a command that ran in the sandbox: as for one on the host,
 /// plus — when its failure looks like the sandbox's doing — a line saying so
 /// and how to ask for the host.
-fn format_sandboxed(root: &Path, timeout_ms: u64, out: sandbox::Output) -> String {
+fn format_sandboxed(
+    root: &Path,
+    timeout_ms: u64,
+    out: sandbox::Output,
+    filter: Option<&Filter>,
+) -> String {
     let status = match &out.outcome {
         // As `ExitStatus` prints it.
         sandbox::Outcome::Exited(code) => format!("[exit status: exit status: {code}]\n"),
@@ -284,7 +331,9 @@ fn format_sandboxed(root: &Path, timeout_ms: u64, out: sandbox::Output) -> Strin
         sandbox::Outcome::Failed(_) => "[not run: the sandbox failed]\n".to_string(),
     };
     let blame = sandbox::diagnose(&out);
-    let mut text = format_result(root, status, out.stdout, out.stderr);
+    let failed = !matches!(out.outcome, sandbox::Outcome::Exited(0));
+    let output = combine(out.stdout, out.stderr);
+    let mut text = format_result(root, status, output, filter, failed);
     if let Some(why) = blame {
         if !text.ends_with('\n') {
             text.push('\n');
@@ -297,24 +346,39 @@ fn format_sandboxed(root: &Path, timeout_ms: u64, out: sandbox::Output) -> Strin
     text
 }
 
-/// `status` (a line saying how the command ended), then its output.
-fn format_result(root: &Path, status: String, stdout: Vec<u8>, stderr: Vec<u8>) -> String {
-    let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-
-    let mut combined = String::new();
-    combined.push_str(&stdout);
+/// What a command printed, as one text: its stdout, then — marked — its
+/// stderr.
+fn combine(stdout: Vec<u8>, stderr: Vec<u8>) -> String {
+    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
     if !stderr.is_empty() {
         if !combined.is_empty() && !combined.ends_with('\n') {
             combined.push('\n');
         }
         combined.push_str("[stderr]\n");
-        combined.push_str(&stderr);
+        combined.push_str(&String::from_utf8_lossy(&stderr));
     }
+    combined
+}
 
+/// `status` (a line saying how the command ended), then its output: what
+/// `filter` selects of it, or — past the budget — its head and its tail.
+/// All of it is in a file whenever some of it is not shown (see
+/// [`filter::render`]).
+fn format_result(
+    root: &Path,
+    status: String,
+    output: String,
+    filter: Option<&Filter>,
+    failed: bool,
+) -> String {
     let mut out = status;
-    // Past the budget, the head and the tail; all of it is in a file.
-    out.push_str(&spill::fit(root, combined, MAX_OUTPUT_BYTES));
+    out.push_str(&filter::render(
+        root,
+        output,
+        filter,
+        failed,
+        MAX_OUTPUT_BYTES,
+    ));
     out
 }
 
@@ -714,31 +778,36 @@ impl Tool for BashOutputTool {
     }
 
     fn spec(&self) -> ToolSpec {
+        let mut parameters = json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The job id from `bash` (e.g. \"job-1\"), or the id of a finished command's kept output (\"out-ab12cd\"). Omit to list jobs (or, when waiting, to use the latest job)."
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "description": "How long to wait, at most, in milliseconds (default 0: return at once; max 600000)."
+                },
+                "until": {
+                    "type": "string",
+                    "description": "With wait_ms: stop waiting as soon as the new output matches this regex."
+                }
+            }
+        });
+        with_filter(&mut parameters);
         ToolSpec {
             name: self.name().to_string(),
             description: "Get a background job's new output (since the last call) and its \
                 status. With wait_ms, block until the job exits, or — with `until` — until \
                 its new output matches that regex, or until wait_ms passes; use this to wait \
                 for a build to finish or a server to come up. Without an id: with wait_ms or \
-                `until`, the most recently started job; otherwise, list the jobs."
+                `until`, the most recently started job; otherwise, list the jobs. Also looks \
+                again at the kept output of a command that already ran: give the id a bash \
+                result named (\"out-…\") with tail, head or grep to see another part of it, \
+                instead of running the command again."
                 .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "The job id from `bash` (e.g. \"job-1\"). Omit to list jobs (or, when waiting, to use the latest job)."
-                    },
-                    "wait_ms": {
-                        "type": "integer",
-                        "description": "How long to wait, at most, in milliseconds (default 0: return at once; max 600000)."
-                    },
-                    "until": {
-                        "type": "string",
-                        "description": "With wait_ms: stop waiting as soon as the new output matches this regex."
-                    }
-                }
-            }),
+            parameters,
         }
     }
 
@@ -754,7 +823,13 @@ impl Tool for BashOutputTool {
                     .cloned()
             })
             .flatten();
-        let Some(id) = args.get("id").and_then(Value::as_str).or(latest.as_deref()) else {
+        let filter = Filter::from_args(&args)?;
+        // The kept output of a command that has ended: another look at it.
+        let named = args.get("id").and_then(Value::as_str);
+        if let Some(kept) = named.and_then(filter::kept_id) {
+            return look_again(ctx.project_root, kept, filter.as_ref());
+        }
+        let Some(id) = named.or(latest.as_deref()) else {
             let jobs = job_list();
             if jobs.is_empty() {
                 return Ok("no background jobs".into());
@@ -786,6 +861,9 @@ impl Tool for BashOutputTool {
                 let Some(job) = jobs.jobs.get_mut(id) else {
                     bail!("no background job {id:?} (bash_output with no id lists them)");
                 };
+                // Asked before the output is read: a job that has ended is
+                // reported once the last of what it printed is here.
+                let settled = job.settled();
                 let fresh = {
                     let out = job.output.lock().unwrap_or_else(|e| e.into_inner());
                     String::from_utf8_lossy(&out[job.seen..]).into_owned()
@@ -793,7 +871,7 @@ impl Tool for BashOutputTool {
                 if let Some(re) = &until {
                     matched = re.is_match(&fresh);
                 }
-                if job.finished() || matched || Instant::now() >= deadline {
+                if settled || matched || Instant::now() >= deadline {
                     job.seen += fresh.len();
                     // This result carries the exit status: the model needs
                     // no notice of what it is reading here.
@@ -808,14 +886,52 @@ impl Tool for BashOutputTool {
                     if until.is_some() && !matched && !job.finished() {
                         out.push_str("[`until` pattern not seen yet]\n");
                     }
-                    // A long log: its start and its end, the rest in a file.
-                    out.push_str(&spill::fit(ctx.project_root, fresh, MAX_OUTPUT_BYTES));
+                    let failed = match job.child.try_wait() {
+                        Ok(Some(status)) => !status.success(),
+                        _ => false,
+                    };
+                    // What the filter selects of it, or a long log's start
+                    // and its end; the rest is in a file.
+                    out.push_str(&filter::render(
+                        ctx.project_root,
+                        fresh,
+                        filter.as_ref(),
+                        failed,
+                        MAX_OUTPUT_BYTES,
+                    ));
                     return Ok(out);
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Another part of the output kept under `id` (see [`filter`]): what
+/// `filter` selects of it, or its start and its end.
+fn look_again(root: &Path, id: &str, filter: Option<&Filter>) -> Result<String> {
+    let Some(text) = super::spill::kept(root, id) else {
+        bail!(
+            "no kept output \"out-{id}\": only the most recent ones are kept. Run the \
+             command again (with tail, head or grep rather than a pipe)."
+        );
+    };
+    let lines = text.lines().count();
+    let mut out = format!("[out-{id}: kept output, {lines} lines]\n");
+    out.push_str(&match filter {
+        Some(filter) => filter::again(id, text, filter, MAX_OUTPUT_BYTES),
+        // Asked for whole: its start and its end, as when it was made.
+        None if text.len() > MAX_OUTPUT_BYTES => {
+            let place = format!(
+                "pass tail, head or grep to see another part, or read {}/{id}.txt with \
+                 offset/limit",
+                super::spill::DIR
+            );
+            super::spill::cut(&text, MAX_OUTPUT_BYTES, &place)
+        }
+        None => text,
+    });
+    Ok(out)
 }
 
 /// `bash_kill`: stop a background job (and everything it started).
@@ -1268,6 +1384,275 @@ mod tests {
         assert!(body.contains(" lines omitted (lines "), "{body}");
         assert_eq!(spilled(&root, &out).lines().count(), 20000);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The id (`out-ab12cd`) a result gives for its kept output.
+    fn kept_id(out: &str) -> String {
+        let (_, rest) = out.split_once("bash_output with id \"").expect("a handle");
+        rest.split_once('"').unwrap().0.to_string()
+    }
+
+    #[test]
+    fn a_filter_shapes_what_is_shown_and_not_how_the_command_ran() {
+        let root = tempdir("bash-filter");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        // The command's own status, which `| tail` would have replaced
+        // with tail's 0; and all of what it printed, in the file.
+        let out = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "seq 1 300; exit 3", "tail": 25}),
+            )
+            .unwrap();
+        let mut lines = out.lines();
+        assert_eq!(lines.next(), Some("[exit status: exit status: 3]"));
+        let header = lines.next().unwrap();
+        assert!(
+            header.starts_with(
+                "[filtered: 25 of 300 lines shown (last 25) — full output: .atelier/tool-output/"
+            ),
+            "{header}"
+        );
+        assert_eq!(lines.next(), Some("276"));
+        assert!(out.ends_with("\n299\n300\n"), "{out}");
+        assert_eq!(spilled(&root, &out).lines().count(), 300);
+
+        // The first lines, and the lines that match, the same way.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 300", "head": 2}))
+            .unwrap();
+        assert!(out.ends_with("]\n1\n2\n"), "{out}");
+        let out = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "seq 1 300", "grep": "^7$", "context": 1}),
+            )
+            .unwrap();
+        assert!(out.starts_with("[exit status: exit status: 0]\n[filtered: 3 of 300"));
+        assert!(out.ends_with("]\n6\n7\n8\n"), "{out}");
+
+        // Output the filter leaves whole is returned as ever.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "echo hi", "tail": 20}))
+            .unwrap();
+        assert_eq!(out, "[exit status: exit status: 0]\nhi\n");
+        // A pattern that is not one is the call's mistake, before anything runs.
+        let err = BashTool
+            .call(&mut ctx, json!({"command": "touch ran", "grep": "("}))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid `grep` regex"), "{err}");
+        assert!(!root.join("ran").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_filter_cannot_hide_a_failure() {
+        let root = tempdir("bash-filter-failed");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        // The error is on stderr at the very end; the pattern only finds
+        // progress lines.
+        let failing = "seq 1 100 | sed 's/^/step /'; echo 'error: disk full' >&2; exit 2";
+        let out = BashTool
+            .call(&mut ctx, json!({"command": failing, "grep": "step 5$"}))
+            .unwrap();
+        assert!(
+            out.starts_with("[exit status: exit status: 2]\n[filtered: 1 of 102 lines shown"),
+            "{out}"
+        );
+        assert!(out.contains("\nstep 5\n[the command failed, and the filter left out the end"));
+        assert!(
+            out.ends_with("step 100\n[stderr]\nerror: disk full\n"),
+            "{out}"
+        );
+        // A pattern that matches nothing does not read as "no errors".
+        let out = BashTool
+            .call(&mut ctx, json!({"command": failing, "grep": "warning"}))
+            .unwrap();
+        assert!(
+            out.contains("[filtered: no line of the 102 lines of output matches \"warning\""),
+            "{out}"
+        );
+        assert!(out.ends_with("error: disk full\n"), "{out}");
+        // Nor does it on a command that succeeded: it says there were lines.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 30", "grep": "error"}))
+            .unwrap();
+        let (status, rest) = out.split_once('\n').unwrap();
+        assert_eq!(status, "[exit status: exit status: 0]");
+        assert!(
+            rest.starts_with("[filtered: no line of the 30 lines"),
+            "{rest}"
+        );
+        assert_eq!(rest.lines().count(), 1);
+        // Killed at the timeout: what it had printed, the same.
+        let out = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "seq 1 50; echo stuck; sleep 20", "timeout_ms": 500, "head": 1}),
+            )
+            .unwrap();
+        assert!(out.starts_with("[command timed out after 500ms"), "{out}");
+        assert!(out.ends_with("\n50\nstuck\n"), "{out}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn kept_output_is_looked_at_again_without_rerunning() {
+        let root = tempdir("bash-filter-again");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        // Runs once: a second run would count twice.
+        let command = "echo run >> runs; seq 1 200 | sed 's/^/row /'; echo 'row 77 FAILED'";
+        let out = BashTool
+            .call(&mut ctx, json!({"command": command, "tail": 2}))
+            .unwrap();
+        assert!(out.ends_with("row 200\nrow 77 FAILED\n"), "{out}");
+        let id = kept_id(&out);
+        assert!(id.starts_with("out-") && id.len() == 10, "{id}");
+
+        // Another part of it: a pattern with context…
+        let again = BashOutputTool
+            .call(
+                &mut ctx,
+                json!({"id": id, "grep": "FAILED|row 42$", "context": 1}),
+            )
+            .unwrap();
+        assert_eq!(
+            again,
+            format!(
+                "[{id}: kept output, 201 lines]\n\
+                 [filtered: 5 of 201 lines shown (grep \"FAILED|row 42$\" with 1 lines of \
+                 context) — all of it is still {id}]\n\
+                 row 41\nrow 42\nrow 43\n--\nrow 200\nrow 77 FAILED\n"
+            )
+        );
+        // …the first lines, by the path the result gave…
+        let path = format!(".atelier/tool-output/{}.txt", &id[4..]);
+        let again = BashOutputTool
+            .call(&mut ctx, json!({"id": path, "head": 1}))
+            .unwrap();
+        assert!(again.ends_with("]\nrow 1\n"), "{again}");
+        // …and a range of lines, with `read`.
+        let range = crate::tools::read::ReadTool
+            .call(&mut ctx, json!({"path": path, "offset": 100, "limit": 2}))
+            .unwrap();
+        assert!(
+            range.contains("row 100") && range.contains("row 101"),
+            "{range}"
+        );
+        assert!(!range.contains("row 102"), "{range}");
+        // Nothing of that made a new file, or ran the command again.
+        let kept = std::fs::read_dir(root.join(".atelier/tool-output")).unwrap();
+        assert_eq!(kept.count(), 1);
+        assert_eq!(std::fs::read_to_string(root.join("runs")).unwrap(), "run\n");
+
+        // An id that names nothing kept says what to do.
+        let err = BashOutputTool
+            .call(&mut ctx, json!({"id": "out-000000"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("no kept output"), "{err}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_background_jobs_output_takes_the_same_filter() {
+        let root = tempdir("bash-filter-bg");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        let id = start(&mut ctx, "seq 1 100; echo 'fatal: no' >&2; exit 1");
+        let out = BashOutputTool
+            .call(&mut ctx, json!({"id": id, "wait_ms": 20000, "head": 2}))
+            .unwrap();
+        let (status, rest) = out.split_once('\n').unwrap();
+        assert!(status.contains("exit status: 1"), "{status}");
+        assert!(
+            rest.starts_with("[filtered: 2 of 101 lines shown (first 2)"),
+            "{rest}"
+        );
+        // It failed: its end is shown although the filter asked for the start.
+        assert!(rest.ends_with("\n100\nfatal: no\n"), "{rest}");
+        // And all of it can be looked at again.
+        let again = BashOutputTool
+            .call(&mut ctx, json!({"id": kept_id(&out), "grep": "^50$"}))
+            .unwrap();
+        assert!(again.ends_with("]\n50\n"), "{again}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_pipe_into_tail_runs_as_written_and_is_told_about_the_parameter() {
+        let root = tempdir("bash-pipe-note");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        // Not rewritten: the status is still the pipeline's, as sh has it.
+        let out = BashTool
+            .call(
+                &mut ctx,
+                json!({"command": "(seq 1 50; exit 3) | tail -n 2"}),
+            )
+            .unwrap();
+        assert!(
+            out.starts_with("[exit status: exit status: 0]\n49\n50\n"),
+            "{out}"
+        );
+        // A subshell is past what the parser follows: no advice, no harm.
+        assert!(!out.contains("[note:"), "{out}");
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 50 | tail -n 2"}))
+            .unwrap();
+        let (run, note) = out.split_once("[note: ").expect("a note");
+        assert_eq!(run, "[exit status: exit status: 0]\n49\n50\n");
+        assert!(
+            note.contains("The exit status reported is tail's"),
+            "{note}"
+        );
+        assert!(note.contains("pass \"tail\": 2 to bash"), "{note}");
+        // A pipe that transforms is the command's business.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "seq 1 50 | wc -l"}))
+            .unwrap();
+        assert_eq!(out, "[exit status: exit status: 0]\n50\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn both_tools_advertise_the_filter() {
+        for spec in [BashTool.spec(), BashOutputTool.spec()] {
+            for name in ["tail", "head", "grep", "context", "invert"] {
+                assert!(
+                    spec.parameters["properties"][name]["description"].is_string(),
+                    "{}: {name}",
+                    spec.name
+                );
+            }
+        }
+        let description = BashTool.spec().description;
+        assert!(description.contains("Never pipe a command into `tail`, `head` or `grep`"));
+        // What was there is still there.
+        assert_eq!(BashTool.spec().parameters["required"], json!(["command"]));
+        assert!(BashOutputTool.spec().parameters["properties"]["until"].is_object());
     }
 
     /// A sandbox that says it is ready, for what is decided before any

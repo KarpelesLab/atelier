@@ -117,7 +117,7 @@
 //! put to it.
 
 pub mod reviewer;
-mod shell;
+pub(crate) mod shell;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

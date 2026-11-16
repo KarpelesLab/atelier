@@ -60,8 +60,57 @@ pub fn fit(root: &Path, text: String, budget: usize) -> String {
     if text.len() <= budget {
         return text;
     }
-    let head_end = head_end(&text, budget * HEAD_PERCENT / 100);
-    let tail_start = tail_start(&text, budget * TAIL_PERCENT / 100).max(head_end);
+    let whereabouts = match keep(root, &text) {
+        Ok(kept) => format!(
+            "full output: {} (use read with offset/limit, or grep)",
+            kept.path
+        ),
+        Err(e) => format!("the full output could not be saved: {e}"),
+    };
+    cut(&text, budget, &whereabouts)
+}
+
+/// A text saved under [`DIR`].
+pub struct Kept {
+    /// Where, relative to the project root.
+    pub path: String,
+    /// The six hex digits of its name: what a tool that reads kept output
+    /// back takes for a handle (see [`kept`]).
+    pub id: String,
+}
+
+/// Save `text` under [`DIR`] whatever its size, for a tool that shows only
+/// part of it and lets the agent come back for the rest. The directory is
+/// trimmed as for [`fit`].
+pub fn keep(root: &Path, text: &str) -> Result<Kept, String> {
+    let path = save(root, text).map_err(|e| e.to_string())?;
+    let id = path.file_stem().unwrap_or_default().to_string_lossy();
+    Ok(Kept {
+        id: id.into_owned(),
+        path: path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string(),
+    })
+}
+
+/// The text [`keep`] (or [`fit`]) saved under the id `id`, if it is still
+/// there: the directory keeps only the most recent files.
+pub fn kept(root: &Path, id: &str) -> Option<String> {
+    // Only a name this module made: never a path.
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    std::fs::read_to_string(root.join(DIR).join(format!("{id}.txt"))).ok()
+}
+
+/// The head and the tail of `text` — which is over `budget` — each ending
+/// on a line boundary where there is one, around a marker that says what is
+/// missing, then `whereabouts`: where the rest is.
+pub fn cut(text: &str, budget: usize, whereabouts: &str) -> String {
+    let head_end = head_end(text, budget * HEAD_PERCENT / 100);
+    let tail_start = tail_start(text, budget * TAIL_PERCENT / 100).max(head_end);
     let (head, middle, tail) = (
         &text[..head_end],
         &text[head_end..tail_start],
@@ -80,13 +129,6 @@ pub fn fit(root: &Path, text: String, budget: usize) -> String {
         )
     } else {
         format!("{} bytes omitted", thousands(middle.len()))
-    };
-    let whereabouts = match save(root, &text) {
-        Ok(path) => format!(
-            "full output: {} (use read with offset/limit, or grep)",
-            path.strip_prefix(root).unwrap_or(&path).display()
-        ),
-        Err(e) => format!("the full output could not be saved: {e}"),
     };
 
     let mut out = String::with_capacity(head.len() + tail.len() + 200);
@@ -205,7 +247,7 @@ fn prune(dir: &Path, keep: &Path) {
 }
 
 /// `1842` as `1,842`.
-fn thousands(n: usize) -> String {
+pub fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {

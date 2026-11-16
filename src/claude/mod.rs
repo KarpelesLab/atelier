@@ -106,7 +106,10 @@ editing it. \
 - `bash` instead of Bash. For long-running commands (servers, watchers, big \
 builds) pass `background: true`, then `bash_output` to read new output or \
 wait for it to finish or print a pattern (`wait_ms`, `until`) — instead of \
-Monitor — and `bash_kill` to stop it. \
+Monitor — and `bash_kill` to stop it. Never pipe a command into tail, head \
+or grep to shorten its output: pass bash's `tail`, `head` or `grep` \
+parameter instead, which keeps the command's own exit status and all of its \
+output (`bash_output` with the id the result names shows another part). \
 - `grep`, `glob`, `ls`, `tree` to search and explore; `symbols` to navigate \
 code (where a name is defined, who uses it, what a file declares); \
 `web_fetch` instead of WebFetch; `todo` for a task list; `node` for sandboxed JavaScript. \

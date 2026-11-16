@@ -238,6 +238,28 @@ pub fn is_assignment(word: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The words of the last command of `command` when the line ends in a
+/// pipeline and that command is its last stage, reading the output of the
+/// one before it (`make 2>&1 | tail -n 20` gives `tail -n 20`). `None` when
+/// the line does not end that way, when its last command sends its output
+/// to a file, and when the line cannot be followed (see [`split`]).
+pub fn last_stage(command: &str) -> Option<Vec<String>> {
+    let src: Vec<char> = command.chars().collect();
+    let mut scanner = Scanner {
+        src: &src,
+        pos: 0,
+        out: Vec::new(),
+    };
+    scanner.list(Until::End, 0).ok()?;
+    // The commands of a substitution are pushed before the command that
+    // holds it, so the last one is the line's own.
+    let last = scanner.out.last()?;
+    if !last.piped || last.writes {
+        return None;
+    }
+    crate::shlex::split(&last.text).ok()
+}
+
 /// The last path component of a program name.
 pub fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
@@ -251,6 +273,9 @@ struct Simple {
     /// It redirects output to something other than `/dev/null` or a
     /// descriptor.
     writes: bool,
+    /// A `|` (or `|&`) of the command line itself — not of a substitution
+    /// inside it — feeds it the output of the command before it.
+    piped: bool,
 }
 
 /// What ends the list being scanned.
@@ -317,10 +342,12 @@ impl Scanner<'_> {
                 }
                 '|' => {
                     self.pos += 1;
+                    let or = self.peek(0) == Some('|');
                     if matches!(self.peek(0), Some('|' | '&')) {
                         self.pos += 1;
                     }
                     self.flush(&mut cur);
+                    cur.piped = !or && depth == 0;
                 }
                 '&' if self.peek(1) == Some('>') => self.redirect(&mut cur)?,
                 '&' => {

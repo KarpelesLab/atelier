@@ -93,7 +93,10 @@ boundaries, around one line saying what is missing and where it is:
 ```
 
 The file is in the project, so `read` (`offset`/`limit`) and `grep` reach it
-without approval. Output with no line breaks is cut by bytes instead, and the
+without approval. For `bash` and `bash_output` the marker also names a
+handle (`out-ab12cd`) that `bash_output` takes with a `tail`, `head` or
+`grep` of its own — see [Part of the output, without a
+pipe](#part-of-the-output-without-a-pipe). Output with no line breaks is cut by bytes instead, and the
 marker counts bytes.
 
 The directory keeps the 50 most recent files and at most 20 MiB; older ones
@@ -212,6 +215,13 @@ stdout/stderr and the exit status.
 | `timeout_ms` | integer | no       | Max run time in ms (default **120000**) |
 | `background` | boolean | no       | Start as a background job (also `run_in_background`) |
 | `sandbox`    | boolean | no       | Only with the [sandbox](sandbox.md) on: `false` runs this command on the host instead, which needs approval |
+| `tail`       | integer | no       | Show only the last N lines of the output |
+| `head`       | integer | no       | Show only the first N lines |
+| `grep`       | string  | no       | Show only the lines matching this regex (Rust `regex` syntax) |
+| `context`    | integer | no       | With `grep`: this many lines before and after each match |
+| `invert`     | boolean | no       | With `grep`: the lines that do not match |
+
+The last five are the [output filter](#part-of-the-output-without-a-pipe).
 
 The child is polled every 20ms and killed if it exceeds the timeout (output
 then reads `[command timed out after Nms and was killed]`). Output over
@@ -261,22 +271,87 @@ result whose failure looks like the sandbox's doing says so, and the model
 can ask for the host with `"sandbox": false`. Background jobs always run on
 the host.
 
+### Part of the output, without a pipe
+
+Agents end commands in `| tail -n 20` or `| grep error` by habit, to keep a
+result short. The pipe costs more than it saves:
+
+- the exit status reported is the filter's — `make | tail` "succeeds"
+  whatever `make` did;
+- what the filter dropped is gone, so a failure whose message was above the
+  last twenty lines reads as a short, clean log, and seeing more means
+  running the command again;
+- the command no longer writes to what it was started on, which buffers its
+  output and hides a prompt.
+
+So the filter is a parameter. `tail`, `head` and `grep` (with `context` and
+`invert`) shape **what the model is shown** and nothing else: the command
+runs as written, unpiped, its own exit status is reported, and all of its
+output is saved under `.atelier/tool-output/`
+([as long output is](#long-output-goes-to-a-file)).
+
+```
+[exit status: exit status: 0]
+[filtered: 20 of 3,402 lines shown (last 20) — full output: .atelier/tool-output/ab12cd.txt (to see another part without rerunning: bash_output with id "out-ab12cd" and tail/head/grep, or read with offset/limit)]
+…
+```
+
+- `grep` is applied first, then `head` and `tail` to what matched (both
+  together: the first N and the last M). `context` adds the lines around
+  what is left. A gap between two shown stretches is a `--` line.
+- **Looking again costs nothing.** The result names a handle, `out-ab12cd`:
+  [`bash_output`](#bash_output) with that `id` and another filter returns
+  another part of the same output, and `read` with `offset`/`limit` on the
+  file returns a range of lines. Neither runs the command again. The handle
+  is there whenever something was left out — by a filter, or because the
+  output was over the budget; a result that shows everything has nothing
+  more to hand out, and saves no file. Kept output lasts as long as its
+  file: the 50 most recent, 20 MiB.
+- **A filter never hides a failure.** The status line always comes first.
+  When the command failed — a status other than zero, a signal, the timeout
+  — and the filter left out any of the last 20 lines of its output, they
+  are appended, unfiltered, under a line saying so: that is where the error
+  usually is. A pattern that matches nothing says `no line of the 3,402
+  lines of output matches "…"` rather than returning an empty result that
+  reads as "no errors".
+- A filter that leaves nothing out (`tail: 50` on ten lines) changes
+  nothing: the result is the plain one.
+
+A command that still ends in a pipe into a plain `tail`, `head` or `grep`
+**runs as written** — it is not refused, and not rewritten: taking the pipe
+off changes the command's exit status and which of stdout and stderr is
+filtered, and the model may be relying on either. Its result ends with a
+note saying what the pipe cost (that the status is the filter's, unless the
+line sets `pipefail`) and which parameter to pass next time (`"tail": 20`).
+Pipes that transform — `| sort | uniq -c`, `| wc -l`, `| jq`, `grep -c` — are
+the command's business and get no note; nor does anything the permission
+rules' [shell parsing](permissions.md) cannot follow.
+
 ## `bash_output`
 
 Read a background job's output since the last call, and its status — or
-wait on it.
+wait on it. Or look again at the kept output of a command that has ended.
 
 | Param     | Type    | Required | Meaning |
 |-----------|---------|----------|---------|
-| `id`      | string  | no       | The job (`job-N`). Omitted: with `wait_ms`/`until`, the latest job; otherwise list all jobs |
+| `id`      | string  | no       | The job (`job-N`), or a kept output (`out-ab12cd`, or its file's path). Omitted: with `wait_ms`/`until`, the latest job; otherwise list all jobs |
 | `wait_ms` | integer | no       | Block up to this long (max 600000) until the job exits… |
 | `until`   | string  | no       | …or its new output matches this regex |
+| `tail`, `head`, `grep`, `context`, `invert` | | no | The [output filter](#part-of-the-output-without-a-pipe), as for `bash` |
 
 Returns `[job-N: running|exit status: … after Ns]` then the new output (its
 start and its end if over 20,000 bytes, [the rest in a
-file](#long-output-goes-to-a-file)). This is how to wait for a server to print
+file](#long-output-goes-to-a-file)), or what the filter selects of it — with
+the same guarantees as for `bash`: a job that failed shows its last lines
+whatever the filter, and what is not shown is kept under a handle. This is
+how to wait for a server to print
 "listening", or to block on a build when there is nothing else to do. Just
 learning that a job has ended needs no call: [it says so](#bash).
+
+With the `id` of a kept output it returns `[out-ab12cd: kept output, N
+lines]` and that output — filtered, if a filter is given; its start and its
+end otherwise. An id whose file has been rotated out is an error that says
+to run the command again.
 
 ## `bash_kill`
 
