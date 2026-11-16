@@ -53,6 +53,9 @@ use super::frame::{self, Decoder};
 /// `$/progress`.
 const SETTLE: Duration = Duration::from_millis(300);
 
+/// The most of a server's error message that is passed on.
+const MAX_ERROR_CHARS: usize = 200;
+
 /// Why a request got no usable answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failure {
@@ -259,6 +262,11 @@ impl Client {
             }
             None => {
                 docs.insert(path.to_path_buf(), Sent { version: 1, hash });
+                // A file the server had not seen may be a project it had
+                // not loaded (tsserver has none until a file is opened,
+                // clangd indexes none): readiness is to be settled anew,
+                // from here.
+                self.shared.state().last_activity = Some(Instant::now());
                 self.notify(
                     "textDocument/didOpen",
                     json!({
@@ -390,11 +398,7 @@ fn receive(message: &Value, writer: &Writer, shared: &Shared) {
             return;
         };
         let outcome = match message.get("error") {
-            Some(error) => Err(error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_string()),
+            Some(error) => Err(error_text(error)),
             None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
         };
         let _ = waiting.send(outcome);
@@ -422,6 +426,26 @@ fn receive(message: &Value, writer: &Writer, shared: &Shared) {
     };
     let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
     let _ = frame::write(writer.as_mut(), &reply);
+}
+
+/// What a server's error says, in a line: servers put a stack trace in the
+/// message (typescript-language-server passes on tsserver's, twenty lines
+/// of it), and the message ends up in a note the model reads.
+fn error_text(error: &Value) -> String {
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    // The trace is the indented lines (`    at …`); what is before it may
+    // be several short ones.
+    let said = message
+        .lines()
+        .map(str::trim_end)
+        .take_while(|line| !line.starts_with([' ', '\t']))
+        .filter(|line| !line.is_empty());
+    let text = said.collect::<Vec<_>>().join(" ");
+    match text.char_indices().nth(MAX_ERROR_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None if text.is_empty() => "unknown error".to_string(),
+        None => text,
+    }
 }
 
 /// A notification: only those that say whether the server is busy matter.
@@ -562,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn a_server_error_is_passed_on_without_its_stack_trace() {
+        // What typescript-language-server 6.1 answers `workspace/symbol`
+        // with before any file is open.
+        let trace = "<syntax> TypeScript Server Error (5.9.3)\nNo Project.\nError: No Project.\n    \
+                     at Object.ThrowNoProject (/n/typescript/lib/typescript.js:186170:11)\n    \
+                     at IpcIOSession.getProjects (/n/typescript/lib/typescript.js:195722:23)";
+        let long = "x".repeat(MAX_ERROR_CHARS * 2);
+        let server = FakeServer::new(move |method, _| match method {
+            "initialize" => Act::Reply(Value::Null),
+            "trace" => Act::Error(trace.to_string()),
+            "long" => Act::Error(long.clone()),
+            _ => Act::Error(String::new()),
+        });
+        let client = start(&server);
+        let failed = |method: &str| match client.request(method, Value::Null, soon()) {
+            Err(Failure::Server(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            failed("trace"),
+            "<syntax> TypeScript Server Error (5.9.3) No Project. Error: No Project."
+        );
+        assert_eq!(failed("long"), format!("{}…", "x".repeat(MAX_ERROR_CHARS)));
+        assert_eq!(failed("empty"), "unknown error");
+    }
+
+    #[test]
     fn requests_from_the_server_are_answered() {
         let server = FakeServer::new(|_, _| Act::Reply(Value::Null));
         let _client = start(&server);
@@ -634,6 +685,30 @@ mod tests {
         assert!(!client.wait_ready(Instant::now() + SETTLE * 2));
         server.tell("experimental/serverStatus", json!({ "quiescent": true }));
         assert!(client.wait_ready(soon()));
+    }
+
+    /// typescript-language-server 6.1 says it is loading the project a
+    /// moment *after* the first file is opened; asked in that moment, it
+    /// answered `references` with those of the one file.
+    #[test]
+    fn a_newly_opened_file_is_given_the_settling_time_again() {
+        let server = FakeServer::new(|_, _| Act::Reply(Value::Null));
+        let client = start(&server);
+        assert!(client.wait_ready(soon()));
+        thread::sleep(SETTLE);
+        client
+            .sync(Path::new("/p/a.ts"), "typescript", "let a")
+            .unwrap();
+        let opened = Instant::now();
+        assert!(client.wait_ready(soon()));
+        assert!(opened.elapsed() >= SETTLE - Duration::from_millis(20));
+        // Not for a file the server already has, changed or not.
+        client
+            .sync(Path::new("/p/a.ts"), "typescript", "let b")
+            .unwrap();
+        let changed = Instant::now();
+        assert!(client.wait_ready(soon()));
+        assert!(changed.elapsed() < SETTLE / 2);
     }
 
     #[test]
