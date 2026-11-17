@@ -1021,6 +1021,9 @@ pub struct Session {
     learned: limit::Learned,
     /// Whether the parallel "subconscious" reviewer runs.
     review_enabled: bool,
+    /// Whether a complex `bash` command gets a model's summary at its
+    /// approval prompt (see [`crate::preflight`]).
+    preflight_enabled: bool,
     /// Pending background reviews; drained (non-blocking) between steps.
     reviews: Vec<std::sync::mpsc::Receiver<String>>,
     /// When signed in with ChatGPT, requests go through the Responses backend.
@@ -1112,6 +1115,10 @@ impl Session {
             Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
             Err(_) => settings.review.enabled,
         };
+        let preflight_enabled = match std::env::var("ATELIER_PREFLIGHT") {
+            Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
+            Err(_) => settings.review.preflight,
+        };
         let hooks = Hooks::load(
             &root,
             &settings.hooks,
@@ -1152,6 +1159,7 @@ impl Session {
             context_limit,
             learned: limit::Learned::default(),
             review_enabled,
+            preflight_enabled,
             reviews: Vec::new(),
             chatgpt: None,
             history: Vec::new(),
@@ -1355,6 +1363,9 @@ impl Session {
     pub fn review_enabled(&self) -> bool {
         self.review_enabled
     }
+    pub fn preflight_enabled(&self) -> bool {
+        self.preflight_enabled
+    }
     #[allow(dead_code)] // used by the /config screen
     pub fn set_auto_approve(&mut self, on: bool) {
         // Auto-approve is the `yolo` mode; switching it off leaves any other
@@ -1374,6 +1385,10 @@ impl Session {
     pub fn set_review_enabled(&mut self, on: bool) {
         self.review_enabled = on;
         self.settings.review.enabled = on;
+    }
+    pub fn set_preflight_enabled(&mut self, on: bool) {
+        self.preflight_enabled = on;
+        self.settings.review.preflight = on;
     }
     /// Set the default model (updates the live model and the persisted default).
     #[allow(dead_code)] // used by the /config screen
@@ -2450,6 +2465,7 @@ impl Session {
                     chatgpt: &mut self.chatgpt,
                     history: &self.history,
                     claude_prompt: &self.claude_prompt,
+                    preflight: self.preflight_enabled,
                 }),
             },
         )
@@ -3262,6 +3278,7 @@ fn config_summary(session: &Session) -> Vec<String> {
         format!("  mode:           {}", session.mode()),
         format!("  context limit:  {}", session.context_limit()),
         format!("  review mode:    {}", session.review_enabled()),
+        format!("  pre-flight:     {}", session.preflight_enabled()),
     ];
     if !s.mcp.is_empty() || !s.mcp_http.is_empty() {
         out.push(format!(

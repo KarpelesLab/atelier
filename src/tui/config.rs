@@ -7,8 +7,10 @@
 //! editable list of settings, and returns when the user saves & exits (Esc /
 //! `q`) or cancels. Read live values from the `Session` accessors
 //! (`config().model`, `auto_approve()`, `context_limit()`, `review_enabled()`,
+//! `preflight_enabled()`,
 //! `settings()`), and apply edits with the setters
-//! (`set_default_model`/`set_auto_approve`/`set_context_limit`/`set_review_enabled`),
+//! (`set_default_model`/`set_auto_approve`/`set_context_limit`/`set_review_enabled`/
+//! `set_preflight_enabled`),
 //! then `session.save_settings()`. Restore the main screen on every exit path.
 //! Do not edit files outside `src/tui/`.
 
@@ -27,15 +29,17 @@ enum Row {
     AutoApprove,
     ContextLimit,
     ReviewMode,
+    Preflight,
 }
 
 impl Row {
     /// Rows in display order.
-    const ALL: [Row; 4] = [
+    const ALL: [Row; 5] = [
         Row::Model,
         Row::AutoApprove,
         Row::ContextLimit,
         Row::ReviewMode,
+        Row::Preflight,
     ];
 
     /// The setting the row edits, in the table the protocol's
@@ -46,6 +50,7 @@ impl Row {
             Row::AutoApprove => "defaults.approve",
             Row::ContextLimit => "defaults.context_limit",
             Row::ReviewMode => "review.enabled",
+            Row::Preflight => "review.preflight",
         };
         settings_api::find(key).expect("every row is a setting of the table")
     }
@@ -67,6 +72,7 @@ struct State {
     auto_approve: bool,
     context_limit: u32,
     review: bool,
+    preflight: bool,
     /// Currently highlighted row.
     selected: usize,
     /// When editing a value row, the in-progress text buffer.
@@ -80,6 +86,7 @@ impl State {
             auto_approve: session.auto_approve(),
             context_limit: session.context_limit(),
             review: session.review_enabled(),
+            preflight: session.preflight_enabled(),
             selected: 0,
             editing: None,
         }
@@ -92,6 +99,7 @@ impl State {
             Row::AutoApprove => bool_text(self.auto_approve).to_string(),
             Row::ContextLimit => self.context_limit.to_string(),
             Row::ReviewMode => bool_text(self.review).to_string(),
+            Row::Preflight => bool_text(self.preflight).to_string(),
         }
     }
 
@@ -100,6 +108,7 @@ impl State {
         match row {
             Row::AutoApprove => self.auto_approve = !self.auto_approve,
             Row::ReviewMode => self.review = !self.review,
+            Row::Preflight => self.preflight = !self.preflight,
             _ => {}
         }
     }
@@ -272,6 +281,7 @@ fn apply(session: &mut Session, state: &State) {
         session.set_context_limit(state.context_limit);
     }
     session.set_review_enabled(state.review);
+    session.set_preflight_enabled(state.preflight);
 }
 
 /// The screen title.
@@ -445,6 +455,7 @@ mod tests {
     fn row_kinds() {
         assert!(Row::AutoApprove.is_bool());
         assert!(Row::ReviewMode.is_bool());
+        assert!(Row::Preflight.is_bool());
         assert!(!Row::Model.is_bool());
         assert!(!Row::ContextLimit.is_bool());
     }

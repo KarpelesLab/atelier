@@ -1176,26 +1176,41 @@ pub(crate) fn approve_with(
     // The approval reviewer answers in the user's place: always where there
     // is nobody to ask, and ahead of the prompt when it is set to. What it
     // leaves open goes on to the prompt.
-    let mut reviewer = policy.reviewer().zip(host);
-    let ahead = ui.unattended() || policy.reviewer().is_some_and(|r| r.always());
-    let review = |(setup, host): (&reviewer::Setup, &mut reviewer::Host), ui: &mut dyn Ui| {
+    let mut host = host;
+    let unattended = ui.unattended();
+    let ahead = unattended || policy.reviewer().is_some_and(|r| r.always());
+    let review = |setup: &reviewer::Setup, host: &mut reviewer::Host, ui: &mut dyn Ui| {
         let mut show = |shown: Shown| match shown {
             Shown::Verdict(record) => ui.approval_reviewed(record),
             Shown::Notice(text) => ui.info(text),
         };
         reviewed(setup, host, &req, &verdict, root, mode, &mut show)
     };
-    if let Some(decided) = reviewer.take_if(|_| ahead).and_then(|r| review(r, ui)) {
+    // The reviewer sees a call once: ahead of the prompt, or after it.
+    let mut unreviewed = policy.reviewer();
+    if ahead
+        && let (Some(setup), Some(host)) = (unreviewed.take(), host.as_deref_mut())
+        && let Some(decided) = review(setup, host, ui)
+    {
         return decided;
+    }
+    // Somebody is about to be asked: a complex command first gets a model's
+    // summary, where that is on — advisory, and silent when it fails.
+    if !unattended
+        && let Some(host) = host.as_deref_mut()
+        && let Some(line) = crate::preflight::summarize(req.tool, req.arguments, root, host)
+    {
+        ui.info(&line);
     }
     match ui.ask_approval(req.tool, req.arguments) {
         Approval::Once => Ok(()),
         // Nobody's no — the client that was asked did not answer: the
         // reviewer, if it has not seen the call yet, decides after all.
-        Approval::Deny => reviewer
-            .take_if(|_| ui.unattended())
-            .and_then(|r| review(r, ui))
-            .unwrap_or_else(|| Err(DENIED.to_string())),
+        Approval::Deny => match (unreviewed, host) {
+            (Some(setup), Some(host)) if ui.unattended() => review(setup, host, ui),
+            _ => None,
+        }
+        .unwrap_or_else(|| Err(DENIED.to_string())),
         Approval::Always => {
             remember(policy, settings, root, trust, &verdict, req.tool, &args, ui);
             Ok(())
@@ -2396,6 +2411,7 @@ mod tests {
                     let mut host = reviewer::Host {
                         call: &mut |_| judge.answer(),
                         context: &reviewer::Context::default,
+                        preflight: false,
                     };
                     let host = Some(&mut host);
                     approve_with(&policy, settings, dir, mode, req, trust, host, ui)
@@ -2628,6 +2644,88 @@ mod tests {
                 .contains("permission rule")
         );
         assert_eq!(ui.asked, 0);
+    }
+
+    /// With the pre-flight on, a complex command's prompt gets the model's
+    /// summary after the rule-based signals; a simple one, a failed
+    /// request, or nobody at the prompt gets none — and the prompt comes
+    /// either way.
+    #[test]
+    fn a_complex_command_is_summarized_before_its_prompt() {
+        let gate = Gate::new("preflight", Permissions::default());
+        let policy = policy(&[], &[], &[]);
+        let run = |command: &str, reply: Result<&str, reviewer::Failure>, ui: &mut Scripted| {
+            let arguments = json!({ "command": command }).to_string();
+            let req = Request {
+                tool: "bash",
+                arguments: &arguments,
+                needs_approval: true,
+                hook_allowed: false,
+                hooks: None,
+                mutates: true,
+            };
+            let mut asked = 0;
+            let mut call = |_: &reviewer::Query| {
+                asked += 1;
+                reply.clone().map(|text| reviewer::Reply {
+                    text: text.to_string(),
+                    model: "test/summarizer".to_string(),
+                })
+            };
+            let mut host = reviewer::Host {
+                call: &mut call,
+                context: &reviewer::Context::default,
+                preflight: true,
+            };
+            let mut settings = gate.settings.clone();
+            let (dir, trust) = (&gate.dir, &gate.trust);
+            let result = approve_with(
+                &policy,
+                &mut settings,
+                dir,
+                Mode::AutoEdit,
+                req,
+                trust,
+                Some(&mut host),
+                ui,
+            );
+            (result, asked)
+        };
+        let script = "for f in /tmp/x/*; do sudo rm -rf \"$f\"; done";
+
+        let mut ui = Scripted::new(|| Approval::Once);
+        let (result, asked) = run(script, Ok("Deletes everything in /tmp/x as root."), &mut ui);
+        assert!(result.is_ok());
+        assert_eq!((asked, ui.asked), (1, 1));
+        let summary = ui.infos.last().unwrap();
+        assert!(
+            summary.contains("advisory: Deletes everything"),
+            "{summary}"
+        );
+        // The rule-based signals are still there, ahead of it.
+        assert!(ui.infos[0].starts_with("⚠"), "{:?}", ui.infos);
+
+        let mut ui = Scripted::new(|| Approval::Once);
+        let (_, asked) = run("cargo test", Ok("Runs the tests."), &mut ui);
+        assert_eq!((asked, ui.asked), (0, 1));
+        assert!(ui.infos.is_empty(), "{:?}", ui.infos);
+
+        let mut ui = Scripted::new(|| Approval::Once);
+        let failed = Err(reviewer::Failure::Failed("timed out".into()));
+        let (result, asked) = run(script, failed, &mut ui);
+        assert!(result.is_ok());
+        assert_eq!((asked, ui.asked), (1, 1));
+        assert!(
+            ui.infos.iter().all(|i| i.starts_with("⚠")),
+            "{:?}",
+            ui.infos
+        );
+
+        let mut ui = Scripted::new(|| Approval::Deny);
+        ui.absent = true;
+        let (result, asked) = run(script, Ok("Deletes."), &mut ui);
+        assert_eq!(result.unwrap_err(), DENIED);
+        assert_eq!(asked, 0);
     }
 
     #[test]
@@ -3519,6 +3617,7 @@ mod tests {
                     let mut host = reviewer::Host {
                         call: &mut |_| judge.answer(),
                         context: &reviewer::Context::default,
+                        preflight: false,
                     };
                     let host = Some(&mut host);
                     approve_unattended(&policy, root, Mode::AutoEdit, &req, NOBODY, host, &mut show)

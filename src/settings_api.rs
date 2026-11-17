@@ -209,7 +209,7 @@ const WAKE: &[&str] = &["never", "questions", "always"];
 const SEARCH: &[&str] = &["searxng", "brave", "tavily", "duckduckgo"];
 
 /// Every setting `settings/get` reports, in the order of
-/// `docs/configuration.md`. The four with a `screen` are the `/config`
+/// `docs/configuration.md`. The five with a `screen` are the `/config`
 /// screen's rows, in the screen's order.
 pub const SPECS: &[Spec] = &[
     spec(
@@ -245,6 +245,14 @@ pub const SPECS: &[Spec] = &[
     .env("ATELIER_REVIEW")
     .default(Builtin::Bool(false))
     .screen("review mode", &[Scope::Project]),
+    spec(
+        "review.preflight",
+        Kind::Bool,
+        "Whether a complex `bash` command gets the model's plain-language summary at its approval prompt",
+    )
+    .env("ATELIER_PREFLIGHT")
+    .default(Builtin::Bool(false))
+    .screen("pre-flight", &[Scope::Project]),
     spec(
         "defaults.mode",
         Kind::Choice(MODES),
@@ -664,7 +672,9 @@ fn env_value(name: &str, raw: &str) -> Option<Value> {
     };
     match name {
         "ATELIER_APPROVE" => Some(json!(matches!(raw, "all" | "yes" | "1"))),
-        "ATELIER_REVIEW" => Some(json!(matches!(raw, "on" | "yes" | "1" | "true"))),
+        "ATELIER_REVIEW" | "ATELIER_PREFLIGHT" => {
+            Some(json!(matches!(raw, "on" | "yes" | "1" | "true")))
+        }
         "ATELIER_PARALLEL_TOOLS" => Some(json!(!matches!(raw, "0" | "off" | "no" | "false"))),
         "ATELIER_SANDBOX" => truthy.map(Value::Bool),
         "ATELIER_CONTEXT_LIMIT" => raw.parse::<u32>().ok().filter(|&n| n > 0).map(Value::from),
@@ -791,6 +801,7 @@ impl<'a> View<'a> {
             "defaults.approve" => Some(Value::Bool(session.mode() == Mode::Yolo)),
             "defaults.context_limit" => Some(Value::from(session.context_limit())),
             "review.enabled" => Some(Value::Bool(session.review_enabled())),
+            "review.preflight" => Some(Value::Bool(session.preflight_enabled())),
             _ => None,
         }
     }
@@ -1082,6 +1093,7 @@ fn apply(session: &mut Session, spec: &Spec, value: &Value) {
             session.set_context_limit(n.unwrap_or(1));
         }
         "review.enabled" => session.set_review_enabled(value.as_bool().unwrap_or(false)),
+        "review.preflight" => session.set_preflight_enabled(value.as_bool().unwrap_or(false)),
         _ => {}
     }
     *session.settings_mut() = project;
@@ -1133,7 +1145,13 @@ mod tests {
         let labels: Vec<_> = screen().filter_map(|s| s.label).collect();
         assert_eq!(
             labels,
-            ["model", "auto-approve", "context limit", "review mode"]
+            [
+                "model",
+                "auto-approve",
+                "context limit",
+                "review mode",
+                "pre-flight"
+            ]
         );
         for spec in SPECS {
             if spec.label.is_none() {

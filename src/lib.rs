@@ -42,6 +42,7 @@ pub mod memory;
 pub mod oauth;
 pub mod own;
 pub mod permissions;
+pub mod preflight;
 pub mod provider;
 pub mod review;
 pub mod risk;

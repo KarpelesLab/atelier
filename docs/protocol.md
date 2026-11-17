@@ -480,7 +480,8 @@ Where the sources are approximate:
   which take effect at the next start.
 - `session` says the running session differs from its configuration, not
   which command did it; it is worked out for the model, the mode,
-  auto-approve, the context limit and review mode. `flag` is `--mode` only.
+  auto-approve, the context limit, review mode and the pre-flight summary.
+  `flag` is `--mode` only.
   With the [Claude backend](claude.md), claude picks its own model: the
   model settings are reported as configured.
 - In an untrusted project, the allow rules saved with "always" during the
@@ -529,9 +530,10 @@ written the way it writes:
 | `defaults.model` | `user`, `project` | The main model. Written to the project's file it is in effect at once, as on the screen. Written to the user's, at once when that value is the one that counts: `ATELIER_MODEL`, `[models] main` and the project's `[defaults] model` win over it (`overridden`) |
 | `defaults.context_limit` | `project` | In effect at once |
 | `review.enabled` | `project` | In effect at once |
+| `review.preflight` | `project` | In effect at once |
 
 - The user-global file is the default, and the place for the user's own
-  choices; but `context_limit` and `review.enabled` are read from the
+  choices; but `context_limit`, `review.enabled` and `review.preflight` are read from the
   project's file only, so that is the one scope they take. A scope the
   setting is not read from is refused rather than written to no effect.
 - `defaults.approve` (the screen's auto-approve) cannot be set: in a

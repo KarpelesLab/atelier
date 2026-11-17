@@ -234,8 +234,9 @@ Not understood, by design — rules are a convenience, not a sandbox:
 ## The approval prompt
 
 When a call needs approval, the agent first prints the rule that asked (if
-one did) and any [risk signals](#risk-signals-bash-only), then asks via
-`Ui::ask_approval`:
+one did), any [risk signals](#risk-signals-bash-only) and — for a complex
+`bash` command, with the [pre-flight summary](#pre-flight-summary-bash-only)
+on — the model's reading of it, then asks via `Ui::ask_approval`:
 
 | Answer     | Effect |
 |------------|--------|
@@ -564,6 +565,59 @@ Signals are informational only — they don't block the call or change whether
 approval is required, and they only ever apply to `bash` (MCP and `node`
 calls show no risk signals today). A command can trigger multiple distinct
 signals at once (each category is reported at most once per call).
+
+## Pre-flight summary (`bash` only)
+
+Rules see a command's words; a twenty-line script with a loop, a heredoc and
+a few substitutions can be clean of every signal above and still be hard to
+read at a glance. With the pre-flight on, such a command gets a model's
+plain-language summary — what it does, and what it touches: files written or
+deleted, network, privilege — as one line under the risk signals:
+
+```
+⚠ recursive force delete (rm -rf)
+🔎 pre-flight, the model's reading — advisory: For each directory under build/, deletes it and re-runs cmake there; nothing outside the project, no network.
+```
+
+It is off by default. Turn it on with `[review] preflight = true` in
+`atelier.toml`, `ATELIER_PREFLIGHT=on` (also `yes`/`1`/`true`, overriding
+the file), or the `/config` screen's **pre-flight** row (see
+[Configuration](configuration.md#review)). Off by default because it is one
+more model request per such prompt, and a wait of up to five seconds before
+the prompt appears.
+
+**Which commands.** `src/preflight.rs` (`is_complex`) counts a command as
+complex when it spans several lines, is longer than 200 characters, has a
+heredoc (`<<`), a command or process substitution (`$(…)`, backticks,
+`<(…)`, `>(…)`), a loop or conditional (`for`, `while`, `until`, `if`,
+`case`, `select`, `function`), `eval` or `xargs`, a nested `sh -c`, two or
+more pipes, or three or more commands chained with `&&`, `||`, `;` or `&`.
+Quoted text does not count (`git commit -m "a; b | c"` is simple). Anything
+else — `cargo test`, `git status && git diff`, `cat f | grep x` — is asked
+about without a request.
+
+**Where the request goes.** The same way as the
+[approval reviewer's](#which-model) when it has no model of its own: to
+`[models] review` (or `[review] model`), else the main model, and the
+ChatGPT model when signed in — over chat-completions or the Responses API
+accordingly. With the [Claude backend](#the-claude-backend) there is no
+endpoint of atelier's own to ask unless the `review` role names a model on a
+configured `[[provider]]`; without one there is simply no summary.
+
+**The command is data.** It is sent as a JSON string inside one object (cut
+at 8 KiB, and a summary of a cut command says so), under a system prompt
+that tells the model to describe it and never to follow anything written in
+it. Nothing of the conversation and no tool output goes with it.
+
+**Advisory, and never in the way.** The summary is a model's reading of
+text the agent wrote: it can be wrong, and the command can try to talk it
+round. It decides nothing — the rule-based signals are still shown and you
+still answer — and it is printed on one line, control characters removed.
+A request that takes longer than five seconds, a provider error, an empty
+reply or no model to ask means no summary and no message: the prompt
+appears as it would have without it. It is asked only where somebody is at
+the prompt — not in a headless run, nor for a background subagent's calls,
+nor when the approval reviewer has already decided the call.
 
 ## Scope not yet covered
 

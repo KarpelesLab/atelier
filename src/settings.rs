@@ -458,6 +458,12 @@ pub struct ReviewSettings {
     /// Model for the reviewer (defaults to the main model when unset).
     #[serde(default)]
     pub model: Option<String>,
+    /// Whether a `bash` command complex enough to be hard to read at a
+    /// glance gets a model's plain-language summary at its approval prompt
+    /// (see [`crate::preflight`]). Off by default: it is one more request,
+    /// and a wait of up to a few seconds before such a prompt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preflight: bool,
 }
 
 /// Per-project defaults from `[defaults]`. Each is overridden by its env var

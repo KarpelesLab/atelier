@@ -43,6 +43,7 @@ other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
 | `ATELIER_CONTEXT_LIMIT`   | *(unset)*                        | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. A positive integer; anything else is ignored. Unset, the threshold follows the model's context window — 80% of it where atelier knows it, else 24,000 — see [Sessions](sessions.md#compaction) |
 | `ATELIER_PARALLEL_TOOLS`  | *(unset)*                        | `agent::batch` | `0`, `off`, `no` or `false` runs the read-only tool calls of one model step one after the other instead of [at the same time](tools.md#read-only-calls-run-in-parallel); any other value turns that on. Overrides `[defaults] parallel_tools` |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
+| `ATELIER_PREFLIGHT`       | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the model's [pre-flight summary](permissions.md#pre-flight-summary-bash-only) of complex `bash` commands at their approval prompt; any other value turns it off. Overrides `[review].preflight` |
 | `ATELIER_TRUST_PROJECT`   | *(unset)*                        | `trust::Store::from_env` | `1` accepts the [gated settings](trust.md) of the project's `atelier.toml` (MCP servers, checkers, providers, allow rules, a `yolo` default, hooks) for this run without recording anything — for headless runs (`--print`), which never ask and otherwise skip them. Only for checkouts you control |
 | `ATELIER_TRUST_HOOKS`     | *(unset)*                        | `trust::Store::from_env` | `1` does the same for the project's [hooks](hooks.md) alone |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | `provider::stream_chat`, `provider::list_models` | Overrides the HTTP connect timeout in milliseconds for both the chat-completion stream (default 60000) and `GET /models` (default 15000), and any provider's `timeout_secs`. Non-numeric or `<= 0` values are ignored |
@@ -466,12 +467,14 @@ it does and how its notes appear.
 [review]
 enabled = false              # overridden by ATELIER_REVIEW
 model = "qwen3-coder:30b"    # optional; [models] review wins; defaults to the main model
+preflight = false            # overridden by ATELIER_PREFLIGHT
 ```
 
-| Field     | Type   | Meaning |
-|-----------|--------|---------|
-| `enabled` | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
-| `model`   | string | Model for the reviewer (a [model address](#addressing-a-model)). `[models] review` is the newer spelling and wins; with neither, the reviewer uses the main model |
+| Field       | Type   | Meaning |
+|-------------|--------|---------|
+| `enabled`   | bool   | Whether the reviewer runs (default `false`); also toggled with `/review [on\|off]`, which persists it here |
+| `model`     | string | Model for the reviewer (a [model address](#addressing-a-model)). `[models] review` is the newer spelling and wins; with neither, the reviewer uses the main model |
+| `preflight` | bool   | Whether a complex `bash` command (several lines, loops, heredocs, substitutions, long pipelines…) gets the review model's plain-language summary of what it does and touches, shown above its approval prompt (default `false`). Advisory only, bounded to five seconds, silent on failure — see [the pre-flight summary](permissions.md#pre-flight-summary-bash-only). Also on the `/config` screen |
 
 ## `[goals]`
 
@@ -770,7 +773,7 @@ network = ["crates.io", "*.crates.io"]
 ## `/config`
 
 `/config` opens a settings view covering the model, auto-approve, the context
-limit, and review mode. In the inline TUI it's a full-screen editor
+limit, review mode, and the [pre-flight summary](permissions.md#pre-flight-summary-bash-only). In the inline TUI it's a full-screen editor
 (alternate screen) — edit the values and save & exit to write them back to
 `atelier.toml`; in the plain REPL, which has no alternate screen, it instead
 prints a read-only text summary of the same settings. Either way it shows

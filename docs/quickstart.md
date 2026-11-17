@@ -82,7 +82,7 @@ dialog after tool calls. With no argument it reports the current state.
 ## Settings screen: `/config`
 
 `/config` opens a settings view for the model, auto-approve, the context
-limit, and review mode. In the inline TUI it's a full-screen editor; in the
+limit, review mode, and the pre-flight summary of complex commands. In the inline TUI it's a full-screen editor; in the
 plain REPL it prints a read-only text summary of the same settings instead.
 Either way it shows the active backend — the configured endpoint, or
 `chatgpt:<model>` once you've signed in with ChatGPT. See

@@ -1,6 +1,7 @@
 //! The session's side of the approval reviewer (see
 //! [`crate::permissions::reviewer`]): how its one request reaches a model,
-//! and which two pieces of the conversation go with it.
+//! and which two pieces of the conversation go with it. The pre-flight
+//! summary of a complex command ([`crate::preflight`]) travels the same way.
 //!
 //! `permissions` decides *whether* a call is reviewed and what to make of
 //! the verdict; it does not know what a session is. What it needs from one
@@ -47,6 +48,9 @@ pub(super) struct Reach<'a> {
     /// Claude backend: the prompt of the turn in progress (the
     /// conversation itself is claude's).
     pub(super) claude_prompt: &'a str,
+    /// Whether a complex command gets a pre-flight summary at its prompt
+    /// (see [`crate::preflight`]), sent the way a review is.
+    pub(super) preflight: bool,
 }
 
 impl Reach<'_> {
@@ -57,6 +61,7 @@ impl Reach<'_> {
         with(&mut reviewer::Host {
             call: &mut |query| call(cfg, chatgpt, query),
             context: &|| context(history, claude_prompt),
+            preflight: self.preflight,
         })
     }
 }
@@ -78,6 +83,8 @@ impl Detached {
         with(&mut reviewer::Host {
             call: &mut |query| call(cfg, chatgpt, query),
             context: &|| held.clone(),
+            // A background agent's calls are decided without a prompt.
+            preflight: false,
         })
     }
 }
