@@ -59,6 +59,7 @@ other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
 | `ATELIER_SANDBOX`         | *(unset)*                        | `sandbox::state` | `1`/`true`/`on` runs `bash` commands in the [sandbox](sandbox.md), `0`/`false`/`off` does not, whatever `[sandbox] enabled` says. Needs a build with the `sandbox` feature |
 | `ATELIER_SANDBOX_ROOT`    | `$XDG_DATA_HOME/atelier/sandbox/rootfs` | `sandbox::state` | The sandbox guest's root filesystem (a directory holding a Linux userland). Overrides the user-global `[sandbox] root` |
 | `ATELIER_SANDBOX_INTERP`  | *(unset)*                        | `sandbox::state` | `1` runs the guest on nixvm's software CPU even where hardware virtualization is available |
+| `ATELIER_TEXT_TOOL_CALLS` | *(unset)*                        | `provider::dialect` | `0`, `off`, `no` or `false` stops atelier from recovering [tool calls a model writes as text](#tool-calls-written-as-text); the answer is then left as the model sent it |
 | `ATELIER_TRACE`           | *(unset)*                        | `provider` | File path to append a JSONL trace to, one line per model request (messages, tool calls, usage), for debugging |
 | `ATELIER_DEBUG`           | *(unset)*                        | `provider::stream_chat` | If set to any value, the outgoing chat-completion request body is printed to stderr before sending (the body only — never headers, so never a key) |
 
@@ -306,6 +307,31 @@ model name is on — in place of `env`.
 and the model serving each role. `/models` lists what each provider's
 `GET /models` reports, written `provider/model` when more than one provider
 is configured.
+
+### Tool calls written as text
+
+A server that doesn't parse a model's tool calls — llama.cpp without
+`--jinja`, vLLM without `--enable-auto-tool-choice`, an Ollama template that
+misses — hands them back inside the answer, in the model's own markup.
+When a response to a chat-completions provider has no structured tool calls,
+atelier looks in its text for these and runs them as if they had come
+structured:
+
+| Dialect | Looks like |
+|---|---|
+| Hermes / Qwen | `<tool_call>{"name": "read", "arguments": {"path": "a.rs"}}</tool_call>` |
+| Qwen3-Coder | `<function=read><parameter=path>a.rs</parameter></function>`, bare or inside `<tool_call>` |
+| Mistral | `[TOOL_CALLS][{"name": "read", "arguments": {…}}]`, or `[TOOL_CALLS]read[ARGS]{…}` |
+| Llama 3.x | `{"name": "read", "parameters": {…}}` — only when that is the whole answer |
+
+Only tools the request offered are taken; a block that names another, or
+doesn't parse, stays in the answer as written, and so does anything inside a
+`<think>` block. The markup of a call that is taken is never shown: text
+streams as usual, and only from what may be the start of a call is it held
+back until atelier knows. A Qwen3-Coder value is read as JSON unless the
+tool's schema says that parameter is a string. When a response does carry
+structured calls, those are the ones run. `ATELIER_TEXT_TOOL_CALLS=off`
+turns this off.
 
 ### Addressing a model
 

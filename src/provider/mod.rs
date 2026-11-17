@@ -6,7 +6,9 @@
 //! - the model's reasoning ("thinking") separated from the final answer,
 //! - **tool advertisement** ([`ToolSpec`]) in the request, and
 //! - **streamed tool-call assembly** — `tool_calls` arrive fragmented across
-//!   SSE chunks (id/name once, arguments in pieces) and are reassembled here.
+//!   SSE chunks (id/name once, arguments in pieces) and are reassembled here;
+//!   a model that writes its calls into the answer instead, in its own
+//!   markup, has them recovered (see [`dialect`]).
 //!
 //! Transport is [`rsurl`]: `Request::send_reader()` returns a blocking
 //! `Read` + `.status()`, which we drive line-by-line as an SSE stream.
@@ -18,6 +20,7 @@
 //!
 //! Not yet: a non-streaming fallback.
 
+mod dialect;
 pub mod endpoint;
 pub mod responses;
 
@@ -521,7 +524,7 @@ fn chat_stream(
     target: &Target,
     messages: &[Message],
     tools: &[ToolSpec],
-    mut on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
+    on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
 ) -> Result<Completion> {
     let body = chat_body(target, messages, tools);
     let body_bytes = serde_json::to_vec(&body)?;
@@ -538,11 +541,35 @@ fn chat_stream(
             .into());
     }
 
+    let text_calls = !tools.is_empty() && dialect::enabled();
+    let out = read_stream(reader, tools, text_calls, on_event)?;
+
+    if let Ok(path) = std::env::var(TRACE_ENV_VAR) {
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let entry = build_trace_entry(&target.model, &body, &tool_names, &out);
+        trace(&path, &entry);
+    }
+
+    Ok(out)
+}
+
+/// The SSE stream of a chat completion, read into a [`Completion`] (see
+/// [`stream_chat`]). With `text_calls`, tool calls the model wrote into its
+/// answer are recovered when it sent no structured ones (see [`dialect`]).
+fn read_stream(
+    reader: impl Read,
+    tools: &[ToolSpec],
+    text_calls: bool,
+    mut on_event: impl FnMut(StreamEvent) -> ControlFlow<()>,
+) -> Result<Completion> {
     let mut out = Completion::default();
     // Tool-call fragments, keyed by their streamed `index`.
     let mut calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
     // The last non-null `finish_reason` seen across chunks.
     let mut finish_reason: Option<String> = None;
+
+    // What the answer holds besides text, when calls written as text count.
+    let mut filter = text_calls.then(|| dialect::TextCalls::new(tools));
 
     let mut lines = BufReader::new(reader);
     let mut line = String::new();
@@ -593,10 +620,20 @@ fn chat_stream(
             && !c.is_empty()
             && flow.is_continue()
         {
-            out.content.push_str(c);
-            flow = on_event(StreamEvent::Content(c));
+            if let Some(filter) = &mut filter {
+                let shown = filter.push(c);
+                if !shown.is_empty() {
+                    flow = on_event(StreamEvent::Content(&shown));
+                }
+            } else {
+                out.content.push_str(c);
+                flow = on_event(StreamEvent::Content(c));
+            }
         }
         if flow.is_break() {
+            if let Some(filter) = &filter {
+                out.content = filter.interrupted();
+            }
             out.interrupted = true;
             return Ok(out);
         }
@@ -624,15 +661,22 @@ fn chat_stream(
             arguments: a.arguments,
         })
         .collect();
+    if let Some(filter) = &mut filter {
+        // The stream is over: a `Break` here has nothing left to stop.
+        let rest = filter.finish();
+        if !rest.is_empty() {
+            let _ = on_event(StreamEvent::Content(&rest));
+        }
+        out.content = filter.text().to_string();
+        // Structured calls win; the text ones are only for a model that
+        // sent none (and their markup is never part of the answer).
+        if out.tool_calls.is_empty() {
+            out.tool_calls = filter.take_calls();
+        }
+    }
     out.finish_reason = finish_reason;
     if should_append_truncation_note(&out.finish_reason, &out.tool_calls) {
         out.content.push_str(TRUNCATION_NOTE);
-    }
-
-    if let Ok(path) = std::env::var(TRACE_ENV_VAR) {
-        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        let entry = build_trace_entry(&target.model, &body, &tool_names, &out);
-        trace(&path, &entry);
     }
 
     Ok(out)
@@ -1588,6 +1632,151 @@ mod tests {
         assert_eq!(entry["request"]["messages"], Value::Null);
         assert_eq!(entry["response"]["usage"], Value::Null);
         assert_eq!(entry["response"]["tool_calls"], json!([]));
+    }
+
+    /// An Ollama-style SSE stream: one chunk per delta, a finish reason on
+    /// the last, then a usage chunk and `[DONE]`.
+    fn sse(deltas: &[Value], finish: &str) -> Vec<u8> {
+        let mut out = String::new();
+        for delta in deltas {
+            let chunk = json!({"id": "chatcmpl-1", "object": "chat.completion.chunk",
+                "model": "m", "choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
+            out.push_str(&format!("data: {chunk}\n\n"));
+        }
+        let last = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]});
+        out.push_str(&format!("data: {last}\n\n"));
+        let usage = json!({"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12}});
+        out.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+        out.into_bytes()
+    }
+
+    fn content(pieces: &[&str]) -> Vec<Value> {
+        pieces.iter().map(|c| json!({"content": c})).collect()
+    }
+
+    fn read_tool() -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }]
+    }
+
+    /// Reads `stream` as a completion with the `read` tool offered: the
+    /// completion, and the content and reasoning shown along the way.
+    fn read_with(stream: &[u8], text_calls: bool) -> (Completion, String, String) {
+        let (mut shown, mut reasoning) = (String::new(), String::new());
+        let completion = read_stream(stream, &read_tool(), text_calls, |ev| {
+            match ev {
+                StreamEvent::Content(c) => shown.push_str(c),
+                StreamEvent::Reasoning(r) => reasoning.push_str(r),
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        (completion, shown, reasoning)
+    }
+
+    #[test]
+    fn a_hermes_call_written_as_text_is_run_and_not_shown() {
+        let mut deltas = vec![json!({"reasoning": "The user wants a file."})];
+        deltas.extend(content(&[
+            "Reading it.\n\n<",
+            "tool_call>\n{\"name\": \"read\", ",
+            "\"arguments\": {\"path\": \"src/main.rs\"}}\n</tool",
+            "_call>",
+        ]));
+        let (c, shown, reasoning) = read_with(&sse(&deltas, "stop"), true);
+        assert_eq!(reasoning, "The user wants a file.");
+        assert_eq!(shown, "Reading it.\n\n");
+        assert_eq!(c.content, "Reading it.\n\n");
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "read");
+        assert_eq!(c.tool_calls[0].arguments, r#"{"path":"src/main.rs"}"#);
+        assert!(c.tool_calls[0].id.starts_with("call_"));
+        assert_eq!(c.usage.unwrap().total_tokens, 12);
+    }
+
+    #[test]
+    fn a_qwen3_coder_call_written_as_text_is_run() {
+        let deltas = content(&[
+            "<tool_call>\n<function=read>\n<para",
+            "meter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>",
+        ]);
+        let (c, shown, _) = read_with(&sse(&deltas, "stop"), true);
+        assert_eq!(shown, "");
+        assert_eq!(c.tool_calls[0].arguments, r#"{"path":"src/lib.rs"}"#);
+    }
+
+    #[test]
+    fn a_mistral_call_written_as_text_is_run() {
+        let deltas = content(&[
+            "[TOOL_CALLS]",
+            "[{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}]",
+        ]);
+        let (c, shown, _) = read_with(&sse(&deltas, "stop"), true);
+        assert_eq!(shown, "");
+        assert_eq!(c.content, "");
+        assert_eq!(c.tool_calls[0].arguments, r#"{"path":"a"}"#);
+    }
+
+    /// Structured calls win over text ones; without text calls turned on,
+    /// the answer is what the model sent, markup and all.
+    #[test]
+    fn structured_calls_win_and_text_calls_can_be_off() {
+        let block = "<tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"b\"}}</tool_call>";
+        let mut deltas = content(&[block]);
+        deltas.push(json!({"tool_calls": [{"index": 0, "id": "call_x",
+            "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}}]}));
+        let (c, _, _) = read_with(&sse(&deltas, "tool_calls"), true);
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].id, "call_x");
+        assert_eq!(c.content, "");
+
+        let (c, shown, _) = read_with(&sse(&content(&[block]), "stop"), false);
+        assert_eq!(shown, block);
+        assert_eq!(c.content, block);
+        assert!(c.tool_calls.is_empty());
+    }
+
+    /// Cut off inside a block: it is no call, so it is shown — and the
+    /// answer gets the truncation note as any cut-off answer does.
+    #[test]
+    fn a_block_cut_off_by_the_token_limit_stays_text() {
+        let deltas = content(&["Sure.", "<tool_call>{\"name\": \"read\", \"argu"]);
+        let (c, shown, _) = read_with(&sse(&deltas, "length"), true);
+        assert_eq!(shown, "Sure.<tool_call>{\"name\": \"read\", \"argu");
+        assert!(c.tool_calls.is_empty());
+        assert!(c.content.ends_with(TRUNCATION_NOTE));
+    }
+
+    /// Stopped while a block was held: the answer keeps it, nothing runs.
+    #[test]
+    fn a_stop_while_a_block_is_held_keeps_it_as_text() {
+        let deltas = content(&["Ok ", "<tool_call>{\"name\"", " more"]);
+        let mut seen = 0;
+        let c = read_stream(&sse(&deltas, "stop")[..], &read_tool(), true, |_| {
+            seen += 1;
+            ControlFlow::Break(())
+        })
+        .unwrap();
+        assert_eq!(seen, 1);
+        assert!(c.interrupted);
+        assert_eq!(c.content, "Ok ");
+        assert!(c.tool_calls.is_empty());
+
+        let mut first = true;
+        let c = read_stream(&sse(&deltas, "stop")[..], &read_tool(), true, |_| {
+            // Shown "Ok " goes on; the stop comes with the next piece shown.
+            if std::mem::take(&mut first) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        })
+        .unwrap();
+        assert!(!c.interrupted, "nothing more was shown before the end");
+        assert_eq!(c.content, "Ok <tool_call>{\"name\" more");
     }
 
     /// `trace` is best-effort: writing to an unwritable path (a directory
