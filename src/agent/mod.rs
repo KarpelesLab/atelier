@@ -3960,6 +3960,7 @@ mod tests {
         .unwrap();
         let ready = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
             rootfs: PathBuf::from("/nonexistent/rootfs"),
+            image: false,
             memory_mb: 64,
             interp: false,
             network: Vec::new(),

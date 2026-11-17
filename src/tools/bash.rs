@@ -2189,6 +2189,7 @@ mod tests {
     fn ready() -> sandbox::State {
         sandbox::State::Ready(sandbox::Setup {
             rootfs: PathBuf::from("/nonexistent/rootfs"),
+            image: false,
             memory_mb: 64,
             interp: false,
             network: Vec::new(),

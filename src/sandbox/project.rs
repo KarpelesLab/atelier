@@ -8,24 +8,18 @@
 //! edits the script in the guest, and atelier runs it outside. So those go
 //! through [`run`](super::run) too, the entry point `bash` uses, and this
 //! module holds what they need on top of it, which `bash` does not: an
-//! environment and a standard input (the guest is handed neither), a command
-//! given as words rather than as a shell line, and whether a program is in
-//! the image at all.
+//! environment and a standard input, a command given as words rather than
+//! as a shell line, and whether a program is in the image at all.
 //!
 //! What stays on the host, and why, is in `docs/sandbox.md` ("What runs
 //! where").
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::{Output, Setup};
-
-/// The longest command line that carries a command's input inside it. The
-/// kernel takes no argument longer than 128 KiB, and the line is one
-/// argument of the helper process; past this the input goes through a file.
-const MAX_INLINE: usize = 96 * 1024;
 
 /// Where the guest's shell looks for programs: the `PATH` the guest is
 /// given (a test asks a guest for it, so the two cannot drift apart).
@@ -53,29 +47,23 @@ pub fn unavailable(what: &str, why: &str) -> String {
 }
 
 /// Whether the image has a program called `program` where the guest's shell
-/// would find it. Looked up in the root filesystem from outside, without
-/// following links: in an image they point into the image (`/bin/busybox`),
-/// not into the host.
+/// would find it. Looked up in the root filesystem from outside
+/// ([`in_root`](super::in_root)), without following links: in an image they
+/// point into the image (`/bin/busybox`), not into the host.
 pub fn in_image(setup: &Setup, program: &str) -> bool {
     if program.contains('/') {
         return false;
     }
-    GUEST_PATH.split(':').any(|dir| {
-        let path = setup.rootfs.join(dir.trim_start_matches('/')).join(program);
-        std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir())
-    })
+    GUEST_PATH
+        .split(':')
+        .any(|dir| super::in_root(setup, &format!("{}/{program}", dir.trim_start_matches('/'))))
 }
 
 /// [`run`](super::run) for a command that reads its standard input and its
 /// environment: `sh -c command` in a fresh guest, in the project, with
-/// `env` exported and `input` on its stdin.
-///
-/// The guest has no stdin and no environment of the host's, so both travel
-/// in the command line: the variables as `export`s, the input as a
-/// here-document (which ends it with a newline if it had none). An input
-/// too large for that, or one that is not text, is put in a file at the top
-/// of the project — the one place both sides can see — for the length of
-/// the run.
+/// `env` in its environment and `input` on its stdin, byte for byte.
+/// Neither goes through the command line or a file: the helper process
+/// that runs the guest is handed both, and gives them to it.
 pub fn run_with_input(
     command: &str,
     env: &[(&str, String)],
@@ -84,77 +72,14 @@ pub fn run_with_input(
     setup: &Setup,
     timeout: Duration,
 ) -> Result<Output> {
-    let mut line = String::new();
-    for (name, value) in env {
-        line.push_str(&format!("export {name}={}; ", quote(value)));
-    }
-    line.push_str("sh -c ");
-    line.push_str(&quote(command));
-    if input.is_empty() {
-        line.push_str(" </dev/null");
-        return super::run(&line, project_root, setup, timeout);
-    }
-    if let Ok(text) = std::str::from_utf8(input)
-        && !text.contains('\0')
-        && line.len() + text.len() <= MAX_INLINE
-    {
-        let mark = delimiter(text);
-        let newline = if text.ends_with('\n') { "" } else { "\n" };
-        line.push_str(&format!(" <<'{mark}'\n{text}{newline}{mark}\n"));
-        return super::run(&line, project_root, setup, timeout);
-    }
-    let file = InputFile::create(project_root, input)?;
-    line.push_str(&format!(" <{}", quote(&file.0.display().to_string())));
-    super::run(&line, project_root, setup, timeout)
-}
-
-/// A here-document delimiter that is no line of `text`.
-fn delimiter(text: &str) -> String {
-    let mut n = 0;
-    loop {
-        let mark = format!("ATELIER_INPUT_{n}");
-        if !text.lines().any(|line| line == mark) {
-            return mark;
-        }
-        n += 1;
-    }
-}
-
-/// A command's input as a file in the project, removed when dropped.
-struct InputFile(PathBuf);
-
-impl InputFile {
-    fn create(project_root: &Path, input: &[u8]) -> Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = project_root.join(format!(
-            ".atelier-sandbox-input-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // `create_new`: never through a link the guest left at that name.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("writing {}", path.display()))?;
-        let file_guard = InputFile(path);
-        std::io::Write::write_all(&mut file, input)
-            .with_context(|| format!("writing {}", file_guard.0.display()))?;
-        Ok(file_guard)
-    }
-}
-
-impl Drop for InputFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+    super::run_with(command, env, Some(input), project_root, setup, timeout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{Outcome, testing};
     use super::*;
+    use std::path::PathBuf;
 
     fn project(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -173,15 +98,6 @@ mod tests {
     }
 
     #[test]
-    fn the_delimiter_is_no_line_of_the_input() {
-        assert_eq!(delimiter("{}"), "ATELIER_INPUT_0");
-        assert_eq!(
-            delimiter("a\nATELIER_INPUT_0\nATELIER_INPUT_1\n"),
-            "ATELIER_INPUT_2"
-        );
-    }
-
-    #[test]
     fn a_program_is_looked_for_in_the_image_not_on_the_host() {
         let root = project("image");
         std::fs::create_dir_all(root.join("usr/bin")).unwrap();
@@ -194,6 +110,7 @@ mod tests {
         std::fs::write(root.join("bin/npx"), b"").unwrap();
         let setup = Setup {
             rootfs: root.clone(),
+            image: false,
             memory_mb: 64,
             interp: false,
             network: Vec::new(),
@@ -210,7 +127,7 @@ mod tests {
     }
 
     /// Through a real guest (see `testing::live_setup`): the environment
-    /// and the input arrive, by the command line and by the file.
+    /// and the input arrive as they are, and nothing is left in the project.
     #[test]
     fn a_command_in_the_guest_gets_its_environment_and_its_input() {
         let Some(setup) = testing::live_setup() else {
@@ -235,16 +152,18 @@ mod tests {
                 "echo \"$ATELIER_EVENT\"\ncat; uname -n # the guest",
                 b"{\"a\":\"it's\\n\"}"
             ),
-            "it's $HOME\n{\"a\":\"it's\\n\"}\nnixvm\n"
+            "it's $HOME\n{\"a\":\"it's\\n\"}nixvm\n"
         );
         assert_eq!(run("wc -c", b""), "0\n");
         // One that does not read its input is not held up by it.
         assert_eq!(run("echo done", &[b'x'; 80_000]), "done\n");
-        assert_eq!(run("wc -c", &[b'x'; 80_000]), "80001\n");
-        // Too large for a command line, and then not text: through a file,
-        // byte for byte, which is gone afterwards.
+        assert_eq!(run("wc -c", &[b'x'; 80_000]), "80000\n");
+        // More than a command line or a pipe holds, and then not text:
+        // byte for byte.
         assert_eq!(run("wc -c", &vec![b'x'; 300_000]), "300000\n");
         assert_eq!(run("od -An -c", b"a\0b"), "   a  \\0   b\n");
+        // An environment variable is not a line of shell.
+        assert_eq!(run("env | grep -c '^ATELIER_'", b""), "1\n");
         let left: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().collect();
         assert!(left.is_empty(), "{left:?}");
         // What `in_image` assumes of the guest.
