@@ -81,12 +81,12 @@ use crate::tools::ask::{Answer, Question};
 use crate::tools::change::FileChange;
 use crate::tools::terminal::{self, CommandEvent, CommandInput};
 
-mod history;
+pub(crate) mod history;
 
-mod query;
+pub(crate) mod query;
 
 /// The protocol version this build speaks (`initialize` reports it).
-const PROTOCOL: u64 = 1;
+pub(crate) const PROTOCOL: u64 = 1;
 
 /// How often the idle session looks for output of its own (see `idle`).
 const IDLE_POLL: Duration = Duration::from_millis(200);
@@ -98,7 +98,7 @@ const GRACE: Duration = Duration::from_secs(5);
 /// This protocol's own JSON-RPC error codes, in the range the standard
 /// leaves to applications (the standard's are in [`rpc::code`]). They are
 /// part of the contract (`docs/protocol.md`): never renumber.
-mod code {
+pub(crate) mod code {
     /// A turn or a command is running, and this needs the session idle.
     pub const TURN_RUNNING: i64 = -32001;
     /// A request other than `initialize` came first.
@@ -113,6 +113,8 @@ mod code {
     pub const NO_COMMAND: i64 = -32006;
     /// Another atelier owns this directory's session (see [`super::in_use`]).
     pub const SESSION_IN_USE: i64 = -32010;
+    /// The session's owner takes no remote (see [`crate::own`]).
+    pub const NO_REMOTE: i64 = -32011;
 }
 
 /// `atelier serve`, as asked for on the command line (see `cli`).
@@ -632,9 +634,44 @@ impl Shared {
     }
 }
 
+/// What `session` is: where, which model through which backend, in which
+/// permission mode.
+pub(crate) fn describe(session: &Session, cwd: &Path) -> Value {
+    // The label names the model actually asked (`chatgpt:<model>` when
+    // signed in with ChatGPT), which the configured one may not be.
+    let model = session.backend_label();
+    let backend = if session.is_claude() {
+        "claude"
+    } else if model.starts_with("chatgpt:") {
+        "chatgpt"
+    } else {
+        "openai"
+    };
+    json!({
+        "cwd": cwd.display().to_string(),
+        "model": model,
+        "backend": backend,
+        "mode": session.mode().name(),
+    })
+}
+
+/// `session` as `session/status` reports it, less what is live (`busy`,
+/// `turn`, `queued`).
+pub(crate) fn status(session: &Session, cwd: &Path) -> Value {
+    let (context_tokens, output_tokens) = session.usage();
+    let mut status = describe(session, cwd);
+    status["usage"] = json!({
+        "context_tokens": context_tokens,
+        "output_tokens": output_tokens,
+    });
+    status["context_limit"] = Value::from(session.context_limit());
+    status["background"] = Value::from(session.background_tasks());
+    status
+}
+
 /// What a `command/input` asks for, in the order it is applied: the
 /// keyboard taken, the window's size, the keys, the keyboard given back.
-fn command_input(params: &Value) -> Result<Vec<CommandInput>, Failure> {
+pub(crate) fn command_input(params: &Value) -> Result<Vec<CommandInput>, Failure> {
     let mut input = Vec::new();
     let attached = match &params["attached"] {
         Value::Null => None,
@@ -676,7 +713,7 @@ fn command_input(params: &Value) -> Result<Vec<CommandInput>, Failure> {
 }
 
 /// A required, non-empty string parameter.
-fn string_param(params: &Value, name: &str) -> Result<String, Failure> {
+pub(crate) fn string_param(params: &Value, name: &str) -> Result<String, Failure> {
     match params[name].as_str() {
         Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
         _ => Err(Failure::params(format!(
@@ -742,36 +779,11 @@ impl Server {
     }
 
     fn status(&self) -> Value {
-        let (context_tokens, output_tokens) = self.session.usage();
-        let mut status = self.describe();
-        status["usage"] = json!({
-            "context_tokens": context_tokens,
-            "output_tokens": output_tokens,
-        });
-        status["context_limit"] = Value::from(self.session.context_limit());
-        status["background"] = Value::from(self.session.background_tasks());
-        status
+        status(&self.session, &self.shared.cwd)
     }
 
-    /// What the session is: where, which model through which backend, in
-    /// which permission mode.
     fn describe(&self) -> Value {
-        // The label names the model actually asked (`chatgpt:<model>` when
-        // signed in with ChatGPT), which the configured one may not be.
-        let model = self.session.backend_label();
-        let backend = if self.session.is_claude() {
-            "claude"
-        } else if model.starts_with("chatgpt:") {
-            "chatgpt"
-        } else {
-            "openai"
-        };
-        json!({
-            "cwd": self.shared.cwd.display().to_string(),
-            "model": model,
-            "backend": backend,
-            "mode": self.session.mode().name(),
-        })
+        describe(&self.session, &self.shared.cwd)
     }
 
     /// `initialize`: connect the configured MCP servers (so the tools the

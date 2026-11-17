@@ -172,7 +172,9 @@ the lock held it is a leftover, and with it the pid is checked against
 `started` before anything is done to it.
 
 `socket` is where the owner answers: what it is doing (for the question),
-and the request to yield. It is a Unix socket in the directory the
+the request to yield, and — when the owner is the terminal interface — the
+[session itself, shared](protocol.md#a-session-shared-with-its-terminal)
+with the front ends that attach to it. It is a Unix socket in the directory the
 coordinator's is in (`$XDG_RUNTIME_DIR/atelier`, else
 `~/.local/state/atelier`), protected as
 [`serve --listen`'s](protocol.md#who-may-connect): a directory only you can

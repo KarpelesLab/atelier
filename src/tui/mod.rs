@@ -95,6 +95,7 @@
 //! drains ([`Ui::command_input`]) and is kept nowhere.
 
 mod config;
+mod host;
 mod input;
 mod term;
 
@@ -111,6 +112,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::agent::{self, Session, Ui};
+use crate::events;
+use crate::own::remote;
 use crate::permissions::Mode;
 use crate::tools::ask::{Answer, Question};
 use crate::tools::terminal::{CommandEvent, CommandInput};
@@ -180,6 +183,10 @@ pub fn run(mut session: Session) -> Result<()> {
         r.push_line(line, true);
     }
     r.refresh()?;
+    // A session this process owns is shared with the remotes that attach
+    // to it (see `host`).
+    remote::serve();
+    host::publish(&session);
 
     // Who took the session over, when that is why the loop ended.
     let mut taken = None;
@@ -190,18 +197,24 @@ pub fn run(mut session: Session) -> Result<()> {
         }
         // Whatever was queued during the last turn is served first, in order,
         // exactly as if it had just been typed (echoed, then dispatched).
-        // `own`: a prompt the session starts by itself (see `agent::idle`),
-        // sent as it is rather than interpreted as a line the user typed.
-        let (input, own) = match r.pop_queued() {
+        // A prompt the session starts by itself (see `agent::idle`) is
+        // sent as it is rather than interpreted as a line the user typed;
+        // a line a remote sent is served as one typed here, and its
+        // request answered once it is known what it was.
+        let (input, from) = match r.pop_queued() {
             Some(line) => {
                 r.push_line(format!("{PROMPT}{line}"), false);
-                (line, false)
+                (line, From::Typed)
             }
             None => match read_line(&mut r, &mut session, turn)? {
-                Idle::Line(line) => (line, false),
-                Idle::Start(prompt) => (prompt, true),
+                Idle::Line(line) => (line, From::Typed),
+                Idle::Start(prompt) => (prompt, From::Session),
+                Idle::Remote(line, asked) => {
+                    host::echo(&mut r, &line, asked.remote);
+                    (line, From::Remote(asked))
+                }
                 // Seen at the top of the loop.
-                Idle::Yield => continue,
+                Idle::Yield | Idle::Queued => continue,
                 // Ctrl-D: exits, unless that would stop claude's background
                 // work and this is the first attempt.
                 Idle::Exit => {
@@ -220,26 +233,65 @@ pub fn run(mut session: Session) -> Result<()> {
             continue;
         }
 
+        // A remote's `turn/start` is a prompt whatever it looks like, and
+        // may come with images.
+        let mut as_is = matches!(from, From::Session);
+        if let From::Remote(asked) = &from
+            && let host::How::Prompt(images) = &asked.how
+        {
+            if let Err(e) = session.stage_images(images) {
+                host::refuse(asked, format!("{e:#}"));
+                r.push_line(format!("error: {e:#}"), false);
+                r.refresh()?;
+                continue;
+            }
+            as_is = trimmed.starts_with('/');
+        }
         // Commands and prompts share one dispatcher. Scope the TuiUi borrow so
         // `r` is free again in the match arms.
-        let outcome = if own {
+        let outcome = if as_is {
             agent::Dispatch::Expanded(trimmed.clone().into())
         } else {
             let mut ui = TuiUi { r: &mut r };
             agent::dispatch(&mut session, &trimmed, &mut ui)
         };
+        let asked = match from {
+            From::Remote(asked) => Some(asked),
+            From::Typed | From::Session => None,
+        };
+        // What a remote's line was, when it was not a turn: the session is
+        // free again, and then its answer — in that order, so that whoever
+        // reads the answer can ask for the next thing at once.
+        let answer = |asked: &host::FromRemote, handled: bool, kind: &str| {
+            remote::release();
+            asked.respond(serde_json::json!({ "handled": handled, "kind": kind }));
+        };
         match outcome {
-            agent::Dispatch::Quit => break,
+            // Leaving is a remote's own business; the session stays.
+            agent::Dispatch::Quit => match &asked {
+                Some(asked) => answer(asked, false, "quit"),
+                None => break,
+            },
             agent::Dispatch::Handled => {
-                // `/mode` and `/model` change what the strip shows.
+                // `/mode` and `/model` change what the strip shows, and
+                // what remotes are told the session is.
                 r.status = build_status(&session, turn);
+                host::publish(&session);
+                if let Some(asked) = &asked {
+                    answer(asked, true, "handled");
+                }
                 r.refresh()?;
             }
-            agent::Dispatch::Config => {
-                config::run(&mut session)?;
-                r.status = build_status(&session, turn);
-                r.refresh()?;
-            }
+            // The settings screen is this terminal's.
+            agent::Dispatch::Config => match &asked {
+                Some(asked) => answer(asked, false, "config"),
+                None => {
+                    config::run(&mut session)?;
+                    r.status = build_status(&session, turn);
+                    host::publish(&session);
+                    r.refresh()?;
+                }
+            },
             outcome @ (agent::Dispatch::Prompt | agent::Dispatch::Expanded(_)) => {
                 // A command that stands for a prompt sends what it expanded
                 // into — on its own model, if it names one, for this turn:
@@ -249,10 +301,34 @@ pub fn run(mut session: Session) -> Result<()> {
                     agent::Dispatch::Expanded(e) => (e.prompt.as_str(), e.model.as_deref()),
                     _ => (trimmed.as_str(), None),
                 };
+                let kind = match &outcome {
+                    agent::Dispatch::Expanded(_) => "expanded",
+                    _ => "prompt",
+                };
+                // A remote that asked what the line is, rather than for it
+                // to be sent, is handed it back, as `serve` hands it.
+                if let Some(asked) = &asked
+                    && matches!(asked.how, host::How::Line { start: false })
+                {
+                    remote::release();
+                    asked.respond(serde_json::json!({
+                        "handled": false, "kind": kind, "text": prompt, "model": model,
+                    }));
+                    continue;
+                }
                 let entered = session.enter_turn_model(model, &mut TuiUi { r: &mut r });
                 turn += 1;
                 r.status = build_status(&session, turn);
-                let result = run_turn(&mut session, &mut r, prompt);
+                let started = asked.map(|asked| {
+                    let answer = match asked.how {
+                        host::How::Prompt(_) => serde_json::json!({}),
+                        host::How::Line { .. } => {
+                            serde_json::json!({ "handled": true, "kind": kind })
+                        }
+                    };
+                    (asked.remote, asked.id, answer)
+                });
+                let result = run_turn(&mut session, &mut r, prompt, started);
                 session.leave_turn_model(entered);
                 result?;
                 // Usage counters moved; recompute the strip now that we can
@@ -320,6 +396,16 @@ pub fn choose(
     Ok(picked)
 }
 
+/// Where a line to serve comes from.
+enum From {
+    /// The keyboard (or the queue it filled during a turn).
+    Typed,
+    /// The session itself: a prompt it starts on its own.
+    Session,
+    /// A remote attached to the session (see [`host`]).
+    Remote(host::FromRemote),
+}
+
 /// How a wait at the idle prompt ended.
 enum Idle {
     /// The user submitted a line.
@@ -330,6 +416,10 @@ enum Idle {
     Start(String),
     /// Another atelier asked for the session (see [`crate::own`]).
     Yield,
+    /// A remote sent this line, to serve as one typed here.
+    Remote(String, host::FromRemote),
+    /// A remote's message is in the queue, for the main loop to serve.
+    Queued,
 }
 
 /// Block at the idle prompt until the user submits a line or asks to exit
@@ -342,7 +432,20 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Idle>
         if crate::own::yielding().is_some() {
             return Ok(Idle::Yield);
         }
-        let Some(event) = term::poll(IDLE_POLL)? else {
+        // What remotes asked for (see `host`); with one attached the
+        // keyboard is waited on for less, since this is also how long
+        // what it types waits.
+        if let Some((line, asked)) = host::at_idle(r, session, turn) {
+            return Ok(Idle::Remote(line, asked));
+        }
+        if r.queued_len() > 0 {
+            return Ok(Idle::Queued);
+        }
+        let wait = match remote::attached() {
+            0 => IDLE_POLL,
+            _ => KEY_POLL,
+        };
+        let Some(event) = term::poll(wait)? else {
             if session.poll_background(&mut TuiUi { r: &mut *r }) {
                 r.status = build_status(session, turn);
                 r.refresh()?;
@@ -445,6 +548,9 @@ enum UiEvent {
     AskUser(Question),
     /// News of the `bash` command the worker is running.
     Command(CommandNews),
+    /// What the worker was waiting to be told, a remote told it: the
+    /// prompt is down, and this line says who answered what.
+    Answered(String),
     /// The turn is over; `Err` carries the rendered error, if any. Always the
     /// last event a worker sends.
     Finished(Result<(), String>),
@@ -461,7 +567,25 @@ enum CommandNews {
 /// Run one model turn on a scoped worker thread while the main thread keeps
 /// the keyboard and the screen. Returns once the turn is over (or the worker
 /// vanished); the renderer is left idle.
-fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> {
+///
+/// `started`: the remote's request that asked for the turn, when one did —
+/// the remote, the request's id, and the answer to give it once the turn
+/// has an id.
+fn run_turn(
+    session: &mut Session,
+    r: &mut Renderer,
+    input: &str,
+    started: Option<(u64, crate::rpc::Id, serde_json::Value)>,
+) -> Result<()> {
+    // The turn as the remotes are told of it (see `host`).
+    let by = started.as_ref().map(|(remote, ..)| *remote);
+    let answer = started.as_ref().map(|(_, id, answer)| (id, answer.clone()));
+    let shared_turn = remote::begin_turn(input, by, answer);
+    let began = Instant::now();
+    let output_before = session.usage().1;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    r.turn_error = None;
+
     let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
     let (ans_tx, ans_rx) = mpsc::channel::<agent::Approval>();
     let (reply_tx, reply_rx) = mpsc::channel::<Answer>();
@@ -475,6 +599,8 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
     r.question = None;
     r.refresh()?;
 
+    // Lent to the worker for the length of the turn.
+    let lent = &mut *session;
     let result = std::thread::scope(|s| {
         s.spawn(move || {
             let mut ui = ChanUi {
@@ -484,8 +610,9 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
                 queue,
                 keys,
                 stop,
+                cwd,
             };
-            let outcome = session.send(input, &mut ui).map_err(|e| format!("{e:#}"));
+            let outcome = lent.send(input, &mut ui).map_err(|e| format!("{e:#}"));
             // The receiver only disappears if the pump failed; nothing to do.
             let _ = ev_tx.send(UiEvent::Finished(outcome));
         });
@@ -501,6 +628,29 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
     // A worker that died mid-command leaves the keyboard here.
     r.command_ended();
     r.commit_pending_if_any();
+    remote::end_turn(|| {
+        let error = r.turn_error.take();
+        let status = match &error {
+            Some(_) => "error",
+            None if r.stop.load(Ordering::Relaxed) => "interrupted",
+            None => "completed",
+        };
+        let (context_tokens, output_after) = session.usage();
+        let mut ended = serde_json::json!({
+            "turn": shared_turn,
+            "status": status,
+            "steps": session.steps(),
+            "duration_ms": u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "usage": {
+                "context_tokens": context_tokens,
+                "output_tokens": output_after.saturating_sub(output_before),
+            },
+        });
+        if let Some(error) = error {
+            ended["error"] = error.into();
+        }
+        (ended, host::snapshot(session))
+    });
     result
 }
 
@@ -568,13 +718,15 @@ fn pump(
             }
         }
 
-        // Then everything the worker produced meanwhile, painted once.
-        let mut dirty = false;
+        // What remotes asked of the turn (see `host`), then everything
+        // the worker produced meanwhile, painted once.
+        let mut dirty = host::in_turn(r, &answers, &replies);
         loop {
             match events.try_recv() {
                 Ok(UiEvent::Finished(outcome)) => {
                     if let Err(e) = outcome {
                         r.push_line(format!("error: {e}"), false);
+                        r.turn_error = Some(e);
                     }
                     return Ok(());
                 }
@@ -685,6 +837,11 @@ fn apply_event(r: &mut Renderer, ev: UiEvent) {
         }
         UiEvent::AskUser(question) => r.ask(question),
         UiEvent::Command(news) => r.command_news(news),
+        UiEvent::Answered(what) => {
+            r.approval_pending = false;
+            r.question = None;
+            r.push_line(format!("  ↳ {what}"), true);
+        }
         UiEvent::Finished(_) => {} // consumed by the pump
     }
 }
@@ -699,7 +856,13 @@ struct ChanUi {
     queue: Queue,
     keys: Keys,
     stop: Arc<AtomicBool>,
+    /// The project root, for the paths of the file changes remotes are
+    /// told of.
+    cwd: std::path::PathBuf,
 }
+
+/// How often a worker waiting on its user looks at what the remotes said.
+const ANSWER_POLL: Duration = Duration::from_millis(20);
 
 impl ChanUi {
     fn send(&self, ev: UiEvent) {
@@ -707,57 +870,128 @@ impl ChanUi {
     }
 }
 
+/// Each callback is drawn here (an event for the main thread) and reported
+/// to the remotes (`remote::event`, in `serve`'s vocabulary).
 impl Ui for ChanUi {
     fn reasoning(&mut self, text: &str) {
+        remote::event("reasoning", || events::text(text));
         self.send(UiEvent::Reasoning(text.to_string()));
     }
     fn content(&mut self, text: &str) {
+        remote::event("text", || events::text(text));
         self.send(UiEvent::Content(text.to_string()));
     }
     fn tool_start(&mut self, name: &str, arguments: &str) {
+        remote::event("tool_start", || events::tool_start(name, arguments));
         self.send(UiEvent::ToolStart {
             name: name.to_string(),
             arguments: arguments.to_string(),
         });
     }
-    fn tool_end(&mut self, _name: &str, result: &str, ok: bool) {
+    fn tool_end(&mut self, name: &str, result: &str, ok: bool) {
+        remote::event("tool_end", || events::tool_end(name, result, ok));
         self.send(UiEvent::ToolEnd {
             result: result.to_string(),
             ok,
+        });
+    }
+    /// Not drawn here (the call itself is): for the remotes, which may
+    /// show a diff.
+    fn file_change(&mut self, tool: &str, change: &crate::tools::change::FileChange) {
+        remote::event("file_change", || {
+            events::file_change(tool, change, &self.cwd)
         });
     }
     fn turn_end(&mut self) {
         self.send(UiEvent::TurnEnd);
     }
     fn info(&mut self, text: &str) {
+        remote::event("info", || events::text(text));
         self.send(UiEvent::Info(text.to_string()));
     }
     fn activity(&mut self, text: &str) {
+        remote::event("activity", || events::text(text));
         self.send(UiEvent::Activity(text.to_string()));
     }
+    /// Put to this terminal and to every remote; whoever answers first has
+    /// answered, and the others are told.
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> agent::Approval {
+        let asked = remote::request("approval/request", || {
+            host::approval_params(tool, arguments)
+        });
         self.send(UiEvent::AskApproval {
             tool: tool.to_string(),
             arguments: arguments.to_string(),
         });
-        // A vanished main thread means no one can approve: deny.
-        self.answers.recv().unwrap_or(agent::Approval::Deny)
+        let Some(asked) = asked else {
+            // A vanished main thread means no one can approve: deny.
+            return self.answers.recv().unwrap_or(agent::Approval::Deny);
+        };
+        let decided = |approval: &agent::Approval| serde_json::json!({ "decision": host::decision(approval) });
+        loop {
+            match self.answers.recv_timeout(ANSWER_POLL) {
+                Ok(approval) => {
+                    remote::settle(asked.id, None, decided(&approval));
+                    return approval;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    remote::settle(asked.id, None, decided(&agent::Approval::Deny));
+                    return agent::Approval::Deny;
+                }
+            }
+            if let Some((who, approval)) = host::approval_from(&asked) {
+                remote::settle(asked.id, Some(who), decided(&approval));
+                let what = format!("{} at remote {who}", host::verdict(&approval));
+                self.send(UiEvent::Answered(what));
+                return approval;
+            }
+        }
     }
     fn ask_user(&mut self, question: &Question) -> Option<Answer> {
+        let asked = remote::request("question/request", || events::question(question));
         self.send(UiEvent::AskUser(question.clone()));
-        // A vanished main thread means there is no one to ask.
-        self.replies.recv().ok()
+        let Some(asked) = asked else {
+            // A vanished main thread means there is no one to ask.
+            return self.replies.recv().ok();
+        };
+        let given = |answer: &Answer| serde_json::json!({ "answer": host::answer_given(answer).0 });
+        loop {
+            match self.replies.recv_timeout(ANSWER_POLL) {
+                Ok(answer) => {
+                    remote::settle(asked.id, None, given(&answer));
+                    return Some(answer);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    remote::settle(asked.id, None, given(&Answer::Declined));
+                    return None;
+                }
+            }
+            if let Some((who, answer)) = host::answer_from(&asked, question) {
+                remote::settle(asked.id, Some(who), given(&answer));
+                let what = format!(
+                    "answered at remote {who}: {}",
+                    host::answer_given(&answer).1
+                );
+                self.send(UiEvent::Answered(what));
+                return Some(answer);
+            }
+        }
     }
     fn notice(&mut self, text: &str) {
+        remote::event("notice", || events::text(text));
         self.send(UiEvent::Notice(text.to_string()));
     }
     fn subconscious(&mut self, text: &str) {
+        remote::event("review", || events::text(text));
         self.send(UiEvent::Subconscious(text.to_string()));
     }
     fn take_queued(&mut self) -> Vec<String> {
         take_leading_prompts(&mut lock(&self.queue))
     }
     fn queued_delivered(&mut self, text: &str) {
+        remote::event("delivered", || events::text(text));
         self.send(UiEvent::Delivered(text.to_string()));
     }
     fn interrupted(&mut self) -> bool {
@@ -768,6 +1002,8 @@ impl Ui for ChanUi {
         true
     }
     fn command_event(&mut self, event: CommandEvent) {
+        // The remotes that show a command's terminal are its screen too.
+        remote::command_event(&event);
         self.send(UiEvent::Command(match event {
             CommandEvent::Started { interactive, .. } => CommandNews::Started { interactive },
             CommandEvent::Output(bytes) => CommandNews::Output(bytes.to_vec()),
@@ -775,8 +1011,11 @@ impl Ui for ChanUi {
             CommandEvent::Ended => CommandNews::Ended,
         }));
     }
+    /// The keys typed here, and those typed at a remote: to the command,
+    /// and nowhere else.
     fn command_input(&mut self) -> Vec<CommandInput> {
-        std::mem::take(&mut *self.keys.lock().unwrap_or_else(|p| p.into_inner()))
+        let local = std::mem::take(&mut *self.keys.lock().unwrap_or_else(|p| p.into_inner()));
+        remote::command_input(local)
     }
 }
 
@@ -860,6 +1099,12 @@ struct Renderer {
     command: Option<Running>,
     /// What the user did to it, for the worker to pass on.
     keys: Keys,
+    /// What remotes asked for that has not been looked at yet (see
+    /// [`host`]).
+    inbox: VecDeque<remote::Inbound>,
+    /// How the turn that just ended failed, if it did: for what the
+    /// remotes are told of its end.
+    turn_error: Option<String>,
 }
 
 impl Renderer {
@@ -878,6 +1123,8 @@ impl Renderer {
             stop: Arc::new(AtomicBool::new(false)),
             command: None,
             keys: Arc::new(Mutex::new(Vec::new())),
+            inbox: VecDeque::new(),
+            turn_error: None,
         }
     }
 
@@ -1025,6 +1272,12 @@ impl Renderer {
     /// actually delivered.
     fn enqueue(&mut self, line: String) {
         self.push_line(format!("{PROMPT}{line}  (queued)"), true);
+        lock(&self.queue).push_back(line);
+    }
+
+    /// [`enqueue`](Self::enqueue), for a line a remote typed.
+    fn enqueue_from(&mut self, line: String, remote: u64) {
+        self.push_line(format!("{PROMPT}{line}  (queued · remote {remote})"), true);
         lock(&self.queue).push_back(line);
     }
 
@@ -1230,19 +1483,23 @@ struct TuiUi<'a> {
 
 impl Ui for TuiUi<'_> {
     fn reasoning(&mut self, text: &str) {
+        remote::event("reasoning", || events::text(text));
         self.r.emit(text, true);
         let _ = self.r.refresh();
     }
     fn content(&mut self, text: &str) {
+        remote::event("text", || events::text(text));
         self.r.emit(text, false);
         let _ = self.r.refresh();
     }
     fn tool_start(&mut self, name: &str, arguments: &str) {
+        remote::event("tool_start", || events::tool_start(name, arguments));
         let args = truncate_tail_head(arguments, 200);
         self.r.emit_block(&format!("⚙ {name} {args}"), true);
         let _ = self.r.refresh();
     }
-    fn tool_end(&mut self, _name: &str, result: &str, ok: bool) {
+    fn tool_end(&mut self, name: &str, result: &str, ok: bool) {
+        remote::event("tool_end", || events::tool_end(name, result, ok));
         let mark = if ok { "✓" } else { "✗" };
         let preview: String = result.chars().take(200).collect();
         self.r.emit_block(&format!("{mark} {preview}"), true);
@@ -1255,13 +1512,17 @@ impl Ui for TuiUi<'_> {
         let _ = self.r.refresh();
     }
     fn info(&mut self, text: &str) {
+        remote::event("info", || events::text(text));
         self.r.emit_block(text, false);
         let _ = self.r.refresh();
     }
     fn activity(&mut self, text: &str) {
+        remote::event("activity", || events::text(text));
         self.r.emit_block(text, true);
         let _ = self.r.refresh();
     }
+    /// Between turns there is no pump, so the keyboard is read here until
+    /// the answer is in — from it, or from a remote (see [`host`]).
     fn ask_approval(&mut self, tool: &str, arguments: &str) -> agent::Approval {
         let args = truncate_tail_head(arguments, 200);
         self.r
@@ -1269,44 +1530,19 @@ impl Ui for TuiUi<'_> {
         self.r
             .emit_block("   [y] once   [a] always   [n] deny", false);
         let _ = self.r.refresh();
-        loop {
-            match term::read() {
-                Ok(Event::Key(k)) => {
-                    if let Some(answer) = approval_key(k) {
-                        return answer;
-                    }
-                }
-                Ok(Event::Resize) => {}
-                Err(_) => return agent::Approval::Deny,
-            }
-        }
+        host::ask_approval(self, tool, arguments)
     }
-    /// Reached when claude's background work asks between turns: there is
-    /// no pump then, so the keyboard is read here until the answer is in.
+    /// Reached when claude's background work asks between turns.
     fn ask_user(&mut self, question: &Question) -> Option<Answer> {
-        self.r.ask(question.clone());
-        loop {
-            let _ = self.r.refresh();
-            match term::read() {
-                Ok(Event::Key(k)) => {
-                    if let Some(answer) = question_key(self.r, k) {
-                        let _ = self.r.refresh();
-                        return Some(answer);
-                    }
-                }
-                Ok(Event::Resize) => {}
-                Err(_) => {
-                    self.r.question = None;
-                    return Some(Answer::Declined);
-                }
-            }
-        }
+        host::ask_user(self, question)
     }
     fn notice(&mut self, text: &str) {
+        remote::event("notice", || events::text(text));
         self.r.emit_block(&format!("! {text}"), false);
         let _ = self.r.refresh();
     }
     fn subconscious(&mut self, text: &str) {
+        remote::event("review", || events::text(text));
         self.r.emit_block(&format!("💭 {text}"), true);
         let _ = self.r.refresh();
     }

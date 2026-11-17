@@ -48,6 +48,8 @@ mod proc;
 #[cfg(unixlike)]
 mod prompt;
 #[cfg(unixlike)]
+pub(crate) mod remote;
+#[cfg(unixlike)]
 mod takeover;
 
 use std::path::Path;

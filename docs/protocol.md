@@ -867,6 +867,7 @@ One per thing the session reports. Events of a turn carry its id as
 | `turn/ended` | see below | The turn is over |
 | `request/cancelled` | `id`, `reason` | A request atelier made no longer needs an answer |
 | `session/closed` | `reason`, `by` | The session is no longer this process's; see below |
+| `turn/started` | `turn`, `text`, `from` | [Shared sessions](#a-session-shared-with-its-terminal) only: a turn started, with this prompt, typed at the owner's terminal or sent by a remote |
 
 The payloads are those of the [`stream-json` events](headless.md#events-stream-json)
 of the same name (`text`, `tool_start`, `tool_end`, `file_change`, …): the
@@ -1010,6 +1011,9 @@ taken as a refusal. Take the prompt down; an answer sent anyway is ignored.
 
 ### `session/closed`
 
+Sent to the client of a `serve` whose session was taken, and to the remotes
+of a [shared session](#leaving-and-the-owner-leaving) when it ends for them.
+
 `{"reason": "taken_over", "by": "pid 4188 on /dev/pts/5"}`: another atelier
 [took the session over](sessions.md#one-session-one-owner). The running
 turn was interrupted (its `turn/ended` may or may not precede this, with
@@ -1035,6 +1039,7 @@ codes are stable:
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |
 | `-32005` | already initialized | A second `initialize` |
 | `-32006` | no command | [`command/input`](#commandinput) with no command running on a terminal |
+| `-32011` | no remote | [A shared session](#a-session-shared-with-its-terminal): `initialize` on the socket of an owner that takes no remote (anything but a terminal interface), or one that is being taken over |
 | `-32010` | session in use | Another atelier owns this directory's session: any method before a choice is made. `data: {"owner", "choices"}`; see [A session that is in use](#a-session-that-is-in-use) |
 | `-32020` | unauthorized | [`--listen`](#listening-on-a-socket) on TCP: the connection's first line was not the token. `"id": null`; the connection is closed |
 | `-32021` | too many sessions | [`--listen`](#listening-on-a-socket): `--max-sessions` connections are being served already. `"id": null`; the connection is closed |
@@ -1258,3 +1263,142 @@ WebSocket upgrade, or not version 13 — this port serves no pages), `400`.
   disconnect. It handles no signals, so the socket file and the token file
   stay behind; both are harmless — the token opens nothing any more — and
   the next listener on the same socket or port replaces them.
+
+## A session shared with its terminal
+
+The terminal interface does not keep its session to itself. While it runs,
+other front ends can attach to it and be **remotes** of the same live
+session: they are shown what happens in it, whoever caused it, and what
+they send is served as if it had been typed at the terminal that owns it.
+This is how a second `atelier` in the same directory becomes a remote
+control of the first (see [One session, one
+owner](sessions.md#one-session-one-owner)), and a program can do the same.
+
+It is this protocol, on a socket the owner listens on, with the session
+being somebody else's. What follows is where that differs from `serve`;
+everything not named here is as above.
+
+### Connecting
+
+The owner's record, `.atelier/session.lock` in the project, names its
+socket (`socket`; see [How it is recorded](sessions.md#how-it-is-recorded)).
+It is a Unix socket, mode `0600`, in a directory only its user can enter:
+**whoever can connect is the same user on the same machine, and that is the
+only gate** — no token, and no TCP. JSON-RPC lines, as on stdio.
+
+Two methods are answered on any owner's socket, without `initialize`:
+
+| Method | Result |
+|--------|--------|
+| `owner/status` | `{"pid", "kind", "since", "tty", "version", "busy", "jobs", "agents", "client", "remote", "remotes"}`: who the owner is and what it has going, as [`-32010`'s `owner`](#a-session-that-is-in-use) reports it; `remote` says whether it takes remotes, `remotes` how many are attached |
+| `session/yield` | Params `{"by": "who asks"}`. The owner stops, saves and exits within two seconds (`{"grace_ms": 2000}`): the first step of a [take-over](sessions.md#one-session-one-owner). The session is free when the lock on `.atelier/session.lock` is |
+
+`initialize` makes the connection a remote. Only a **terminal interface**
+takes remotes: an owner that is the line REPL, `serve`, `acp` or a `--print`
+run answers it with `-32011`.
+
+```json
+{"protocol":1,"atelier":{"version":"0.1.2"},
+ "session":{"cwd":"/home/me/project","model":"qwen3-coder","backend":"openai","mode":"auto-edit","tools":["…"]},
+ "capabilities":{"steer":true,"interrupt":true,"approvals":true,"questions":true,"images":true,
+                 "commands":true,"history":true,"file_changes":true,"command_input":true,
+                 "queries":["models/list","…"],"approval_timeout":null,"shared":true},
+ "shared":{"remote":2,"owner":{"pid":4021,"kind":"terminal","tty":"/dev/pts/3"},
+           "busy":true,"turn":7,"remotes":2}}
+```
+
+`capabilities.shared` says the session is shared; `shared.remote` is this
+remote's number, by which events name it (`remote-2`) and the owner's
+transcript shows it; `shared.busy` and `shared.turn` say whether a turn is
+running now. `session` is as of the last time the session was idle.
+
+### Catching up
+
+- **What was said before**: [`session/history`](#sessionhistory). On a
+  shared session it is answered at any time, also in the middle of a turn —
+  from the conversation as it stood when the session was last idle, which
+  is everything before the running turn.
+- **The turn in progress** is sent again from its start, right behind the
+  `initialize` result: its `turn/started`, then every event it produced so
+  far, in order. (The last 2 MiB of them; when more than that was dropped,
+  an `event/notice` behind `turn/started` says so.) Live events follow
+  without a gap or a repeat.
+- **What is waiting for an answer** — an `approval/request` or a
+  `question/request` nobody has answered yet — is sent to a remote that
+  attaches while it waits.
+
+### Turns
+
+| | On a shared session |
+|-|---------------------|
+| `turn/started` | A notification of its own, sent to every remote when a turn starts, whoever started it: `{"turn": 7, "text": "the prompt", "from": "terminal"}`. `from` is `terminal` (typed at the owner's terminal, or started by the session itself) or `remote-N` |
+| `turn/start` | The prompt is served at the owner's terminal as if typed there (and shown there as the remote's). `images` as usual; `max_turns` is not supported and is ignored. Turn ids are the session's: they count every turn since the owner started, not this remote's |
+| `turn/steer`, `turn/interrupt` | As usual, on the running turn whoever started it. A steering message the turn did not take is not returned in `turn/ended`: it becomes the next prompt, as a line still queued at the owner's terminal does |
+| `turn/ended` | Sent to every remote. No `undelivered` |
+| `command/run` | The command runs **in the owner's process**, which is where the session's settings live: `/model`, `/mode`, `/mcp add`, `/compact`, `/new` change the one session for everybody. With `"start": true`, a line that is a prompt (or a command that stands for one) is sent at once, on the model the command asks for, and the result is `{"handled": true, "kind": "prompt" \| "expanded", "turn": 7}`; without it the line is handed back, as usual. `/config` and `/quit` come back as `config` and `quit`: the settings screen is the owner terminal's, and leaving is `shutdown` |
+| `event/*` between turns | `event/idle`, which also carries the output of commands typed at the owner's terminal |
+| `session/status` | Also `remotes`: how many are attached |
+| `shutdown` | **Detaches** this remote (`{}`, then the connection is closed). `force` means nothing: the session is not a remote's to end, and neither it nor its turn, its jobs or its agents are touched — as when the connection just closes |
+
+A remote may start a turn while the owner's user is typing: the session
+serves lines in the order it gets them, and a prompt that arrives while a
+turn runs is refused with `-32001` like any other (steer instead).
+
+### Requests are put to everybody
+
+An `approval/request` or a `question/request` goes to **every remote, and
+to the owner's own terminal**. Whoever answers first has answered. The
+others are sent [`request/cancelled`](#requestcancelled) with reason
+`answered`, who it was, and what:
+
+```json
+{"jsonrpc":"2.0","method":"request/cancelled",
+ "params":{"id":3,"reason":"answered","by":"remote-2","decision":"once"}}
+{"jsonrpc":"2.0","method":"request/cancelled",
+ "params":{"id":4,"reason":"answered","by":"terminal","answer":{"labels":["SQLite"]}}}
+```
+
+- `decision` for an approval (`once`, `always`, `deny`); `answer` for a
+  question, in the form an answer is given (`labels`, `text` or
+  `declined`).
+- An answer that is not one — an error, a `decision` that is none of the
+  three, labels the question does not have — is ignored, and the request
+  stays up for everybody. (A client that is alone with its session has its
+  malformed answer taken as a refusal; here somebody else may still give a
+  good one.)
+- There is no `--approval-timeout`: a person is at the owner's terminal.
+- An interrupt answers it (`deny`, `declined`), which is reported the same
+  way, as answered at the terminal.
+- The [approval reviewer](permissions.md#the-approval-reviewer)'s verdicts
+  arrive as `event/info` lines, as the terminal shows them, rather than as
+  `event/approval`.
+
+### A command's terminal
+
+A remote that said `"terminal": true` is sent the
+[`event/command_*` and `event/input_wanted`](#typing-to-a-command) events
+of the command the owner runs, and its `command/input` reaches that
+command, exactly as for `serve`. Any number of front ends may type to it.
+
+- What is typed goes to the command and nowhere else. It is not shown at
+  the owner's terminal or sent to another remote; what they see is what the
+  command itself prints — its terminal's echo included, where it echoes.
+  The model, `session/history` and the saved session get the output
+  [without what was typed](#typing-to-a-command), as always.
+- `attached` counts per front end: the command's timeout stands still
+  while at least one of them holds the keyboard. A remote that disconnects
+  gives it back.
+- The terminal has one size, the last one anybody set.
+
+### Leaving, and the owner leaving
+
+A remote that disconnects — `shutdown`, a closed socket, a crash — changes
+nothing in the session. When the session ends for its remotes, they are
+told and the connection is closed:
+
+| [`session/closed`](#sessionclosed) | |
+|---|---|
+| `{"reason": "ended"}` | The owner quit |
+| `{"reason": "taken_over", "by": "pid 4188 on /dev/pts/5"}` | Another atelier took the session over; attach to that one, if it takes remotes |
+
+An owner that is killed says nothing: the connection just closes.

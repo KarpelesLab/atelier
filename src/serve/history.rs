@@ -28,14 +28,14 @@ const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 1000;
 
 /// Which page was asked for.
-pub(super) struct Page {
+pub(crate) struct Page {
     limit: usize,
     before: Option<usize>,
 }
 
 impl Page {
     /// Read `limit` and `before` out of the request's parameters.
-    pub(super) fn parse(params: &Value) -> Result<Page, Failure> {
+    pub(crate) fn parse(params: &Value) -> Result<Page, Failure> {
         let number = |name: &str| match &params[name] {
             Value::Null => Ok(None),
             v => v
@@ -67,7 +67,7 @@ impl Page {
     }
 
     /// The last `limit` of `items` before `before`, each with its index.
-    fn cut(&self, items: Vec<Value>) -> Value {
+    pub(crate) fn cut(&self, items: Vec<Value>) -> Value {
         let total = items.len();
         let end = self.before.map_or(total, |before| before.min(total));
         let first = end.saturating_sub(self.limit);

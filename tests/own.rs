@@ -188,6 +188,16 @@ fn has_tool_result(body: &str) -> bool {
         .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"))
 }
 
+/// Whether a request ends on a tool's result: the step after a call,
+/// rather than a prompt's first.
+fn after_tool(body: &str) -> bool {
+    let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let last = request["messages"]
+        .as_array()
+        .and_then(|m| m.last().cloned());
+    last.is_some_and(|m| m["role"] == "tool")
+}
+
 /// What the user said last in a request.
 fn last_user(body: &str) -> String {
     let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -587,6 +597,19 @@ impl Term {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for {needle:?} on the terminal:\n{}",
+                self.text()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait until `needle` has been shown `times` times.
+    fn wait_times(&self, needle: &str, times: usize) {
+        let deadline = Instant::now() + PATIENCE;
+        while self.text().matches(needle).count() < times {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {needle:?} ({times} times) on the terminal:\n{}",
                 self.text()
             );
             thread::sleep(Duration::from_millis(20));
@@ -1511,4 +1534,682 @@ fn a_terminal_owner_stuck_in_a_turn_still_gives_its_terminal_back() {
     release.store(true, Ordering::SeqCst);
     assert_eq!(next.finish(), 0);
     assert!(ateliers_in(&dir).is_empty());
+}
+
+// ============================================================ remotes
+
+/// A front end attached to an owner's socket: the embedding protocol,
+/// spoken by hand.
+struct Remote {
+    stream: std::os::unix::net::UnixStream,
+    /// Every message received so far, in order.
+    log: Arc<Mutex<Vec<Value>>>,
+    /// Set once the owner closed the connection.
+    closed: Arc<AtomicBool>,
+    seen: usize,
+    next_id: u64,
+    /// Its number among the owner's remotes (`initialize`).
+    number: u64,
+}
+
+impl Remote {
+    /// Connect to the socket of the session's owner in `dir`.
+    fn connect(dir: &Path) -> Remote {
+        let socket = record(dir).expect("an owner")["socket"]
+            .as_str()
+            .expect("with a socket")
+            .to_string();
+        let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+        let (log, closed) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (sink, ended) = (Arc::clone(&log), Arc::clone(&closed));
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        thread::spawn(move || {
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let message: Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
+                sink.lock().unwrap().push(message);
+            }
+            ended.store(true, Ordering::SeqCst);
+        });
+        Remote {
+            stream,
+            log,
+            closed,
+            seen: 0,
+            next_id: 100,
+            number: 0,
+        }
+    }
+
+    /// Connect and attach, as a client that shows a command's terminal
+    /// (`terminal`) or one that does not.
+    fn attach(dir: &Path, terminal: bool) -> Remote {
+        let mut remote = Remote::connect(dir);
+        let hello = remote.result(
+            "initialize",
+            json!({"client": {"name": "test", "version": "1"}, "terminal": terminal}),
+        );
+        assert_eq!(hello["protocol"], 1, "{hello}");
+        assert_eq!(hello["capabilities"]["shared"], true, "{hello}");
+        remote.number = hello["shared"]["remote"].as_u64().expect("a number");
+        remote
+    }
+
+    fn send(&mut self, message: Value) {
+        writeln!(self.stream, "{message}").expect("write to the owner");
+    }
+
+    /// The next message, from where the last look stopped, for which
+    /// `want` holds; the others are skipped.
+    fn next(&mut self, what: &str, want: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            {
+                let log = self.log.lock().unwrap();
+                while self.seen < log.len() {
+                    let message = log[self.seen].clone();
+                    self.seen += 1;
+                    if want(&message) {
+                        return message;
+                    }
+                }
+            }
+            assert!(
+                !self.closed.load(Ordering::SeqCst) || self.seen < self.log.lock().unwrap().len(),
+                "the owner closed the connection before {what}; received:\n{:#?}",
+                self.log.lock().unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; received:\n{:#?}",
+                self.log.lock().unwrap()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        // Answers are looked for from the start: one may have been passed
+        // over while waiting for a notification.
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let log = self.log.lock().unwrap();
+            let answer = log
+                .iter()
+                .find(|m| m["id"] == id && m.get("method").is_none());
+            if let Some(answer) = answer {
+                return answer.clone();
+            }
+            assert!(Instant::now() < deadline, "no answer to {method}: {log:#?}");
+            drop(log);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn result(&mut self, method: &str, params: Value) -> Value {
+        let answer = self.call(method, params);
+        assert!(answer.get("error").is_none(), "{method} failed: {answer}");
+        answer["result"].clone()
+    }
+
+    /// The next notification `method`: its params.
+    fn notification(&mut self, method: &str) -> Value {
+        self.next(method, |m| m["method"] == method && m.get("id").is_none())["params"].clone()
+    }
+
+    /// The next request `method` the owner makes: the whole message.
+    fn request(&mut self, method: &str) -> Value {
+        self.next(method, |m| m["method"] == method && m.get("id").is_some())
+    }
+
+    /// Answer a request of the owner's.
+    fn answer(&mut self, request: &Value, result: Value) {
+        self.send(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}));
+    }
+
+    /// The text of the turn's answer: `event/text` up to `turn/ended`,
+    /// whose params are returned with it.
+    fn turn(&mut self) -> (String, Value) {
+        let mut text = String::new();
+        loop {
+            let message = self.next("the turn's end", |m| {
+                m["method"] == "event/text" || m["method"] == "turn/ended"
+            });
+            if message["method"] == "turn/ended" {
+                return (text, message["params"].clone());
+            }
+            text.push_str(message["params"]["text"].as_str().unwrap_or_default());
+        }
+    }
+
+    /// Wait for the owner to close the connection.
+    fn closed(&self) {
+        wait_until("the owner to close the connection", || {
+            self.closed.load(Ordering::SeqCst)
+        });
+    }
+
+    /// Whether a notification `method` was ever received.
+    fn ever(&self, method: &str) -> bool {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m["method"] == method)
+    }
+}
+
+impl Drop for Remote {
+    /// Hang up: the reader's copy of the socket would keep it open.
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// A `bash` call that says it started (`started`) and waits for the test
+/// to let it go (`go`).
+fn gated_bash(id: &str) -> Vec<u8> {
+    tool_calls(&[(
+        id,
+        "bash",
+        json!({"command": "echo > started; while [ ! -e go ]; do sleep 0.02; done; echo released"}),
+    )])
+}
+
+/// A remote is a second front end of the owner's session: it is shown the
+/// conversation so far, then what happens as it happens, whoever typed;
+/// what it sends is served as if typed at the owner's terminal, where it is
+/// marked as the remote's; and its leaving ends nothing.
+#[test]
+fn a_remote_sees_the_conversation_and_drives_the_session() {
+    let mock = echo();
+    let dir = project("remote");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    owner.line("say one");
+    owner.wait_for("re: one");
+    wait_until("the session to be saved", || {
+        dir.join(".atelier/session.json").exists()
+    });
+
+    let mut remote = Remote::connect(&dir);
+    // Before it has said who it is, it is nobody.
+    let early = remote.call("turn/start", json!({"text": "hi"}));
+    assert_eq!(early["error"]["code"], -32002, "{early}");
+    let hello = remote.result(
+        "initialize",
+        json!({"client": {"name": "test", "version": "1"}}),
+    );
+    assert_eq!(hello["session"]["model"], "mock");
+    assert_eq!(hello["session"]["cwd"], dir.display().to_string());
+    assert!(
+        hello["session"]["tools"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "{hello}"
+    );
+    assert_eq!(hello["shared"]["owner"]["pid"], owner.pid());
+    assert_eq!(hello["shared"]["owner"]["kind"], "terminal");
+    assert_eq!(hello["shared"]["busy"], false);
+    let number = hello["shared"]["remote"].as_u64().unwrap();
+    owner.wait_for(&format!("· remote {number} attached (test 1)"));
+    let twice = remote.call("initialize", json!({}));
+    assert_eq!(twice["error"]["code"], -32005, "{twice}");
+
+    // The conversation so far.
+    let history = remote.result("session/history", json!({}));
+    assert_eq!(history["total"], 2, "{history}");
+    assert_eq!(history["items"][0]["text"], "say one");
+    assert_eq!(history["items"][1]["text"], "re: one");
+
+    // A line of the remote's: a turn in the owner's session.
+    let ran = remote.result("command/run", json!({"line": "say two", "start": true}));
+    assert_eq!(ran["kind"], "prompt");
+    assert_eq!(ran["handled"], true);
+    assert_eq!(ran["turn"], 2, "the session's second turn: {ran}");
+    let started = remote.notification("turn/started");
+    assert_eq!(
+        started,
+        json!({"turn": 2, "text": "say two", "from": format!("remote-{number}")})
+    );
+    let (text, ended) = remote.turn();
+    assert_eq!(text, "re: two");
+    assert_eq!(ended["turn"], 2);
+    assert_eq!(ended["status"], "completed");
+    owner.wait_for(&format!("› say two  ← remote {number}"));
+    owner.wait_for("re: two");
+    assert!(mock.body(1).contains("re: one"), "one conversation");
+
+    // A line typed at the owner's terminal: the remote sees it too.
+    owner.line("say three");
+    let started = remote.notification("turn/started");
+    assert_eq!(
+        started,
+        json!({"turn": 3, "text": "say three", "from": "terminal"})
+    );
+    let (text, ended) = remote.turn();
+    assert_eq!(
+        (text.as_str(), &ended["status"]),
+        ("re: three", &json!("completed"))
+    );
+    let history = remote.result("session/history", json!({}));
+    assert_eq!(history["total"], 6, "{history}");
+
+    // `turn/start`, as `serve` has it; and what a line is, without sending it.
+    let started = remote.result("turn/start", json!({"text": "say four"}));
+    assert_eq!(started, json!({"turn": 4}));
+    assert_eq!(remote.turn().0, "re: four");
+    let asked = remote.result("command/run", json!({"line": "say five"}));
+    assert_eq!(
+        asked,
+        json!({"handled": false, "kind": "prompt", "text": "say five", "model": null})
+    );
+    assert_eq!(mock.requests(), 4);
+
+    // Settings live in the owner's process and are changed there.
+    let ran = remote.result("command/run", json!({"line": "/mode plan"}));
+    assert_eq!(ran, json!({"handled": true, "kind": "handled"}));
+    assert!(
+        remote.notification("event/info")["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: plan")
+    );
+    let status = remote.result("session/status", json!({}));
+    assert_eq!(status["mode"], "plan");
+    assert_eq!(
+        (&status["busy"], &status["remotes"]),
+        (&json!(false), &json!(1))
+    );
+    owner.wait_for("· plan");
+    // What belongs to the owner's terminal is said to.
+    assert_eq!(
+        remote.result("command/run", json!({"line": "/config"}))["kind"],
+        "config"
+    );
+    assert_eq!(
+        remote.result("command/run", json!({"line": "/quit"}))["kind"],
+        "quit"
+    );
+    // What needs the session is answered from it.
+    let usage = remote.result("usage/get", json!({}));
+    assert_eq!(usage["total"]["requests"], 4, "{usage}");
+    let settings = remote.result("settings/get", json!({}));
+    assert!(
+        settings["settings"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    let unknown = remote.call("no/such", json!({}));
+    assert_eq!(unknown["error"]["code"], -32601, "{unknown}");
+
+    // Leaving ends the connection and nothing else.
+    remote.result("shutdown", json!({}));
+    remote.closed();
+    owner.wait_for(&format!("· remote {number} detached"));
+    owner.line("/mode auto-edit");
+    owner.line("say six");
+    owner.wait_for("re: six");
+    assert_eq!(record(&dir).unwrap()["pid"], owner.pid());
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+/// An approval is put to the owner's terminal and to every remote, and
+/// whoever answers first has answered: the others see it answered, and by
+/// whom. A remote that attaches while one is waiting is asked too.
+#[test]
+fn an_approval_is_put_to_all_and_answered_by_the_first() {
+    let mock = Mock::scripted(|_, body| match after_tool(body) {
+        false => tool_calls(&[("call_1", "bash", json!({"command": "echo ran > ran.txt"}))]),
+        true => answer("done"),
+    });
+    let dir = project("approve");
+    let mut cmd = atelier(&mock.base_url(), &dir, &[]);
+    cmd.env_remove("ATELIER_APPROVE");
+    let mut owner = Term::spawn(cmd);
+    wait_owner(&dir, owner.pid());
+    owner.wait_for("/help for commands");
+    let mut a = Remote::attach(&dir, false);
+
+    // Answered at a remote.
+    owner.line("first");
+    owner.wait_for("allow tool 'bash'?");
+    let asked = a.request("approval/request");
+    assert_eq!(asked["params"]["tool"], "bash");
+    assert_eq!(
+        asked["params"]["arguments"]["command"],
+        "echo ran > ran.txt"
+    );
+    assert_eq!(asked["params"]["turn"], 1);
+    // One that comes while it waits is brought up to date, and asked.
+    let mut b = Remote::attach(&dir, false);
+    assert_eq!(b.notification("turn/started")["text"], "first");
+    let also = b.request("approval/request");
+    assert_eq!(also["id"], asked["id"]);
+    // An answer that is none leaves the question up.
+    a.answer(&asked, json!({"decision": "maybe"}));
+    a.answer(&asked, json!({"decision": "once"}));
+    let told = b.notification("request/cancelled");
+    assert_eq!(
+        told,
+        json!({"id": asked["id"], "reason": "answered", "by": format!("remote-{}", a.number),
+               "decision": "once"})
+    );
+    owner.wait_for(&format!("↳ allowed once at remote {}", a.number));
+    assert_eq!(a.turn().0, "done");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("ran.txt")).unwrap(),
+        "ran\n"
+    );
+    // The late one saw the rest of the turn as well.
+    assert_eq!(b.turn().1["status"], "completed");
+
+    // Answered at the owner's terminal: the remotes are told.
+    std::fs::remove_file(dir.join("ran.txt")).unwrap();
+    owner.line("second");
+    let asked = a.request("approval/request");
+    b.request("approval/request");
+    // (Typed once the prompt is up, as a person would.)
+    owner.wait_times("allow tool 'bash'?", 2);
+    owner.keys(b"n");
+    for remote in [&mut a, &mut b] {
+        let told = remote.notification("request/cancelled");
+        assert_eq!(
+            told,
+            json!({"id": asked["id"], "reason": "answered", "by": "terminal", "decision": "deny"})
+        );
+    }
+    a.turn();
+    assert!(!dir.join("ran.txt").exists(), "denied");
+    // An answer that comes after is nobody's.
+    b.answer(&asked, json!({"decision": "once"}));
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+    assert!(!dir.join("ran.txt").exists());
+}
+
+/// A question of the model's goes the same way.
+#[test]
+fn a_question_is_answered_at_a_remote_or_at_the_terminal() {
+    let mock = Mock::scripted(|_, body| match after_tool(body) {
+        false => tool_calls(&[(
+            "call_1",
+            "ask",
+            json!({"question": "Which database?", "options": ["SQLite", "Postgres"]}),
+        )]),
+        true => answer("noted"),
+    });
+    let dir = project("question");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut a = Remote::attach(&dir, false);
+    let mut b = Remote::attach(&dir, false);
+
+    owner.line("first");
+    owner.wait_for("? Which database?");
+    let asked = a.request("question/request");
+    assert_eq!(asked["params"]["question"], "Which database?");
+    a.answer(&asked, json!({"labels": ["Postgres"]}));
+    let told = b.notification("request/cancelled");
+    assert_eq!(told["by"], format!("remote-{}", a.number));
+    assert_eq!(told["answer"], json!({"labels": ["Postgres"]}));
+    owner.wait_for(&format!("↳ answered at remote {}: Postgres", a.number));
+    assert_eq!(a.turn().0, "noted");
+    assert!(mock.body(1).contains("Postgres"), "{}", mock.body(1));
+
+    owner.line("second");
+    let asked = b.request("question/request");
+    owner.wait_times("? Which database?", 2);
+    owner.line("1");
+    let told = b.notification("request/cancelled");
+    assert_eq!(
+        told,
+        json!({"id": asked["id"], "reason": "answered", "by": "terminal",
+               "answer": {"labels": ["SQLite"]}})
+    );
+    b.turn();
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+/// A remote steers the running turn and stops it, as the keyboard does.
+#[test]
+fn a_remote_steers_and_interrupts_the_turn() {
+    let mock = Mock::scripted(|n, body| {
+        if last_user(body).contains("hold") && !after_tool(body) {
+            return gated_bash(&format!("call_{n}"));
+        }
+        answer(&format!(
+            "heard: {}",
+            last_user(body).split_whitespace().last().unwrap_or("")
+        ))
+    });
+    let dir = project("steer");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Remote::attach(&dir, false);
+
+    // Not without a turn.
+    let none = remote.call("turn/steer", json!({"text": "x"}));
+    assert_eq!(none["error"]["code"], -32003, "{none}");
+    let none = remote.call("turn/interrupt", json!({}));
+    assert_eq!(none["error"]["code"], -32003, "{none}");
+
+    owner.line("hold");
+    owner.wait_for("⚙ bash");
+    wait_until("the command to start", || dir.join("started").exists());
+    // The session is the turn's: what needs it waits or is refused.
+    let busy = remote.call("command/run", json!({"line": "/help"}));
+    assert_eq!(busy["error"]["code"], -32001, "{busy}");
+    assert_eq!(busy["error"]["data"]["turn"], 1);
+    let busy = remote.call("turn/start", json!({"text": "x"}));
+    assert_eq!(busy["error"]["code"], -32001, "{busy}");
+    let status = remote.result("session/status", json!({}));
+    assert_eq!(
+        (&status["busy"], &status["turn"]),
+        (&json!(true), &json!(1))
+    );
+    let steered = remote.result("turn/steer", json!({"text": "and then lemons"}));
+    assert_eq!(steered, json!({"turn": 1, "queued": 1}));
+    owner.wait_for(&format!(
+        "› and then lemons  (queued · remote {})",
+        remote.number
+    ));
+    std::fs::write(dir.join("go"), "").unwrap();
+    assert_eq!(
+        remote.notification("event/delivered")["text"],
+        "and then lemons"
+    );
+    let (text, ended) = remote.turn();
+    assert_eq!(text, "heard: lemons");
+    assert_eq!(ended["status"], "completed");
+
+    // Stopped from the remote: the command on the owner's terminal is
+    // killed, and the turn ends interrupted.
+    std::fs::remove_file(dir.join("go")).unwrap();
+    std::fs::remove_file(dir.join("started")).unwrap();
+    let started = remote.result("turn/start", json!({"text": "hold"}));
+    wait_until("the command to start", || dir.join("started").exists());
+    let stopped = remote.result("turn/interrupt", json!({}));
+    assert_eq!(stopped["turn"], started["turn"]);
+    let (_, ended) = remote.turn();
+    assert_eq!(ended["status"], "interrupted", "{ended}");
+    owner.wait_for(&format!("! stopping… (asked at remote {})", remote.number));
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+/// A remote that goes away in the middle of the turn it started takes
+/// nothing with it: the turn runs to its end, and is saved.
+#[test]
+fn a_remote_leaving_mid_turn_does_not_stop_the_turn() {
+    let mock = Mock::scripted(|n, body| match has_tool_result(body) {
+        false => gated_bash(&format!("call_{n}")),
+        true => answer("finished without you"),
+    });
+    let dir = project("leave");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Remote::attach(&dir, false);
+    let number = remote.number;
+    remote.result("turn/start", json!({"text": "work"}));
+    wait_until("the command to start", || dir.join("started").exists());
+    drop(remote);
+    owner.wait_for(&format!("· remote {number} detached"));
+    std::fs::write(dir.join("go"), "").unwrap();
+    owner.wait_for("finished without you");
+    wait_until("the turn to be saved", || {
+        std::fs::read_to_string(dir.join(".atelier/session.json"))
+            .is_ok_and(|s| s.contains("finished without you"))
+    });
+    // And the next one is brought up to date from what was saved.
+    let mut again = Remote::attach(&dir, false);
+    // (Attached while the turn was still closing, it is sent the turn as
+    // events and the history as of before it: the turn is in the history
+    // once it has ended.)
+    wait_until("the session to be idle", || {
+        again.result("session/status", json!({}))["busy"] == false
+    });
+    let history = again.result("session/history", json!({}));
+    let last = history["items"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["text"], "finished without you");
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+/// However the owner ends, its remotes find out: told when it could tell
+/// (a quit, a take-over), cut off when it could not.
+#[test]
+fn remotes_learn_that_the_owner_is_gone() {
+    let mock = echo();
+    let dir = project("gone-owner");
+
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Remote::attach(&dir, false);
+    owner.line("/quit");
+    assert_eq!(
+        remote.notification("session/closed"),
+        json!({"reason": "ended"})
+    );
+    remote.closed();
+    assert_eq!(owner.exit(), 0);
+
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Remote::attach(&dir, false);
+    let mut next = Piped::spawn(atelier(&mock.base_url(), &dir, &["--take-over"]));
+    let closed = remote.notification("session/closed");
+    assert_eq!(closed["reason"], "taken_over");
+    assert!(
+        closed["by"]
+            .as_str()
+            .unwrap()
+            .contains(&next.pid().to_string()),
+        "{closed}"
+    );
+    remote.closed();
+    assert_eq!(owner.exit(), 0);
+    wait_owner(&dir, next.pid());
+    // The line REPL that took it takes no remote, and says so.
+    let mut refused = Remote::connect(&dir);
+    let no = refused.call("initialize", json!({}));
+    assert_eq!(no["error"]["code"], -32011, "{no}");
+    assert!(
+        no["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the line REPL"),
+        "{no}"
+    );
+    assert_eq!(next.finish(), 0);
+
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let remote = Remote::attach(&dir, false);
+    Command::new("kill")
+        .args(["-9", &owner.pid().to_string()])
+        .status()
+        .unwrap();
+    remote.closed();
+    assert!(!remote.ever("session/closed"));
+    assert_eq!(owner.exit(), -1);
+}
+
+/// A command that stops to ask is typed to from a remote that shows its
+/// terminal. What is typed goes to the command and nowhere else: the
+/// owner's terminal and the model see the command's output without it.
+#[test]
+fn a_command_is_typed_to_from_a_remote() {
+    let mock = Mock::scripted(|_, body| match has_tool_result(body) {
+        false => tool_calls(&[(
+            "call_1",
+            "bash",
+            json!({"command": "printf 'Code: '; read -r code; echo \"got ${#code} characters\"",
+                   "interactive": true}),
+        )]),
+        true => answer("thanks"),
+    });
+    let dir = project("typed");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    // Something on the input line: the keyboard is not handed over by
+    // itself, and stays the owner's.
+    owner.keys(b"x");
+    let mut typist = Remote::attach(&dir, true);
+    let mut watcher = Remote::attach(&dir, true);
+    let plain = Remote::attach(&dir, false);
+
+    typist.result("turn/start", json!({"text": "ask me"}));
+    let started = typist.notification("event/command_started");
+    assert_eq!(started["interactive"], true);
+    let mut shown = String::new();
+    while !shown.contains("Code: ") {
+        shown.push_str(
+            typist.notification("event/command_output")["data"]
+                .as_str()
+                .unwrap(),
+        );
+    }
+    typist.result(
+        "command/input",
+        json!({"attached": true, "cols": 80, "rows": 24}),
+    );
+    typist.result("command/input", json!({"data": "sesame-4242\r"}));
+    typist.notification("event/command_ended");
+    let (text, ended) = typist.turn();
+    assert_eq!(
+        (text.as_str(), &ended["status"]),
+        ("thanks", &json!("completed"))
+    );
+    // Once it is over there is nothing to type to.
+    let late = typist.call("command/input", json!({"data": "x"}));
+    assert_eq!(late["error"]["code"], -32006, "{late}");
+
+    // The command ran with what was typed.
+    let result = mock.body(1);
+    assert!(result.contains("got 11 characters"), "{result}");
+    // Nobody was sent it but the command: not the model, not the owner's
+    // terminal, and the other remote only as the terminal's own echo.
+    assert!(!result.contains("sesame-4242"), "{result}");
+    owner.wait_for("thanks");
+    assert!(!owner.text().contains("sesame-4242"), "{}", owner.text());
+    watcher.notification("event/command_ended");
+    let all = |remote: &Remote| -> String {
+        let log = remote.log.lock().unwrap();
+        log.iter()
+            .filter(|m| m["method"] != "event/command_output")
+            .map(Value::to_string)
+            .collect()
+    };
+    assert!(!all(&typist).contains("sesame-4242"));
+    assert!(!all(&watcher).contains("sesame-4242"));
+    // A remote that did not ask for the terminal is shown none of it.
+    wait_until("the turn to end for all", || plain.ever("turn/ended"));
+    assert!(!plain.ever("event/command_started") && !plain.ever("event/command_output"));
+    let saved = std::fs::read_to_string(dir.join(".atelier/session.json")).unwrap();
+    assert!(!saved.contains("sesame-4242"), "{saved}");
+    owner.keys(b"\x7f");
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
 }

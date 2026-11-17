@@ -25,7 +25,7 @@ use crate::rpc::Failure;
 
 /// The query methods, as `initialize` advertises them
 /// (`capabilities.queries`).
-pub(super) const METHODS: [&str; 7] = [
+pub(crate) const METHODS: [&str; 7] = [
     "models/list",
     "mcp/list",
     "peers/list",
@@ -36,7 +36,7 @@ pub(super) const METHODS: [&str; 7] = [
 ];
 
 /// A query, with its parameters checked.
-pub(super) enum Query {
+pub(crate) enum Query {
     /// `fetch`: ask each provider which models it offers.
     Models {
         fetch: bool,
@@ -52,7 +52,7 @@ pub(super) enum Query {
 impl Query {
     /// The query `method` names, or `None` when it is not one of them.
     /// Fails on parameters of the wrong type.
-    pub(super) fn parse(method: &str, params: &Value) -> Result<Option<Self>, Failure> {
+    pub(crate) fn parse(method: &str, params: &Value) -> Result<Option<Self>, Failure> {
         Ok(Some(match method {
             "models/list" => Query::Models {
                 fetch: match &params["fetch"] {
@@ -72,7 +72,7 @@ impl Query {
     }
 
     /// The result, read off `session`.
-    pub(super) fn answer(&self, session: &Session) -> Value {
+    pub(crate) fn answer(&self, session: &Session) -> Value {
         match self {
             Query::Models { fetch } => session.models_data(*fetch),
             Query::Mcp => session.mcp_data(),
