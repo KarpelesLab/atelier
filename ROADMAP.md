@@ -6,8 +6,8 @@ and continuously feeds itself context (git status, diagnostics, …) — driven
 from a deliberately minimal terminal interface.
 
 Status: **M0–M14 done** (§3); **M15–M24** (§3b) done but for the sandbox,
-which builds, tests and commits in its guest but is still opt-in and has no
-network — see "Progress on M15–M22" and "What is next" there. This document
+which builds, tests, commits and reaches the hosts it is allowed, but is
+still opt-in and not in the release binaries — see "Progress on M15–M22" and "What is next" there. This document
 is the plan of record; it changes as we build.
 
 ---
@@ -416,7 +416,7 @@ overlay or a mouse.
 | Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | no — git does it (M16 dropped) |
 | Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | ✅ prune tool output, then a hand-off summary; `/compact`, `/context`; retry on overflow |
 | Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | ✅ allow/ask/deny patterns, command splitting, user-global rules, `permissions check` |
-| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | ⏳ nixvm, opt-in `sandbox` feature: `bash`, background jobs and command files run in the guest, which builds and commits; no network, not in the release binaries (docs/sandbox.md) |
+| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | ⏳ nixvm, opt-in `sandbox` feature: `bash`, background jobs and command files run in the guest, which builds, commits (linked worktrees and submodules too) and reaches the hosts on `[sandbox] network`; not in the release binaries (docs/sandbox.md) |
 | Approvals without the user | — | — | reviewer agent with a policy, fails closed | ✅ a reviewer model with a policy, failing closed; `permission_request` hooks |
 | Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | ✅ `plan`, `ask-edits`, `auto-edit`, `yolo` |
 | Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | ✅ `task`, agents as files, step cap, parallel, background, worktrees |
@@ -459,17 +459,20 @@ last one leaves.
 |---|---|---|
 | M15 Instructions & memory | ✅ | — |
 | M16 | dropped | — |
-| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins, the approval reviewer | ⏳ the nixvm sandbox (nixvm 0.0.7) runs `bash`, background jobs and command-file shell lines, and `git commit`, `cargo` and `make -j` work in the guest; it stays opt-in (`--features sandbox`) — see "What is next" |
-| M18 Subagents | ✅ `task`, agent files, step cap, parallel, background, worktree isolation; on the coordinator: ask/answer, opt-in wake, advisory locks | subagents as coordinator instances (a child in another process or terminal) |
+| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins, the approval reviewer | ⏳ the nixvm sandbox (nixvm 0.0.8) runs `bash`, background jobs and command-file shell lines, and `git commit` (in a linked worktree or a submodule too), `cargo` and `make -j` work in the guest; `[sandbox] network` lets it reach hosts by name; it stays opt-in (`--features sandbox`) — see "What is next" |
+| M18 Subagents | ✅ `task`, agent files, step cap, parallel, background, worktree isolation; on the coordinator: ask/answer, opt-in wake, advisory locks, and a subagent as an instance of its own (`process: true`) | — |
 | M19 Commands, skills, hooks | ✅ | — |
 | M20 Tools | ✅ `ask`, `web_search`, diagnostics, parallel reads, output to a file, job notices, `symbols`, MCP (OAuth, filters, deferred tools, code mode, `atelier mcp`) | — |
-| M21 Headless & automation | ✅ JSON/stream-json, schema, `atelier serve`, `atelier acp`, `/goal`, `/loop`, `review`, `doctor`, `debug prompt`, GitHub Action | to be tried for real: the action on a runner, ACP in an editor; runs when no atelier is open are cron + `--print` |
-| M22 Models, context, cache | ✅ | cache benefit not yet measured; the default compaction threshold (8000) is small next to the tool list |
+| M21 Headless & automation | ✅ JSON/stream-json, schema, `atelier serve`, `atelier acp`, `/goal`, `/loop`, `review`, `doctor`, `debug prompt`, GitHub Action | ACP was run against the protocol's own client library (docs/acp.md); to be tried for real: the action on a runner, ACP in an editor; runs when no atelier is open are cron + `--print` |
+| M22 Models, context, cache | ✅ the compaction threshold follows the model's context window; the cache's benefit is measured (docs/sessions.md) | — |
 
-Not exercised against the real thing, and worth doing before relying on
-them: the Claude-backend paths of most of the above (its live tests are
-opt-in), OAuth against a real authorization server, language servers other
-than rust-analyzer, search providers other than DuckDuckGo.
+Tried against the real thing on 2026-11-17, with what was found fixed:
+`symbols` with rust-analyzer, clangd, gopls, the TypeScript server and
+pyright; `atelier acp` with the protocol's own client library; the Claude
+backend's live tests; `web_search` with SearXNG (docs/tools.md,
+docs/acp.md, docs/claude.md). Not yet, and worth doing before relying on
+them: the Claude-backend paths its seven live tests do not reach, OAuth
+against a real authorization server, the Brave and Tavily search providers.
 
 ### What is next
 
@@ -477,20 +480,17 @@ In order; the first waits on nixvm, the rest are atelier's own.
 
 1. **The sandbox in the release binaries.** Waits on nixvm: a host-directory
    filesystem and KVM that need no libc, so the fullrust build can mount the
-   project (docs/sandbox.md, "What nixvm needs next").
-2. **The sandbox's network, by host name.** The guest has none, so `apk add`,
-   `cargo fetch` and `npm install` still go to the host and still ask.
-   atelier answers the guest's DNS and lets through the addresses it gave
-   out for allowed names (`[sandbox] network`).
-3. **The rest of the sandbox**: a linked git worktree and a submodule (their
-   git data is outside the project); the commands of the `node` tool, hooks,
+   project (docs/sandbox.md, "What nixvm needs next"; nixvm #13).
+2. **The rest of the sandbox**: the commands of the `node` tool, hooks,
    diagnostics checkers, MCP servers and the Claude backend, which run on
-   the host; nixvm's "run this command" API, to drop the exact version pin.
-4. **Trying what was built against the real thing**: the list above, the
-   GitHub Action on a runner, ACP in an editor, `--local` with the 27B.
-5. **Leftovers**: subagents as coordinator instances (M18); the cache
-   benefit measured, and a default compaction threshold that fits the tool
-   list (M22).
+   the host; a command the user can type to, which the host has and the
+   guest has not; a network allowlist that is exact by name rather than by
+   address (nixvm #18); a root image atelier fetches, and packages that
+   stay installed (nixvm #16); nixvm's "run this command" API, to drop the
+   exact version pin (nixvm #14).
+3. **Trying what was built against the real thing**: the list above, the
+   GitHub Action on a runner, ACP in an editor, `--local` with the 27B, and
+   the interactive `bash` on macOS, where its terminal has not been run.
 
 The milestone texts below are the plan as written; where what was built
 differs, the docs (`docs/`) are the reference.
