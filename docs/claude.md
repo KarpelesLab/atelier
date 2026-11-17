@@ -6,7 +6,7 @@ already installed and signed in to**:
 
 ```sh
 atelier --claude                         # interactive
-ATELIER_MODEL=sonnet atelier --claude    # pick a model (passed as --model)
+ATELIER_MODEL=sonnet atelier --claude    # pick a model (passed as --model; or /model)
 atelier --claude --continue              # resume the last Claude session here
 atelier --claude -p "explain src/main.rs"
 ```
@@ -32,6 +32,7 @@ interface:
 | `stream_event` text / thinking deltas | streamed answer / dimmed reasoning |
 | `assistant` message `tool_use` blocks | `⚙ tool args` |
 | `user` message `tool_result` blocks | `✓` / `✗ result` |
+| the same from inside a subagent (`parent_tool_use_id` set) | dimmed `  ⤷ tool args` / `  ⤷ ✗ tool: error` lines (see [Subagents](#subagents)) |
 | `control_request` `can_use_tool` | the usual approval prompt (`⚠` risk signals for `Bash`) |
 | `result` | end of turn, token usage |
 
@@ -127,6 +128,44 @@ Once claude has it, a Ctrl-C stop delivers it along with the stop message.
 A message typed after the last tool call runs as the next turn. Slash
 commands always wait for the turn to end.
 
+## Subagents
+
+What claude's subagents (`Agent`/`Task`) do shows under the call that
+started them, as dimmed activity lines, the way atelier's own
+[subagents](agents.md) show:
+
+```
+⚙ Agent {"description":"probe", …}
+  ⤷ bash echo one
+  ⤷ ✗ read: error: failed to read "/nope": No such file or directory
+✓ Agent: …
+```
+
+Each tool call the subagent makes is a line, and so is each call that
+failed (with the first line of its error); what it writes and thinks is
+not streamed into the answer — its final report comes back as the `Agent`
+call's result, as usual. When several subagents run at once, or the one
+reporting runs in the background (its call returned long ago), each line
+starts with the `description` its `Agent` call gave: `  ⤷ later · bash
+sleep 2`. A background subagent's lines arrive whenever it works, at the
+prompt too; one that reports while the answer is streaming waits for the
+end of the current line rather than cutting it in two.
+
+## Models
+
+`/models` lists the models claude offers, as claude itself reports them
+(its `initialize` control request — launching claude first if no message
+has been sent yet): its aliases (`default`, `opus`, `sonnet`, `haiku`) and
+whatever else your account has, each with claude's description, the one in
+use marked `*`, and, once a turn has run, the model actually serving
+(`serving: claude-sonnet-5-5`). If claude can't be asked, the aliases every
+version takes are listed instead.
+
+`/model <name>` (anything `claude --model` takes) relaunches claude with
+`--model <name>` before the next message, resuming the same conversation —
+or, while background tasks run, once they finish. `ATELIER_MODEL` sets the
+model to start with.
+
 ## Stopping a turn, and background agents
 
 **Background work is never killed unless you explicitly ask.** Background
@@ -147,16 +186,17 @@ Ctrl-C). So atelier never sends a plain interrupt:
   `--print` and piped input wait for them before exiting. The process is
   only relaunched after an error if it actually died.
 
-`cargo test live_ -- --ignored` checks the Ctrl-C property and mid-turn
-messages against the real CLI, and `cargo test --test claude_live -- --ignored` checks atelier's
+`cargo test live_ -- --ignored` checks the Ctrl-C property, mid-turn
+messages, subagent activity (in the turn and from the background) and
+`/models` against the real CLI, and `cargo test --test claude_live -- --ignored` checks atelier's
 tools through the relay and as replacements — reading, images, background
 jobs, approval policy (both run a few cheap Haiku turns on your account).
 
-Both were last run on 2026-11-17, against Claude Code 2.1.326 on Linux:
-their seven tests passed. Those seven are the only tests there are against
+Both were last run on 2026-11-18, against Claude Code 2.1.326 on Linux:
+their eight tests passed. Those eight are the only tests there are against
 the real CLI: what they do not reach — permission rules over claude's
-built-ins, hooks, subagents, the approval reviewer, `atelier acp --claude`
-and `atelier serve` on this backend — is tested without it, or not at all.
+built-ins, hooks, the approval reviewer, `atelier acp --claude` and
+`atelier serve` on this backend — is tested without it, or not at all.
 
 ## Permissions
 
@@ -197,8 +237,6 @@ request, so atelier's rules and modes do not see them — this matters with
   claude is idle does not make it start a turn.
 - Ctrl-C while claude is still on a *queued* message (behind a turn it
   started itself) stops that turn, and the queued message then runs.
-- Subagent activity is shown only as its single top-level tool call.
-- `/models` doesn't list anything; use `ATELIER_MODEL`.
 - Providers, `[models]` roles and variants (`/providers`, `/effort`) don't
   apply: claude chooses and calls its own models. Its requests are not in
   the usage log either; `/usage` shows the token counts claude reports.

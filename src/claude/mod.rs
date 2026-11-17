@@ -30,6 +30,16 @@
 //! accepts any number of turns). It is restarted with `--resume <session>`
 //! when it has to be relaunched (MCP config changed, or it died).
 //!
+//! # Subagents
+//!
+//! What a subagent does arrives on the same stream, marked with the id of
+//! the `Agent`/`Task` call that started it (`parent_tool_use_id`). Its tool
+//! calls, and the ones that fail, are shown as [`Ui::activity`] lines under
+//! that call (`  ⤷ Bash ls /`), named after the call's `description` when
+//! several subagents run or the one reporting runs in the background. Its
+//! text, reasoning and token counts stay out of the conversation's: claude
+//! hands its final report back as the `Agent` call's result.
+//!
 //! # Turns, background work, and stopping
 //!
 //! Background subagents and shells live inside the child, and finishing ones
@@ -66,7 +76,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::agent::Ui;
+use crate::agent::{Ui, clip, summarize};
 use crate::permissions;
 use crate::provider::ToolSpec;
 use crate::settings::Settings;
@@ -158,6 +168,25 @@ const MAX_TURNS_RESULT: &str = "error_max_turns";
 /// How often a waiting turn checks whether the user asked to stop.
 const POLL: Duration = Duration::from_millis(50);
 
+/// How long [`Bridge::models`] waits for claude to answer.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// claude's tools that start a subagent (`Task` in older versions).
+const AGENT_TOOLS: &[&str] = &["Agent", "Task"];
+
+/// Calls a subagent makes that are claude's plumbing rather than its work
+/// (handing its report back), so not shown.
+const UNSHOWN_SUBAGENT_TOOLS: &[&str] = &["SubagentHandback"];
+
+/// What `/models` offers when claude can't be asked: the aliases `--model`
+/// takes in every recent version.
+const MODEL_ALIASES: &[(&str, &str)] = &[
+    ("default", "claude's recommended model"),
+    ("opus", "the latest Opus"),
+    ("sonnet", "the latest Sonnet"),
+    ("haiku", "the latest Haiku"),
+];
+
 /// How to launch the CLI.
 pub struct Launch<'a> {
     /// The `claude` executable.
@@ -193,6 +222,15 @@ pub struct Bridge {
     model: Option<String>,
     /// tool_use id -> tool name, so results can be labeled.
     tool_names: HashMap<String, String>,
+    /// Subagents that may still report, by the id of the call that started
+    /// them (see [the module docs](self#subagents)).
+    agents: HashMap<String, Subagent>,
+    /// The models claude offers, once asked ([`Bridge::models`]).
+    models: Option<Vec<ModelChoice>>,
+    /// Streamed text stopped mid-line: subagent activity is held in `held`
+    /// until the line is complete.
+    mid_line: bool,
+    held: Vec<String>,
     /// Background tasks (subagents, background shells, monitors) running in
     /// the child, per its latest `background_tasks_changed`.
     background: usize,
@@ -229,6 +267,24 @@ struct TurnState {
     /// The failure reported by the awaited turn's `result`, if any.
     error: Option<String>,
     done: bool,
+}
+
+/// A subagent claude started: what its activity lines are attributed to.
+struct Subagent {
+    /// The `description` its `Agent` call gave (else its type).
+    label: String,
+    /// It runs in the background: its call returned at once, and it goes
+    /// on reporting until claude says it finished.
+    background: bool,
+}
+
+/// A model claude offers, as its `initialize` response lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelChoice {
+    /// What `--model` (and `/model`) takes: `opus`, `sonnet`, a full id.
+    pub value: String,
+    /// claude's one-line description.
+    pub description: String,
 }
 
 /// What the bridge's event loop receives.
@@ -382,6 +438,10 @@ impl Bridge {
             session_id: launch.resume.map(str::to_owned),
             model: None,
             tool_names: HashMap::new(),
+            agents: HashMap::new(),
+            models: None,
+            mid_line: false,
+            held: Vec::new(),
             background: 0,
             context: 0,
             output: 0,
@@ -459,6 +519,7 @@ impl Bridge {
             }
         }
         ui.turn_end();
+        self.line_ended(ui);
         match st.error {
             // claude's own step limit (`--max-turns`), reported the way
             // atelier's loop reports its own.
@@ -505,6 +566,34 @@ impl Bridge {
         }
     }
 
+    /// The models claude offers (`/models`), from its answer to an
+    /// `initialize` request — asked once per process; whatever else arrives
+    /// meanwhile is rendered as [`pump`](Self::pump) would.
+    pub fn models(&mut self, ui: &mut dyn Ui, host: &mut dyn ToolHost) -> Result<Vec<ModelChoice>> {
+        if self.models.is_none() {
+            self.write(&json!({
+                "type": "control_request",
+                "request_id": new_uuid(),
+                "request": { "subtype": "initialize" },
+            }))?;
+            let deadline = std::time::Instant::now() + MODELS_TIMEOUT;
+            while self.models.is_none() {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    bail!("claude did not list its models");
+                }
+                match self.incoming.recv_timeout(left.min(POLL)) {
+                    Ok(inc) => self.receive(inc, ui, host, None)?,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        unreachable!("the bridge holds no sender")
+                    }
+                }
+            }
+        }
+        Ok(self.models.clone().unwrap_or_default())
+    }
+
     /// Act on one incoming item; `turn` is the turn being waited on, if any.
     fn receive(
         &mut self,
@@ -545,18 +634,16 @@ impl Bridge {
                     self.model = model;
                 }
             }
-            Event::Text(t) => ui.content(&t),
-            Event::Thinking(t) => ui.reasoning(&t),
+            Event::Text(t) => self.stream(&t, ui, |ui, t| ui.content(t)),
+            Event::Thinking(t) => self.stream(&t, ui, |ui, t| ui.reasoning(t)),
             Event::ToolUse { id, name, input } => {
-                // atelier's own tools read as themselves, not `mcp__atelier__…`.
-                #[cfg(unixlike)]
-                let name = name
-                    .strip_prefix(TOOL_PREFIX)
-                    .map_or(name.clone(), str::to_owned);
+                let name = display_name(name);
                 ui.tool_start(&name, &input);
+                self.line_ended(ui);
                 if let Some(st) = turn {
                     st.tools.insert(id.clone());
                 }
+                self.note_agent(&id, &name, &input);
                 self.tool_names.insert(id, name);
             }
             Event::ToolResult {
@@ -567,9 +654,27 @@ impl Bridge {
                 if let Some(st) = turn {
                     st.tools.remove(&id);
                 }
+                // A subagent in the foreground is done when its call
+                // returns; one in the background has only just started.
+                if self.agents.get(&id).is_some_and(|a| !a.background) {
+                    self.agents.remove(&id);
+                }
                 let name = self.tool_names.remove(&id).unwrap_or_default();
                 ui.tool_end(&name, &content, !is_error);
             }
+            Event::Subagent { parent, event } => self.subagent(&parent, *event, ui),
+            Event::TaskStarted {
+                tool_use_id,
+                background,
+            } => {
+                if let Some(a) = self.agents.get_mut(&tool_use_id) {
+                    a.background = background;
+                }
+            }
+            Event::TaskDone(tool_use_id) => {
+                self.agents.remove(&tool_use_id);
+            }
+            Event::Models(models) => self.models = Some(models),
             Event::Context(n) => {
                 self.context = n;
                 self.steps += 1;
@@ -618,12 +723,57 @@ impl Bridge {
                     // reporting on background work. Separate it visually;
                     // the bare summary claude emits when everything has
                     // settled (`num_turns: 0`) has nothing to separate.
-                    _ if !empty => ui.turn_end(),
+                    _ if !empty => {
+                        ui.turn_end();
+                        self.line_ended(ui);
+                    }
                     _ => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// Stream text (answer or reasoning, by `out`). While it stops mid-line,
+    /// subagent activity waits — a line of it would cut the text in two —
+    /// and is shown as soon as the line is complete.
+    fn stream(&mut self, text: &str, ui: &mut dyn Ui, out: fn(&mut dyn Ui, &str)) {
+        let rest = match text.rfind('\n') {
+            Some(end) if !self.held.is_empty() => {
+                out(ui, &text[..=end]);
+                self.line_ended(ui);
+                &text[end + 1..]
+            }
+            _ => text,
+        };
+        if rest.is_empty() {
+            return;
+        }
+        out(ui, rest);
+        if rest.ends_with('\n') {
+            self.line_ended(ui);
+        } else {
+            self.mid_line = true;
+        }
+    }
+
+    /// The interface is at the start of a line (a tool call or the end of a
+    /// turn closed the streamed text): show the activity held meanwhile.
+    fn line_ended(&mut self, ui: &mut dyn Ui) {
+        self.mid_line = false;
+        for line in std::mem::take(&mut self.held) {
+            ui.activity(&line);
+        }
+    }
+
+    /// Show a line of subagent activity, or hold it until the streamed text
+    /// reaches the end of its line.
+    fn show_activity(&mut self, line: String, ui: &mut dyn Ui) {
+        if self.mid_line {
+            self.held.push(line);
+        } else {
+            ui.activity(&line);
+        }
     }
 
     /// Ctrl-C: preempt the running turn with the stop message. The awaited
@@ -666,6 +816,73 @@ impl Bridge {
         Ok(())
     }
 
+    /// Remember a call that starts a subagent, so what the subagent does can
+    /// be attributed to it.
+    fn note_agent(&mut self, id: &str, name: &str, input: &str) {
+        if !AGENT_TOOLS.contains(&name) {
+            return;
+        }
+        let args: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+        let label = ["description", "subagent_type"]
+            .iter()
+            .find_map(|k| args[*k].as_str().filter(|s| !s.trim().is_empty()))
+            .unwrap_or(name);
+        self.agents.insert(
+            id.to_string(),
+            Subagent {
+                label: clip(label),
+                background: false,
+            },
+        );
+    }
+
+    /// Show one event from inside the subagent `parent` started: its tool
+    /// calls, and those of them that failed (see [the module
+    /// docs](self#subagents)).
+    fn subagent(&mut self, parent: &str, ev: Event, ui: &mut dyn Ui) {
+        match ev {
+            Event::ToolUse { id, name, input } => {
+                let name = display_name(name);
+                if !UNSHOWN_SUBAGENT_TOOLS.contains(&name.as_str()) {
+                    let line = self.attributed(parent, &summarize(&name, &input));
+                    self.show_activity(line, ui);
+                }
+                // A subagent's own subagent is attributed by its own label.
+                self.note_agent(&id, &name, &input);
+                self.tool_names.insert(id, name);
+            }
+            Event::ToolResult {
+                id,
+                content,
+                is_error,
+            } => {
+                if self.agents.get(&id).is_some_and(|a| !a.background) {
+                    self.agents.remove(&id);
+                }
+                let name = self.tool_names.remove(&id).unwrap_or_default();
+                if is_error {
+                    let first = content.lines().find(|l| !l.trim().is_empty());
+                    let line = clip(&format!("✗ {name}: {}", first.unwrap_or("failed")));
+                    let line = self.attributed(parent, &line);
+                    self.show_activity(line, ui);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A subagent's activity line: indented under its call, and named when
+    /// that call alone doesn't say whose it is — several subagents running,
+    /// or one in the background, whose call is long gone from the screen.
+    fn attributed(&self, parent: &str, text: &str) -> String {
+        match self.agents.get(parent) {
+            Some(a) if a.background || self.agents.len() > 1 => {
+                format!("  ⤷ {} · {text}", a.label)
+            }
+            _ => format!("  ⤷ {text}"),
+        }
+    }
+
     fn send_user(&mut self, content: Value, uuid: &str) -> Result<()> {
         self.write(&json!({
             "type": "user",
@@ -703,6 +920,61 @@ impl Drop for Bridge {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// How a claude tool is shown: atelier's own read as themselves, not
+/// `mcp__atelier__…`.
+fn display_name(name: String) -> String {
+    #[cfg(unixlike)]
+    if let Some(own) = name.strip_prefix(TOOL_PREFIX) {
+        return own.to_string();
+    }
+    name
+}
+
+/// What `/models` prints under the Claude backend: the models claude offers
+/// (or, when it couldn't be asked, the aliases every version takes), the one
+/// chosen marked `*` — `chosen` is what `--model` was given, `None` for
+/// claude's default — and the model actually serving, when known.
+pub fn model_listing(
+    offered: &[ModelChoice],
+    chosen: Option<&str>,
+    serving: Option<&str>,
+) -> Vec<String> {
+    let fallback: Vec<ModelChoice>;
+    let offered = if offered.is_empty() {
+        fallback = MODEL_ALIASES
+            .iter()
+            .map(|(value, description)| ModelChoice {
+                value: value.to_string(),
+                description: description.to_string(),
+            })
+            .collect();
+        &fallback[..]
+    } else {
+        offered
+    };
+    let chosen = chosen.unwrap_or("default");
+    let width = offered.iter().map(|m| m.value.len()).max().unwrap_or(0);
+    let mut out: Vec<String> = offered
+        .iter()
+        .map(|m| {
+            let mark = if m.value == chosen { "*" } else { " " };
+            format!("{mark} {:<width$}  {}", m.value, m.description)
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    if !offered.iter().any(|m| m.value == chosen) {
+        out.push(format!("* {chosen}"));
+    }
+    if let Some(model) = serving {
+        out.push(format!("serving: {model}"));
+    }
+    out.push(
+        "/model <name> switches: claude restarts with --model, resuming this conversation".into(),
+    );
+    out
 }
 
 /// A random (v4-format) uuid, without pulling in a crate: std's per-instance
@@ -896,6 +1168,22 @@ enum Event {
     /// Number of background tasks now running.
     Background(usize),
     Permission(PermissionRequest),
+    /// An event from inside a subagent: one of its tool calls or results
+    /// (`event`), under the call that started it (`parent`).
+    Subagent {
+        parent: String,
+        event: Box<Event>,
+    },
+    /// A task (a subagent, a shell) started for the call `tool_use_id`, in
+    /// the background or not.
+    TaskStarted {
+        tool_use_id: String,
+        background: bool,
+    },
+    /// The task started for the call `tool_use_id` is over.
+    TaskDone(String),
+    /// The models claude offers (its answer to `initialize`).
+    Models(Vec<ModelChoice>),
     /// A user message's progress: `queued`, `started`, then a final state
     /// (`completed`, or another when it didn't run to completion).
     Lifecycle {
@@ -914,18 +1202,29 @@ enum Event {
 
 /// Parse one output line. Unknown or irrelevant lines yield nothing.
 ///
-/// Only top-level activity is surfaced: events from inside a subagent
-/// (`parent_tool_use_id` set) are skipped — the subagent shows as its one
-/// `Task`/`Agent` tool call. Text is taken from the partial-message deltas;
-/// the complete `assistant` message is used only for tool calls and usage, so
-/// nothing is printed twice.
+/// Text is taken from the partial-message deltas; the complete `assistant`
+/// message is used only for tool calls and usage, so nothing is printed
+/// twice. Of the events from inside a subagent (`parent_tool_use_id` set)
+/// only tool calls and results are surfaced, wrapped in
+/// [`Event::Subagent`]: its text and usage are not the conversation's.
 fn parse_line(line: &str) -> Vec<Event> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
     let s = |v: &Value| v.as_str().map(str::to_owned);
-    if !v["parent_tool_use_id"].is_null() {
-        return Vec::new();
+    if let Some(parent) = s(&v["parent_tool_use_id"]) {
+        let events = match v["type"].as_str() {
+            Some("assistant") => tool_uses(&v["message"]),
+            Some("user") => tool_results(&v["message"]),
+            _ => Vec::new(),
+        };
+        return events
+            .into_iter()
+            .map(|e| Event::Subagent {
+                parent: parent.clone(),
+                event: Box::new(e),
+            })
+            .collect();
     }
     match v["type"].as_str() {
         Some("system") if v["subtype"] == "init" => s(&v["session_id"])
@@ -958,18 +1257,20 @@ fn parse_line(line: &str) -> Vec<Event> {
                 _ => Vec::new(),
             }
         }
+        Some("system") if v["subtype"] == "task_started" => s(&v["tool_use_id"])
+            .map(|tool_use_id| Event::TaskStarted {
+                tool_use_id,
+                background: v["is_backgrounded"].as_bool().unwrap_or(false),
+            })
+            .into_iter()
+            .collect(),
+        Some("system") if v["subtype"] == "task_notification" => s(&v["tool_use_id"])
+            .map(Event::TaskDone)
+            .into_iter()
+            .collect(),
         Some("assistant") => {
             let msg = &v["message"];
-            let mut out: Vec<Event> = blocks(&msg["content"])
-                .filter(|b| b["type"] == "tool_use")
-                .filter_map(|b| {
-                    Some(Event::ToolUse {
-                        id: s(&b["id"])?,
-                        name: s(&b["name"])?,
-                        input: b["input"].to_string(),
-                    })
-                })
-                .collect();
+            let mut out = tool_uses(msg);
             let u = &msg["usage"];
             let ctx = [
                 "input_tokens",
@@ -984,15 +1285,11 @@ fn parse_line(line: &str) -> Vec<Event> {
             }
             out
         }
-        Some("user") => blocks(&v["message"]["content"])
-            .filter(|b| b["type"] == "tool_result")
-            .filter_map(|b| {
-                Some(Event::ToolResult {
-                    id: s(&b["tool_use_id"])?,
-                    content: result_text(&b["content"]),
-                    is_error: b["is_error"].as_bool().unwrap_or(false),
-                })
-            })
+        Some("user") => tool_results(&v["message"]),
+        Some("control_response") => v["response"]["response"]["models"]
+            .as_array()
+            .map(|models| Event::Models(models.iter().filter_map(model_choice).collect()))
+            .into_iter()
             .collect(),
         Some("control_request") if v["request"]["subtype"] == "can_use_tool" => {
             let r = &v["request"];
@@ -1017,6 +1314,52 @@ fn parse_line(line: &str) -> Vec<Event> {
 
 fn blocks(content: &Value) -> impl Iterator<Item = &Value> {
     content.as_array().into_iter().flatten()
+}
+
+/// The tool calls in an `assistant` message.
+fn tool_uses(msg: &Value) -> Vec<Event> {
+    blocks(&msg["content"])
+        .filter(|b| b["type"] == "tool_use")
+        .filter_map(|b| {
+            Some(Event::ToolUse {
+                id: b["id"].as_str()?.to_owned(),
+                name: b["name"].as_str()?.to_owned(),
+                input: b["input"].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The tool results in a `user` message.
+fn tool_results(msg: &Value) -> Vec<Event> {
+    blocks(&msg["content"])
+        .filter(|b| b["type"] == "tool_result")
+        .filter_map(|b| {
+            Some(Event::ToolResult {
+                id: b["tool_use_id"].as_str()?.to_owned(),
+                content: result_text(&b["content"]),
+                is_error: b["is_error"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// One entry of the `models` claude's `initialize` response lists. Its
+/// description already names the model (`Opus 5.5 · …`); the display name
+/// is added when it says something more (`Default (recommended)`).
+fn model_choice(m: &Value) -> Option<ModelChoice> {
+    let value = m["value"].as_str()?.to_owned();
+    let description = m["description"].as_str().unwrap_or_default();
+    let display = m["displayName"].as_str().unwrap_or_default();
+    let first = display.split_whitespace().next().unwrap_or_default();
+    let description = if description.is_empty() {
+        display.to_owned()
+    } else if first.is_empty() || description.contains(first) {
+        description.to_owned()
+    } else {
+        format!("{display} · {description}")
+    };
+    Some(ModelChoice { value, description })
 }
 
 /// A tool result's content as text: either a plain string or an array of
@@ -1065,9 +1408,118 @@ mod tests {
     }
 
     #[test]
-    fn skips_subagent_events() {
+    fn subagent_events_are_only_its_tool_calls() {
+        // Lines as Claude Code 2.1.326 sends them (trimmed).
         let text = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}},"parent_tool_use_id":"toolu_1"}"#;
         assert!(parse_line(text).is_empty());
+        let prompt = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Do two things using the Bash tool"}]},"parent_tool_use_id":"toolu_1","agent_id":"a68e","session_id":"s","subagent_type":"general-purpose"}"#;
+        assert!(parse_line(prompt).is_empty());
+        let answer = r#"{"type":"assistant","message":{"model":"claude-haiku-5-5","content":[{"type":"text","text":"The command ran."}],"usage":{"input_tokens":2,"cache_read_input_tokens":11663,"output_tokens":16}},"parent_tool_use_id":"toolu_1","agent_id":"a68e","session_id":"s"}"#;
+        assert!(parse_line(answer).is_empty(), "no text, no context size");
+
+        let call = r#"{"type":"assistant","message":{"model":"claude-haiku-5-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"ls /","description":"List root directory contents"},"caller":{"type":"direct"}}],"usage":{"input_tokens":2,"cache_creation_input_tokens":11663,"cache_read_input_tokens":0,"output_tokens":16}},"parent_tool_use_id":"toolu_1","agent_id":"a68e","session_id":"s"}"#;
+        assert_eq!(
+            parse_line(call),
+            vec![Event::Subagent {
+                parent: "toolu_1".into(),
+                event: Box::new(Event::ToolUse {
+                    id: "toolu_2".into(),
+                    name: "Bash".into(),
+                    input: r#"{"command":"ls /","description":"List root directory contents"}"#
+                        .into(),
+                }),
+            }]
+        );
+        let failed = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"Exit code 1\ncat: /nonexistent_file_xyz: No such file or directory","is_error":true,"tool_use_id":"toolu_3"}]},"parent_tool_use_id":"toolu_1","agent_id":"a68e","session_id":"s","tool_use_result":"Error: Exit code 1"}"#;
+        assert_eq!(
+            parse_line(failed),
+            vec![Event::Subagent {
+                parent: "toolu_1".into(),
+                event: Box::new(Event::ToolResult {
+                    id: "toolu_3".into(),
+                    content: "Exit code 1\ncat: /nonexistent_file_xyz: No such file or directory"
+                        .into(),
+                    is_error: true,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_task_lifecycle() {
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a6fa","run_id":"r","tool_use_id":"toolu_1","description":"alpha","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"p","uuid":"u","session_id":"s"}"#;
+        assert_eq!(
+            parse_line(started),
+            vec![Event::TaskStarted {
+                tool_use_id: "toolu_1".into(),
+                background: true,
+            }]
+        );
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"a6fa","run_id":"r","tool_use_id":"toolu_1","status":"completed","output_file":"/tmp/x.output","summary":"A","uuid":"u","session_id":"s"}"#;
+        assert_eq!(parse_line(done), vec![Event::TaskDone("toolu_1".into())]);
+    }
+
+    #[test]
+    fn parses_the_models_claude_offers() {
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"commands":[],"models":[{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)","description":"Opus 5.5 · Best for everyday, complex tasks","supportsEffort":true},{"value":"claude-fable-5-2[1m]","resolvedModel":"claude-fable-5-2","displayName":"Fable","description":"Fable 5.2 · Most capable for your hardest and longest-running tasks"},{"value":"haiku","displayName":"Haiku","description":"Haiku 5.5 · Fastest for quick answers"}],"pid":1}}}"#;
+        let choice = |value: &str, description: &str| ModelChoice {
+            value: value.into(),
+            description: description.into(),
+        };
+        assert_eq!(
+            parse_line(line),
+            vec![Event::Models(vec![
+                choice(
+                    "default",
+                    "Default (recommended) · Opus 5.5 · Best for everyday, complex tasks"
+                ),
+                choice(
+                    "claude-fable-5-2[1m]",
+                    "Fable 5.2 · Most capable for your hardest and longest-running tasks"
+                ),
+                choice("haiku", "Haiku 5.5 · Fastest for quick answers"),
+            ])]
+        );
+        // Other control responses (to a permission answer, say) are nothing.
+        let other =
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r2"}}"#;
+        assert!(parse_line(other).is_empty());
+    }
+
+    #[test]
+    fn model_listing_marks_the_chosen_model() {
+        let offered = [
+            ModelChoice {
+                value: "default".into(),
+                description: "Default (recommended) · Opus 5.5".into(),
+            },
+            ModelChoice {
+                value: "haiku".into(),
+                description: "Haiku 5.5 · Fastest".into(),
+            },
+        ];
+        let lines = model_listing(&offered, Some("haiku"), Some("claude-haiku-5-5"));
+        assert_eq!(
+            lines[..3],
+            [
+                "  default  Default (recommended) · Opus 5.5",
+                "* haiku    Haiku 5.5 · Fastest",
+                "serving: claude-haiku-5-5",
+            ]
+        );
+        assert!(lines[3].starts_with("/model <name>"), "{lines:?}");
+        // No --model: claude's default. One it doesn't list is still shown.
+        assert!(model_listing(&offered, None, None)[0].starts_with("* default"));
+        let lines = model_listing(&offered, Some("claude-sonnet-5-5"), None);
+        assert_eq!(lines[2], "* claude-sonnet-5-5");
+        // claude couldn't be asked: the aliases.
+        let lines = model_listing(&[], Some("opus"), None);
+        let values: Vec<&str> = lines[..4]
+            .iter()
+            .map(|l| l[2..].split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(values, ["default", "opus", "sonnet", "haiku"]);
+        assert!(lines[1].starts_with("* opus"));
     }
 
     #[test]
@@ -1569,6 +2021,10 @@ mod tests {
         /// Typed "while the turn runs"; handed over on the bridge's ask.
         queued: Vec<String>,
         delivered: Vec<String>,
+        /// Subagent activity lines, and how much text had streamed when
+        /// each was shown.
+        activity: Vec<String>,
+        activity_at: Vec<usize>,
     }
 
     impl Ui for LiveUi {
@@ -1581,6 +2037,10 @@ mod tests {
         }
         fn tool_end(&mut self, _: &str, _: &str, _: bool) {}
         fn info(&mut self, _: &str) {}
+        fn activity(&mut self, text: &str) {
+            self.activity.push(text.to_string());
+            self.activity_at.push(self.text.len());
+        }
         fn ask_approval(&mut self, _: &str, _: &str) -> Approval {
             Approval::Once
         }
@@ -1694,6 +2154,192 @@ mod tests {
         .unwrap();
         assert_eq!(ui.delivered.len(), 1, "{:?}", ui.delivered);
         assert!(ui.text.contains("BANANA"), "{:?}", ui.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for `claude` that prints `lines` and then stays up (so
+    /// what is written to it doesn't fail), in a fresh directory; the
+    /// bridge ends it when dropped.
+    #[cfg(unixlike)]
+    fn replaying(lines: &[&str]) -> (Bridge, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("atelier-replay-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stream.jsonl"), lines.join("\n") + "\n").unwrap();
+        let bin = dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\ncat stream.jsonl\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launch = Launch {
+            bin: bin.to_str().unwrap(),
+            model: None,
+            resume: None,
+            keep_builtins: false,
+            max_turns: None,
+        };
+        // A test running in parallel may fork while the script is still
+        // open for writing, and the child holds it open a moment: the
+        // script is then busy ("Text file busy") until that child execs.
+        let mut tries = 0;
+        loop {
+            match Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()) {
+                Ok(b) => return (b, dir),
+                Err(_) if tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+    }
+
+    /// Subagent activity is shown under its call, between turns too:
+    /// background agents named, a lone one in the foreground not.
+    #[cfg(unixlike)]
+    #[test]
+    fn subagent_activity_is_attributed_to_its_call() {
+        // The shape of what Claude Code 2.1.326 sent for two background
+        // agents and then one in the foreground (trimmed).
+        let (mut b, dir) = replaying(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"A1","name":"Agent","input":{"description":"alpha","prompt":"p","run_in_background":true,"subagent_type":"general-purpose"}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_agent","description":"alpha"}]}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"A1","description":"alpha","is_backgrounded":true,"task_type":"local_agent"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"A1","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully."}]}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"A2","name":"Agent","input":{"description":"beta","prompt":"p","run_in_background":true,"subagent_type":"general-purpose"}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"t2","tool_use_id":"A2","description":"beta","is_backgrounded":true,"task_type":"local_agent"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"A2","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully."}]}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Launched.","num_turns":3,"usage":{"output_tokens":9}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"B1","name":"Bash","input":{"command":"sleep 3; echo A","description":"Sleep"}}],"usage":{"input_tokens":2,"cache_read_input_tokens":9000}},"parent_tool_use_id":"A1","agent_id":"t1"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"B2","name":"Bash","input":{"command":"cat /nope_xyz","description":"Print"}}]},"parent_tool_use_id":"A2","agent_id":"t2"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"Exit code 1\ncat: /nope_xyz: No such file or directory","is_error":true,"tool_use_id":"B2"}]},"parent_tool_use_id":"A2","agent_id":"t2"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The command failed."}]},"parent_tool_use_id":"A2","agent_id":"t2"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t2","tool_use_id":"A2","status":"completed","summary":"failed"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"B1","type":"tool_result","content":"A","is_error":false}]},"parent_tool_use_id":"A1","agent_id":"t1"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"A1","status":"completed","summary":"A"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"F1","name":"Agent","input":{"description":"look around","prompt":"p","subagent_type":"Explore"}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"t3","tool_use_id":"F1","description":"look around","is_backgrounded":false,"task_type":"local_agent"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"R1","name":"mcp__atelier__read","input":{"path":"src/main.rs"}}]},"parent_tool_use_id":"F1","agent_id":"t3"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"fn main() {}","is_error":false,"tool_use_id":"R1"}]},"parent_tool_use_id":"F1","agent_id":"t3"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t3","tool_use_id":"F1","status":"completed","summary":"ok"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"F1","type":"tool_result","content":[{"type":"text","text":"report"}]}]},"parent_tool_use_id":null}"#,
+        ]);
+        let mut ui = LiveUi::default();
+        // No turn is running: what arrives is rendered as between turns.
+        b.wait_background(&mut ui, &mut NoTools).unwrap();
+        assert_eq!(
+            ui.activity,
+            [
+                "  ⤷ alpha · Bash sleep 3; echo A",
+                "  ⤷ beta · Bash cat /nope_xyz",
+                "  ⤷ beta · ✗ Bash: Exit code 1",
+                "  ⤷ read src/main.rs",
+            ]
+        );
+        assert_eq!(ui.tools, ["Agent", "Agent", "Agent"]);
+        assert!(ui.text.is_empty(), "{:?}", ui.text);
+        // The subagent's request is not the conversation's context size.
+        assert_eq!(b.context(), 0);
+        assert!(b.agents.is_empty());
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A background subagent reporting while the answer streams waits for
+    /// the end of the line, rather than cutting it in two.
+    #[cfg(unixlike)]
+    #[test]
+    fn subagent_activity_waits_for_the_end_of_a_line() {
+        let delta = |t: &str| {
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": t}}, "parent_tool_use_id": null})
+            .to_string()
+        };
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"A1","name":"Agent","input":{"description":"later","prompt":"p","run_in_background":true}}]},"parent_tool_use_id":null}"#.to_string(),
+            r#"{"type":"system","subtype":"task_started","tool_use_id":"A1","is_backgrounded":true}"#.to_string(),
+            delta("Launched it; "),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"B1","name":"Bash","input":{"command":"sleep 2"}}]},"parent_tool_use_id":"A1"}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"H1","name":"SubagentHandback","input":{}}]},"parent_tool_use_id":"A1"}"#.to_string(),
+            delta("it reports later.\nMeanwhile"),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"B2","name":"Bash","input":{"command":"echo two"}}]},"parent_tool_use_id":"A1"}"#.to_string(),
+            delta(" nothing."),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"x","num_turns":1}"#.to_string(),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (mut b, dir) = replaying(&lines);
+        let mut ui = LiveUi::default();
+        b.wait_background(&mut ui, &mut NoTools).unwrap();
+        assert_eq!(
+            ui.activity,
+            ["  ⤷ later · Bash sleep 2", "  ⤷ later · Bash echo two"]
+        );
+        let first_line = "Launched it; it reports later.\n".len();
+        assert_eq!(ui.activity_at, [first_line, ui.text.len()]);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/models` asks claude (`initialize`) once, and keeps the answer.
+    #[cfg(unixlike)]
+    #[test]
+    fn models_come_from_claudes_answer() {
+        let (mut b, dir) = replaying(&[
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"models":[{"value":"opus","displayName":"Opus","description":"Opus 5.5 · Best for everyday, complex tasks"}]}}}"#,
+        ]);
+        let mut ui = LiveUi::default();
+        let models = b.models(&mut ui, &mut NoTools).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].value, "opus");
+        assert_eq!(b.models(&mut ui, &mut NoTools).unwrap(), models);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What subagents do shows up — in the turn, and between turns from one
+    /// in the background — and `/models` lists what claude offers.
+    #[test]
+    #[ignore = "drives the real claude CLI on your account; run with --ignored"]
+    fn live_subagent_activity_and_models() {
+        let dir = std::env::temp_dir().join(format!("atelier-live-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = Launch {
+            bin: "claude",
+            model: Some("haiku"),
+            resume: None,
+            keep_builtins: false,
+            max_turns: None,
+        };
+        let mut b = Bridge::spawn(&launch, &dir, &Settings::default(), Vec::new()).unwrap();
+        let mut ui = LiveUi::default();
+        let models = b.models(&mut ui, &mut NoTools).unwrap();
+        let values: Vec<&str> = models.iter().map(|m| m.value.as_str()).collect();
+        assert!(
+            ["opus", "sonnet", "haiku"]
+                .iter()
+                .all(|v| values.contains(v)),
+            "{values:?}"
+        );
+
+        b.turn(
+            json!(
+                "Use the Agent tool once, in the foreground (run_in_background false), \
+                 subagent_type general-purpose, description 'probe'. Its task: run \
+                 `echo one` with the Bash tool, then `cat /nonexistent_atelier_file` \
+                 with the Bash tool, then report both outputs. Then launch a second \
+                 Agent with run_in_background true, description 'later', whose task \
+                 is to run `sleep 2; echo two` with the Bash tool and report. Do not \
+                 wait for the second one: end your turn with one short line."
+            ),
+            &mut ui,
+            &mut NoTools,
+        )
+        .unwrap();
+        b.wait_background(&mut ui, &mut NoTools).unwrap();
+        let shown = ui.activity.join("\n");
+        // The foreground one is named only if the model ran both at once.
+        assert!(shown.contains("Bash echo one"), "{shown}");
+        assert!(shown.contains("✗ Bash"), "{shown}");
+        assert!(shown.contains("⤷ later · Bash sleep 2"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

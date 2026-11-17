@@ -893,7 +893,7 @@ impl Ui for AskingFor<'_> {
 
 /// A tool call as one short line: the tool and the argument that says most
 /// about it (`read src/x.rs`).
-pub(super) fn summarize(name: &str, arguments: &str) -> String {
+pub(crate) fn summarize(name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let subject = [
         "command",
@@ -913,7 +913,7 @@ pub(super) fn summarize(name: &str, arguments: &str) -> String {
 }
 
 /// `text` as a single line of at most [`MAX_ACTIVITY_CHARS`].
-pub(super) fn clip(text: &str) -> String {
+pub(crate) fn clip(text: &str) -> String {
     let line = text.lines().next().unwrap_or("");
     if line.chars().count() > MAX_ACTIVITY_CHARS || line.len() < text.trim_end().len() {
         let cut: String = line.chars().take(MAX_ACTIVITY_CHARS).collect();

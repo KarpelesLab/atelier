@@ -65,6 +65,7 @@ mod subagent;
 mod turn_model;
 
 pub use subagent::process::{HELPER as SUBAGENT_HELPER, main as subagent_main};
+pub(crate) use subagent::{clip, summarize};
 
 const SYSTEM_PROMPT: &str = "\
 You are atelier, an AI coding assistant operating inside a project directory. \
@@ -507,8 +508,9 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             }
         }
         "/models" if session.is_claude() => {
-            ui.info("Claude backend: the model is chosen by claude itself;");
-            ui.info("set ATELIER_MODEL (e.g. opus, sonnet) to pass --model");
+            for line in session.claude_models(ui) {
+                ui.info(&line);
+            }
         }
         "/models" => {
             for line in provider::model_listing(session.config()) {
@@ -568,9 +570,9 @@ pub fn dispatch(session: &mut Session, line: &str, ui: &mut dyn Ui) -> Dispatch 
             Some(name) => {
                 session.set_model(name);
                 ui.info(&format!("model set to {name}"));
-                if !session.is_claude()
-                    && let Some(suffix) = session.config().stray_variant(name)
-                {
+                if session.is_claude() {
+                    ui.info("claude restarts with it before the next message, resuming this conversation");
+                } else if let Some(suffix) = session.config().stray_variant(name) {
                     ui.info(&format!(
                         "note: '{suffix}' is not a known variant, so it is sent as part of the model name"
                     ));
@@ -2361,6 +2363,60 @@ impl Session {
     /// Messages queued mid-turn aren't delivered early here; the interface
     /// sends them as ordinary prompts once the turn ends.
     fn send_claude(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
+        self.launch_claude(ui)?;
+        self.quit_warned = false;
+        self.claude_prompt = user_input.to_string();
+
+        let text = match self.gather_context() {
+            Some(ctx) => format!("<atelier-context>\n{ctx}\n</atelier-context>\n\n{user_input}"),
+            None => user_input.to_string(),
+        };
+        let images = std::mem::take(&mut self.pending_images);
+        let content = claude::user_content(&text, &images);
+
+        let (bridge, mut runner) = self.parts();
+        let bridge = bridge.expect("launched above");
+        let result = bridge.turn(content, ui, &mut runner);
+        // Only relaunch (next turn, resuming) if the child actually died; a
+        // live one may be running background work.
+        let dead = !bridge.is_alive();
+        // Added up: a `turn_end` hook may run several turns for one prompt.
+        let (steps, answer) = (bridge.take_steps(), bridge.take_answer());
+        self.steps += steps;
+        self.claude_answer = answer;
+        self.sync_claude();
+        if dead {
+            self.claude = None;
+        }
+        result
+    }
+
+    /// `/models` under the Claude backend: what claude offers (launching it
+    /// if it isn't running yet), with the chosen model marked.
+    fn claude_models(&mut self, ui: &mut dyn Ui) -> Vec<String> {
+        let offered = self.launch_claude(ui).and_then(|()| {
+            let (bridge, mut runner) = self.parts();
+            bridge.expect("launched above").models(ui, &mut runner)
+        });
+        self.sync_claude();
+        // As after a turn: only a process that died is let go.
+        if self.claude.as_mut().is_some_and(|b| !b.is_alive()) {
+            self.claude = None;
+        }
+        let offered = offered.unwrap_or_else(|e| {
+            ui.info(&format!("{e:#}; the aliases claude takes:"));
+            Vec::new()
+        });
+        let Backend::Claude { model, .. } = &self.cfg.backend else {
+            unreachable!("claude_models without the Claude backend");
+        };
+        let serving = self.claude.as_ref().and_then(Bridge::model);
+        claude::model_listing(&offered, model.as_deref(), serving)
+    }
+
+    /// Make sure claude runs, relaunching it first when the MCP config or
+    /// the model changed and no background work would die with it.
+    fn launch_claude(&mut self, ui: &mut dyn Ui) -> Result<()> {
         // Relaunching ends the process and whatever runs in it, so a pending
         // MCP or model change waits for background work to finish.
         if self.claude_restart && self.claude.is_some() {
@@ -2380,7 +2436,7 @@ impl Session {
                 keep_builtins,
             } = &self.cfg.backend
             else {
-                unreachable!("send_claude without the Claude backend");
+                unreachable!("launch_claude without the Claude backend");
             };
             let launch = claude::Launch {
                 bin,
@@ -2399,31 +2455,7 @@ impl Session {
             )?);
             self.claude_restart = false;
         }
-        self.quit_warned = false;
-        self.claude_prompt = user_input.to_string();
-
-        let text = match self.gather_context() {
-            Some(ctx) => format!("<atelier-context>\n{ctx}\n</atelier-context>\n\n{user_input}"),
-            None => user_input.to_string(),
-        };
-        let images = std::mem::take(&mut self.pending_images);
-        let content = claude::user_content(&text, &images);
-
-        let (bridge, mut runner) = self.parts();
-        let bridge = bridge.expect("spawned above");
-        let result = bridge.turn(content, ui, &mut runner);
-        // Only relaunch (next turn, resuming) if the child actually died; a
-        // live one may be running background work.
-        let dead = !bridge.is_alive();
-        // Added up: a `turn_end` hook may run several turns for one prompt.
-        let (steps, answer) = (bridge.take_steps(), bridge.take_answer());
-        self.steps += steps;
-        self.claude_answer = answer;
-        self.sync_claude();
-        if dead {
-            self.claude = None;
-        }
-        result
+        Ok(())
     }
 
     /// Append any messages queued in the UI as one user message; returns how
