@@ -323,7 +323,7 @@ unfiltered, for preparing the root filesystem by hand.
 
 ## What works in the guest, and what doesn't
 
-Measured with nixvm 0.0.7 (the version this is built on) and Alpine 3.22
+Measured with nixvm 0.0.7 (this is now built on 0.0.8, where the tests pass; the figures were not taken again) and Alpine 3.22
 x86-64 on KVM.
 
 | | |

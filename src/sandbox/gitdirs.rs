@@ -1058,6 +1058,10 @@ mod tests {
         let base = temp("live-hostile");
         let (victim, project) = (base.join("victim"), base.join("project"));
         std::fs::create_dir_all(&project).unwrap();
+        if !guest_has_git(&project, &setup) {
+            let _ = std::fs::remove_dir_all(base);
+            return;
+        }
         // A real repository next door, with something to steal.
         fake_git_dir(&victim.join(".git"));
         std::fs::write(victim.join(".git/config"), "[remote]\n\turl = token\n").unwrap();

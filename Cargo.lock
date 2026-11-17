@@ -728,9 +728,9 @@ dependencies = [
 
 [[package]]
 name = "nixvm"
-version = "0.0.7"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9e3c43ebfe53a20b09b6d274f4869277db02fec458b05fc55407dfb08132f5"
+checksum = "5b0ae7af4e079c0f76fe509cd74a6338f70e9aba725596858ce798f08f182fe1"
 dependencies = [
  "purecrypto 0.10.6",
 ]
