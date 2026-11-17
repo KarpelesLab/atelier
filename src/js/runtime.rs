@@ -1,12 +1,18 @@
 //! Glue for running user JS on an [`Interp`]: the bootstrap that assembles the
-//! host objects, error rendering, and output truncation.
+//! host objects, top-level `await`, and error rendering.
 
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use kataan::Interp;
+use kataan::NanBox;
+use kataan::heap::Handle;
 use kataan::interrupt::Interrupt;
 use kataan::nbexec::ExecError;
 use kataan::parser::Parser;
+use kataan::realm::Realm;
+
+use super::fs::Scope;
 
 /// JS run before the user's code. It gathers the mangled `__atelier_*` globals
 /// (registered from Rust) into the `fs` / `console` / `os` / `encoding` /
@@ -26,6 +32,17 @@ use kataan::parser::Parser;
 /// network access), so — unlike `fs` and the network globals — they're always
 /// assembled here, regardless of the `network` flag; they don't affect the
 /// tool's confinement or approval requirement.
+///
+/// `fs.promises` (also `require("fs/promises")`) is the same operations
+/// returning promises: each runs the synchronous method when called and
+/// settles with its result or its error — so it is checked exactly as the
+/// synchronous one, and `await` and `.then` work as in Node. kataan drains
+/// its job queue at the end of every `interp.run`, so the reactions run
+/// before the script's result is read.
+///
+/// `require` knows only the built-in host objects (`fs`, `fs/promises`,
+/// `path`, `os`, with or without `node:`), for scripts written the Node way;
+/// there is no module loading.
 pub const BOOTSTRAP: &str = r#"
 fs = {
   readFile: __atelier_fs_readFile,
@@ -50,6 +67,20 @@ fs = {
     return __atelier_fs_writeFileBytes(p, a);
   },
 };
+// The host objects are captured here, not looked up by name when called:
+// a script's own top-level `const fs = require("fs")` is a global lexical
+// binding that every later name lookup of `fs` would find (in its TDZ).
+fs.promises = (function (host) {
+  var p = {};
+  Object.keys(host).forEach(function (name) {
+    var f = host[name];
+    p[name] = function () {
+      var args = arguments;
+      return new Promise(function (resolve) { resolve(f.apply(host, args)); });
+    };
+  });
+  return p;
+})(fs);
 console = {
   log: __atelier_console_log,
   error: __atelier_console_error,
@@ -169,6 +200,14 @@ path = (function () {
     sep: "/",
   };
 })();
+require = (function (builtins) {
+  return function (name) {
+    var n = String(name);
+    if (n.indexOf("node:") === 0) n = n.substring(5);
+    if (Object.prototype.hasOwnProperty.call(builtins, n)) return builtins[n];
+    throw new Error("Cannot find module '" + name + "': only fs, fs/promises, path and os can be required");
+  };
+})({ fs: fs, "fs/promises": fs.promises, path: path, os: os });
 "#;
 
 /// JS run **only** when the call opts into network (`network: true`), after
@@ -203,10 +242,15 @@ fetch = function (url, options) {
 };
 "#;
 
-/// Build an interpreter, install the mediated host (`fs` + `console`, plus the
-/// network host when `network` is set and the `tools` object when the call
-/// came with a [`Port`](super::tools::Port) to the session's tools), run the
-/// bootstrap(s) and the user's program, and return the captured output as a single [`String`].
+/// Build an interpreter, install the mediated host (`fs` within `scope` +
+/// `console`, plus the network host when `network` is set and the `tools`
+/// object when the call came with a [`Port`](super::tools::Port) to the
+/// session's tools), run the bootstrap(s) and the user's program, and return
+/// the captured output as a single [`String`].
+///
+/// A program that only parses as the body of an async function — one with a
+/// top-level `await` — is run as one (see [`parse_user`]); its rejection is
+/// reported like an uncaught throw.
 ///
 /// Takes fully **owned** data so it can run on a dedicated worker thread: the
 /// `Interp` and every `NanBox` are created and dropped here, never crossing the
@@ -214,7 +258,7 @@ fetch = function (url, options) {
 /// [`super::NodeTool::call`], which drives this under a wall-clock timeout.
 pub fn execute(
     code: String,
-    root: PathBuf,
+    scope: Scope,
     network: bool,
     tools: Option<super::tools::Port>,
     interrupt: Interrupt,
@@ -243,7 +287,7 @@ pub fn execute(
     } else {
         None
     };
-    let user_prog = match parse(&code) {
+    let user_prog = match parse_user(&code) {
         Ok(p) => p,
         Err(msg) => return msg,
     };
@@ -253,7 +297,8 @@ pub fn execute(
     // and the interpreter aborts cooperatively (on loop back-edges) with
     // `ExecError::Interrupted`.
     interp.realm_mut().interrupt = Some(interrupt);
-    super::fs::install(&mut interp, root);
+    super::fs::install(&mut interp, scope);
+    let uncaught = install_uncaught(&mut interp);
     super::os::install(&mut interp);
     super::encoding::install(&mut interp);
     super::hash::install(&mut interp);
@@ -291,7 +336,14 @@ pub fn execute(
     let result = interp.run(&user_prog);
 
     let mut output = out.borrow().clone();
+    let rejected = uncaught.borrow_mut().take();
     match result {
+        Ok(_) if rejected.is_some() => {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&format!("Uncaught {}", rejected.unwrap_or_default()));
+        }
         Ok(value) => {
             // With no console output, fall back to the script's final value.
             if output.is_empty() {
@@ -313,19 +365,84 @@ pub fn execute(
     output
 }
 
-/// Render an [`ExecError`] into a human-readable message. A thrown JS value is
-/// displayed via the realm; everything else falls back to its debug form.
+/// Register `__atelier_uncaught(reason)`, which the async wrapper of a
+/// top-level-`await` program rejects into (see [`parse_user`]). The reason is
+/// kept as text — `String(reason)`, so an `Error` reads `Error: message` —
+/// since a `NanBox` must not outlive the call that handed it over.
+fn install_uncaught(interp: &mut Interp) -> Rc<RefCell<Option<String>>> {
+    let slot = Rc::new(RefCell::new(None));
+    let kept = slot.clone();
+    interp.register_global_fn("__atelier_uncaught", 1, move |cx, _this, args| {
+        let reason = args.first().copied().unwrap_or_else(|| cx.undefined());
+        let text = cx
+            .to_string(reason)
+            .unwrap_or_else(|_| "(an error that cannot be shown)".into());
+        *kept.borrow_mut() = Some(text);
+        Ok(cx.undefined())
+    });
+    slot
+}
+
+/// Render an [`ExecError`] into a human-readable message. A thrown error
+/// object reads `Name: message`; any other thrown JS value is displayed via
+/// the realm; everything else falls back to its debug form.
 ///
 /// Must be called immediately after the failing `run`, before any further
 /// `run` — the moving GC may relocate the thrown value on the next collection.
 pub fn render_exec_error(interp: &Interp, err: &ExecError) -> String {
     match err {
-        ExecError::Throw(nb) => interp.realm().to_display_string(*nb),
+        ExecError::Throw(nb) => {
+            error_text(interp.realm(), *nb).unwrap_or_else(|| interp.realm().to_display_string(*nb))
+        }
         other => format!("{other:?}"),
     }
+}
+
+/// `name: message` for a thrown object that has a string `message` (own or
+/// inherited), as `Error.prototype.toString` would put it; `None` for
+/// anything else. The realm's display form of an object is `[object
+/// Object]`, which says nothing about what went wrong.
+fn error_text(realm: &Realm, v: NanBox) -> Option<String> {
+    let object = Handle::from_raw(v.as_handle()?);
+    let string = |key: &str| -> Option<String> {
+        // Up the prototype chain, a few links at most.
+        let mut at = Some(object);
+        for _ in 0..8 {
+            let here = at?;
+            if let Some(value) = realm.get_property(here, key) {
+                let handle = Handle::from_raw(value.as_handle()?);
+                return (realm.type_of(handle)? == "string")
+                    .then(|| realm.to_display_string(value));
+            }
+            at = realm.object_proto(here);
+        }
+        None
+    };
+    let message = string("message")?;
+    let name = string("name").unwrap_or_else(|| "Error".into());
+    Some(match (name.is_empty(), message.is_empty()) {
+        (true, _) => message,
+        (false, true) => name,
+        (false, false) => format!("{name}: {message}"),
+    })
 }
 
 /// Parse `src` into a program, mapping a parse failure to a readable message.
 pub fn parse(src: &str) -> Result<kataan::ast::Program, String> {
     Parser::parse_program(src).map_err(|e| format!("SyntaxError: {e:?}"))
+}
+
+/// Parse the user's program. A script is a script; one that does not parse
+/// as one but does as the body of an async function is a script with a
+/// top-level `await` (which kataan's script goal does not allow), and is run
+/// as that function, its rejection going to `__atelier_uncaught`. The body
+/// starts on the first line, so line numbers in errors stay the user's. What
+/// parses neither way is reported with the script's own syntax error.
+fn parse_user(src: &str) -> Result<kataan::ast::Program, String> {
+    let err = match parse(src) {
+        Ok(p) => return Ok(p),
+        Err(e) => e,
+    };
+    let wrapped = format!("(async function () {{{src}\n}})().then(undefined, __atelier_uncaught);");
+    parse(&wrapped).map_err(|_| err)
 }

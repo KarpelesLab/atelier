@@ -282,13 +282,19 @@ fn detect_dynamic_eval(tokens: &[String]) -> bool {
 
 /// Warnings about what a tool call might do, for the approval prompt.
 pub fn signals(tool: &str, arguments: &str) -> Vec<String> {
-    if tool != "bash" {
+    if tool != "bash" && tool != "node" {
         return Vec::new();
     }
 
     let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
         return Vec::new();
     };
+    // A script says what it reaches beyond the project in its arguments
+    // (the network, outside paths): name that, which the prompt's clipped
+    // argument line may not show.
+    if tool == "node" {
+        return crate::js::approval_signals(&value);
+    }
     let Some(command) = value.get("command").and_then(|v| v.as_str()) else {
         return Vec::new();
     };
@@ -364,6 +370,29 @@ mod tests {
         let args = bash_args("rm -rf /");
         assert!(signals("edit_file", &args).is_empty());
         assert!(signals("mcp__foo__bar", &args).is_empty());
+    }
+
+    /// A script names what it reaches beyond the project; its code is not
+    /// scanned (what it can do is what the host gives it).
+    #[test]
+    fn node_names_its_network_and_outside_paths() {
+        let plain = serde_json::json!({ "code": "rm -rf /" }).to_string();
+        assert!(signals("node", &plain).is_empty());
+        let args = serde_json::json!({
+            "code": "1",
+            "network": true,
+            "allow_read": ["/etc/hosts", "~/notes"],
+            "allow_write": ["/tmp/out"],
+        })
+        .to_string();
+        assert_eq!(
+            signals("node", &args),
+            [
+                "network access (fetch)",
+                "reads outside the project: /etc/hosts, ~/notes",
+                "writes outside the project: /tmp/out",
+            ]
+        );
     }
 
     #[test]

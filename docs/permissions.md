@@ -27,9 +27,10 @@ asks before them, `yolo` asks about nothing.
     the default, so any tool from any connected server always requires
     approval, regardless of what it actually does.
   - **`node` with `network: true`** — opts into `fetch`/`httpGet`/
-    `httpRequest`, at which point the call is treated as unconfined
-    (`NodeTool::requires_approval` returns `true` exactly when `network` is
-    set).
+    `httpRequest`, at which point the call is treated as unconfined.
+  - **`node` with `allow_read`/`allow_write`** naming a path outside the
+    project — its `fs` may then use those paths (and only those); the
+    prompt lists them (see [Scripting](scripting.md#outside-the-project-allow_read-and-allow_write)).
 
 ## Modes
 
@@ -50,7 +51,7 @@ What each mode does with each class of tool, when no rule matches the call:
 | Read-only, confined | `read` (in the project), `grep`, `glob`, `ls`, `tree`, `symbols`, `todo`, `skill`, `memory` `read`/`list`, `bash_output`, `bash_kill`, `peers`, `peer_answer`, `peer_lock` | run | run | run | run |
 | Read-only, unconfined | `web_fetch`, `web_search`, `read` outside the project, MCP tools their server marks `readOnlyHint: true`, MCP `read_resource` / `get_prompt` | ask | ask | ask | run |
 | Modifying, confined | `write`, `edit`, `multiedit`, `apply_patch`, `notebook_edit`, `node` (its `fs` can write), `memory` `save`/`delete` | **refused** | **ask** | run | run |
-| Modifying, unconfined | `bash`, `node` with `network: true`, every other MCP tool, `peer_send`, `peer_ask` | **refused** (but see `bash` below) | ask | ask | run |
+| Modifying, unconfined | `bash`, `node` with `network: true` or outside paths, every other MCP tool, `peer_send`, `peer_ask` | **refused** (but see `bash` below) | ask | ask | run |
 
 And with [rules](#rules):
 
@@ -257,7 +258,9 @@ What "always" saves:
   `python -c`, `node -e`, `find -exec`, …), commands that cannot be followed
   or that an allow rule could never cover (see above), and calls an `ask`
   rule prompted for. Write a rule by hand if you want one.
-- **MCP tools and `node`** — the tool name.
+- **MCP tools and `node`** — the tool name; but nothing for a `node`
+  call with `allow_read`/`allow_write` (a rule for `node` would let every
+  later script reach wherever it names).
 - **`web_fetch`** — `web_fetch(domain:<host>)`. **`read`** outside the
   project — that exact path.
 

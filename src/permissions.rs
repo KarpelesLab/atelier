@@ -799,6 +799,10 @@ impl Policy {
                 .map(|h| format!("{tool}(domain:{h})"))
                 .into_iter()
                 .collect(),
+            // A script granted paths outside the project: no rule. One for
+            // `node` would let every later script go anywhere it names, and
+            // a pattern over the arguments cannot pin the paths down.
+            Subject::Json(_) if tool == "node" && crate::js::declares_paths(args) => Vec::new(),
             // MCP tools and the rest: the tool, by name.
             Subject::Json(_) => vec![tool.to_string()],
         }
@@ -2263,6 +2267,10 @@ mod tests {
             ["mcp__github__create_issue"]
         );
         assert_eq!(p.propose("node", &json!({"network": true}), root), ["node"]);
+        assert!(
+            p.propose("node", &json!({"allow_read": ["/etc"]}), root)
+                .is_empty()
+        );
         assert_eq!(
             p.propose("web_fetch", &json!({"url": "https://Docs.rs/serde"}), root),
             ["web_fetch(domain:docs.rs)"]
@@ -2940,6 +2948,7 @@ mod tests {
             ("apply_patch", json!({"patch": ""})),
             ("notebook_edit", path.clone()),
             ("node", json!({"code": "1"})),
+            ("node", json!({"code": "1", "allow_write": ["src/out"]})),
             ("memory", json!({"action": "save", "name": "x"})),
             ("memory", json!({"action": "delete", "name": "x"})),
             ("memory", json!({"action": "frobnicate"})),
@@ -2951,6 +2960,7 @@ mod tests {
         for (tool, args) in [
             ("bash", json!({"command": "ls"})),
             ("node", json!({"code": "1", "network": true})),
+            ("node", json!({"code": "1", "allow_read": ["/etc/hosts"]})),
         ] {
             assert_eq!(class(tool, args.clone()), (true, true), "{tool} {args}");
         }

@@ -5,7 +5,8 @@
 implements and mediates itself — a safer alternative to `bash` for logic
 that's awkward as a shell one-liner (loops, parsing, small transforms).
 Because the engine core is sans-I/O, every effect (`fs`, network) is a
-Rust-implemented global that checks the project boundary on every call.
+Rust-implemented global that checks the project boundary on every call —
+and the call says up front, in its arguments, anything it needs beyond it.
 
 ## Parameters
 
@@ -14,6 +15,8 @@ Rust-implemented global that checks the project boundary on every call.
 | `code`       | string  | yes      | JavaScript source to run |
 | `network`    | boolean | no       | Install `fetch`/`httpGet`/`httpRequest` (default false). Setting this `true` makes the call require approval |
 | `tools`      | boolean | no       | Install the [`tools`](#tools--calling-other-tools-code-mode) object, to call other tools from the script (default false) |
+| `allow_read` | string[] | no      | Paths [outside the project](#outside-the-project-allow_read-and-allow_write) `fs` may read. Naming one makes the call require approval |
+| `allow_write` | string[] | no     | Paths outside the project `fs` may read and write. Same approval |
 | `timeout_ms` | integer | no       | Wall-clock budget in ms (default **5000**, clamped to at most 600000) |
 
 The tool result is the script's captured `console` output; if nothing was
@@ -21,21 +24,48 @@ logged, it falls back to the display form of the script's final expression
 value (or is empty for `undefined`). Output past 10KB comes back as its start and its end, with all of it
 saved to a file ([spilled output](tools.md#long-output-goes-to-a-file)). A thrown
 error is appended as `Uncaught <message>` (a syntax error is reported the
-same way, without running anything).
+same way, without running anything). A thrown error reads
+`Uncaught TypeError: <message>`.
 
-## No modules
+## No modules, but `require` for the built-ins
 
-There is **no `require`/`import`** — CommonJS and ES modules are
-unavailable. `fs` and `console` are plain globals already in scope; just use
-them directly.
+There is no module loading: `import` is unavailable and nothing is read
+from `node_modules`. `fs`, `path`, `os` and `console` are plain globals
+already in scope. For scripts written the Node way, `require` returns the
+built-ins — `require("fs")`, `require("fs/promises")` (that is
+`fs.promises`), `require("path")`, `require("os")`, each also with the
+`node:` prefix — and throws `Cannot find module` for any other name.
 
-## `fs` — synchronous, project-confined
+```js
+const fsp = require("node:fs/promises");
+const path = require("path");
+```
 
-Every method is synchronous (no promises/callbacks/await) and every path
-argument is resolved against the project root the same way built-in file
-tools are (`tools::confine`): relative paths are joined to the root, `.`/`..`
-are normalized, and anything that still doesn't stay under the root throws a
-catchable JS error instead of touching the filesystem.
+## Top-level `await`
+
+A script may `await` at the top level. kataan's scripts don't allow that
+themselves, so a program that doesn't parse as a script but does as the
+body of an async function is run as one. Everything else is the same, but
+for two things: there is no final-expression fallback for the result (use
+`console.log`), and top-level declarations are the function's locals. An
+awaited rejection that nothing catches ends the script as a throw would:
+`Uncaught Error: <message>` after the output so far.
+
+Promise reactions run before the script's result is read, `await`ed or not.
+A rejection that is never awaited or caught is dropped silently, though —
+there is no unhandled-rejection report — so `await` or `.catch` what can
+fail.
+
+## `fs` — project-confined
+
+The methods are synchronous and return their result directly (there are no
+callbacks); [`fs.promises`](#fspromises) has the same ones returning
+promises. Every path argument is resolved against the project root the same
+way built-in file tools are (`tools::confine`): relative paths are joined to
+the root, `.`/`..` are normalized, and anything that still doesn't stay
+under the root throws a catchable JS error instead of touching the
+filesystem — unless the call [granted](#outside-the-project-allow_read-and-allow_write)
+that path.
 
 | Method | Signature | Behavior |
 |--------|-----------|----------|
@@ -51,8 +81,8 @@ catchable JS error instead of touching the filesystem.
 | `fs.rename` | `(from, to)` | Renames/moves within the project root |
 | `fs.readFileBytes` | `(path) -> Uint8Array` | Reads a file as raw bytes |
 | `fs.writeFileBytes` | `(path, data)` | Writes a `Uint8Array` or plain byte array |
-| `fs.glob` | `(pattern) -> string[]` | Project files matching a glob (respects .gitignore) |
-| `fs.copyFile` | `(src, dst)` | Copy a file (both confined; creates dst dirs) |
+| `fs.glob` | `(pattern) -> string[]` | Project files matching a glob (respects .gitignore; the project only, whatever is granted) |
+| `fs.copyFile` | `(src, dst)` | Copy a file (src read, dst written; creates dst dirs) |
 
 ```js
 fs.writeFile("notes/todo.txt", "buy milk\n");
@@ -67,6 +97,57 @@ try {
   console.log("blocked:", e.message);
 }
 ```
+
+### `fs.promises`
+
+The same methods, each returning a promise of what the synchronous one
+returns — so `fs.promises.readFile(path)` is a promise of a string, and a
+refused path or a failed operation is a rejection instead of a throw. The
+names are Node's; the signatures and results are this `fs`'s (`stat` gives
+`{isFile, isDirectory, …}` booleans, `exists` is there, there are no options
+objects).
+
+```js
+const fsp = require("fs/promises");
+const names = await fsp.readdir("src");
+const sizes = await Promise.all(names.map(async (n) => (await fsp.stat("src/" + n)).size));
+console.log(sizes.reduce((a, b) => a + b, 0));
+```
+
+Each operation runs when it is called (the interpreter is single-threaded),
+so `Promise.all` orders them but doesn't overlap them; the promise settles
+with the result on the next turn of the job queue. They are checked exactly
+as the synchronous methods are.
+
+### Outside the project: `allow_read` and `allow_write`
+
+A path outside the project throws — unless the call names it. `allow_read`
+lists paths the script may read, `allow_write` paths it may read and write
+(write, append, mkdir, rm, rmdir, rename, the destination of copyFile).
+Each entry is absolute, `~/…` (the home directory), or relative to the
+project root, and covers itself and everything under it.
+
+```json
+{ "code": "console.log(fs.readFile('/etc/hosts'))", "allow_read": ["/etc/hosts"] }
+```
+
+- **Naming an outside path makes the call require approval**, like
+  `network: true`. The prompt says what the script asks for, one line per
+  kind: `⚠ reads outside the project: /etc/hosts`,
+  `⚠ writes outside the project: ~/notes`. Entries inside the project ask
+  for nothing (the script has those already) and need no approval.
+- **The grant is exactly what was declared.** The mediated `fs` allows those
+  prefixes, by whole path components (`/data/ref` covers `/data/ref/x`, not
+  `/data/reference`), after `.`/`..` are folded; a write under a read-only
+  entry, and every other outside path, still throws.
+- **It lasts one call.** Answering "always" runs the call but saves no rule:
+  a rule for `node` would let every later script reach whatever it names.
+  An `allow` rule written by hand for `node` covers these calls like any
+  other.
+- A call that was not approved — the tool called directly, without the
+  session's approval — is refused outright rather than run with the paths.
+- Like the project check, it's lexical: symlinks are not followed, so a
+  link inside a granted directory reaches where it points.
 
 ## `console`
 
@@ -245,6 +326,6 @@ console.log(httpGet("https://example.com/robots.txt"));
 
 ## What's not there yet
 
-Per the project roadmap: async `fs`, out-of-project `fs` access mediated by
-approval (today it's a hard reject, not a prompt), and typed-array/binary
-support for request/response bodies (everything is currently string-based).
+Per the project roadmap: typed-array/binary support for request/response
+bodies (everything is currently string-based), Node's callback-style `fs`
+API, and an unhandled-rejection report.

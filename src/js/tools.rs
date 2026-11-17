@@ -187,6 +187,10 @@ pub fn install(interp: &mut Interp, port: Port) {
 /// script on a worker and serve its tool calls through `host` until it ends.
 /// `catalog` is what the script is told it can call. The result is the
 /// script's output, as for any `node` call.
+///
+/// Only for a call that passed its own approval (the tool runner calls this
+/// where it would have called the tool): the outside paths it declares in
+/// `allow_read`/`allow_write` are granted as declared.
 pub fn run(
     project_root: &Path,
     args: &Value,
@@ -197,8 +201,9 @@ pub fn run(
         code,
         network,
         timeout_ms,
-    } = Params::parse(args)?;
-    let root = project_root.to_path_buf();
+        grants,
+    } = Params::parse(args, project_root)?;
+    let scope = grants.scope(project_root);
     let interrupt = Interrupt::new();
     let worker_interrupt = interrupt.clone();
     let (events, inbox) = mpsc::channel();
@@ -210,7 +215,7 @@ pub fn run(
         .name("node-script".into())
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
-            let out = runtime::execute(code, root, network, Some(port), worker_interrupt);
+            let out = runtime::execute(code, scope, network, Some(port), worker_interrupt);
             // Nobody listening means the script was given up on.
             let _ = events.send(Event::Done(out));
         })

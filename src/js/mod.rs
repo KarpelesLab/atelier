@@ -2,21 +2,21 @@
 //!
 //! The `node` tool runs a JS script on [kataan](https://github.com/KarpelesLab/kataan)
 //! with **host APIs we implement and mediate**. kataan's core is sans-I/O, so we
-//! provide `fs`/`console` ourselves and check every effect at call time — v1
-//! confines `fs` to the project root and exposes no network, so the tool can't
-//! escape the project and is therefore auto-approved (`requires_approval = false`).
+//! provide `fs`/`console` ourselves and check every effect at call time. By
+//! default `fs` is confined to the project root and there is no network, so a
+//! plain call can't escape the project and is auto-approved; asking for the
+//! network or for paths outside the project makes the call need approval.
 //!
-//! # Contract / plan for the implementer (owns `src/js/`)
+//! # Outside the project
 //!
-//! Implement `NodeTool::call`: build an `Interp`, install a mediated `fs` object
-//! (methods registered with `interp.register_fn`, each resolving its path
-//! against `ctx.project_root` and rejecting anything outside — mirror
-//! `ToolCtx::resolve`), install a `console` that captures output, run the
-//! script, drive `kataan::host::timers::run_event_loop` if needed, and return
-//! the captured console output (and the result / any thrown error) as the tool
-//! result string. Add `src/js/fs.rs`, `src/js/console.rs`, `src/js/runtime.rs`
-//! as you see fit. Do not edit files outside `src/js/`. Keep `NodeTool`'s public
-//! shape (name, spec, requires_approval) so the registration keeps working.
+//! A call can name paths outside the project its script may use:
+//! `allow_read` (read only) and `allow_write` (read and write), each entry
+//! covering itself and what is under it. Declaring one makes the call need
+//! approval ([`Tool::requires_approval_in`]) — the user is shown exactly what
+//! the script asks for, ahead of the prompt (`risk::signals`) — and the
+//! mediated `fs` then allows those prefixes and still refuses every other
+//! outside path (see [`fs::Scope`]). The grant is per call: nothing is
+//! remembered, and "always" saves no rule for it (`permissions::propose`).
 //!
 //! # Code mode
 //!
@@ -26,6 +26,7 @@
 //! [`NodeTool::call`] but by the agent's tool runner through [`tools::run`],
 //! which serves the script's tool calls on the turn's thread. See [`tools`].
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -74,10 +75,126 @@ struct Params {
     network: bool,
     /// The script's time budget, within `1..=MAX_TIMEOUT_MS`.
     timeout_ms: u64,
+    /// Paths outside the project the script may use.
+    grants: Grants,
+}
+
+/// The paths a call names in `allow_read` / `allow_write`, made absolute
+/// (relative to the project root, `~` the home directory) and lexically
+/// normalized — the form [`fs::Scope`] checks paths in.
+#[derive(Debug, Default, PartialEq)]
+pub struct Grants {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
+}
+
+impl Grants {
+    /// The grants `args` declare. A malformed list (not an array of
+    /// non-empty strings) is an error, never read as no grant.
+    pub fn parse(args: &Value, root: &Path) -> Result<Self> {
+        let list = |key: &str| -> Result<Vec<PathBuf>> {
+            let Some(value) = args.get(key).filter(|v| !v.is_null()) else {
+                return Ok(Vec::new());
+            };
+            let items = value
+                .as_array()
+                .ok_or_else(|| anyhow!("`{key}` must be an array of paths"))?;
+            items
+                .iter()
+                .map(|item| match item.as_str() {
+                    Some(p) if !p.trim().is_empty() => Ok(absolute(root, p)),
+                    _ => Err(anyhow!(
+                        "`{key}` must be an array of non-empty path strings"
+                    )),
+                })
+                .collect()
+        };
+        Ok(Self {
+            read: list("allow_read")?,
+            write: list("allow_write")?,
+        })
+    }
+
+    /// The grants that reach outside `root` (one inside it grants nothing
+    /// the script did not already have).
+    pub fn outside(&self, root: &Path) -> Self {
+        let keep = |list: &[PathBuf]| -> Vec<PathBuf> {
+            list.iter()
+                .filter(|p| !p.starts_with(root))
+                .cloned()
+                .collect()
+        };
+        Self {
+            read: keep(&self.read),
+            write: keep(&self.write),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.write.is_empty()
+    }
+
+    /// The `fs` scope of a script run with these grants in `root`.
+    fn scope(self, root: &Path) -> fs::Scope {
+        fs::Scope {
+            root: root.to_path_buf(),
+            read: self.read,
+            write: self.write,
+        }
+    }
+}
+
+/// `path` made absolute against `root`, with a leading `~` read as the home
+/// directory, and `.`/`..` folded (as [`crate::tools::confine`] does).
+fn absolute(root: &Path, path: &str) -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    let joined = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match home() {
+            Some(h) => h.join(rest.trim_start_matches('/')),
+            None => root.join(path),
+        },
+        _ => root.join(path),
+    };
+    crate::tools::normalize(&joined)
+}
+
+/// Whether a `node` call names any path in `allow_read`/`allow_write` — the
+/// question without the root at hand, where a path in the project counts
+/// too. "Always" saves no blanket `node` rule for such a call.
+pub fn declares_paths(args: &Value) -> bool {
+    ["allow_read", "allow_write"]
+        .iter()
+        .any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// What the approval prompt says about a `node` call beyond its arguments:
+/// the network, and each outside path, by what the script may do there.
+pub fn approval_signals(args: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if args
+        .get("network")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push("network access (fetch)".to_string());
+    }
+    for (key, what) in [
+        ("allow_read", "reads outside the project"),
+        ("allow_write", "writes outside the project"),
+    ] {
+        let Some(items) = args.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let paths: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+        if !paths.is_empty() {
+            out.push(format!("{what}: {}", paths.join(", ")));
+        }
+    }
+    out
 }
 
 impl Params {
-    fn parse(args: &Value) -> Result<Self> {
+    fn parse(args: &Value, root: &Path) -> Result<Self> {
         let code = args
             .get("code")
             .and_then(Value::as_str)
@@ -92,10 +209,12 @@ impl Params {
             .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(1, MAX_TIMEOUT_MS);
+        let grants = Grants::parse(args, root)?.outside(root);
         Ok(Self {
             code,
             network,
             timeout_ms,
+            grants,
         })
     }
 }
@@ -115,22 +234,38 @@ impl Tool for NodeTool {
     fn requires_approval(&self, args: &Value) -> bool {
         // Confined by default (mediated fs stays in the project root), so a plain
         // call is auto-approved. A call that opts into network (`network: true`)
-        // is unconfined and requires approval.
+        // is unconfined and requires approval; so, without the root to tell, is
+        // one that names any path for `allow_read`/`allow_write`.
         args.get("network")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+            || declares_paths(args)
+    }
+
+    /// As [`requires_approval`](Tool::requires_approval), but a declared path
+    /// inside the project asks for nothing new and needs no approval. A
+    /// malformed list does (the call will fail, but nothing is waved through).
+    fn requires_approval_in(&self, args: &Value, root: &Path) -> bool {
+        let network = args
+            .get("network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        network || Grants::parse(args, root).map_or(true, |g| !g.outside(root).is_empty())
     }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "node".into(),
-            description: "Run a JavaScript program in a sandboxed runtime (no \
-                require/import — CommonJS and ES modules are unavailable). Six globals are \
-                provided directly, already in scope (do NOT require() or import them): `console` \
-                (log, error), a SYNCHRONOUS `fs` confined to the project directory, a pure \
-                `path` (POSIX-style path utilities, no I/O), a pure `os` (host facts, no \
-                I/O), a pure `encoding` (base64/hex string conversions, no I/O), and a pure \
-                `hash` (SHA-256, no I/O). The fs methods return values directly — no promises, callbacks, or await: \
+            description: "Run a JavaScript program in a sandboxed runtime (no module \
+                loading: `import` is unavailable, and require() only returns the built-ins \
+                'fs', 'fs/promises', 'path' and 'os'). Six globals are provided directly, \
+                already in scope: `console` (log, error), an `fs` confined to the project \
+                directory, a pure `path` (POSIX-style path utilities, no I/O), a pure `os` \
+                (host facts, no I/O), a pure `encoding` (base64/hex string conversions, no \
+                I/O), and a pure `hash` (SHA-256, no I/O). The fs methods are SYNCHRONOUS and \
+                return values directly (no callbacks); fs.promises has the same methods \
+                returning promises, for `await fs.promises.readFile(...)` (top-level await \
+                works): \
                 fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
                 fs.readdir(path) -> string[]; fs.exists(path) -> boolean; fs.mkdir(path); \
                 fs.stat(path) -> {isFile, isDirectory, size, mtimeMs}; \
@@ -142,7 +277,9 @@ impl Tool for NodeTool {
                 Binary I/O: \
                 fs.readFileBytes(path) -> Uint8Array; fs.writeFileBytes(path, data) where data \
                 is a Uint8Array or a plain array of byte numbers. Paths \
-                are relative to the project root and cannot escape it. `path` (always \
+                are relative to the project root and cannot escape it, except paths the \
+                call lists in `allow_read`/`allow_write` (which makes it require approval). \
+                `path` (always \
                 available, no filesystem access of its own): path.join(...parts), \
                 path.dirname(p), path.basename(p[, ext]), path.extname(p), path.normalize(p), \
                 path.isAbsolute(p), path.sep ('/'). `os` (always available): os.platform() \
@@ -192,6 +329,22 @@ impl Tool for NodeTool {
                             from the script and work on their results there. Default false.",
                         "default": false
                     },
+                    "allow_read": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paths OUTSIDE the project the script's fs may read \
+                            (each covers itself and everything under it; absolute, `~/`, or \
+                            relative to the project root). Naming any makes this call require \
+                            user approval. Only for files the task really needs outside the \
+                            project; every other outside path still throws."
+                    },
+                    "allow_write": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paths OUTSIDE the project the script's fs may read and \
+                            write (create, append, remove, rename). Same form and approval as \
+                            `allow_read`."
+                    },
                     "timeout_ms": {
                         "type": "integer",
                         "description": "Wall-clock execution budget in milliseconds. Default \
@@ -217,14 +370,24 @@ impl Tool for NodeTool {
                  session to approve and run them"
             );
         }
-        // Owned inputs for the worker thread: the script source, the `fs`
-        // confinement root, and whether to install the network host.
+        // Owned inputs for the worker thread: the script source, where its
+        // `fs` may go, and whether to install the network host.
         let Params {
             code,
             network,
             timeout_ms,
-        } = Params::parse(&args)?;
-        let root = ctx.project_root.to_path_buf();
+            grants,
+        } = Params::parse(&args, ctx.project_root)?;
+        // Outside paths are only for a call that went through approval, which
+        // `requires_approval_in` demands for them: calling the tool directly
+        // does not skip the prompt.
+        if !grants.is_empty() && !ctx.approved {
+            bail!(
+                "`allow_read`/`allow_write` name paths outside the project, which needs the \
+                 user's approval, and this call was not approved"
+            );
+        }
+        let scope = grants.scope(ctx.project_root);
         let project_root = ctx.project_root;
 
         // Run the interpreter on a dedicated worker thread and wait for its
@@ -244,7 +407,7 @@ impl Tool for NodeTool {
             .name("node-script".into())
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
-                let out = runtime::execute(code, root, network, None, worker_interrupt);
+                let out = runtime::execute(code, scope, network, None, worker_interrupt);
                 // Ignore a send error: it only means we already timed out and
                 // the receiver is gone.
                 let _ = tx.send(out);
@@ -893,5 +1056,238 @@ false
             "all three invalid inputs should throw: {output:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run a `node` call with `args` in `root`, approved or not.
+    fn call(
+        root: &std::path::Path,
+        args: serde_json::Value,
+        approved: bool,
+    ) -> anyhow::Result<String> {
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+            approved,
+        };
+        NodeTool.call(&mut ctx, args)
+    }
+
+    /// `fs.promises` mirrors the synchronous methods, and a top-level
+    /// `await` runs the script as an async body.
+    #[test]
+    fn fs_promises_with_top_level_await() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                await fs.promises.writeFile("p.txt", "via promises");
+                const text = await fs.promises.readFile("p.txt", "utf8");
+                const names = await fs.promises.readdir(".");
+                console.log(text, names.join(","), await fs.promises.exists("p.txt"));
+            "#,
+        );
+        assert_eq!(output.trim(), "via promises p.txt true", "{output}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `Promise.all` example of docs/scripting.md.
+    #[test]
+    fn fs_promises_with_promise_all() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a"), "12345").unwrap();
+        std::fs::write(root.join("src/b"), "678").unwrap();
+        let output = run(
+            &root,
+            r#"
+                const fsp = require("fs/promises");
+                const names = await fsp.readdir("src");
+                const sizes = await Promise.all(names.map(async (n) => (await fsp.stat("src/" + n)).size));
+                console.log(sizes.reduce((a, b) => a + b, 0));
+            "#,
+        );
+        assert_eq!(output.trim(), "8", "{output}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A refused path rejects the promise (no throw at the call), with the
+    /// same confinement as the synchronous method; `.then` chains run before
+    /// the result is read.
+    #[test]
+    fn fs_promises_reject_an_escape() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.promises.readFile("../../etc/passwd").then(
+                    function () { console.log("NOT_REJECTED"); },
+                    function (e) { console.log("rejected:", e.message); }
+                );
+                console.log("first");
+            "#,
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "first", "{output}");
+        assert!(lines[1].starts_with("rejected:"), "{output}");
+        assert!(lines[1].contains("escapes the project root"), "{output}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An awaited rejection nobody catches ends the script like a throw.
+    #[test]
+    fn uncaught_rejection_after_await_is_reported() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                console.log("before");
+                await fs.promises.readFile("../outside.txt");
+                console.log("NOT_REACHED");
+            "#,
+        );
+        assert!(output.starts_with("before\nUncaught Error: "), "{output}");
+        assert!(!output.contains("NOT_REACHED"), "{output}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A thrown error reads `Name: message`, not `[object Object]`.
+    #[test]
+    fn uncaught_error_shows_its_message() {
+        let root = tmpdir();
+        assert_eq!(
+            run(&root, r#"throw new TypeError("bad thing")"#).trim(),
+            "Uncaught TypeError: bad thing"
+        );
+        assert_eq!(run(&root, r#"throw "plain""#).trim(), "Uncaught plain");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real syntax error is reported as the script's, not hidden by the
+    /// top-level-`await` retry.
+    #[test]
+    fn syntax_error_is_still_reported() {
+        let root = tmpdir();
+        let output = run(&root, "let x = ;");
+        assert!(output.starts_with("SyntaxError"), "{output}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `require` returns the built-in host objects, Node-style, and nothing
+    /// else.
+    #[test]
+    fn require_returns_the_builtins() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                const fs = require("fs");
+                const fsp = require("node:fs/promises");
+                const path = require("path");
+                console.log(fs.promises === fsp, typeof fsp.readFile, path.join("a", "b"),
+                    typeof require("os").platform);
+                try { require("child_process"); } catch (e) { console.log("refused:", e.message); }
+            "#,
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "true function a/b function", "{output}");
+        assert!(
+            lines[1].starts_with("refused: Cannot find module"),
+            "{output}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An approved call reaches the outside paths it declared — read-only
+    /// ones for reading only — and no other.
+    #[test]
+    fn outside_paths_granted_by_an_approved_call() {
+        let root = tmpdir();
+        let ro = tmpdir();
+        let rw = tmpdir();
+        let other = tmpdir();
+        std::fs::write(ro.join("in.txt"), "outside text").unwrap();
+        std::fs::write(other.join("secret.txt"), "no").unwrap();
+        let code = format!(
+            r#"
+                console.log(fs.readFile({ro:?} + "/in.txt"));
+                try {{ fs.writeFile({ro:?} + "/x.txt", "x"); console.log("RO_WRITTEN"); }}
+                catch (e) {{ console.log("ro write:", e.message); }}
+                await fs.promises.writeFile({rw:?} + "/sub/out.txt", "written");
+                try {{ fs.readFile({other:?} + "/secret.txt"); console.log("OTHER_READ"); }}
+                catch (e) {{ console.log("other:", e.message); }}
+            "#,
+            ro = ro.to_str().unwrap(),
+            rw = rw.to_str().unwrap(),
+            other = other.to_str().unwrap(),
+        );
+        let args = json!({
+            "code": code,
+            "allow_read": [ro],
+            "allow_write": [rw],
+        });
+        let output = call(&root, args, true).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "outside text", "{output}");
+        assert!(lines[1].contains("granted for reading only"), "{output}");
+        assert!(lines[2].starts_with("other:"), "{output}");
+        assert!(lines[2].contains("allow_read/allow_write"), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(rw.join("sub/out.txt")).unwrap(),
+            "written"
+        );
+        assert!(!ro.join("x.txt").exists());
+        for dir in [root, ro, rw, other] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Outside paths are refused to a call that did not go through approval,
+    /// so calling the tool directly cannot skip the prompt; a declared path
+    /// inside the project asks for nothing.
+    #[test]
+    fn outside_paths_need_approval() {
+        let root = tmpdir();
+        let args = json!({ "code": "1", "allow_read": ["/etc"] });
+        assert!(NodeTool.requires_approval_in(&args, &root));
+        assert!(NodeTool.requires_approval(&args));
+        let err = call(&root, args, false).unwrap_err();
+        assert!(err.to_string().contains("not approved"), "{err}");
+
+        let inside = json!({ "code": "1", "allow_write": ["build", "./out/../x"] });
+        assert!(!NodeTool.requires_approval_in(&inside, &root));
+        assert_eq!(call(&root, inside, false).unwrap().trim(), "1");
+
+        // Malformed: asks (and then fails), never read as no grant.
+        for bad in [json!("/etc"), json!([5]), json!([""])] {
+            let args = json!({ "code": "1", "allow_read": bad });
+            assert!(NodeTool.requires_approval_in(&args, &root), "{args}");
+            assert!(call(&root, args, true).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Grants are made absolute: relative to the root, `~` the home.
+    #[test]
+    fn grants_are_absolute_and_normalized() {
+        let root = std::path::Path::new("/work/proj");
+        let args = json!({
+            "allow_read": ["../shared/./lib", "/etc/hosts"],
+            "allow_write": ["~/notes", "sub"],
+        });
+        let grants = super::Grants::parse(&args, root).unwrap();
+        assert_eq!(
+            grants.read,
+            [
+                PathBuf::from("/work/shared/lib"),
+                PathBuf::from("/etc/hosts")
+            ]
+        );
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(grants.write[0], PathBuf::from(home).join("notes"));
+        }
+        let outside = grants.outside(root);
+        assert_eq!(outside.write.len(), 1, "the in-project grant is dropped");
+        assert_eq!(outside.read.len(), 2);
     }
 }
