@@ -101,7 +101,7 @@ Decisions marked "evaluate" are revisited at the milestone that needs them.
 Each milestone is shippable and independently demoable. Exit criteria are the
 bar for "done".
 
-### M0 — Skeleton & provider spike
+### M0 — Skeleton & provider spike ✅
 Prove we can hold a streaming conversation with the real endpoint.
 
 - Workspace + crates scaffolded; CI (fmt, clippy, test) green.
@@ -120,7 +120,7 @@ Prove we can hold a streaming conversation with the real endpoint.
 `192.168.0.50:11400` with a selectable model, with thinking rendered separately
 from the answer. No tools yet.
 
-### M1 — Agent loop & tool calling
+### M1 — Agent loop & tool calling ✅
 Turn the chat into an agent.
 
 - `atelier-core`: conversation state, turn orchestration, the **tool-call loop**
@@ -135,7 +135,7 @@ Turn the chat into an agent.
 **Exit:** the agent can complete a real task ("read X, change Y, run the test")
 end to end via tool calls against a tool-capable model (`qwen3-coder:30b`).
 
-### M2 — Minimal TUI
+### M2 — Minimal TUI ✅
 The intended interface.
 
 - `atelier-tui`: single input line + status strip (model · cwd · git branch ·
@@ -173,7 +173,7 @@ side-effects.
 **Exit (met):** a first-run user approves/denies each unconfined action; a power
 user pre-authorizes with "always"; in-project edits never nag.
 
-### M4 — Context helpers
+### M4 — Context helpers ✅
 The "feed the agent" pipeline.
 
 - `atelier-context`: a `ContextProvider` trait; providers run per turn (budgeted)
@@ -188,7 +188,7 @@ The "feed the agent" pipeline.
 **Exit:** the agent visibly reacts to repo state it was never explicitly told
 about (e.g. notices uncommitted changes, a failing build).
 
-### M5 — MCP support
+### M5 — MCP support ✅
 Extend the tool surface via the ecosystem.
 
 - MCP client — **stdio** ✅ and **Streamable HTTP** ✅ transports (shared
@@ -205,7 +205,7 @@ Extend the tool surface via the ecosystem.
 **Exit:** a configured MCP server's tools are callable in a task, indistinguishable
 from built-in tools to the agent.
 
-### M6 — Session & context management
+### M6 — Session & context management ✅
 Make long sessions durable.
 
 - ✅ Persist conversation to `.atelier/session.json` after each turn; resume
@@ -225,15 +225,19 @@ the next message — OpenAI multimodal content parts) and a **`multiedit`** tool
 (atomic multi-edit of one file).
 
 ### M7 — Hardening & polish
-- Provider quirks: per-model tool-calling dialects, missing SSE fields, retries,
-  backoff, timeouts.
-- Config UX, better `/` commands. `--print`/`-p` pipe-friendly headless mode ✅
-  (one-shot prompt from args or stdin; answer on stdout, everything else stderr).
-- Docs: quickstart, config reference, tool reference, MCP setup.
+- ✅ Provider quirks: missing SSE fields, retries, backoff, timeouts
+  (`send_reader_retrying`); `ATELIER_DEBUG` dumps raw provider traffic.
+- ⏳ Per-model tool-calling dialects (models that emit tool calls as text,
+  e.g. `<tool_call>` blocks, instead of structured `tool_calls`).
+- ✅ Config UX (`/config`), `/` commands, `--print`/`-p` pipe-friendly
+  headless mode (one-shot prompt from args or stdin; answer on stdout,
+  everything else stderr).
+- ✅ Docs: quickstart, config reference, tool reference, MCP setup
+  (`docs/`).
 
 **Exit:** stable enough for daily driving on real work.
 
-### M8 — Scripting via a mediated JS runtime (`Node` tool)
+### M8 — Scripting via a mediated JS runtime (`Node` tool) — v1 ✅
 
 Give the agent a real scripting surface that is *safer* than raw `bash`, by
 running JavaScript on our own engine ([kataan](https://github.com/KarpelesLab/kataan),
@@ -274,7 +278,7 @@ project-confined `fs` (readFile/writeFile/readdir/exists/mkdir) + captured
   (`readFileBytes`/`writeFileBytes` via a real `Uint8Array`).
 - ⏳ async `fs`; out-of-project fs via approval.
 
-### M9 — Safer command execution (script analysis)
+### M9 — Safer command execution (script analysis) — v1 ✅
 
 `bash` (and any future `python`) runs opaque, unconfined code. Beyond a yes/no
 prompt, analyze what a script will do before running it.
@@ -835,16 +839,15 @@ truth. Each item maps to a milestone.
 
 ## 6. Open decisions (resolve at the milestone that needs it)
 
-1. **Line editor:** `reedline` vs. hand-rolled input. Blocker is clean coexistence
-   of a live input row with streamed output above it (M2).
-2. **Tool schemas:** hand-written JSON Schema per tool vs. derive from Rust types
-   (e.g. `schemars`). Lean derive to avoid drift (M1).
-3. **Edit semantics:** exact-string replace (like this harness) vs. diff/patch
-   application. Start with exact-match; revisit for reliability (M1).
-4. **Multiple concurrent tool calls:** run in parallel when independent? Start
-   sequential for legibility; parallelize later if models emit batches (M1/M4).
-5. **Config precedence:** project `atelier.toml` vs. user global vs. env/flags —
-   nail down the overlay order (M0).
+1. ✅ **Line editor:** hand-rolled on crossterm — the live input row and
+   streamed scrollback above it needed full control (M2).
+2. ✅ **Tool schemas:** hand-written JSON Schema per tool; no derive crate.
+3. ✅ **Edit semantics:** exact-string replace (`edit`, `multiedit`), plus
+   `apply_patch` for models trained on patches.
+4. **Multiple concurrent tool calls:** still sequential for legibility;
+   parallelize later if models emit independent batches (M1/M4).
+5. **Config precedence:** today env vars/flags overlay the project
+   `atelier.toml`; a user-global config file is not implemented yet (M0).
 
 ---
 
