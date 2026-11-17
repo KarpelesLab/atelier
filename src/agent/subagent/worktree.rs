@@ -169,7 +169,7 @@ impl Worktree {
         let top = match prefix.is_empty() {
             true => None,
             false => {
-                let top = git(project, &["rev-parse", "--show-toplevel"]).map_err(&refused)?;
+                let top = git(project, &["rev-parse", "--show-toplevel"]).map_err(refused)?;
                 Some(PathBuf::from(top))
             }
         };
