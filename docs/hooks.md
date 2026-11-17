@@ -25,7 +25,7 @@ timeout_secs = 30              # optional, default 60
 |-------|------|---------|
 | `event` | string | One of the [events](#events) |
 | `match` | string | A regex the **whole** tool name must match (`edit` does not match `multiedit`; write `edit\|multiedit` or `.*edit`). Only for the tool events (`pre_tool`, `post_tool`, `permission_request`); without it the hook runs for every tool |
-| `command` | string | Run with `sh -c`, in the project root |
+| `command` | string | Run with `sh -c`, in the project root — on your machine, except a project's hook while the [sandbox](sandbox.md#project-hooks) is on, which runs in its guest |
 | `timeout_secs` | integer | The command — and everything it started — is killed after this long (default 60) |
 
 Two files are read:
@@ -41,6 +41,16 @@ the next start.
 
 An entry atelier can't use — an unknown event, a `match` that isn't a valid
 regex — is skipped with a warning at startup; the others still load.
+
+**With the [sandbox](sandbox.md) on, the project's hooks run in its guest**
+and yours on the host. A project hook then has the image's programs and
+environment rather than your machine's, the project and nothing else of your
+files, and no network beyond `[sandbox] network`; it is told about the event
+and answers the same way. A hook that needs your machine — a notifier, a
+formatter only you have installed — belongs in your own file. If the sandbox
+is on but cannot run, project hooks do not run at all, with a notice saying
+so. [Project hooks in the sandbox](sandbox.md#project-hooks) has the
+details.
 
 ## Trust
 

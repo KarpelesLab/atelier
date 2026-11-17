@@ -150,6 +150,9 @@ when one is due, the tool, `post_tool` hooks. So:
 - plan mode refuses the calls that change something, `ask-edits` asks
   before a `write`; (`node` itself is not available in plan mode, as its own
   `fs` can write);
+- with the [sandbox](sandbox.md#what-runs-where) on, a script's `bash` call
+  runs in the guest, unasked, like the model's; `sandbox: false` asks. A
+  script starts no process any other way;
 - the tool's own limits apply: `read` pages a long file, `bash` output past
   its cap is [spilled](tools.md#long-output-goes-to-a-file), and files a
   script reads are tracked for `edit` like any other read.

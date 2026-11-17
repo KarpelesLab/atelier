@@ -613,4 +613,71 @@ mod tests {
         assert!(err.to_string().contains("not available here"), "{err}");
         assert!(world.ran().is_empty());
     }
+
+    /// A script starts no process of its own: the commands it runs are
+    /// `bash` calls, served like the model's. So with the sandbox on they
+    /// run in it unasked — or not at all, when it cannot run — and
+    /// `"sandbox": false` from a script asks, as it does from the model.
+    #[test]
+    fn a_scripts_commands_go_where_the_models_do() {
+        use crate::sandbox;
+        let mut world = World::new("sandbox");
+        let code = r#"
+            var r = tools.call("bash", { command: "echo ran > ran-here.txt" });
+            console.log(r.ok, r.text);
+        "#;
+        // No sandbox: the user is asked, and here says no.
+        let mut ui = Recorder::new(false);
+        world.script(Mode::AutoEdit, &mut ui, code);
+        assert_eq!(ui.asked.len(), 1, "{:?}", ui.asked);
+
+        // On, and unable to start a guest: nobody is asked, the call
+        // fails, and nothing ran on the host.
+        let _reset = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
+            rootfs: PathBuf::from("/nonexistent/rootfs"),
+            memory_mb: 64,
+            interp: false,
+            network: Vec::new(),
+            helper: Some(PathBuf::from("/nonexistent/atelier")),
+            notes: Vec::new(),
+        }));
+        let mut ui = Recorder::new(false);
+        let out = world.script(Mode::AutoEdit, &mut ui, code);
+        assert!(ui.asked.is_empty(), "{:?}", ui.asked);
+        assert!(
+            out.starts_with("false ") && out.contains("sandbox"),
+            "{out}"
+        );
+        assert!(!world.path("ran-here.txt").exists());
+
+        // The way to the host is the model's: asked about, and refused.
+        let mut ui = Recorder::new(false);
+        world.script(
+            Mode::AutoEdit,
+            &mut ui,
+            r#"tools.call("bash", { command: "echo ran > ran-here.txt", sandbox: false });"#,
+        );
+        assert_eq!(ui.asked.len(), 1, "{:?}", ui.asked);
+        assert!(!world.path("ran-here.txt").exists());
+    }
+
+    /// Through a real guest (see `sandbox::testing::live_setup`).
+    #[test]
+    fn a_scripts_command_runs_in_the_guest() {
+        use crate::sandbox;
+        let Some(setup) = sandbox::testing::live_setup() else {
+            return;
+        };
+        let mut world = World::new("sandbox-live");
+        world.root = std::fs::canonicalize(&world.root).unwrap();
+        let _reset = sandbox::testing::set(sandbox::State::Ready(setup));
+        let mut ui = Recorder::new(false);
+        let out = world.script(
+            Mode::AutoEdit,
+            &mut ui,
+            r#"console.log(tools.call("bash", { command: "uname -n" }).text);"#,
+        );
+        assert!(ui.asked.is_empty(), "{:?}", ui.asked);
+        assert!(out.contains("\nnixvm\n"), "{out}");
+    }
 }

@@ -1,7 +1,9 @@
 # Sandboxed `bash` (experimental)
 
 With the sandbox on, the `bash` tool — foreground commands, background
-jobs — and the shell lines of command files run inside
+jobs —, the shell lines of command files, and the commands the project has
+atelier run by itself — its hooks and its diagnostics checkers
+([what runs where](#what-runs-where)) — run inside
 [nixvm](https://github.com/KarpelesLab/nixvm): a real Linux userland (Alpine,
 typically) whose system calls are served by nixvm's kernel, in Rust, inside
 atelier's own process tree — not by the host's. The guest sees the project
@@ -115,6 +117,136 @@ command the way the tool would.
   out.
 - The tool's description gains a paragraph telling the model all this, only
   while the sandbox is on.
+
+## What runs where
+
+`bash` is not the only thing atelier runs. With the sandbox on, a command
+goes to the guest when it **executes what is in the project** and atelier
+runs it **without asking**: the guest can write the project, unasked, so
+such a command on the host would be the way out — the agent edits
+`scripts/check.sh` or `build.rs` in the guest, and atelier runs it outside.
+What is the user's own, or cannot work in a guest that sees only the
+project, stays on the host, and is listed here so that nobody has to guess.
+
+| What | Runs | Why |
+|---|---|---|
+| `bash`, background jobs, a command file's `` !`command` `` lines | guest | [above](#what-changes-for-bash) |
+| The commands of a [`node` script](scripting.md) | guest | A script starts no process: its commands are `tools.call("bash", …)`, served like the model's own calls — in the guest unasked, on the host with `"sandbox": false` and your approval |
+| **Project hooks** (`[[hooks]]` in the project's `atelier.toml`) | guest | They run the repository's scripts, on every tool call, unasked |
+| **Diagnostics checkers**, configured or detected | guest | They run the project's build: `cargo check` runs build scripts and proc macros, `npx tsc` a binary from `node_modules` |
+| **Your own hooks** (the user-global `atelier.toml`) | host | They are your commands, they usually live outside the project (a notifier, a script in your home), and nothing in the project can add one |
+| `node`'s own `fs`, and its `fetch` with `network: true` | host, in atelier's process | Not a command: `fs` is confined to the project by atelier, the network asks. `fs` is **not** held to the guest's [read-only paths](#what-the-guest-sees): a script can write `.git/hooks` or `atelier.toml`, as `write` can |
+| MCP servers (`[[mcp]]`) | host | [below](#what-stays-on-the-host-and-what-it-would-take) |
+| Language servers (the `symbols` tool) | host | below — and note that they run the project's code |
+| The Claude backend (`claude`) | host | below |
+| A provider's `api_key_command`, the browser for a login, atelier's own `git` calls for context | host | The first two are about your credentials; `git` only reads, and what it could be made to run (`.git/config`, hooks) the guest cannot write |
+
+### Project hooks
+
+A hook from the project's `atelier.toml` runs as `sh -c` in a fresh guest,
+in the project, for its `timeout_secs`. It is told about the event as on the
+host — the JSON on stdin, `ATELIER_EVENT`, `ATELIER_TOOL`, `ATELIER_FILE`,
+`ATELIER_PROJECT` — and its exit status and stdout [mean what they mean
+there](hooks.md#how-a-hook-answers). What differs:
+
+- **The image's programs, not yours.** A hook that calls `rustfmt`, `jq` or
+  `prettier` needs them in the image (`apk add`), and gets the image's
+  version. Of the environment it has the guest's (`PATH`, `HOME`, …) and the
+  four `ATELIER_*` variables, nothing of yours.
+- **No network** beyond [`[sandbox] network`](#the-network), and nothing of
+  the machine outside the project: a hook that posts to a chat, plays a
+  sound or writes a log in your home cannot. That hook is yours rather than
+  the project's: put it in your own `atelier.toml`, where it runs on the
+  host.
+- **About 50 ms each** on KVM (a guest is created per hook), and much more
+  for anything that computes on the software CPU.
+- **A failure that looks like the sandbox's doing says so**, in the notice a
+  failed hook gets: `hook post_tool (prettier --write …) failed: exit 127:
+  sh: prettier: not found [sandbox: a program it needs is not in the
+  sandbox's image …]`. As on the host, a hook that fails decides nothing and
+  the session goes on.
+- **On but unavailable, project hooks do not run** — no root filesystem, a
+  build without the feature —, with a notice each time saying so. They are
+  never run on the host instead. A hook that guards something (`exit 2`)
+  therefore guards nothing until the sandbox works or is switched off;
+  `bash` refuses its commands in that state too.
+- The event's JSON travels in the guest's command line. Past 96 KiB (a
+  `write` of a large file) it goes through a file at the top of the
+  project, `.atelier-sandbox-input-<pid>-<n>`, removed when the hook ends.
+
+Project hooks still need [the project trusted](trust.md) before they run at
+all; the sandbox adds to that, it replaces none of it. `/hooks` says where
+each hook runs.
+
+Your own hooks are not sandboxed, whatever they run. One that runs the
+project's code — `command = "npm run lint"` in your global file — runs it on
+the host, where a sandboxed command may have changed what `lint` means. Keep
+those to tools that do not execute the project, or make them project hooks.
+
+### Diagnostics checkers
+
+A [checker](configuration.md#diagnostics) runs in a fresh guest, in the
+project, with its words as written (no shell, as on the host), for its
+timeout. Without `[[diagnostics]]`, the checkers are picked by what **the
+image** has — `cargo`, `npx`, `go`, `ruff`, a `python3` that can import
+pyflakes — not by what your machine has: a Rust project gets `cargo check`
+once the image has cargo (`apk add cargo`), and none before.
+
+- A checker whose program the image lacks is reported once, as the
+  sandbox's doing, and skipped for the session — as one that cannot start is
+  on the host.
+- Its dependencies must be on disk or fetchable: `cargo check` of a project
+  with crates.io dependencies needs `crates.io` and `*.crates.io` on
+  [`[sandbox] network`](#the-network), or a vendored/fetched registry in
+  the project. A run that fails for want of the network says so.
+- It is the image's toolchain, so the diagnostics are that version's, and
+  `target/` is shared with whatever you build on the host. A first `cargo
+  check` in a cold guest may pass the 60 s a detected checker gets; it is
+  tried once more after the next change.
+- On but unavailable: reported once as not run, and not run on the host.
+
+### What stays on the host, and what it would take
+
+**MCP servers.** A stdio server is a long-lived process that atelier talks
+to over its stdin and stdout, usually an `npx` or `uvx` package that calls a
+service with a token from your environment. In the guest it would have no
+stdin (a guest's is empty: tried, a line written to `atelier sandbox run`
+does not arrive), none of your environment, an empty home, no network
+beyond the allowlist, and no `node` unless the image has one — and a fresh
+guest per command, where a server needs one for the session. Servers are
+not the project's content either: `[[mcp]]` names a command, which
+[trust](trust.md) gates, and `atelier.toml` is read-only in the guest, so a
+sandboxed command cannot add or change one. *It would take:* a guest stdin
+and environment (nixvm's "run this command" API, [below](#what-nixvm-needs-next)),
+a guest that lives as long as the session, and a per-server network list —
+and would be worth it for a server the project ships in its own tree (`command
+= "./tools/server.py"`), which today runs on the host with the project's
+code. That case is not covered: trust such a project knowing it.
+
+**Language servers.** Same shape (long-lived, spoken to over stdio), and
+they need the host's toolchain to say anything true about your build. They
+are the one thing left that runs the project's code on the host unasked:
+rust-analyzer runs build scripts and proc macros, the TypeScript server
+loads `node_modules/typescript`. They start only in a trusted project and
+only when `symbols` is first used; with the sandbox on that is still a way
+for a sandboxed command to have something run outside. An
+[`[[lsp]]`](configuration.md#lsp) entry replaces the detected server for
+its extensions, and one whose command does not speak LSP is given up on:
+`symbols` then answers from the text.
+
+**The Claude backend.** `claude` is your own installed CLI: it reads its
+login from `~/.claude`, talks to Anthropic, and is a glibc program — the
+guest has no home, no such host on its network, and a musl userland (tried:
+`claude` is not there, `api.anthropic.com` does not resolve). It is not the
+project's content, and it is the model, not a command the model runs. What
+matters is what it runs, and that is covered where atelier runs it: by
+default claude's `Bash`, file and fetch tools are switched off and
+atelier's replace them ([Claude backend](claude.md)), so its commands are
+`bash` calls like any other — in the guest. With
+`ATELIER_CLAUDE_BUILTINS=keep`, claude's own `Bash` runs inside claude, on
+the host; it is then asked about like an unsandboxed command (the sandbox
+does not wave it through). Background shells and subagents claude starts
+itself are claude's, on the host, under its own rules.
 
 ## What the guest sees
 
@@ -415,8 +547,18 @@ is the first thing to fix for the sandbox to ship in the release binaries.
   that runs it. A command that stops at a prompt there is reported to the
   model as having asked for input, and `interactive: true` as not honoured;
   `"sandbox": false` runs it on the host, with approval.
-- **The Claude backend's and the `node` tool's commands**, hooks, diagnostics
-  checkers and MCP servers are not sandboxed; only the `bash` tool is.
+- **MCP servers, language servers and the Claude backend run on the host**,
+  as do your own hooks ([what runs where](#what-runs-where)). Of these,
+  language servers and an MCP server that lives in the project's tree run
+  the project's code there. Running them in a guest needs a stdin, an
+  environment and a guest that outlives one command.
+- **The `node` tool's `fs` is not held to the guest's read-only paths**
+  (`.git/hooks`, `.git/config`, `atelier.toml`): it writes them on the
+  host, unasked, sandbox or not.
+- **A hook that must run on the host cannot be a project hook** while the
+  sandbox is on: there is no per-hook switch, only your own file.
+- **`atelier sandbox status` does not list** where hooks and checkers run;
+  `/hooks` does for hooks.
 
 ## What nixvm needs next
 

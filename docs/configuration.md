@@ -677,6 +677,11 @@ downloaded):
 Configuring any checker turns auto-detection off, so list every one you want
 — or a single always-clean one (`command = "true"`) to have none.
 
+With the [sandbox](sandbox.md#diagnostics-checkers) on, checkers run in its
+guest, not on your machine: "installed" then means in the sandbox's image,
+and a checker the image lacks, or the sandbox being unable to run, is
+reported once — nothing runs on the host instead.
+
 ## `[[lsp]]`
 
 Language servers for the [`symbols`](tools.md#symbols) tool, by file

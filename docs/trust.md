@@ -30,7 +30,7 @@ wait for `/trust`.
 | `[defaults] mode = "yolo"`, or `approve = true` | Turns every approval prompt off |
 | `[[hooks]]` | Shell commands run on lifecycle events |
 | `[search] key_env`, `[search] url` | An environment variable of the file's choosing, sent as the key to a search endpoint — and the endpoint itself, which would also be sent the key in your own `ATELIER_SEARCH_KEY`, and the agent's queries |
-| `[sandbox] enabled` | Either way it is a say over the `bash` tool: `true` stops the commands the [sandbox](sandbox.md) can run from asking; `false` takes away a sandbox you switched on in your own file, so commands run on the host |
+| `[sandbox] enabled` | Either way it is a say over the `bash` tool: `true` stops the commands the [sandbox](sandbox.md) can run from asking; `false` takes away a sandbox you switched on in your own file, so commands — and the project's hooks and checkers, which run [where `bash` does](sandbox.md#what-runs-where) — run on the host |
 | `[sandbox] network` | Hosts the sandbox's guest can [connect to](sandbox.md#the-network). Its commands are not asked about, so a host on the list is somewhere they can send the project |
 
 Not gated, because they only restrict or are harmless:
