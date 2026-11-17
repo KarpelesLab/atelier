@@ -4533,8 +4533,8 @@ fn sandboxed_bash_runs_unasked_while_rules_and_the_host_still_ask() {
 /// user's own sandbox is taken away), so it waits for trust like the other
 /// gated settings. Seen through `atelier sandbox status`, in any build: an
 /// untrusted project's switch leaves the sandbox off and says why; trusted,
-/// it is acted on (here it can't run — no root filesystem — which is the
-/// point: it was asked for).
+/// it is acted on (here it can't run, or has no root filesystem yet —
+/// which is the point: it was asked for).
 #[test]
 fn a_projects_sandbox_switch_waits_for_trust() {
     let dir = unique_dir("sandbox-trust");
@@ -4559,7 +4559,12 @@ fn a_projects_sandbox_switch_waits_for_trust() {
     let trusted = status(&[("ATELIER_TRUST_PROJECT", "1")]);
     assert!(!trusted.contains("sandbox: off"), "{trusted}");
     assert!(!trusted.contains("not in effect"), "{trusted}");
-    assert!(trusted.contains("unavailable"), "{trusted}");
+    // Without the feature it cannot run; with it, and no root of the
+    // user's, it is on and says which image it would fetch.
+    assert!(
+        trusted.contains("unavailable") || trusted.contains("atelier fetches one"),
+        "{trusted}"
+    );
 
     // The trust notice names it.
     let out = Command::new(env!("CARGO_BIN_EXE_atelier"))

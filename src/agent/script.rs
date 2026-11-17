@@ -635,6 +635,7 @@ mod tests {
         // fails, and nothing ran on the host.
         let _reset = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
             rootfs: PathBuf::from("/nonexistent/rootfs"),
+            image: false,
             memory_mb: 64,
             interp: false,
             network: Vec::new(),

@@ -7,9 +7,11 @@
 //!
 //! # What the guest is given
 //!
-//! - `/`: the root filesystem the user provides (an extracted Alpine
-//!   minirootfs, say), read-only, under a writable layer in memory that is
-//!   thrown away when the command ends.
+//! - `/`: a root filesystem — a directory the user provides (an extracted
+//!   Alpine minirootfs, say), else the Alpine image atelier fetches once
+//!   ([`Setup::image`]) with the packages the user installed over it —
+//!   read-only, under a writable layer in memory that is thrown away when
+//!   the command ends.
 //! - The project directory, read-write, **at the same absolute path** as on
 //!   the host, so the paths a command prints are the paths every other tool
 //!   uses. The command starts there.
@@ -43,8 +45,11 @@
 //!
 //! Nothing outlives the command but what it wrote in the project: the next
 //! one starts in a fresh guest, so a file left in `/tmp` or a package
-//! installed with `apk` is gone. Background jobs are not sandboxed — a
-//! server in one guest could not be reached from the next command's.
+//! installed with `apk` is gone (packages that stay are installed by the
+//! user, with `atelier sandbox run --rw-root`). A background job runs in a
+//! guest of its own, for as long as it lives: a server started in one
+//! cannot be reached from another command's. The project's hooks and
+//! diagnostics checkers run in a guest too ([`project`]).
 //!
 //! # When the sandbox is in the way
 //!
@@ -64,6 +69,8 @@ use anyhow::{Context, Result};
 use crate::settings::{SandboxSettings, Settings};
 
 pub mod gitdirs;
+#[cfg(sandbox)]
+pub mod image;
 pub mod net;
 pub mod project;
 
@@ -71,6 +78,9 @@ pub mod project;
 pub const HELPER: &str = "sandbox-exec";
 /// `atelier sandbox-exec --probe` succeeds if this build can run a guest.
 const PROBE: &str = "--probe";
+/// `atelier sandbox-exec --fetch <store>` fetches the root image into
+/// `<store>`, unless it is there.
+const FETCH: &str = "--fetch";
 
 /// Guest RAM ceiling when `[sandbox] memory_mb` doesn't say.
 const DEFAULT_MEMORY_MB: u64 = 4096;
@@ -97,8 +107,14 @@ pub enum State {
 /// What a sandboxed run needs to know.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Setup {
-    /// The guest's root filesystem: a directory holding a Linux userland.
+    /// The guest's root filesystem: a directory holding a Linux userland —
+    /// or, with `image`, the directory atelier keeps its fetched image in.
     pub rootfs: PathBuf,
+    /// The root is the Alpine image atelier fetches from its registry the
+    /// first time a guest needs it, and keeps in `rootfs` with the packages
+    /// installed over it ([`image_root`]) — because the sandbox is on and
+    /// the user named no root of their own.
+    pub image: bool,
     /// Guest RAM ceiling, in MiB.
     pub memory_mb: u64,
     /// Use nixvm's software CPU even where hardware virtualization is there.
@@ -204,8 +220,8 @@ fn resolve(
     if let Some(why) = unsupported_build() {
         return State::Unavailable(why.to_string());
     }
-    let rootfs = match rootfs(&env, user, default_root) {
-        Ok(dir) => dir,
+    let (rootfs, image) = match rootfs(&env, user, default_root) {
+        Ok(found) => found,
         Err(why) => return State::Unavailable(why),
     };
     let (network, mut notes) = network(project, user);
@@ -218,6 +234,7 @@ fn resolve(
     }
     State::Ready(Setup {
         rootfs,
+        image,
         memory_mb: project
             .memory_mb
             .or(user.memory_mb)
@@ -245,33 +262,87 @@ fn network(project: &SandboxSettings, user: &SandboxSettings) -> (Vec<String>, V
     (list.entries(), notes)
 }
 
-/// The root filesystem to use, or why there is none.
+/// The root filesystem to use — a directory, or (`true`) the store of the
+/// image atelier fetches — or why there is none.
+///
+/// A root the user named is used or reported missing, never replaced by a
+/// download. With none named: a userland unpacked at `default_root`, else
+/// the image, kept beside it.
 fn rootfs(
     env: &dyn Fn(&str) -> Option<String>,
     user: &SandboxSettings,
     default_root: Option<PathBuf>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, bool), String> {
     let home = |path: &str| match path.strip_prefix("~/") {
         Some(rest) => std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(rest))
             .unwrap_or_else(|| PathBuf::from(path)),
         None => PathBuf::from(path),
     };
-    let dir = env("ATELIER_SANDBOX_ROOT")
-        .or_else(|| user.root.clone())
-        .map(|p| home(&p))
-        .or(default_root)
-        .ok_or("no root filesystem: set ATELIER_SANDBOX_ROOT (see docs/sandbox.md)")?;
     // Not `exists()`: in an Alpine root `/bin/sh` is a link to `/bin/busybox`,
     // which would be looked up on the host.
-    if !dir.is_dir() || std::fs::symlink_metadata(dir.join("bin/sh")).is_err() {
-        return Err(format!(
+    let userland =
+        |dir: &Path| dir.is_dir() && std::fs::symlink_metadata(dir.join("bin/sh")).is_ok();
+    let named = env("ATELIER_SANDBOX_ROOT")
+        .or_else(|| user.root.clone())
+        .map(|p| home(&p));
+    match (named, default_root) {
+        (Some(dir), _) if userland(&dir) => Ok((dir, false)),
+        (Some(dir), _) => Err(format!(
             "no root filesystem at {} (a directory holding a Linux userland, with \
              bin/sh; docs/sandbox.md says how to make one)",
             dir.display()
-        ));
+        )),
+        (None, Some(dir)) if userland(&dir) => Ok((dir, false)),
+        (None, Some(dir)) => Ok((dir.with_file_name(IMAGE_STORE), true)),
+        (None, None) => {
+            Err("no root filesystem: set ATELIER_SANDBOX_ROOT (see docs/sandbox.md)".to_string())
+        }
     }
-    Ok(dir)
+}
+
+/// The directory the fetched image is kept in, beside the default root
+/// (`$XDG_DATA_HOME/atelier/sandbox/image`): the registry's blobs and the
+/// flattened root as nixvm caches them, [`IMAGE_CURRENT`], and `layers/`.
+const IMAGE_STORE: &str = "image";
+/// In the store: which image was fetched (its reference, then the root's
+/// file under the store), written once the fetch succeeded.
+const IMAGE_CURRENT: &str = "current";
+
+/// The fetched image in `store`, if there is one: the reference it was
+/// fetched by, its root (a squashfs file), and the directory of the
+/// packages installed over it — one per image, since a layer holds what
+/// differs from the image under it.
+pub fn image_root(store: &Path) -> Option<(String, PathBuf, PathBuf)> {
+    let current = std::fs::read_to_string(store.join(IMAGE_CURRENT)).ok()?;
+    let mut lines = current.lines();
+    let (reference, file) = (lines.next()?, lines.next()?);
+    // A name nixvm made, under the store: nothing else is followed.
+    if file.contains("..") || file.starts_with('/') {
+        return None;
+    }
+    let root = store.join(file);
+    let layer = store.join("layers").join(root.file_stem()?);
+    root.is_file().then(|| (reference.to_string(), root, layer))
+}
+
+/// Whether the root filesystem has something that is not a directory at
+/// `path` (relative, `usr/bin/cargo`). Looked up from outside, without
+/// following links: in an image they point into the image
+/// (`/bin/busybox`), not into the host. `false` for an image that has not
+/// been fetched yet.
+pub fn in_root(setup: &Setup, path: &str) -> bool {
+    if !setup.image {
+        return std::fs::symlink_metadata(setup.rootfs.join(path)).is_ok_and(|meta| !meta.is_dir());
+    }
+    #[cfg(sandbox)]
+    {
+        image::has(&setup.rootfs, path)
+    }
+    #[cfg(not(sandbox))]
+    {
+        false
+    }
 }
 
 /// Why this build has no sandbox, if it hasn't.
@@ -329,10 +400,52 @@ pub struct Output {
 /// `Err` is for not being able to start the helper process at all; a sandbox
 /// that started and failed is [`Outcome::Failed`].
 pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration) -> Result<Output> {
+    run_with(command, &[], None, project_root, setup, timeout)
+}
+
+/// [`run`], with `env` added to the guest's environment and `input` as the
+/// command's standard input (`None`: an empty one).
+pub fn run_with(
+    command: &str,
+    env: &[(&str, String)],
+    input: Option<&[u8]>,
+    project_root: &Path,
+    setup: &Setup,
+    timeout: Duration,
+) -> Result<Output> {
+    // The image, the first time: fetched before the command and outside
+    // its time limit, and said in its result.
+    let fetched = match fetch_image(setup) {
+        Ok(said) => said,
+        Err(why) => {
+            return Ok(Output {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                outcome: Outcome::Failed(why),
+                report: Report::default(),
+            });
+        }
+    };
     let status_path = status_path();
-    let child = helper_command(command, project_root, setup, timeout, &status_path)?
-        .spawn()
-        .context("starting the sandbox process")?;
+    let mut child = helper_command(
+        command,
+        project_root,
+        setup,
+        timeout,
+        &status_path,
+        env,
+        input.is_some(),
+    )?
+    .spawn()
+    .context("starting the sandbox process")?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // On a thread of its own: a command that does not read its input
+        // must not hold this one up (the pipe closes when it ends).
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, &input);
+        });
+    }
     // The guest's own time limit ends it at `timeout`; the helper is only
     // killed if that didn't work.
     let captured = crate::tools::bash::capture(child, timeout + GRACE)?;
@@ -361,11 +474,54 @@ pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration)
             )
         }
     };
+    let mut stderr = fetched;
+    stderr.extend(captured.stderr);
     Ok(Output {
         stdout: captured.stdout,
-        stderr: captured.stderr,
+        stderr,
         outcome,
         report,
+    })
+}
+
+/// How long fetching the image may take.
+const FETCH_LIMIT: Duration = Duration::from_secs(600);
+
+/// Fetch the root image if `setup` uses one and it is not there yet, in a
+/// helper process of its own. What that process said — where the image
+/// comes from and where it went — or why it failed.
+fn fetch_image(setup: &Setup) -> Result<Vec<u8>, String> {
+    // One fetch at a time from this process: the second finds it done.
+    static FETCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
+    if !setup.image || image_root(&setup.rootfs).is_some() {
+        return Ok(Vec::new());
+    }
+    let helper = match &setup.helper {
+        Some(path) => path.clone(),
+        None => crate::app::helper_exe().map_err(|e| format!("{e:#}"))?,
+    };
+    let child = Command::new(helper)
+        .arg(HELPER)
+        .arg(FETCH)
+        .arg(&setup.rootfs)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("starting the sandbox process: {e}"))?;
+    let captured = crate::tools::bash::capture(child, FETCH_LIMIT).map_err(|e| format!("{e:#}"))?;
+    if captured.status.is_some_and(|s| s.success()) {
+        return Ok(captured.stderr);
+    }
+    let said = String::from_utf8_lossy(&captured.stderr);
+    Err(match said.trim() {
+        "" => format!(
+            "fetching its root image did not finish in {} minutes",
+            FETCH_LIMIT.as_secs() / 60
+        ),
+        said => said.replace("atelier: sandbox: ", "").replace('\n', " "),
     })
 }
 
@@ -375,6 +531,13 @@ const NO_STATUS: &str = "-";
 const NO_STATE: &str = "-";
 /// The helper's flag that carries the network allowlist, `+` between entries.
 const NET_FLAG: &str = "net=";
+/// The helper's flags for a root that is the fetched image, and for a
+/// command that is given the helper's standard input.
+const IMAGE_FLAG: &str = "image";
+const STDIN_FLAG: &str = "stdin";
+/// What a variable of the helper's environment is called that is one of
+/// the guest's: the helper is started with no others, and passes on none.
+const GUEST_ENV: &str = "ATELIER_GUEST_ENV_";
 
 /// How long a background job's guest may live.
 const BACKGROUND_LIMIT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -390,6 +553,8 @@ pub fn background(command: &str, project_root: &Path, setup: &Setup) -> Result<C
         setup,
         BACKGROUND_LIMIT,
         Path::new(NO_STATUS),
+        &[],
+        false,
     )
 }
 
@@ -415,6 +580,8 @@ fn helper_command(
     setup: &Setup,
     timeout: Duration,
     status_path: &Path,
+    env: &[(&str, String)],
+    stdin: bool,
 ) -> Result<Command> {
     let helper = match &setup.helper {
         Some(path) => path.clone(),
@@ -423,6 +590,12 @@ fn helper_command(
     let mut flags = Vec::new();
     if setup.interp {
         flags.push("interp".to_string());
+    }
+    if setup.image {
+        flags.push(IMAGE_FLAG.to_string());
+    }
+    if stdin {
+        flags.push(STDIN_FLAG.to_string());
     }
     // No entry holds a `,` or a `+` ([`net::Allowlist::entries`]).
     if !setup.network.is_empty() {
@@ -444,8 +617,12 @@ fn helper_command(
         // Nothing of the host's environment reaches the helper, and so
         // none reaches the guest by way of it.
         .env_clear()
+        .envs(
+            env.iter()
+                .map(|(name, value)| (format!("{GUEST_ENV}{name}"), value)),
+        )
         .current_dir(project_root)
-        .stdin(Stdio::null())
+        .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     Ok(cmd)
@@ -661,6 +838,17 @@ pub fn helper_main(args: &[String]) -> u8 {
     {
         return if cfg!(sandbox) { 0 } else { EXIT_FAILED };
     }
+    if let [fetch, store] = args
+        && fetch == FETCH
+    {
+        return match fetch_into(Path::new(store)) {
+            Ok(()) => 0,
+            Err(why) => {
+                eprintln!("atelier: sandbox: {why}");
+                EXIT_FAILED
+            }
+        };
+    }
     let [
         status_path,
         rootfs,
@@ -683,6 +871,11 @@ pub fn helper_main(args: &[String]) -> u8 {
         timeout: timeout_ms.parse().ok().map(Duration::from_millis),
         memory_mb: memory_mb.parse().unwrap_or(DEFAULT_MEMORY_MB),
         interp: flags.split(',').any(|f| f == "interp"),
+        image: flags.split(',').any(|f| f == IMAGE_FLAG),
+        stdin: flags.split(',').any(|f| f == STDIN_FLAG),
+        env: std::env::vars()
+            .filter_map(|(name, value)| Some(format!("{}={value}", name.strip_prefix(GUEST_ENV)?)))
+            .collect(),
         net: false,
         allow: flags
             .split(',')
@@ -735,9 +928,31 @@ fn exit_status(outcome: &Outcome) -> u8 {
     }
 }
 
+/// Fetch the root image into `store` unless it is there, saying on stderr
+/// what is fetched from where.
+fn fetch_into(store: &Path) -> Result<(), String> {
+    #[cfg(sandbox)]
+    {
+        image::ensure(store).map(|_| ())
+    }
+    #[cfg(not(sandbox))]
+    {
+        let _ = store;
+        Err(unsupported_build()
+            .unwrap_or("no sandbox in this build")
+            .to_string())
+    }
+}
+
 /// One guest run, as the helper and `atelier sandbox run` describe it.
 struct Spec<'a> {
+    /// A directory holding a userland, or with `image` the image's store.
     rootfs: &'a Path,
+    image: bool,
+    /// The command reads this process's standard input (else an empty one).
+    stdin: bool,
+    /// `NAME=value` entries added to the guest's environment.
+    env: Vec<String>,
     project: &'a Path,
     /// The project's state directory ([`crate::state`]), if it has one.
     state: Option<&'a Path>,
@@ -774,6 +989,9 @@ fn execute(spec: &Spec) -> (Outcome, Report) {
     {
         let _ = (
             spec.rootfs,
+            spec.image,
+            spec.stdin,
+            &spec.env,
             spec.project,
             spec.state,
             spec.command,
@@ -790,13 +1008,18 @@ fn execute(spec: &Spec) -> (Outcome, Report) {
 }
 
 const USAGE: &str = "usage: atelier sandbox status
+       atelier sandbox fetch
        atelier sandbox run [--net] [--rw-root] [--interp] [--] <command…>
+
+`fetch` downloads the root image now rather than at the first command (only
+where no root filesystem of your own is configured).
 
 `run` executes a shell command in the sandbox, in the current directory, as
 the `bash` tool would: with the network of `[sandbox] network`, if any. Two
 switches are for preparing the root filesystem and are never used for the
-agent's commands: --rw-root mounts it read-write, so what the command
-installs stays, and --net gives the guest the host's whole network
+agent's commands: --rw-root makes what the command changes in it stay (in
+your root directory, or in the layer kept over the fetched image), and --net
+gives the guest the host's whole network
 (`atelier sandbox run --net --rw-root -- apk add git`).";
 
 /// `atelier sandbox …`: say what the sandbox would do here, or run a command
@@ -806,6 +1029,29 @@ pub fn run_command(args: &[String]) -> Result<u8> {
     match args.split_first().map(|(a, rest)| (a.as_str(), rest)) {
         Some(("status", [])) => {
             for line in status_lines(&root) {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        Some(("fetch", [])) => {
+            if let Some(why) = unsupported_build() {
+                anyhow::bail!("{why}");
+            }
+            let (store, image) = rootfs(
+                &|key| std::env::var(key).ok().filter(|v| !v.trim().is_empty()),
+                &user_settings(),
+                default_rootfs(),
+            )
+            .map_err(|why| anyhow::anyhow!(why))?;
+            if !image {
+                println!(
+                    "nothing to fetch: the root filesystem is {}",
+                    store.display()
+                );
+                return Ok(0);
+            }
+            fetch_into(&store).map_err(|why| anyhow::anyhow!(why))?;
+            for line in root_lines(&store, true) {
                 println!("{line}");
             }
             Ok(0)
@@ -832,7 +1078,7 @@ pub fn run_command(args: &[String]) -> Result<u8> {
                 anyhow::bail!("{why}");
             }
             let user = user_settings();
-            let rootfs = rootfs(
+            let (rootfs, image) = rootfs(
                 &|key| std::env::var(key).ok().filter(|v| !v.trim().is_empty()),
                 &user,
                 default_rootfs(),
@@ -847,6 +1093,10 @@ pub fn run_command(args: &[String]) -> Result<u8> {
             let state = crate::state::dir(&root);
             let (outcome, report) = execute(&Spec {
                 rootfs: &rootfs,
+                image,
+                // The terminal's, for a command typed by hand.
+                stdin: true,
+                env: Vec::new(),
                 project: &root,
                 state: state.as_deref(),
                 command: &command,
@@ -897,8 +1147,12 @@ fn status_lines_with(root: &Path, store: crate::trust::Store) -> Vec<String> {
         ),
         State::Unavailable(why) => out.push(format!("sandbox: enabled, but unavailable: {why}")),
         State::Ready(setup) => {
-            out.push("sandbox: on — foreground `bash` commands run in nixvm".to_string());
-            out.push(format!("root filesystem: {}", setup.rootfs.display()));
+            out.push(
+                "sandbox: on — `bash` commands and background jobs, command files' shell \
+                 lines, and the project's hooks and diagnostics checkers run in nixvm"
+                    .to_string(),
+            );
+            out.extend(root_lines(&setup.rootfs, setup.image));
             out.push(format!("guest memory: {} MiB", setup.memory_mb));
             let kvm = !setup.interp
                 && cfg!(all(
@@ -963,6 +1217,35 @@ pub fn kept_mounts(project: &Path, state: Option<&Path>) -> Vec<String> {
         .filter(|dir| !dir.starts_with(project) && !project.starts_with(dir))
         .filter_map(|dir| dir.to_str().map(str::to_string))
         .collect()
+}
+
+/// What `atelier sandbox status` says of the root filesystem.
+fn root_lines(rootfs: &Path, image: bool) -> Vec<String> {
+    if !image {
+        return vec![format!("root filesystem: {}", rootfs.display())];
+    }
+    match image_root(rootfs) {
+        Some((reference, root, layer)) => vec![
+            format!("root filesystem: the image {reference}, fetched"),
+            format!("  kept in: {}", root.display()),
+            format!(
+                "  packages installed over it: {} — {}",
+                layer.display(),
+                if layer.is_dir() {
+                    "written by `atelier sandbox run --rw-root`, read by every guest"
+                } else {
+                    "none yet (`atelier sandbox run --net --rw-root -- apk add git`)"
+                }
+            ),
+        ],
+        None => vec![
+            "root filesystem: none configured — atelier fetches one: the official Alpine \
+             image, pinned by digest, from its registry (docker.io; about 4 MB), at the \
+             first sandboxed command or with `atelier sandbox fetch`"
+                .to_string(),
+            format!("  it will be kept in: {}", rootfs.display()),
+        ],
+    }
 }
 
 /// What the `bash` tool's description says about the sandbox while it is
@@ -1056,6 +1339,12 @@ mod guest {
         for entry in environment() {
             guest = guest.env(entry);
         }
+        for entry in &spec.env {
+            guest = guest.env(entry.clone());
+        }
+        if spec.stdin {
+            guest = guest.stdin(io::stdin());
+        }
         if let Some(limit) = spec.timeout {
             guest = guest.wall_time(limit);
         }
@@ -1131,22 +1420,42 @@ mod guest {
     }
 
     /// The guest's `/`: the root filesystem read-only under a writable
-    /// layer in memory — or itself, read-write, for `--rw-root` — with
-    /// `resolver` as its `/etc/resolv.conf`, if the guest has a network.
+    /// layer in memory — or, for `--rw-root`, with what the command changes
+    /// kept — and `resolver` as its `/etc/resolv.conf`, if the guest has a
+    /// network.
     fn root(spec: &Spec, resolver: Option<&str>) -> Result<Box<dyn MountFs>, String> {
-        // Not `exists()`: `/bin/sh` is a link to `/bin/busybox`, which
-        // would be looked up on the host.
-        if std::fs::symlink_metadata(spec.rootfs.join("bin/sh")).is_err() {
-            return Err(format!(
-                "the root filesystem {} has no /bin/sh",
-                spec.rootfs.display()
-            ));
-        }
-        let mut root: Box<dyn MountFs> = if spec.rw_root {
-            Box::new(Passthrough::new(spec.rootfs))
+        let mut root: Box<dyn MountFs> = if spec.image {
+            let (file, layer) = super::image::ensure(spec.rootfs)?;
+            let image = Box::new(super::image::open(&file)?);
+            if spec.rw_root {
+                super::image::with_layer_kept(image, &layer).map_err(|e| {
+                    if e.raw_os_error() == Some(16) {
+                        "another command is writing the sandbox's packages (one \
+                         `--rw-root` command at a time)"
+                            .to_string()
+                    } else {
+                        format!("{}: {e}", layer.display())
+                    }
+                })?
+            } else {
+                let lower = super::image::with_layer(image, &layer);
+                Box::new(Overlay::new(lower, Box::new(TmpFs::new())))
+            }
         } else {
-            let lower = Box::new(Passthrough::read_only(spec.rootfs));
-            Box::new(Overlay::new(lower, Box::new(TmpFs::new())))
+            // Not `exists()`: `/bin/sh` is a link to `/bin/busybox`, which
+            // would be looked up on the host.
+            if std::fs::symlink_metadata(spec.rootfs.join("bin/sh")).is_err() {
+                return Err(format!(
+                    "the root filesystem {} has no /bin/sh",
+                    spec.rootfs.display()
+                ));
+            }
+            if spec.rw_root {
+                Box::new(Passthrough::new(spec.rootfs))
+            } else {
+                let lower = Box::new(Passthrough::read_only(spec.rootfs));
+                Box::new(Overlay::new(lower, Box::new(TmpFs::new())))
+            }
         };
         if let Some(resolver) = resolver {
             let _ = root.mkdir("etc", 0o755);
@@ -1714,6 +2023,7 @@ pub mod testing {
         };
         Some(super::Setup {
             rootfs,
+            image: false,
             memory_mb: 1024,
             interp: false,
             network: Vec::new(),
@@ -1881,8 +2191,195 @@ mod tests {
             State::Ready(_)
         ));
         let missing = [("ATELIER_SANDBOX_ROOT", "/nonexistent/rootfs")];
-        let state = resolve(&env(&missing), &on(), &user, Some(good));
+        let state = resolve(&env(&missing), &on(), &user, Some(good.clone()));
         assert!(matches!(state, State::Unavailable(why) if why.contains("/nonexistent/rootfs")));
+
+        // Nobody named a root and none is unpacked at the default place:
+        // the image atelier fetches, kept beside it. A root that was named
+        // and is not there is an error, not a reason to download one.
+        let nothing = good.with_file_name("no-root-here").join("rootfs");
+        let State::Ready(setup) = resolve(&env(&[]), &on(), &none, Some(nothing.clone())) else {
+            panic!("expected ready");
+        };
+        assert!(setup.image);
+        assert_eq!(setup.rootfs, nothing.with_file_name("image"));
+        let state = resolve(&env(&missing), &on(), &none, Some(nothing.clone()));
+        assert!(matches!(state, State::Unavailable(_)));
+        // And with the sandbox off, nothing is looked for at all.
+        assert_eq!(resolve(&env(&[]), &none, &none, Some(nothing)), State::Off);
+    }
+
+    /// The store says which image it holds once the fetch is complete, and
+    /// names nothing outside itself.
+    #[test]
+    fn a_fetched_image_is_one_the_store_names_and_holds() {
+        let store = fake_rootfs("store");
+        assert_eq!(image_root(&store), None);
+        std::fs::create_dir_all(store.join("roots")).unwrap();
+        let current = store.join(IMAGE_CURRENT);
+        std::fs::write(&current, "example/alpine@sha256:abc\nroots/abc.sqfs\n").unwrap();
+        // Named, but not there.
+        assert_eq!(image_root(&store), None);
+        std::fs::write(store.join("roots/abc.sqfs"), b"").unwrap();
+        assert_eq!(
+            image_root(&store),
+            Some((
+                "example/alpine@sha256:abc".to_string(),
+                store.join("roots/abc.sqfs"),
+                store.join("layers/abc"),
+            ))
+        );
+        for elsewhere in ["/etc/passwd", "../roots/abc.sqfs"] {
+            std::fs::write(&current, format!("x\n{elsewhere}\n")).unwrap();
+            assert_eq!(image_root(&store), None, "{elsewhere}");
+        }
+        // Not fetched: nothing is in it, and status says what will happen.
+        let setup = Setup {
+            rootfs: store.join("empty"),
+            image: true,
+            memory_mb: 64,
+            interp: false,
+            network: Vec::new(),
+            helper: None,
+            notes: Vec::new(),
+        };
+        assert!(!in_root(&setup, "bin/sh"));
+        let lines = root_lines(&setup.rootfs, true);
+        assert!(lines[0].contains("atelier fetches one"), "{lines:?}");
+        assert!(lines[0].contains("docker.io"), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// The image cannot be fetched (here: nowhere to put it): the command
+    /// is not run, and the result says why and what to do without a
+    /// network — through the helper process, as a session would see it.
+    #[test]
+    fn a_root_image_that_cannot_be_fetched_is_a_failure_that_says_so() {
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        let project = std::env::temp_dir().join(format!(
+            "atelier-sandbox-test-nofetch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+        let setup = Setup {
+            rootfs: PathBuf::from("/dev/null/store"),
+            image: true,
+            ..setup
+        };
+        let out = run(
+            "echo ran > ran.txt",
+            &project,
+            &setup,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let Outcome::Failed(why) = &out.outcome else {
+            panic!("{:?}", out.outcome);
+        };
+        assert!(
+            why.contains("could not fetch the sandbox's root image"),
+            "{why}"
+        );
+        assert!(why.contains("ATELIER_SANDBOX_ROOT"), "{why}");
+        assert!(!project.join("ran.txt").exists());
+        // A background job says the same where its output goes.
+        let job = background("echo ran > ran.txt", &project, &setup)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(!job.status.success());
+        assert!(
+            String::from_utf8_lossy(&job.stderr).contains("could not fetch"),
+            "{job:?}"
+        );
+        assert!(!project.join("ran.txt").exists());
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// The real thing, with `ATELIER_SANDBOX_TEST_NET=1` (it downloads the
+    /// image, about 4 MB): fetched once and said, a guest runs on it, what
+    /// `--rw-root` puts in the root stays and what any other command puts
+    /// there does not.
+    #[test]
+    fn the_fetched_image_runs_guests_and_keeps_what_rw_root_installs() {
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        if std::env::var_os("ATELIER_SANDBOX_TEST_NET").is_none() {
+            eprintln!("skipped: needs the network (ATELIER_SANDBOX_TEST_NET=1)");
+            return;
+        }
+        let base =
+            std::env::temp_dir().join(format!("atelier-sandbox-test-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+        let data = project.parent().unwrap().join("data");
+        let helper = setup.helper.clone().unwrap();
+        let setup = Setup {
+            rootfs: data.join("atelier/sandbox/image"),
+            image: true,
+            ..setup
+        };
+        assert!(!in_root(&setup, "bin/sh"));
+
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        let out = run(
+            "cat /etc/alpine-release",
+            &project,
+            &setup,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(out.outcome, Outcome::Exited(0), "{}", text(&out.stderr));
+        assert!(text(&out.stdout).starts_with("3."), "{}", text(&out.stdout));
+        // Said, the once it happens.
+        assert!(text(&out.stderr).contains("fetching the image docker.io/"));
+        let again = run(
+            "touch /usr/bin/mine; ls /usr/bin/mine",
+            &project,
+            &setup,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(again.outcome, Outcome::Exited(0));
+        assert!(again.stderr.is_empty(), "{}", text(&again.stderr));
+        assert!(in_root(&setup, "bin/sh"));
+        assert!(!in_root(&setup, "usr/bin/mine"));
+
+        // `atelier sandbox run --rw-root`, as the user types it.
+        let by_hand = |words: &[&str]| {
+            Command::new(&helper)
+                .args(["sandbox", "run"])
+                .args(words)
+                .env_clear()
+                .env("XDG_DATA_HOME", &data)
+                .env("ATELIER_SANDBOX", "1")
+                .current_dir(&project)
+                .output()
+                .unwrap()
+        };
+        let kept = by_hand(&[
+            "--rw-root",
+            "--",
+            "echo '#!/bin/sh' > /usr/bin/kept; chmod +x /usr/bin/kept; chown 0:0 /usr/bin/kept",
+        ]);
+        assert!(kept.status.success(), "{}", text(&kept.stderr));
+        assert!(in_root(&setup, "usr/bin/kept"));
+        let out = run(
+            "kept && stat -c %u /usr/bin/kept; ls /usr/bin/mine",
+            &project,
+            &setup,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(text(&out.stdout), "0\n", "{}", text(&out.stderr));
+        assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The guest's network is the user's list and the project's together,
@@ -1927,6 +2424,8 @@ mod tests {
             &setup,
             Duration::from_secs(1),
             Path::new(NO_STATUS),
+            &[],
+            false,
         )
         .unwrap();
         let args: Vec<_> = command.get_args().collect();
