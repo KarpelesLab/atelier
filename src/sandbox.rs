@@ -34,12 +34,12 @@
 //! [`run`] does not call nixvm in this process: it starts atelier again as
 //! `atelier sandbox-exec …` ([`helper_main`]), which builds the guest, runs
 //! the command with its output on its own stdout and stderr, and leaves the
-//! outcome in a status file. That costs a few milliseconds and buys three
-//! things. nixvm reports guest faults and its time limit on the process's
-//! stderr, which would land in the middle of the terminal interface. A
-//! command that outlives its timeout can always be killed, whatever state
-//! the guest kernel is in. And a crash in the emulator ends that process,
-//! not the session.
+//! outcome in a status file. That costs a few milliseconds and buys two
+//! things. A command that outlives its timeout can always be killed,
+//! whatever state the guest kernel is in. And a crash in the emulator ends
+//! that process, not the session. (The guest itself is nixvm's
+//! `Sandbox::execute`, which prints nothing and reads nothing of the
+//! process's environment; the helper is started with none all the same.)
 //!
 //! Nothing outlives the command but what it wrote in the project: the next
 //! one starts in a fresh guest, so a file left in `/tmp` or a package
@@ -279,10 +279,7 @@ fn unsupported_build() -> Option<&'static str> {
     if cfg!(sandbox) {
         None
     } else if cfg!(feature = "sandbox") {
-        Some(
-            "this build of atelier cannot mount a host directory in the sandbox (nixvm \
-             needs a libc for that: the fullrust release builds have none)",
-        )
+        Some("this build of atelier is for a system the sandbox does not run on")
     } else {
         Some("this atelier was built without the `sandbox` feature")
     }
@@ -444,9 +441,8 @@ fn helper_command(
         .arg(setup.memory_mb.to_string())
         .arg(flags.join(","))
         .arg(command)
-        // Nothing of the host's environment reaches the helper, so none of
-        // nixvm's `NIXVM_*` switches (host networking among them) can be set
-        // from outside.
+        // Nothing of the host's environment reaches the helper, and so
+        // none reaches the guest by way of it.
         .env_clear()
         .current_dir(project_root)
         .stdin(Stdio::null())
@@ -905,7 +901,10 @@ fn status_lines_with(root: &Path, store: crate::trust::Store) -> Vec<String> {
             out.push(format!("root filesystem: {}", setup.rootfs.display()));
             out.push(format!("guest memory: {} MiB", setup.memory_mb));
             let kvm = !setup.interp
-                && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                && cfg!(all(
+                    any(target_os = "linux", target_os = "fullrust"),
+                    target_arch = "x86_64"
+                ))
                 && std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -994,36 +993,24 @@ pub fn tool_note(network: &[String]) -> String {
 
 #[cfg(sandbox)]
 mod guest {
-    //! Building a nixvm guest and running one command in it. nixvm 0.0.5's
-    //! own entry points don't fit — `Sandbox::run` mounts the working
-    //! directory at `/work`, starts in `/root`, wires the guest to the
-    //! host's terminal and returns only an exit code — so this assembles the
-    //! same pieces (mount table, loader, backend, kernel) itself.
+    //! One command in a nixvm guest, through nixvm's embedding API
+    //! (`Sandbox::execute`): the root, the project and the git directory as
+    //! filesystems of atelier's own making, the command's output on the
+    //! writers given, and the outcome read from what nixvm returns.
 
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use nixvm::abi::Arch;
     use nixvm::fs::blockdev::SharedDisks;
     use nixvm::fs::{
-        Attrs, CgroupFs, DevFs, DirEntry, MountFs, MountTable, Overlay, Passthrough, ProcFs,
-        SetTime, SysFs, TmpFs,
+        Attrs, CgroupFs, DirEntry, MountFs, Overlay, PageStore, Passthrough, ProcFs, SetTime, TmpFs,
     };
-    use nixvm::kernel::Kernel;
-    use nixvm::limits::{Limits, Quota};
-    use nixvm::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
-    use nixvm::vcpu::{Backend, GuestMemory};
+    use nixvm::kernel::notice::Notice;
+    use nixvm::limits::Quota;
+    use nixvm::sandbox::{LimitHit, Network, Sandbox, Unsupported};
 
     use super::{Outcome, Report, Spec};
-
-    /// Where the guest's address space starts, and how far it extends: what
-    /// nixvm 0.0.5 uses itself (its x86-64 interpreter faults with more).
-    const GUEST_BASE: u64 = 0x1_0000;
-    const GUEST_VSIZE: u64 = 32 << 30;
-    const PAGE: u64 = 4096;
-    /// What a guest killed for running out of time exits with (128 + KILL).
-    const KILLED: i32 = 137;
 
     pub fn exec(
         spec: &Spec,
@@ -1037,182 +1024,153 @@ mod guest {
             .ok_or("the project path must be absolute and UTF-8")?;
         let project = project.trim_end_matches('/').to_string();
 
-        let mut mounts = MountTable::new();
-        if spec.rw_root {
-            mounts.mount("/", Box::new(Passthrough::new(spec.rootfs)));
-        } else {
-            let lower = Box::new(Passthrough::read_only(spec.rootfs));
-            mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
-        }
-        mounts.mount("/tmp", Box::new(TmpFs::new()));
-        mounts.mount("/dev", Box::new(DevFs::new()));
-        mounts.mount("/proc", Box::new(ProcFs::new(1)));
-        mounts.mount("/sys", Box::new(SysFs::new(1)));
-        // The project, at its own path. The directories leading to it exist
-        // only in the guest (the root's writable layer, or `/tmp`).
-        mkdir_all(&mut mounts, &project);
-        mounts.mount(
-            project.clone(),
-            Box::new(Guarded::new(
-                spec.project,
-                &super::protected_paths(spec.project),
-            )),
-        );
-        // The git directory of a linked worktree or a submodule, where the
-        // project's `.git` file says it is — if it names the project back.
-        if let Some(git) = super::gitdirs::plan(spec.project).mount {
-            mkdir_all(&mut mounts, &git.guest);
-            let guarded = Guarded::new(&git.host, &git.protected).only(git.writable.as_deref());
-            mounts.mount(git.guest, Box::new(guarded));
-        }
-        // What atelier keeps for the project outside it, to look at.
-        for kept in super::kept_mounts(spec.project, spec.state) {
-            mkdir_all(&mut mounts, &kept);
-            let host = Passthrough::read_only(Path::new(&kept));
-            mounts.mount(kept, Box::new(host));
-        }
-        for dir in ["/root", "/etc"] {
-            mkdir_all(&mut mounts, dir);
-        }
         // The whole network of the host (`--net`), that of the allowlist, or
         // none. An allowlist nothing of which was understood allows nothing.
         let (allow, _) = super::net::Allowlist::parse(&spec.allow);
         let filter = (!spec.net && !allow.is_empty()).then(|| super::net::Filter::new(allow));
+        let policy = filter.as_ref().map(super::net::Filter::policy);
         let resolver = match &filter {
             _ if spec.net => Some(resolv_conf()),
             Some(_) => Some(super::net::resolv_conf()),
             None => None,
         };
-        if let Some(resolver) = resolver {
-            let _ = mounts.create("/etc/resolv.conf", 0o644);
-            let _ = mounts.truncate("/etc/resolv.conf", 0);
-            let _ = mounts.write_at("/etc/resolv.conf", 0, resolver.as_bytes());
+
+        let mut guest = Sandbox::builder()
+            // Nothing of the host that is not mounted below.
+            .no_work_dir()
+            .cwd(project.clone())
+            .ncpus(1)
+            .mem_bytes((spec.memory_mb << 20).max(64 << 20))
+            .prefer_interp(spec.interp)
+            .stdout(stdout)
+            .stderr(stderr)
+            // What nixvm's kernel has to say about a guest it killed — a
+            // fault, memory running out — goes where the command's own
+            // complaints go. Not the time limit: the outcome says that.
+            .on_notice(|notice| {
+                if matches!(notice, Notice::Fault { .. } | Notice::OutOfMemory { .. }) {
+                    eprintln!("{notice}");
+                }
+            })
+            .shell(spec.command);
+        for entry in environment() {
+            guest = guest.env(entry);
         }
-
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            spec.command.to_string(),
-        ];
-        let shell = mounts
-            .follow("/bin/sh")
-            .ok_or("the root filesystem has no /bin/sh")?;
-        let elf = mounts
-            .read_file(&shell)
-            .ok_or("cannot read the root filesystem's /bin/sh")?;
-        let arch = Arch::from_elf(&elf).ok_or("the root filesystem's /bin/sh is not an ELF")?;
-
-        let ceiling = nixvm::limits::guest_memory_ceiling().max(64 << 20);
-        let mem_bytes = (spec.memory_mb << 20).min(ceiling) / PAGE * PAGE;
-        let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE.max(mem_bytes), mem_bytes);
-        mem.set_guest_arch(arch)
-            .map_err(|e| format!("guest memory: {e:?}"))?;
-        let process = ProcessSpec {
-            argv: argv.clone(),
-            envp: environment(&project),
-        };
-        let image = match interp_path(&elf) {
-            Some(linker) => {
-                let linker_elf = mounts
-                    .read_file(&linker)
-                    .ok_or_else(|| format!("the root filesystem has no {linker}"))?;
-                load_dynamic(&mut mem, &elf, &linker_elf, &process)
-            }
-            None => load_static(&mut mem, &elf, &process),
+        if let Some(limit) = spec.timeout {
+            guest = guest.wall_time(limit);
         }
-        .map_err(|e| format!("loading /bin/sh: {e}"))?;
-        // The heap grows up from the program break and mappings down from
-        // the stack; they meet halfway.
-        let mid = image.program_break + (image.stack_bottom - image.program_break) / 2;
-        let mid = mid - mid % PAGE;
-
-        let backend = backend(arch, spec.interp)?;
-        let vcpu = backend
-            .new_vcpu(image.entry, image.stack_pointer)
-            .map_err(|e| e.to_string())?;
-
-        let mut kernel = Kernel::new(arch, mounts);
-        let mut limits = Limits::for_this_host();
-        limits.wall_time = spec.timeout;
-        kernel.set_limits(limits);
-        kernel.set_ncpus(1);
-        kernel.set_stdout(stdout);
-        kernel.set_stderr(stderr);
-        kernel.set_stdin(Box::new(io::empty()));
-        kernel.set_cwd(project);
-        kernel.set_exe(&shell);
-        kernel.set_cmdline(argv);
-        kernel.set_heap(image.program_break, mid);
-        kernel.set_mmap_area(image.stack_bottom, mid);
-        let policy = filter.as_ref().map(super::net::Filter::policy);
-        if spec.net {
-            kernel.set_egress(Box::new(nixvm::kernel::egress::HostEgress));
-        } else if let Some(filter) = filter {
-            kernel.set_egress(Box::new(filter));
-        }
-
-        let code = kernel.run(vcpu, mem).map_err(|e| e.to_string())?;
-        let _ = io::stdout().flush();
-        let mut unsupported: Vec<String> = kernel
-            .unsupported()
-            .into_iter()
-            .map(|(nr, count)| format!("syscall {nr} ×{count}"))
-            .collect();
-        unsupported.extend(
-            kernel
-                .unsupported_subcommands()
-                .into_iter()
-                .map(|((call, sub), count)| format!("{call} {sub:#x} ×{count}")),
+        // `/`: a filesystem atelier makes, mounted over the empty one nixvm
+        // starts from (of two mounts at one path, nixvm's table takes the
+        // later).
+        guest = guest.mount("/", once(root(spec, resolver.as_deref())?));
+        // The project, at its own path. The directories leading to it exist
+        // only in the guest.
+        let protected = super::protected_paths(spec.project);
+        guest = guest.mount(
+            project,
+            once(Box::new(Guarded::new(spec.project, &protected))),
         );
+        // The git directory of a linked worktree or a submodule, where the
+        // project's `.git` file says it is — if it names the project back.
+        if let Some(git) = super::gitdirs::plan(spec.project).mount {
+            let guarded = Guarded::new(&git.host, &git.protected).only(git.writable.as_deref());
+            guest = guest.mount(git.guest, once(Box::new(guarded)));
+        }
+        // What atelier keeps for the project outside it, to look at.
+        for kept in super::kept_mounts(spec.project, spec.state) {
+            guest = guest.bind_ro(&kept, kept.clone());
+        }
+        guest = guest.network(match filter {
+            _ if spec.net => Network::Host,
+            Some(filter) => {
+                let filter = Mutex::new(Some(filter));
+                Network::egress(move || {
+                    let filter = filter.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    Box::new(filter.expect("one guest per filter"))
+                })
+            }
+            None => Network::None,
+        });
+
+        let ran = guest.execute().map_err(|e| e.to_string())?;
         let report = Report {
-            backend: Some(backend.name().to_string()),
-            unsupported,
+            backend: Some(ran.backend.to_string()),
+            unsupported: ran
+                .unsupported
+                .iter()
+                .map(|call| match call {
+                    Unsupported::Syscall { nr, count } => format!("syscall {nr} ×{count}"),
+                    Unsupported::Subcommand {
+                        syscall,
+                        sub,
+                        count,
+                    } => format!("{syscall} {sub:#x} ×{count}"),
+                })
+                .collect(),
             filtered: policy.is_some(),
             refused: policy.map_or_else(Vec::new, |policy| {
                 let policy = policy.lock().unwrap_or_else(|e| e.into_inner());
                 policy.refused().to_vec()
             }),
         };
-        let outcome = if kernel.time_limit_reached() && code == KILLED {
-            Outcome::TimedOut
-        } else {
-            Outcome::Exited(code)
+        let outcome = match ran.limit {
+            Some(LimitHit::WallTime) => Outcome::TimedOut,
+            _ => Outcome::Exited(ran.exit_code),
         };
         Ok((outcome, report))
     }
 
-    /// The CPU backend: hardware virtualization where nixvm finds it for
-    /// this guest architecture, else its interpreter — or the interpreter
-    /// outright when asked.
-    fn backend(arch: Arch, interp: bool) -> Result<Box<dyn Backend>, String> {
-        if !interp {
-            return nixvm::vcpu::select(arch).map_err(|e| e.to_string());
+    /// A filesystem made here, as the factory nixvm's builder asks for: it
+    /// is called once, for the one guest a builder runs.
+    fn once(fs: Box<dyn MountFs>) -> impl Fn() -> Box<dyn MountFs> + Send + Sync + 'static {
+        let fs = Mutex::new(Some(fs));
+        move || {
+            let fs = fs.lock().unwrap_or_else(|e| e.into_inner()).take();
+            fs.expect("one guest per filesystem")
         }
-        match arch {
-            Arch::X86_64 => nixvm::vcpu::interp_x86::X86Backend::new(arch)
-                .map(|b| Box::new(b) as Box<dyn Backend>),
-            Arch::Aarch64 => nixvm::vcpu::interp::InterpBackend::new(arch)
-                .map(|b| Box::new(b) as Box<dyn Backend>),
-        }
-        .map_err(|e| e.to_string())
     }
 
-    /// The guest's whole environment. `safe.directory`: the guest runs as
-    /// root and the project's files belong to the host's user, which git
-    /// otherwise refuses to work with — everywhere (`*`), since a submodule
-    /// in the project is a repository of its own to git, and the guest
-    /// holds no repository but the project's.
-    fn environment(project: &str) -> Vec<String> {
-        vec![
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-            "HOME=/root".to_string(),
-            "USER=root".to_string(),
-            "TERM=dumb".to_string(),
-            "LANG=C.UTF-8".to_string(),
-            format!("PWD={project}"),
-            "GIT_CONFIG_COUNT=1".to_string(),
-            "GIT_CONFIG_KEY_0=safe.directory".to_string(),
-            "GIT_CONFIG_VALUE_0=*".to_string(),
+    /// The guest's `/`: the root filesystem read-only under a writable
+    /// layer in memory — or itself, read-write, for `--rw-root` — with
+    /// `resolver` as its `/etc/resolv.conf`, if the guest has a network.
+    fn root(spec: &Spec, resolver: Option<&str>) -> Result<Box<dyn MountFs>, String> {
+        // Not `exists()`: `/bin/sh` is a link to `/bin/busybox`, which
+        // would be looked up on the host.
+        if std::fs::symlink_metadata(spec.rootfs.join("bin/sh")).is_err() {
+            return Err(format!(
+                "the root filesystem {} has no /bin/sh",
+                spec.rootfs.display()
+            ));
+        }
+        let mut root: Box<dyn MountFs> = if spec.rw_root {
+            Box::new(Passthrough::new(spec.rootfs))
+        } else {
+            let lower = Box::new(Passthrough::read_only(spec.rootfs));
+            Box::new(Overlay::new(lower, Box::new(TmpFs::new())))
+        };
+        if let Some(resolver) = resolver {
+            let _ = root.mkdir("etc", 0o755);
+            let _ = root.create("etc/resolv.conf", 0o644);
+            let _ = root.truncate("etc/resolv.conf", 0);
+            let _ = root.write_at("etc/resolv.conf", 0, resolver.as_bytes());
+        }
+        Ok(root)
+    }
+
+    /// What the guest's environment holds besides nixvm's own `PATH`,
+    /// `HOME` and `PWD`. `safe.directory`: the guest runs as root and the
+    /// project's files belong to the host's user, which git otherwise
+    /// refuses to work with — everywhere (`*`), since a submodule in the
+    /// project is a repository of its own to git, and the guest holds no
+    /// repository but the project's.
+    fn environment() -> [&'static str; 6] {
+        [
+            "USER=root",
+            "TERM=dumb",
+            "LANG=C.UTF-8",
+            "GIT_CONFIG_COUNT=1",
+            "GIT_CONFIG_KEY_0=safe.directory",
+            "GIT_CONFIG_VALUE_0=*",
         ]
     }
 
@@ -1236,44 +1194,28 @@ mod guest {
             .collect()
     }
 
-    fn mkdir_all(mounts: &mut MountTable, path: &str) {
-        let mut at = String::new();
-        for part in path.split('/').filter(|p| !p.is_empty()) {
-            at.push('/');
-            at.push_str(part);
-            if mounts.stat(&at).is_none() {
-                let _ = mounts.mkdir(&at, 0o755);
-            }
-        }
-    }
-
-    /// How a path in the project relates to the protected ones.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Place {
-        /// A protected path, or under one: nothing about it may change.
-        Protected,
-        /// A directory a protected path is under: it may not be renamed,
-        /// removed or replaced, or the protected path would go with it.
-        Above,
-        Free,
-    }
-
-    /// A host directory — the project, or a git directory outside it — with
-    /// some paths under it kept read-only.
+    /// A host directory — the project, or a git directory outside it — as
+    /// the guest gets it: nixvm's host-directory filesystem, with what
+    /// atelier adds to it.
     ///
-    /// A read-only mount over them would not do: nixvm's mounts are found by
-    /// path, so renaming a directory above one (`mv .git g`) takes its
-    /// contents out from under it. This sits between the mount table and the
-    /// host directory instead and refuses, by path, every operation that
-    /// would change a protected path or move it. nixvm's kernel resolves
-    /// `..` and symbolic links before it calls a filesystem, so the path
-    /// seen here is the one acted on (the tests go through links to check).
+    /// - The protected paths are nixvm's to keep (`Passthrough::protect`):
+    ///   read-only as the host nodes they are, whatever name they are
+    ///   reached by — through a link, `..`, or a directory above them that
+    ///   was renamed (a read-only mount over them, found by path, would be
+    ///   walked around with `mv .git g`).
+    /// - Optionally, nothing may change but a list of paths ([`only`]): a
+    ///   linked worktree's repository, of which the guest writes what a
+    ///   commit writes.
+    /// - A file created read-only can still be written ([`lend_write`]),
+    ///   and no FIFO, socket or device is made in a host directory.
+    ///
+    /// [`only`]: Guarded::only
+    /// [`lend_write`]: Guarded::lend_write
     #[derive(Debug)]
     pub(super) struct Guarded {
         inner: Passthrough,
         /// The host directory `inner` serves.
         root: PathBuf,
-        protected: Vec<Vec<String>>,
         /// If set, the only paths that may change at all (the protected
         /// ones under them still may not).
         writable: Option<Vec<Vec<String>>>,
@@ -1282,70 +1224,58 @@ mod guest {
     impl Guarded {
         pub(super) fn new(root: &Path, protected: &[String]) -> Self {
             Self {
-                inner: Passthrough::new(root),
+                inner: Passthrough::new(root).protect(protected),
                 root: root.to_path_buf(),
-                protected: protected
-                    .iter()
-                    .map(|p| p.split('/').map(str::to_string).collect())
-                    .collect(),
                 writable: None,
             }
         }
 
         /// Keep everything read-only but `writable` (`None`: no such
-        /// restriction).
+        /// restriction). What is in the directory now and is not on the
+        /// list is protected as the node it is, like the protected paths;
+        /// a name that is not there yet is refused by where it would be.
         pub(super) fn only(mut self, writable: Option<&[String]>) -> Self {
-            self.writable = writable.map(|paths| {
-                paths
-                    .iter()
-                    .map(|p| p.split('/').map(str::to_string).collect())
-                    .collect()
-            });
+            let Some(paths) = writable else {
+                return self;
+            };
+            let writable: Vec<Vec<String>> = paths
+                .iter()
+                .map(|p| p.split('/').map(str::to_string).collect())
+                .collect();
+            let mut kept = Vec::new();
+            existing_outside(&self.root, &mut Vec::new(), &writable, &mut kept);
+            self.inner = self.inner.protect(kept);
+            self.writable = Some(writable);
             self
         }
 
-        fn place(&self, rel: &str) -> Place {
+        /// Whether `rel` is outside the paths that may change.
+        fn fixed(&self, rel: &str) -> bool {
+            let Some(writable) = &self.writable else {
+                return false;
+            };
             let mut parts = Vec::new();
             for part in rel.split('/') {
                 match part {
                     "" | "." => {}
                     // Never seen from the mount table; if it ever is, the
                     // path is not what it looks like.
-                    ".." => return Place::Protected,
+                    ".." => return true,
                     part => parts.push(part),
                 }
             }
-            let within = |root: &Vec<String>| {
+            !writable.iter().any(|root| {
                 parts.len() >= root.len() && parts.iter().zip(root).all(|(a, b)| *a == b.as_str())
-            };
-            if let Some(writable) = &self.writable
-                && !writable.iter().any(within)
-            {
-                return Place::Protected;
-            }
-            let mut place = Place::Free;
-            for protected in &self.protected {
-                let shared = parts
-                    .iter()
-                    .zip(protected)
-                    .take_while(|(a, b)| **a == b.as_str())
-                    .count();
-                if shared == protected.len() {
-                    return Place::Protected;
-                }
-                if shared == parts.len() {
-                    place = Place::Above;
-                }
-            }
-            place
+            })
         }
 
-        /// Refuse to change `rel`'s contents or attributes.
-        fn writable(&self, rel: &str) -> io::Result<()> {
-            match self.place(rel) {
-                Place::Protected => Err(read_only()),
-                Place::Above | Place::Free => Ok(()),
+        /// Refuse to change `rel` — its contents, its attributes, its name
+        /// — where only a list of paths may change and it is not on it.
+        fn changeable(&self, rel: &str) -> io::Result<()> {
+            if self.fixed(rel) {
+                return Err(io::Error::from_raw_os_error(30)); // EROFS
             }
+            Ok(())
         }
 
         /// Do `op` on `rel` with the owner's write bit lent to it. The
@@ -1378,18 +1308,43 @@ mod guest {
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
             result
         }
-
-        /// Refuse to add, remove or replace the name `rel`.
-        fn movable(&self, rel: &str) -> io::Result<()> {
-            match self.place(rel) {
-                Place::Protected | Place::Above => Err(read_only()),
-                Place::Free => Ok(()),
-            }
-        }
     }
 
-    fn read_only() -> io::Error {
-        io::Error::from_raw_os_error(30) // EROFS
+    /// The host refused for want of permission (`EACCES`) — not nixvm for a
+    /// protected path, which is `EROFS` or `EPERM`.
+    fn refused_by_mode(e: &io::Error) -> bool {
+        e.raw_os_error() == Some(13)
+    }
+
+    /// What is in `dir` now (`at`: its path from the mounted directory) and
+    /// is not under one of `writable`, added to `kept`. A directory that
+    /// leads to a writable path is looked into instead: it is kept in place
+    /// by what is protected in it, or by the list itself.
+    fn existing_outside(
+        dir: &Path,
+        at: &mut Vec<String>,
+        writable: &[Vec<String>],
+        kept: &mut Vec<String>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            at.push(name);
+            let under = writable.iter().any(|w| at.starts_with(w));
+            let leads = writable
+                .iter()
+                .any(|w| w.len() > at.len() && w.starts_with(at));
+            if leads && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                existing_outside(&entry.path(), at, writable, kept);
+            } else if !under {
+                kept.push(at.join("/"));
+            }
+            at.pop();
+        }
     }
 
     impl MountFs for Guarded {
@@ -1423,25 +1378,35 @@ mod guest {
         fn read_only(&self) -> bool {
             self.inner.read_only()
         }
+        fn attach_pages(&mut self, store: &Arc<dyn PageStore>) {
+            self.inner.attach_pages(store);
+        }
+        fn page_id(&mut self, rel: &str) -> Option<u64> {
+            self.inner.page_id(rel)
+        }
+        fn check_write(&mut self, rel: &str) -> io::Result<()> {
+            self.changeable(rel)?;
+            self.inner.check_write(rel)
+        }
         fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             match self.inner.write_at(rel, off, buf) {
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Err(e) if refused_by_mode(&e) => {
                     self.lend_write(rel, |inner| inner.write_at(rel, off, buf))
                 }
                 other => other,
             }
         }
         fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
-            self.movable(rel)?;
+            self.changeable(rel)?;
             self.inner.create(rel, mode)
         }
         fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
-            self.movable(rel)?;
+            self.changeable(rel)?;
             self.inner.mkdir(rel, mode)
         }
         fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
-            self.movable(rel)?;
+            self.changeable(rel)?;
             // A FIFO, socket or device in a host directory is opened by the
             // host, where a FIFO with no other end blocks nixvm's kernel
             // thread for good. They belong in the guest's own /tmp.
@@ -1453,64 +1418,65 @@ mod guest {
             self.inner.mknod(rel, mode)
         }
         fn unlink(&mut self, rel: &str) -> io::Result<()> {
-            self.movable(rel)?;
+            self.changeable(rel)?;
             self.inner.unlink(rel)
         }
         fn rmdir(&mut self, rel: &str) -> io::Result<()> {
-            self.movable(rel)?;
+            self.changeable(rel)?;
             self.inner.rmdir(rel)
         }
         fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             match self.inner.truncate(rel, len) {
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Err(e) if refused_by_mode(&e) => {
                     self.lend_write(rel, |inner| inner.truncate(rel, len))
                 }
                 other => other,
             }
         }
         fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             self.inner.set_times(rel, atime, mtime)
         }
         fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             self.inner.set_owner(rel, uid, gid)
         }
         fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             self.inner.set_mode(rel, mode)
         }
         fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
-            self.movable(linkpath)?;
+            self.changeable(linkpath)?;
             self.inner.symlink(target, linkpath)
         }
         fn readlink(&mut self, rel: &str) -> io::Result<String> {
             self.inner.readlink(rel)
         }
         fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-            self.movable(from)?;
-            self.movable(to)?;
+            self.changeable(from)?;
+            self.changeable(to)?;
             self.inner.rename(from, to)
         }
         fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
-            // A second name for a protected file would be a way to write it.
-            self.writable(old_rel)?;
-            self.movable(new_rel)?;
+            // A second name for a file that may not change would be a way
+            // to write it.
+            self.changeable(old_rel)?;
+            self.changeable(new_rel)?;
             self.inner.link(old_rel, new_rel)
         }
         fn getxattr(&mut self, rel: &str, name: &str) -> io::Result<Vec<u8>> {
             self.inner.getxattr(rel, name)
         }
         fn setxattr(&mut self, rel: &str, name: &str, value: &[u8]) -> io::Result<()> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             self.inner.setxattr(rel, name, value)
         }
         fn listxattr(&mut self, rel: &str) -> io::Result<Vec<String>> {
             self.inner.listxattr(rel)
         }
         fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
-            self.writable(rel)?;
+            self.changeable(rel)?;
             self.inner.removexattr(rel, name)
         }
         fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
@@ -1525,71 +1491,107 @@ mod guest {
     mod tests {
         use super::*;
 
-        fn guard(protected: &[&str]) -> Guarded {
-            let protected: Vec<String> = protected.iter().map(|p| p.to_string()).collect();
-            Guarded::new(Path::new("/nonexistent"), &protected)
+        fn dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "atelier-sandbox-test-guard-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
         }
 
+        fn errno<T: std::fmt::Debug>(result: io::Result<T>) -> Option<i32> {
+            result.unwrap_err().raw_os_error()
+        }
+
+        /// The protected paths are nixvm's to keep; this is what atelier
+        /// counts on it for, tried on the filesystem itself.
         #[test]
-        fn a_path_is_protected_above_one_or_free() {
-            let g = guard(&[".git/hooks", ".git/config", "atelier.toml"]);
-            for path in [
+        fn protected_paths_cannot_change_or_move() {
+            let root = dir("protected");
+            std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+            std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+            std::fs::write(root.join("atelier.toml"), "").unwrap();
+            let protected = [
                 ".git/hooks",
-                ".git/hooks/pre-commit",
-                "/.git/hooks/a/b",
                 ".git/config",
+                ".git/commondir",
                 "atelier.toml",
-                "./atelier.toml",
-                ".git//hooks/",
-                "src/../.git/hooks/x",
-            ] {
-                assert_eq!(g.place(path), Place::Protected, "{path}");
-            }
-            for path in [".git", "", "/", ".git/"] {
-                assert_eq!(g.place(path), Place::Above, "{path}");
-            }
-            for path in [
-                ".git/hooks2",
-                ".git/config.lock",
-                ".git/index",
-                ".github/workflows/ci.yml",
-                "src/atelier.toml",
-                "atelier.toml.bak",
-                "hooks",
-            ] {
-                assert_eq!(g.place(path), Place::Free, "{path}");
-            }
-        }
-
-        #[test]
-        fn what_is_refused_where() {
-            let g = guard(&[".git/hooks"]);
-            // Contents and attributes: only the protected paths themselves.
-            assert!(g.writable(".git/hooks/pre-commit").is_err());
-            assert!(g.writable(".git").is_ok());
-            assert!(g.writable(".git/index").is_ok());
-            // Names: also every directory above them.
-            assert!(g.movable(".git").is_err());
-            assert!(g.movable(".git/hooks").is_err());
-            assert!(g.movable(".git/objects").is_ok());
-            assert_eq!(g.movable(".git").unwrap_err().raw_os_error(), Some(30));
+            ]
+            .map(str::to_string);
+            let mut g = Guarded::new(&root, &protected);
+            // Contents, attributes, names: all read-only.
+            assert_eq!(errno(g.create(".git/hooks/pre-commit", 0o755)), Some(30));
+            assert_eq!(errno(g.write_at(".git/config", 0, b"x")), Some(30));
+            assert_eq!(errno(g.truncate("atelier.toml", 0)), Some(30));
+            assert_eq!(errno(g.set_mode(".git/config", 0o777)), Some(30));
+            assert_eq!(errno(g.unlink("atelier.toml")), Some(30));
+            assert_eq!(errno(g.rename("atelier.toml", "a.toml")), Some(30));
+            assert!(g.check_write(".git/config").is_err());
+            // One that is not there cannot be made.
+            assert!(g.create(".git/commondir", 0o644).is_err());
+            // Nor carried off with the directory above it, nor replaced.
+            assert!(g.rename(".git", "g").is_err());
+            assert!(g.rename("src", ".git").is_err());
+            assert!(g.link(".git/config", "hard").is_err());
+            // Through a link, it is the same node.
+            g.symlink(".git", "g2").unwrap();
+            assert!(g.create("g2/hooks/pre-commit", 0o755).is_err());
+            assert!(g.write_at("g2/config", 0, b"x").is_err());
+            // The rest is ordinary.
+            g.create(".git/index", 0o644).unwrap();
+            g.write_at(".git/index", 0, b"x").unwrap();
+            g.mkdir(".git/objects", 0o755).unwrap();
+            g.create("src.rs", 0o644).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join(".git/config")).unwrap(),
+                "[core]\n"
+            );
+            assert_eq!(
+                std::fs::read_dir(root.join(".git/hooks")).unwrap().count(),
+                0
+            );
+            // No special files in a host directory.
+            assert_eq!(errno(g.mknod("fifo", 0o010_644)), Some(1));
+            std::fs::remove_dir_all(&root).unwrap();
         }
 
         /// A linked worktree's repository: read-only but for what a commit
         /// writes, and in that, what ties the worktree to it.
         #[test]
         fn only_the_listed_paths_are_writable() {
-            let writable = ["objects", "packed-refs", "worktrees/wt"].map(str::to_string);
-            let g = guard(&["worktrees/wt/commondir"]).only(Some(&writable));
+            let root = dir("only");
+            for made in [
+                "objects/ab",
+                "hooks",
+                "worktrees/wt",
+                "worktrees/other",
+                "logs",
+            ] {
+                std::fs::create_dir_all(root.join(made)).unwrap();
+            }
+            for (file, text) in [
+                ("config", "[core]\n"),
+                ("HEAD", "ref: refs/heads/main\n"),
+                ("worktrees/wt/commondir", "../..\n"),
+                ("worktrees/other/HEAD", "ref\n"),
+            ] {
+                std::fs::write(root.join(file), text).unwrap();
+            }
+            let writable =
+                ["objects", "packed-refs", "logs/refs", "worktrees/wt"].map(str::to_string);
+            let protected = ["worktrees/wt/commondir".to_string()];
+            let mut g = Guarded::new(&root, &protected).only(Some(&writable));
             for path in [
                 "objects/ab/cdef",
                 "objects",
                 "packed-refs",
+                "logs/refs/heads",
                 "worktrees/wt/index.lock",
                 "worktrees/wt",
             ] {
-                assert!(g.writable(path).is_ok(), "{path}");
-                assert!(g.movable(path).is_ok() || path == "worktrees/wt", "{path}");
+                assert!(g.changeable(path).is_ok(), "{path}");
             }
             for path in [
                 "",
@@ -1598,14 +1600,43 @@ mod guest {
                 "HEAD",
                 "objects2",
                 "packed-refs.new",
+                "logs/HEAD",
                 "worktrees",
                 "worktrees/other/HEAD",
-                "worktrees/wt/commondir",
                 "objects/../config",
             ] {
-                assert!(g.writable(path).is_err(), "{path}");
-                assert!(g.movable(path).is_err(), "{path}");
+                assert!(g.changeable(path).is_err(), "{path}");
             }
+            // On the filesystem: what a commit writes goes through…
+            g.create("objects/ab/cdef", 0o444).unwrap();
+            g.write_at("objects/ab/cdef", 0, b"object").unwrap();
+            g.create("worktrees/wt/index.lock", 0o644).unwrap();
+            g.rename("worktrees/wt/index.lock", "worktrees/wt/index")
+                .unwrap();
+            g.mkdir("logs/refs", 0o755).unwrap();
+            // …and nothing else, by its own name or through a link made
+            // where the guest may write.
+            assert!(g.write_at("config", 0, b"x").is_err());
+            assert!(g.create("hooks/post-commit", 0o755).is_err());
+            assert!(g.write_at("worktrees/wt/commondir", 0, b"x").is_err());
+            assert!(g.rename("worktrees/wt", "worktrees/gone").is_err());
+            assert!(g.rename("hooks", "objects/hooks").is_err());
+            g.symlink("../config", "objects/c").unwrap();
+            assert!(g.write_at("objects/c", 0, b"x").is_err());
+            g.symlink("../hooks", "objects/h").unwrap();
+            assert!(g.create("objects/h/post-commit", 0o755).is_err());
+            g.symlink("../worktrees/other", "objects/o").unwrap();
+            assert!(g.write_at("objects/o/HEAD", 0, b"x").is_err());
+            assert_eq!(
+                std::fs::read_to_string(root.join("config")).unwrap(),
+                "[core]\n"
+            );
+            assert_eq!(std::fs::read_dir(root.join("hooks")).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::read_to_string(root.join("worktrees/other/HEAD")).unwrap(),
+                "ref\n"
+            );
+            std::fs::remove_dir_all(&root).unwrap();
         }
     }
 }
@@ -2344,9 +2375,9 @@ mod tests {
             assert_eq!(out.outcome, Outcome::TimedOut, "{command}");
             assert!(started.elapsed() < Duration::from_secs(10), "{command}");
         }
-        // A command that wedges nixvm 0.0.5's kernel past its own time limit
-        // (removing a FIFO it made in a host directory): the helper process
-        // is killed, and the session goes on.
+        // A command that wedged nixvm 0.0.5's kernel past its own time limit
+        // (removing a FIFO it made in a host directory, which atelier now
+        // refuses to make): whatever it does, the session goes on.
         let started = std::time::Instant::now();
         let out = super::run(
             "mkfifo wedge; rm -f wedge",
