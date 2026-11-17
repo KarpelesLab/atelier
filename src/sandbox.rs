@@ -61,6 +61,7 @@ use crate::settings::{SandboxSettings, Settings};
 
 pub mod gitdirs;
 pub mod net;
+pub mod project;
 
 /// The hidden subcommand [`run`] starts atelier with.
 pub const HELPER: &str = "sandbox-exec";
