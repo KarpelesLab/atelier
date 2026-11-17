@@ -547,6 +547,16 @@ rather than returning made-up or empty results. A failure reads
 `<provider> search failed: <reason>` on one line (host unreachable, HTTP
 status, unexpected response); the API key is never part of it.
 
+Of the providers, DuckDuckGo and SearXNG have been run for real. SearXNG
+was, on 2026-11-17: an instance of that week's source (commit `2d500cb`)
+on the same machine, asked through the tool by a model. As installed it
+answered 403 — the JSON format is off by default — and the tool's error
+said which setting turns it on (`search.formats`); with `json` added, a
+query came back as eight results, and one with `domains` and
+`max_results` as three, all from that domain. Nothing needed changing.
+Brave and Tavily need an account each and have only met the test suite's
+local server.
+
 ## `notebook_edit`
 
 Edit a Jupyter notebook cell. The notebook must have been `read` this session
