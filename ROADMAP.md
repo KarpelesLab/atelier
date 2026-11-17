@@ -367,6 +367,11 @@ servers, and per-turn context.
   `bash` background jobs + `bash_output`/`bash_kill` cover Monitor;
   `notebook_edit`; `web_fetch` converts HTML and pages. Tools are marked
   `anthropic/alwaysLoad` so claude doesn't defer them.
+- ✅ Subagent activity: a subagent's tool calls (and failures) show nested
+  under its `Agent` call, named by the agent when several run or it runs
+  in the background; its text stays out of the answer.
+- ✅ `/models` lists claude's own models (from its `initialize` reply);
+  `/model <x>` relaunches with `--model`, resuming.
 - ✅ Messages typed mid-turn join the running claude turn (handed over
   while a tool runs; claude delivers them after the tool results).
 
