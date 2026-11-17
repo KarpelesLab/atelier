@@ -26,9 +26,10 @@ starts the process with.
 > the specification and JSON schema as published on 2026-11-13 (schema
 > release 1.31.0). Every message atelier sends is checked against that
 > schema by the test suite (`tests/acp.rs`), which plays the editor's part.
-> **It has not been run against a real editor yet**: how Zed or another
-> client lays out what it is sent, and anything a client does that the
-> specification does not say, is untested. Reports are welcome.
+> It has been run against the protocol's own TypeScript client library
+> ([below](#tried-against)), with a model behind it. **It has not been run
+> in an editor yet**: how Zed or another client lays out what it is sent is
+> untested. Reports are welcome.
 
 ## Setting it up
 
@@ -218,7 +219,8 @@ to the configured ones. They are not written to `atelier.toml`, and they
 are connected whether or not the project is [trusted](trust.md): trust is
 about what a *repository* may start, and these are your editor's. A server
 whose name a configured one already has is skipped. With the Claude backend
-they are not passed on (claude takes its servers from the settings).
+they are not passed on (claude takes its servers from the settings). `/mcp`
+lists them after the configured ones, under "for this session".
 
 ### Notices
 
@@ -254,6 +256,53 @@ the capability, a paragraph in the answer.
 | `-32603` | The turn failed (the model's endpoint, a hook that blocked the prompt): the message says how |
 | `-32002` | A `sessionId` this connection did not create (`data.sessionId` repeats it) |
 | `1001` | A second `session/new` |
+
+## Tried against
+
+On 2026-11-17, `atelier acp` was driven by a headless client written on
+the protocol's TypeScript library (`@agentclientprotocol/sdk` 2.7.0, its
+stable v1 entry point, Node 26), which checks what it receives against the
+schema as it parses it; the model was a Qwen3.8 behind an OpenAI-compatible
+endpoint. In sessions of several prompts each:
+
+- `initialize`, `session/new`, a plain answer with thought and message
+  chunks, `usage_update`;
+- a `bash` call asked about with `session/request_permission` — allowed
+  once, rejected, and answered `cancelled`; a `write` in `ask-edits` mode,
+  asked about with its diff;
+- `write` and `read` through the client's `fs/write_text_file` and
+  `fs/read_text_file`;
+- `session/cancel` in the middle of an answer and while a permission
+  request was pending, and the library's own way to give up on a request
+  (`$/cancel_request`, sent when its caller aborts): the prompt ended as
+  `cancelled` each time, and the next prompt ran;
+- `session/set_mode`, slash commands, a refused second `session/new`;
+- a prompt of `text`, `resource` and `resource_link` blocks, and one with
+  an `image`;
+- the `ask` tool as `elicitation/create`, the `todo` list as a `plan`,
+  `notice` updates with and without the capability;
+- an MCP server given in `session/new`;
+- the client going away — its end of the pipe closed mid-answer, and with a
+  permission request pending: atelier exited at once.
+
+The library rejected nothing, and the 775 messages atelier sent in those
+sessions were also checked, one by one, against the schema file the library
+ships (the same file as the one in `tests/data`). One thing was wrong, and
+is fixed: `/mcp` answered "no MCP servers configured" in a session that was
+using a server of the client's.
+
+Two things a client author may want to know, neither atelier's to change.
+atelier writes the last `agent_message_chunk` and `usage_update` of a turn
+and then the result of `session/prompt`, in that order; the client's
+handlers nevertheless saw the result first when the three arrived
+together. And answers arrive in bursts when the model is fast: a
+`session/cancel` sent at the first chunk still had some ninety chunks
+ahead of it.
+
+Not tried: an editor (Zed, JetBrains, Neovim); the Rust or Python client
+libraries; an older client, which may not know `usage_update` or `notice`;
+`--claude` as the backend of an ACP session; an `http` MCP server from the
+client; the v2 draft of the protocol, which atelier does not speak.
 
 ## See also
 
