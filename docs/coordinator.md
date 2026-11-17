@@ -32,7 +32,10 @@ with a message saying so; nothing else in atelier depends on it.
 | `/subscribe <topic>`, `/unsubscribe <topic>` | Start or stop receiving a topic |
 
 An instance is named after its project directory (`atelier`, and
-`atelier-2` for a second one in a directory of the same name).
+`atelier-2` for a second one in a directory of the same name). A
+[subagent that runs as a process](agents.md#as-a-process) is an instance
+too, named after its parent and its agent (`atelier.explore`) and listed as
+`subagent of atelier`; it is there for as long as its task takes.
 
 A message that arrives is shown in the receiving instance (`✉ name: …`)
 and handed to its agent: at the agent's next step if it is working, or
@@ -80,6 +83,12 @@ A question that timed out before you prompted the idle instance is still
 passed on to its agent with that prompt, as an ordinary message: nobody is
 waiting any more, but what was asked may still matter.
 
+This is also how one agent hands a piece of work to an instance you opened
+yourself: the question is the task, the answer the report. The other
+instance does it under its own mode and rules, and asks *its* user what
+they would be asked. (A [subagent](agents.md) is for work the asking agent
+wants done under its own.)
+
 The asking turn cannot be interrupted while it waits (no tool call can), so
 an agent should give `timeout_secs` when a short wait is all the question is
 worth. An idle instance does not answer by itself — the question waits for
@@ -117,7 +126,9 @@ if the coordinator restarts, each instance announces what it holds to the
 new one, so the table comes back as it was.
 
 Subagents (the `task` tool) edit without the note: only the instance's own
-conversation is checked against the table.
+conversation is checked against the table. The exception is a subagent that
+runs [as a process](agents.md#as-a-process): it is an instance, so its edits
+are checked and its locks are its own.
 
 ## Waking an idle instance
 
@@ -225,7 +236,7 @@ untouched — see [waking](#waking-an-idle-instance)). A `call` arrives at its t
 answer the coordinator passes back to the caller; it fails if the target
 disconnects (error `-32004`) or takes longer than `timeout_ms` (error
 `-32003`; 30 s by default, 30 minutes at most). Instances answer `ping`,
-`info` and `ask` — `call` is the extension point for richer
+`info`, `ask` and `task` — `call` is the extension point for richer
 instance-to-instance requests (`Client::handle` in `src/coord/client.rs`).
 
 The lock table is the one thing the coordinator keeps, and it keeps it in
@@ -252,6 +263,17 @@ the id up and answers `{answered: true, answer}`. A question closed without
 an answer is answered `{answered: false, reason}`. The target forgets a
 question after the same `timeout_ms`, so an agent is never asked to answer
 one nobody waits for (`src/coord/ask.rs`).
+
+`task` is what a [subagent that runs as a process](agents.md#as-a-process)
+says to the instance that started it: `call {to: <parent's id>, method:
+"task", params: {task, op, …}}`, where `task` is an id only the two know and
+`op` is `take` (the child is up; the answer is its task), `say` (a line of
+progress), `change` (a file it wrote), `approve` (a tool call it wants to
+make; the answer is `{refusal}` — none, or the refused call's result) or
+`report` (how it ended). The child always asks and the parent answers, so
+no call outlasts a step, and a coordinator that restarts costs a retry. An
+instance says whose subagent it is in `hello` (`parent`), which `list`
+passes on (`src/agent/subagent/process.rs`).
 
 The code is in `src/coord/`: `daemon.rs` (the coordinator), `client.rs`
 (an instance's connection, reconnection and launch of the coordinator),

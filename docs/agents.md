@@ -72,6 +72,7 @@ lines, not full YAML); the text after it is the agent's **system prompt**.
 | `tools` | no | The tools it may call: names, with `*` as a wildcard (`mcp__docs__*`). A comma list, a bracketed one (`[read, grep]`), or `- item` lines. Default: every tool the session has |
 | `max_steps` | no | Model requests it may make before it is told to wrap up (see below). Default 40 |
 | `isolation` | no | `worktree`: every run of this agent works in a [git worktree of its own](#worktree-isolation) instead of the project directory. Default: none. Any other value makes the file invalid |
+| `process` | no | `true`: every run of this agent is an [atelier process of its own](#as-a-process), an instance on the coordinator. Default `false`. Any other value makes the file invalid |
 
 Other keys are ignored. A file without a `description` or without a prompt is
 skipped; `/agents` says which and why.
@@ -93,7 +94,7 @@ with no counterpart simply grants nothing. Their `model` (`sonnet`, `opus`,
 |---|---|
 | Conversation | Its own, starting at the task's prompt. Nothing of the parent's conversation, and the parent gets nothing of the child's but the final message |
 | System prompt | The agent's, plus the project's instruction files (`AGENTS.md`) — the project's rules apply to it too. Not the per-turn snapshot (git status, diagnostics, layout): what matters of it belongs in the task's prompt |
-| Tools | The parent's, filtered to the agent's `tools`. MCP servers are shared, not reconnected |
+| Tools | The parent's, filtered to the agent's `tools`. MCP servers are shared, not reconnected (a child that runs [as a process](#as-a-process) connects its own) |
 | Files | The same project directory — unless it is [isolated in a worktree](#worktree-isolation) — with its own read tracking: it must read a file before editing it, whatever the parent has read |
 | Model | The agent's `model`, else the session's |
 | Persistence | None. A subagent is never saved or resumed, and the [reviewer](review.md) does not watch it |
@@ -370,6 +371,111 @@ lock whose process is gone does not count). `git worktree remove --force
 `.atelier/tool-output/`, unless pointed at it. Agent ids are not reused for
 a directory that exists: a new agent skips to the next free one.
 
+## As a process
+
+A subagent normally runs inside the atelier that started it. With
+`process: true` — in the agent's file, for every run of that agent, or in
+the call — it runs as **an atelier process of its own**, which joins the
+[coordinator](coordinator.md) as an instance like the ones you start in
+other terminals:
+
+```
+› /peers
+connected to coordinator 0.1.2 as 'proj'
+proj (you) — working, qwen3-coder:30b, in /home/you/proj
+proj.reviewer — working, qwen3-coder:30b, in /home/you/proj, subagent of proj
+```
+
+It is named after its parent and its agent (`proj.reviewer`, then
+`proj.reviewer-2`), and what an instance can do, it can do — given the
+[`peer*` tools](tools.md#peers-peer_send) in its `tools`:
+
+- **Talk to its siblings.** Agents started in one step can `peer_send` and
+  `peer_ask` each other by name, and each is shown what arrives at its next
+  step, the way any working instance is. Your other instances can write to
+  it as well, and it to them.
+- **Hold locks of its own.** A `peer_lock` it takes is in its name, not its
+  parent's, and ends with it. Its edits are checked against the [lock
+  table](coordinator.md#saying-what-you-are-working-on) — a child inside the
+  parent's process edits without that check.
+
+Use it for agents that work at the same time and need to coordinate. For
+everything else it buys nothing: the default costs no process.
+
+### What stays the same
+
+Everything the `task` call promises. The parent hands over the same task,
+gets the same report with the same footer, and shows the same lines; the
+step cap, `background: true`, `/agents`, `/agents stop`, Ctrl-C and
+[`isolation: worktree`](#worktree-isolation) work as they do for any
+subagent. The task, the child's activity lines, its approval requests and
+its report travel through the coordinator.
+
+**Permissions are the parent's**, as for every subagent. The process decides
+nothing: each call it wants to make is sent to the parent, which first
+checks that the tool is one the agent was given, then applies its own rules
+and mode and — in the foreground — asks you, in the parent's prompt, after
+the usual `⤷ the subagent … asks to run:` line. In the background the rules
+decide alone and what would ask is denied, as [above](#nobody-is-asked). The
+process never has a tool its parent does not have, and it runs under the
+parent's mode whatever `ATELIER_MODE` or `atelier.toml` would give a session
+started by hand. If the parent cannot be reached, nothing is approved and
+the child stops. (An approval prompt left unanswered for 30 minutes is a
+refusal: the coordinator holds no call open longer.)
+
+### What differs
+
+| | |
+|---|---|
+| Configuration | Read again by the new process, from the parent's project directory and environment — the same endpoint, providers and hooks, unless a file changed in between. The model, the mode, the step cap and the tool list are the parent's as they are at the call |
+| MCP servers | Connected again by the child (only when its agent may use an MCP tool, and only in a trusted project), not shared with the parent: a server that keeps state per connection starts fresh |
+| `peer*` tools | Act as the child's own instance, not as the parent's |
+| Startup | A process and a connection: a fraction of a second per agent |
+
+### When there is no process to be had
+
+A child that could not be started as a process **runs inside the parent
+instead**, after a line saying why:
+
+```
+⤷ explore: find config readers
+  ⤷ ! not in a process of its own, but in this one: this atelier runs without the coordinator
+```
+
+That is the case when the session has no coordinator
+(`ATELIER_NO_COORDINATOR`, or a system without one) or has lost it and not
+found it again within a few seconds, when the executable cannot be started,
+and when the new process does not come for its task within 20 seconds. The
+task has not begun at that point, and where it runs changes nothing about
+its result — unlike a worktree, which is never dropped quietly.
+
+A process that **dies after it took the task** is another matter: it may
+have written files. The `task` call fails (`⤶ explore: failed — its process
+ended before it reported (signal: 9 (SIGKILL))`), the result tells the model
+that whatever the agent did stays done and nothing was reported, and the
+task is not run again.
+
+### Stopping, and a parent that goes away
+
+The child is the parent's process and lives no longer than it. Stopping —
+Ctrl-C in the foreground, `/agents stop` or quitting for a background agent
+— reaches it at once and is cooperative as always: it ends at its next
+step and reports where it got to. One that has not wound down after 10
+seconds is killed, with the commands it started. If the parent itself dies,
+however it dies, the child notices and stops the same way. The coordinator
+may restart at any time without costing the child: the two find each other
+again through the new one.
+
+### An instance you opened yourself
+
+Handing work to an atelier already running in another terminal needs no
+`task`: it is [`peer_ask`](coordinator.md#asking-another-agent). The
+question is the task and the answer is the report, and whether an idle
+instance takes it up without you is that instance's own setting
+([`[coordinator] wake`](coordinator.md#waking-an-idle-instance)) — nothing
+on the asking side can make another instance act. It works under its own
+mode and rules, and its prompts are answered in its own terminal.
+
 ## With the Claude backend
 
 `task` and these agents belong to atelier's own loop. With `--claude`, claude
@@ -381,8 +487,5 @@ it. `/agents` still lists what atelier would run.
 
 Planned under the same roadmap item (M18), not in this version:
 
-- **Subagents over the coordinator** — a child as another atelier instance
-  (a process, or one you opened in another terminal), with messages between
-  siblings.
 - Per-agent reasoning effort and permission rules in the front matter.
 - Hook events around a subagent's start and stop.

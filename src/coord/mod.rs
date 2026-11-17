@@ -34,6 +34,8 @@
 //! from other instances delivered into the conversation (`agent`). One
 //! `call` method, `ask`, carries a question to another instance's *agent*
 //! and its answer back — the `peer_ask` and `peer_answer` tools ([`ask`]).
+//! Another, `task`, is how a subagent that runs as a process of its own
+//! talks to the instance that started it (`agent::subagent`).
 //!
 //! The coordinator also keeps one table: the advisory locks, by which an
 //! instance says which paths it is working on ([`locks`], the `peer_lock`
@@ -223,14 +225,25 @@ fn disabled() -> bool {
 /// being retried for as long as the process lives. `None` when disabled or
 /// unsupported here.
 pub fn start(root: &Path, model: &str) -> Option<Arc<Client>> {
-    if disabled() || cfg!(not(unixlike)) {
-        return None;
-    }
-    let dir = runtime_dir()?;
     let name = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "atelier".to_string());
+    start_as(root, name, None, model)
+}
+
+/// [`start`], for an instance that is the subagent of another (see
+/// `agent::subagent`'s `process` module): under the `name` its parent chose
+/// for it, and listed as the subagent of the instance named `parent`.
+pub fn start_child(root: &Path, name: &str, parent: &str, model: &str) -> Option<Arc<Client>> {
+    start_as(root, name.to_string(), Some(parent.to_string()), model)
+}
+
+fn start_as(root: &Path, name: String, parent: Option<String>, model: &str) -> Option<Arc<Client>> {
+    if disabled() || cfg!(not(unixlike)) {
+        return None;
+    }
+    let dir = runtime_dir()?;
     Some(Client::start(client::Options {
         dir,
         // Resolved now: after a self-update replaces the binary, the running
@@ -239,6 +252,7 @@ pub fn start(root: &Path, model: &str) -> Option<Arc<Client>> {
         name,
         cwd: root.display().to_string(),
         model: model.to_string(),
+        parent,
     }))
 }
 

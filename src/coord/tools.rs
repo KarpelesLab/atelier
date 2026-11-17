@@ -62,6 +62,11 @@ pub fn render_instances(list: &Value) -> Vec<String> {
             if !topics.is_empty() {
                 line.push_str(&format!(", listening to {}", topics.join(" ")));
             }
+            // A subagent running as a process of its own (see
+            // `agent::subagent`).
+            if let Some(parent) = i["parent"].as_str() {
+                line.push_str(&format!(", subagent of {parent}"));
+            }
             line
         })
         .collect()

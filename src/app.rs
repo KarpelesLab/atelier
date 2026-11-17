@@ -30,14 +30,22 @@ fn exit_code(result: Result<u8>) -> ExitCode {
 }
 
 /// The subcommands atelier runs itself with: the coordinator daemon, the
-/// local model's supervisor, the relay claude launches, a sandboxed command.
-const HELPERS: [&str; 4] = ["coordinator", "local-serve", "mcp-serve", sandbox::HELPER];
+/// local model's supervisor, the relay claude launches, a sandboxed command,
+/// a subagent in a process of its own.
+const HELPERS: [&str; 5] = [
+    "coordinator",
+    "local-serve",
+    "mcp-serve",
+    sandbox::HELPER,
+    agent::SUBAGENT_HELPER,
+];
 
 /// For a program that embeds atelier and has no `atelier` binary beside it:
 /// call this first thing in `main` with the arguments (less the program's
 /// name). When they are one of atelier's own helper invocations — atelier
 /// starts copies of the running program for the coordinator, the local
-/// model's server, the Claude relay and the sandbox — it runs it and gives
+/// model's server, the Claude relay, the sandbox and subagents that run as
+/// processes — it runs it and gives
 /// the exit status to leave with; otherwise `None`, and the program goes
 /// on. The alternative is [`set_helper_exe`].
 pub fn helper(args: &[String]) -> Option<ExitCode> {
@@ -89,6 +97,12 @@ pub fn run(args: &[String]) -> Result<u8> {
     // instances (they launch it themselves), or a word with it (see `coord`).
     if args.first().map(String::as_str) == Some("coordinator") {
         return coord::run_command(&args[1..]).map(|()| 0);
+    }
+    // `atelier subagent …`: the child of one `task` call, as a process of
+    // its own; started by the session that made the call (see
+    // `agent::subagent`).
+    if args.first().map(String::as_str) == Some(agent::SUBAGENT_HELPER) {
+        return finish(agent::subagent_main(&args[1..]));
     }
     // `atelier permissions check …`: what the permission rules decide for a
     // call, and which rule decided (see `permissions`).
@@ -259,7 +273,7 @@ pub fn with_local(mut session: agent::Session, flag: bool) -> Result<agent::Sess
 
 /// What starting the local model has to say when nobody is at a terminal:
 /// on stderr, since stdout may be a `--print` answer or a protocol.
-struct Quiet;
+pub(crate) struct Quiet;
 
 impl agent::Ui for Quiet {
     fn reasoning(&mut self, _: &str) {}
@@ -278,11 +292,37 @@ impl agent::Ui for Quiet {
 }
 
 pub fn open_session(claude: bool, mode: Option<permissions::Mode>) -> Result<agent::Session> {
+    open(claude, mode, None)
+}
+
+/// [`open_session`] for a subagent that runs as a process of its own (see
+/// `agent::subagent`): working in the current directory, but with the
+/// settings — and the trust — of `project`, its parent's directory, which
+/// is another one when the child works in a worktree; and joined to the
+/// coordinator as `name`, the subagent of the instance named `parent`.
+pub(crate) fn open_child(
+    project: &std::path::Path,
+    name: &str,
+    parent: &str,
+) -> Result<agent::Session> {
+    open(false, None, Some((project, name, parent)))
+}
+
+/// A subagent's process: the project it belongs to, its name among the
+/// instances, its parent's.
+type ChildOf<'a> = (&'a std::path::Path, &'a str, &'a str);
+
+fn open(
+    claude: bool,
+    mode: Option<permissions::Mode>,
+    child: Option<ChildOf>,
+) -> Result<agent::Session> {
     // `--claude` selects the Claude Code backend (same as ATELIER_BACKEND=claude).
     let mut cfg = Config::from_env(claude);
     let claude = matches!(cfg.backend, config::Backend::Claude { .. });
     let root = std::env::current_dir()?;
-    let settings = Settings::load(&root).unwrap_or_else(|e| {
+    let project = child.map_or(root.as_path(), |(project, ..)| project);
+    let settings = Settings::load(project).unwrap_or_else(|e| {
         eprintln!("warning: {e:#}; using empty settings");
         Settings::default()
     });
@@ -297,7 +337,7 @@ pub fn open_session(claude: bool, mode: Option<permissions::Mode>) -> Result<age
     // and what is allowed only once the user has trusted the project (see
     // `trust`); until then its gated parts are left out here and wherever
     // else they would be acted on.
-    let trust = trust::Trust::load(&root, &settings, trust::Store::from_env());
+    let trust = trust::Trust::load(project, &settings, trust::Store::from_env());
     let user_settings = Settings::load_user().unwrap_or_default();
     for warning in cfg.apply_settings(&trust.effective(&settings), &user_settings) {
         eprintln!("warning: {warning}");
@@ -306,13 +346,16 @@ pub fn open_session(claude: bool, mode: Option<permissions::Mode>) -> Result<age
     let mut tools = tools::builtin_registry();
     // Join the other atelier instances on this machine, starting the
     // coordinator that connects them if this is the first one up.
-    let coordinator = coord::start(&root, &cfg.model);
+    let coordinator = match child {
+        None => coord::start(&root, &cfg.model),
+        Some((_, name, parent)) => coord::start_child(&root, name, parent, &cfg.model),
+    };
     if let Some(c) = &coordinator {
         coord::tools::register(&mut tools, c);
     }
     // Subagents run on atelier's own loop; claude has its own (see
-    // `tools::task`).
-    if !claude {
+    // `tools::task`). A subagent starts none.
+    if !claude && child.is_none() {
         tools.register(Box::new(tools::task::TaskTool::new(
             root.clone(),
             agents::global_dir(),

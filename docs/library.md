@@ -80,8 +80,8 @@ cargo run --example embed -- "what does this project do?"
 - **The current directory is the project.** A session works in the
   process's working directory, so one process holds one project's sessions.
 - **Helper processes.** atelier starts copies of the running program for
-  the coordinator, the local model's server, the Claude relay and the
-  sandbox. Either call `atelier::app::helper(&args)` first thing in `main`,
+  the coordinator, the local model's server, the Claude relay, the
+  sandbox and subagents that run as processes. Either call `atelier::app::helper(&args)` first thing in `main`,
   as above, so that your program answers those invocations; or name an
   installed `atelier` with `atelier::app::set_helper_exe(path)`.
 - **stderr.** Setting up a session reports configuration warnings on

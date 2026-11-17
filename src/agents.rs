@@ -39,6 +39,9 @@
 //! - `isolation` — optional; `worktree` has every run of the agent work in
 //!   a git worktree of its own instead of the project directory (see
 //!   [`Isolation`])
+//! - `process` — optional; `true` has every run of the agent be an atelier
+//!   process of its own, an instance on the coordinator (see
+//!   `agent::subagent`'s `process` module)
 //!
 //! No agent ever gets the `task` tool, whatever `tools` says: subagents do
 //! not start subagents.
@@ -160,6 +163,9 @@ pub struct Agent {
     pub max_steps: u32,
     /// Where it works, unless the call that runs it asks for a worktree.
     pub isolation: Isolation,
+    /// Whether it runs as an atelier process of its own — an instance on
+    /// the coordinator — also when the call that runs it does not ask.
+    pub process: bool,
     /// Its system prompt.
     pub prompt: String,
     pub source: Source,
@@ -242,6 +248,7 @@ fn builtins() -> Vec<Agent> {
             tools: Some(EXPLORE_TOOLS.iter().map(|t| t.to_string()).collect()),
             max_steps: DEFAULT_MAX_STEPS,
             isolation: Isolation::Shared,
+            process: false,
             prompt: EXPLORE_PROMPT.to_string(),
             source: Source::Builtin,
         },
@@ -255,6 +262,7 @@ fn builtins() -> Vec<Agent> {
             tools: None,
             max_steps: DEFAULT_MAX_STEPS,
             isolation: Isolation::Shared,
+            process: false,
             prompt: GENERAL_PROMPT.to_string(),
             source: Source::Builtin,
         },
@@ -328,6 +336,11 @@ fn parse(stem: &str, text: &str, claude_compat: bool) -> Result<Agent> {
         None => Isolation::Shared,
         Some(value) => Isolation::parse(value).map_err(anyhow::Error::msg)?,
     };
+    let process = match field("process") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => bail!("`process` must be true or false, not {other:?}"),
+    };
     // `inherit` is how other harnesses spell "the session's model".
     let model = field("model")
         .filter(|m| !claude_compat && *m != "inherit")
@@ -339,6 +352,7 @@ fn parse(stem: &str, text: &str, claude_compat: bool) -> Result<Agent> {
         tools: field("tools").map(tool_list),
         max_steps,
         isolation,
+        process,
         prompt: prompt.to_string(),
         // Replaced by `scan`, which knows the path.
         source: Source::Builtin,
@@ -386,8 +400,9 @@ pub fn command(root: &Path, global: Option<&Path>) -> Vec<String> {
             Isolation::Shared => "",
             Isolation::Worktree => " · isolation: worktree",
         };
+        let process = if a.process { " · process" } else { "" };
         out.push(format!(
-            "      {source} · tools: {tools} · max {} steps{model}{isolation}",
+            "      {source} · tools: {tools} · max {} steps{model}{isolation}{process}",
             a.max_steps
         ));
     }
@@ -397,7 +412,7 @@ pub fn command(root: &Path, global: Option<&Path>) -> Vec<String> {
     }
     out.push(
         "  define one in .atelier/agents/<name>.md (front matter: description, tools, model, \
-         max_steps, isolation; the body is its system prompt)"
+         max_steps, isolation, process; the body is its system prompt)"
             .to_string(),
     );
     out
@@ -490,6 +505,34 @@ mod tests {
             listing.contains(
                 ".atelier/agents/writer.md · tools: all · max 40 steps · isolation: worktree"
             ),
+            "{listing}"
+        );
+    }
+
+    #[test]
+    fn process_is_true_or_false() {
+        let with = |value: &str| {
+            let text = format!("---\ndescription: d\nprocess: {value}\n---\nBody");
+            parse("talker", &text, false)
+        };
+        assert!(with("true").unwrap().process);
+        assert!(!with("false").unwrap().process);
+        assert!(
+            !parse("p", "---\ndescription: d\n---\nBody", false)
+                .unwrap()
+                .process
+        );
+        let err = with("yes").unwrap_err().to_string();
+        assert!(err.contains("`process` must be true or false"), "{err}");
+
+        let (root, global) = dirs("process");
+        write(
+            root.join(".atelier/agents/talker.md"),
+            "---\ndescription: d\nprocess: true\n---\nBody",
+        );
+        let listing = command(&root, Some(&global)).join("\n");
+        assert!(
+            listing.contains(".atelier/agents/talker.md · tools: all · max 40 steps · process"),
             "{listing}"
         );
     }

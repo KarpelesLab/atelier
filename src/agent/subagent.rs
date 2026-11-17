@@ -65,10 +65,17 @@
 //! report for the parent to take the changes from. See the `worktree`
 //! module.
 //!
-//! Not here yet (see ROADMAP.md, M18): running a child as another atelier
-//! instance through the coordinator.
+//! # As a process
+//!
+//! An agent defined with `process: true`, or a call that asks for it, runs
+//! in an atelier process of its own, which joins the coordinator as an
+//! instance. The child's thread is still started here and still holds the
+//! [`Link`]; it waits on the process where it would have run the
+//! conversation, and passes on what the process says. See the `process`
+//! module.
 
 mod background;
+pub(super) mod process;
 mod worktree;
 
 use std::collections::VecDeque;
@@ -90,6 +97,8 @@ use crate::tools::task::TaskCall;
 
 pub(super) use background::{AgentInfo, Background, NOTICE_OPEN, Roster};
 use background::{Rules, Seat};
+pub(super) use process::Handed;
+use process::{Process, Remote};
 use worktree::Worktree;
 
 /// Added to every agent's system prompt: what being a subagent means.
@@ -135,6 +144,9 @@ enum Parent {
     /// and how it ends go to its seat in the roster; its calls are decided
     /// by the rules alone.
     Detached { seat: Arc<Seat>, rules: Arc<Rules> },
+    /// The parent is another process: this child is an instance of its own,
+    /// and what it says travels through the coordinator (see `process`).
+    Remote(Arc<Remote>),
 }
 
 impl Link {
@@ -148,6 +160,7 @@ impl Link {
             Parent::Detached { rules, seat } => {
                 return rules.decide(tool, arguments, &mut |line| seat.activity(line));
             }
+            Parent::Remote(remote) => return remote.approve(tool, arguments, &self.stop),
         };
         let (reply, verdict) = mpsc::channel();
         let asked = events.send(Event::Approve {
@@ -173,17 +186,22 @@ impl Link {
                 });
             }
             Parent::Detached { seat, .. } => seat.activity(text),
+            Parent::Remote(remote) => remote.activity(text),
         }
     }
 
     /// A file the child's tool call wrote. A background agent's go
     /// unreported: nobody is listening when they happen.
     fn file_change(&self, tool: &str, change: &FileChange) {
-        if let Parent::Waiting { events, .. } = &self.to {
-            let _ = events.send(Event::Change {
-                tool: tool.to_string(),
-                change: change.clone(),
-            });
+        match &self.to {
+            Parent::Waiting { events, .. } => {
+                let _ = events.send(Event::Change {
+                    tool: tool.to_string(),
+                    change: change.clone(),
+                });
+            }
+            Parent::Detached { .. } => {}
+            Parent::Remote(remote) => remote.file_change(tool, change),
         }
     }
 
@@ -197,6 +215,7 @@ impl Link {
                 });
             }
             Parent::Detached { seat, .. } => seat.finish(outcome),
+            Parent::Remote(remote) => remote.done(outcome),
         }
     }
 
@@ -205,7 +224,12 @@ impl Link {
     /// foreground child stopped with its parent's turn just ends: the turn
     /// it would report to is over.)
     fn stopped_in_background(&self) -> bool {
-        matches!(self.to, Parent::Detached { .. }) && self.stop.load(Ordering::Relaxed)
+        let background = match &self.to {
+            Parent::Waiting { .. } => false,
+            Parent::Detached { .. } => true,
+            Parent::Remote(remote) => remote.background(),
+        };
+        background && self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -304,11 +328,42 @@ struct Job {
     link: Link,
     /// Where it works, when isolated: settled when it ends.
     worktree: Option<Worktree>,
+    /// Set when it is to run in a process of its own (see `process`).
+    process: Option<Process>,
 }
 
 impl Job {
     /// Run the child to its answer and report it. On the child's thread.
     fn run(mut self) {
+        let remote = match self.process.take() {
+            None => None,
+            Some(process) => match process.run(&self) {
+                Ok(outcome) => Some(outcome),
+                // No process ran it, and nothing was done: here, then.
+                Err(why) => {
+                    self.link.activity(clip(&format!(
+                        "! not in a process of its own, but in this one: {why}"
+                    )));
+                    None
+                }
+            },
+        };
+        let mut outcome = match remote {
+            Some(outcome) => outcome,
+            None => self.converse(),
+        };
+        // However it ended: what it left in a worktree of its own is part
+        // of what it reports.
+        if let Some(worktree) = self.worktree.take() {
+            let settled = worktree.settle();
+            outcome.text.push_str(&settled.report);
+            outcome.line.push_str(&settled.note);
+        }
+        self.link.done(outcome);
+    }
+
+    /// The child's conversation, from its prompt to how it ended.
+    fn converse(&mut self) -> Outcome {
         let mut ui = ChildUi {
             link: self.link.clone(),
         };
@@ -334,7 +389,7 @@ impl Job {
         }
         footer.push(']');
         let last = self.session.last_answer();
-        let mut outcome = match result {
+        match result {
             // Told to stop, it ended without the report it was asked for.
             Ok(()) if self.link.stopped_in_background() => {
                 let said = match last.trim() {
@@ -380,15 +435,7 @@ impl Job {
                 line: format!("⤶ {label}: failed after {steps} — {e:#}"),
                 tokens_out,
             },
-        };
-        // However it ended: what it left in a worktree of its own is part
-        // of what it reports.
-        if let Some(worktree) = self.worktree.take() {
-            let settled = worktree.settle();
-            outcome.text.push_str(&settled.report);
-            outcome.line.push_str(&settled.note);
         }
-        self.link.done(outcome);
     }
 }
 
@@ -450,7 +497,8 @@ impl Session {
                     };
                     let root = worktree.as_ref().map(Worktree::root);
                     let session = self.child(&task.agent, link.clone(), root);
-                    jobs.push((index, session, task, link, worktree));
+                    let process = task.process.then(|| self.process(false));
+                    jobs.push((index, session, task, link, worktree, process));
                     slots.push(Slot::Running);
                 }
                 Err(msg) => {
@@ -468,7 +516,7 @@ impl Session {
         let jobs: Vec<Job> = jobs
             .into_iter()
             .enumerate()
-            .map(|(n, (index, session, task, link, worktree))| {
+            .map(|(n, (index, session, task, link, worktree, process))| {
                 let label = if several {
                     format!("{}#{}", task.agent.name, n + 1)
                 } else {
@@ -483,6 +531,7 @@ impl Session {
                     session,
                     link,
                     worktree,
+                    process,
                 }
             })
             .collect();
@@ -612,6 +661,7 @@ impl Session {
         let job = Job {
             label: format!("{name} {id}"),
             session: self.child(&task.agent, link.clone(), root),
+            process: task.process.then(|| self.process(true)),
             agent: task.agent,
             prompt: task.prompt,
             link,

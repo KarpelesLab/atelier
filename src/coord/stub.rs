@@ -20,9 +20,26 @@ pub struct Options {
     pub name: String,
     pub cwd: String,
     pub model: String,
+    pub parent: Option<String>,
 }
 
 pub struct Client;
+
+/// A `call` from another instance: there is never one here.
+pub struct Incoming {
+    pub from: String,
+    pub cwd: String,
+    pub params: Value,
+    pub reply: Responder,
+}
+
+pub struct Responder;
+
+impl Responder {
+    pub fn answer(self, _: Result<Value, String>) -> Result<()> {
+        bail!(UNSUPPORTED)
+    }
+}
 
 const UNSUPPORTED: &str = "the coordinator is not supported on this platform";
 
@@ -32,6 +49,19 @@ impl Client {
     }
     pub fn name(&self) -> String {
         String::new()
+    }
+    pub fn id(&self) -> String {
+        String::new()
+    }
+    pub fn dir(&self) -> &std::path::Path {
+        std::path::Path::new("")
+    }
+    pub fn connected(&self) -> bool {
+        false
+    }
+    pub fn handle_deferred(&self, _: &str, _: impl Fn(Incoming) + Send + Sync + 'static) {}
+    pub fn call(&self, _: &str, _: &str, _: Value, _: std::time::Duration) -> Result<Value> {
+        bail!(UNSUPPORTED)
     }
     pub fn link_status(&self) -> String {
         UNSUPPORTED.to_string()
@@ -55,6 +85,9 @@ impl Client {
         bail!(UNSUPPORTED)
     }
     pub fn set_wake_depth(&self, _: u32) {}
+    pub fn wake_depth(&self) -> u32 {
+        0
+    }
     pub fn lock_acquire(&self, _: &std::path::Path, _: &str) -> Result<Vec<Lock>> {
         bail!(UNSUPPORTED)
     }

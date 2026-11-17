@@ -61,6 +61,9 @@ pub struct Options {
     pub name: String,
     pub cwd: String,
     pub model: String,
+    /// The name of the instance this one is a subagent of, when it is one
+    /// (see `agent::subagent`'s `process` module): shown by `list`.
+    pub parent: Option<String>,
 }
 
 /// What this instance tells the coordinator about itself.
@@ -71,6 +74,7 @@ struct Me {
     cwd: String,
     model: String,
     status: String,
+    parent: Option<String>,
 }
 
 #[derive(Default)]
@@ -204,6 +208,7 @@ impl Client {
                 cwd: opts.cwd,
                 model: opts.model,
                 status: "idle".into(),
+                parent: opts.parent,
             }),
             link: Mutex::new(Link {
                 down: "connecting".into(),
@@ -260,6 +265,23 @@ impl Client {
     /// This instance's name among the connected instances.
     pub fn name(&self) -> String {
         lock(&self.sh.me).name.clone()
+    }
+
+    /// This instance's id: stable for the life of the process, and — unlike
+    /// its name — nobody else's after it. An address for `call`.
+    pub fn id(&self) -> String {
+        self.sh.id.clone()
+    }
+
+    /// The directory of the coordinator this instance joins.
+    pub fn dir(&self) -> &Path {
+        &self.sh.dir
+    }
+
+    /// Whether the link is up — waiting for it as long as a request would
+    /// (a session that has just started is still connecting).
+    pub fn connected(&self) -> bool {
+        self.sh.wait_linked(CONNECT_WAIT).is_ok()
     }
 
     /// One line on the state of the link, for `/peers`.
@@ -412,6 +434,11 @@ impl Client {
         self.sh.wake_depth.store(depth, Ordering::Relaxed);
     }
 
+    /// What [`set_wake_depth`](Self::set_wake_depth) last said.
+    pub fn wake_depth(&self) -> u32 {
+        self.sh.wake_depth.load(Ordering::Relaxed)
+    }
+
     /// Answer the question `id` another instance asked this one; returns
     /// the asker's name.
     pub fn answer_question(&self, id: &str, text: &str) -> Result<String> {
@@ -511,7 +538,7 @@ enum Ended {
 impl Shared {
     fn describe(&self) -> Value {
         let me = lock(&self.me);
-        json!({
+        let mut v = json!({
             "id": self.id,
             "name": me.name,
             "pid": std::process::id(),
@@ -519,7 +546,11 @@ impl Shared {
             "model": me.model,
             "status": me.status,
             "version": VERSION,
-        })
+        });
+        if let Some(parent) = &me.parent {
+            v["parent"] = parent.as_str().into();
+        }
+        v
     }
 
     fn write(&self, msg: &Value) -> Result<()> {

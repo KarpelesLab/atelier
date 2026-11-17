@@ -79,7 +79,7 @@ struct Peer {
     id: String,
     name: String,
     /// What it told us about itself (`pid`, `cwd`, `model`, `status`,
-    /// `version`).
+    /// `version`, and `parent` when it is another instance's subagent).
     info: Map<String, Value>,
     topics: BTreeSet<String>,
     /// Unix seconds when it (last) said hello.
@@ -708,7 +708,7 @@ fn hello(st: &mut State, conn: u64, p: &Value) -> Reply {
     }
     let name = st.unique_name(&sanitize(p["name"].as_str().unwrap_or_default()), conn);
     let mut info = Map::new();
-    for key in ["pid", "cwd", "model", "status", "version"] {
+    for key in ["pid", "cwd", "model", "status", "version", "parent"] {
         if let Some(v) = p.get(key) {
             info.insert(key.into(), v.clone());
         }

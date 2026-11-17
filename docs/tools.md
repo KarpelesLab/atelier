@@ -664,6 +664,7 @@ their descriptions.
 | `description` | string | no       | The task in 3–6 words, shown while it runs (default: the prompt's first line) |
 | `background`  | boolean | no      | Start the agent and return its id at once instead of waiting for its report (default false; `run_in_background` is accepted too) |
 | `isolation`   | string | no       | `"worktree"`: the agent works in a fresh git worktree at HEAD instead of the project directory. Uncommitted changes are not carried over. An agent whose definition says `isolation: worktree` is isolated whatever the call says |
+| `process`     | boolean | no      | Run the agent as an atelier process of its own, an instance the other instances can message (default false). An agent whose definition says `process: true` runs so whatever the call says |
 
 The result is the subagent's final message followed by a footer,
 `[explore: 7 steps · 412 output tokens]`. A subagent that reaches its step
@@ -687,6 +688,14 @@ it changed anything, its report ends with the worktree's path, a `git diff
 (`git -C <worktree> diff --binary <base> | git apply`); nothing is merged
 automatically. An untouched worktree is removed. Outside a git repository,
 or in one without a commit, the call is an error result.
+
+With `process: true` the agent is [a separate atelier
+instance](agents.md#as-a-process), named `<instance>.<agent>` among the
+peers, so that agents running at the same time can `peer_send` and
+`peer_ask` each other. The result, the limits and who approves its calls
+are unchanged. Without a coordinator the agent runs inside the caller
+instead, and a line says so; if its process dies mid-task the call is an
+error result.
 
 `task` calls that follow one another in one step run at the same time; their
 results come back in call order. Subagents have every limit the caller has —

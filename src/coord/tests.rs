@@ -49,7 +49,47 @@ fn client(dir: &Path, name: &str) -> Arc<Client> {
         name: name.into(),
         cwd: format!("/work/{name}"),
         model: "mock".into(),
+        parent: None,
     })
+}
+
+/// An instance that is the subagent of another says so, and `list` — the
+/// `peers` tool, `/peers` — shows it.
+#[test]
+fn a_subagents_instance_is_listed_under_its_parent() {
+    let dir = Dir::new("parent");
+    let _daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let parent = client(&dir.0, "proj");
+    wait_for("the parent", || parent.list().is_ok());
+    let child = Client::start(Options {
+        dir: dir.0.clone(),
+        exe: None,
+        name: "proj.explore".into(),
+        cwd: "/work/proj".into(),
+        model: "mock".into(),
+        parent: Some("proj".into()),
+    });
+    wait_for("the child", || child.list().is_ok());
+    assert!(parent.connected() && child.dir() == dir.0);
+
+    let list = parent.list().unwrap();
+    let lines = super::tools::render_instances(&list);
+    assert!(
+        lines.contains(&"proj (you) — idle, mock, in /work/proj".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"proj.explore — idle, mock, in /work/proj, subagent of proj".to_string()),
+        "{lines:?}"
+    );
+    // It is reached by its id as well as by its name.
+    assert_eq!(
+        parent
+            .call(&child.id(), "ping", json!({}), Duration::from_secs(5))
+            .unwrap(),
+        json!("pong")
+    );
+    client::control(&dir.0, "shutdown").unwrap();
 }
 
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {

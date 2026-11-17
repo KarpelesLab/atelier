@@ -62,6 +62,8 @@ mod standalone;
 mod subagent;
 mod turn_model;
 
+pub use subagent::process::{HELPER as SUBAGENT_HELPER, main as subagent_main};
+
 const SYSTEM_PROMPT: &str = "\
 You are atelier, an AI coding assistant operating inside a project directory. \
 You have tools to read and modify files and run commands; use them to inspect \
@@ -1028,6 +1030,9 @@ pub struct Session {
     /// The subagents this session started in the background (see
     /// [`subagent`]); they are stopped when it is dropped.
     background: subagent::Background,
+    /// The tasks handed to subagents that run as processes of their own,
+    /// which report through the coordinator (see `subagent::process`).
+    handed: subagent::Handed,
 }
 
 impl Session {
@@ -1113,12 +1118,15 @@ impl Session {
             standalone: None,
             goal: None,
             background: subagent::Background::default(),
+            handed: subagent::Handed::default(),
         }
     }
 
     /// Join the other atelier instances through the coordinator: messages
     /// from them reach the conversation, and they see this one's status.
     pub fn attach_coordinator(&mut self, client: std::sync::Arc<coord::Client>) {
+        // Its subagents that run as instances of their own call in here.
+        self.handed.serve(&client);
         self.coord = Some(client);
     }
 
@@ -1845,7 +1853,19 @@ impl Session {
         // A subagent's task is not the user's prompt: the `user_prompt` and
         // `turn_end` hooks are about the conversation the user is having.
         if self.child.is_some() {
-            return self.run_turn(user_input, ui);
+            // A child on a thread has no link of its own. One that is a
+            // process is an instance like any other (see
+            // `subagent::process`), and hears its peers — its siblings —
+            // the way any turn does.
+            let Some(coord) = self.coord.clone() else {
+                return self.run_turn(user_input, ui);
+            };
+            coord.update("working", &self.backend_label());
+            let mut ui = PeerUi {
+                inner: ui,
+                coord: &coord,
+            };
+            return self.run_turn(user_input, &mut ui);
         }
         let user_input = &self.hook_prompt(user_input, ui)?;
         // A warning about quitting was about the moment it was given.
@@ -3314,6 +3334,7 @@ mod tests {
                 name: name.into(),
                 cwd: "/w".into(),
                 model: "m".into(),
+                parent: None,
             });
             wait_for("the instance to connect", || client.list().is_ok());
             client

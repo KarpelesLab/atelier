@@ -4708,7 +4708,12 @@ struct LiveRepl {
 
 impl LiveRepl {
     fn start(base_url: &str, cwd: &Path) -> LiveRepl {
-        let mut child = atelier(base_url, cwd)
+        LiveRepl::spawn(atelier(base_url, cwd))
+    }
+
+    /// The REPL that `cmd` starts.
+    fn spawn(mut cmd: Command) -> LiveRepl {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -5754,6 +5759,663 @@ fn a_question_wakes_an_idle_instance_and_its_answer_comes_back() {
 
     coordinator(&coord, "stop");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A project directory with a short name (`proj`: instances are named after
+/// it) and a coordinator of the test's own, stopped when the test is over.
+#[cfg(unix)]
+struct Joined {
+    dir: PathBuf,
+    coord: PathBuf,
+}
+
+#[cfg(unix)]
+impl Joined {
+    fn new(name: &str) -> Joined {
+        let base = unique_dir(name);
+        let dir = base.join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        Joined {
+            dir,
+            coord: base.join("run"),
+        }
+    }
+
+    /// `atelier` in the project, connected to the coordinator.
+    fn atelier(&self, base_url: &str) -> Command {
+        let mut cmd = atelier(base_url, &self.dir);
+        cmd.env("ATELIER_COORDINATOR_DIR", &self.coord)
+            .env_remove("ATELIER_NO_COORDINATOR");
+        cmd
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Joined {
+    fn drop(&mut self) {
+        coordinator(&self.coord, "stop");
+    }
+}
+
+/// Subagents as processes 1 — the same `task`, in another process. With
+/// `process: true` the child is an atelier of its own, joined to the
+/// coordinator as an instance named after its parent and its agent — which
+/// it sees for itself here, with the `peers` tool. Everything else is as for
+/// a child on a thread: its tools are the parent's without `task`, the
+/// project's instructions reach it, its answer is the parent's tool result
+/// with the same footer, and the transcript has the same three lines.
+#[cfg(unix)]
+#[test]
+fn a_process_subagent_is_an_instance_and_reports_like_any_other() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains(GENERAL_MARKER);
+        let answered = !messages_of(&request(body), "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "CHILD-TASK: say who is there",
+                    "description": "look around",
+                    "process": true,
+                }),
+            ),
+            (true, false) => json_tool_call("call_peers", "peers", serde_json::json!({})),
+            (true, true) => text_response("CHILD-REPORT: two of us"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let joined = Joined::new("task-process");
+    std::fs::write(joined.dir.join("AGENTS.md"), "PROJECT-RULES for everyone").unwrap();
+
+    let mut cmd = joined.atelier(&mock.base_url());
+    cmd.args(["-p", "--output-format", "stream-json", "PARENT-PROMPT"]);
+    let out = finish(cmd, None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(mock.requests(), 4, "stderr: {stderr}");
+
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let child = requests_with_system(&mock, GENERAL_MARKER);
+    assert_eq!((parent.len(), child.len()), (2, 2));
+    // The child's conversation: the agent's prompt and the project's
+    // instructions, the task alone, the parent's tools without `task`.
+    let system = child[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("PROJECT-RULES") && !system.contains(PARENT_MARKER),
+        "{system}"
+    );
+    assert_eq!(
+        messages_of(&child[0], "user"),
+        ["CHILD-TASK: say who is there"]
+    );
+    let mut expected = tool_names(&parent[0]);
+    assert!(expected.contains(&"task".to_string()) && expected.contains(&"peers".to_string()));
+    expected.retain(|t| t != "task");
+    assert_eq!(tool_names(&child[0]), expected);
+
+    // It ran as an instance of its own: `peers`, called by the child, lists
+    // the parent and the child itself, as the parent's subagent.
+    let listing = messages_of(&child[1], "tool").remove(0);
+    let here = joined.dir.display();
+    assert!(
+        listing.contains(&format!("proj — working, mock, in {here}\n")),
+        "{listing}"
+    );
+    assert!(
+        listing.contains(&format!(
+            "proj.general (you) — working, mock, in {here}, subagent of proj"
+        )),
+        "{listing}"
+    );
+
+    // The parent got the report, and the user saw what they always see.
+    let results = messages_of(&parent[1], "tool");
+    assert!(
+        results[0].starts_with("CHILD-REPORT: two of us\n\n[general: 2 steps"),
+        "{results:?}"
+    );
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        info,
+        [
+            "⤷ general: look around",
+            "  ⤷ peers",
+            "⤶ general: done (2 steps)"
+        ]
+    );
+    let ends = of_type(&events, "tool_end");
+    assert_eq!((ends.len(), &ends[0]["ok"]), (1, &serde_json::json!(true)));
+    assert_eq!(events.last().unwrap()["result"], "parent done");
+    // The child left with its task.
+    wait_until("the child to leave the coordinator", || {
+        !coordinator(&joined.coord, "status").contains("proj.general")
+    });
+}
+
+/// Subagents as processes 2 — approvals. The process decides nothing: its
+/// unconfined calls are put to the parent's user in the parent's prompt,
+/// named as the agent's, exactly as a child's on a thread are; a refusal is
+/// the child's tool result. Here from an agent *defined* as a process.
+#[cfg(unix)]
+#[test]
+fn a_process_subagents_calls_are_put_to_the_parents_user() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains("MAKER-PROMPT");
+        let results = messages_of(&request(body), "tool").len();
+        let bash = |id: &str, command: &str| {
+            json_tool_call(id, "bash", serde_json::json!({"command": command}))
+        };
+        match (child, results) {
+            (false, 0) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({"agent": "maker", "prompt": "make the files"}),
+            ),
+            (true, 0) => bash("call_1", "echo one > first.txt"),
+            (true, 1) => bash("call_2", "echo two > second.txt"),
+            (true, _) => text_response("child report"),
+            (false, _) => text_response("parent done"),
+        }
+    }));
+    let joined = Joined::new("task-process-approval");
+    let agents = joined.dir.join(".atelier/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("maker.md"),
+        "---\ndescription: makes files\nprocess: true\n---\nMAKER-PROMPT",
+    )
+    .unwrap();
+
+    // The prompt, then the answers to the two approval prompts.
+    let mut cmd = joined.atelier(&mock.base_url());
+    cmd.env_remove("ATELIER_APPROVE");
+    let out = finish(cmd, Some("go\ny\nn\n"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        stdout.matches("⤷ the subagent maker asks to run:").count(),
+        2,
+        "stdout: {stdout}\n stderr: {stderr}"
+    );
+    assert_eq!(stdout.matches("allow tool 'bash'").count(), 2, "{stdout}");
+    // Approved once, refused once.
+    assert_eq!(
+        std::fs::read_to_string(joined.dir.join("first.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(!joined.dir.join("second.txt").exists());
+    let child = requests_with_system(&mock, "MAKER-PROMPT");
+    assert_eq!(child.len(), 3, "stdout: {stdout}\n stderr: {stderr}");
+    let results = messages_of(&child[2], "tool");
+    assert!(results[1].contains("denied permission"), "{results:?}");
+    assert!(stdout.contains("⤶ maker: done (3 steps)"), "{stdout}");
+    assert!(stdout.contains("parent done"), "{stdout}");
+    // Nothing fell back to a thread.
+    assert!(!stdout.contains("not in a process of its own"), "{stdout}");
+}
+
+/// Subagents as processes 3 — without a coordinator. A session that runs
+/// alone has nothing to carry a child's words: the child runs on a thread
+/// instead, after a line saying so, and the task is done all the same.
+#[test]
+fn without_a_coordinator_a_process_subagent_runs_on_a_thread() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains(EXPLORE_MARKER);
+        let answered = !messages_of(&request(body), "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "explore",
+                    "prompt": "read the notes",
+                    "description": "inspect the notes",
+                    "process": true,
+                }),
+            ),
+            (true, false) => json_tool_call(
+                "call_read",
+                "read",
+                serde_json::json!({"path": "notes.txt"}),
+            ),
+            (true, true) => text_response("CHILD-REPORT"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let dir = unique_dir("task-process-alone");
+    std::fs::write(dir.join("notes.txt"), "MARKER-IN-FILE\n").unwrap();
+
+    // (`ATELIER_NO_COORDINATOR` is set for every run of these tests.)
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["-p", "--output-format", "stream-json", "look"],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        info,
+        [
+            "⤷ explore: inspect the notes",
+            "  ⤷ ! not in a process of its own, but in this one: this atelier runs without the \
+             coordinator",
+            "  ⤷ read notes.txt",
+            "⤶ explore: done (2 steps)"
+        ]
+    );
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = messages_of(&parent[1], "tool");
+    assert!(
+        results[0].starts_with("CHILD-REPORT\n\n[explore: 2 steps"),
+        "{results:?}"
+    );
+    assert_eq!(events.last().unwrap()["result"], "parent done");
+}
+
+/// Subagents as processes 4 — a child that dies. Its process is killed in
+/// the middle of the task (by the command it runs): the `task` call fails
+/// with a result that says the process is gone and that what it did stays
+/// done, the task is not run a second time, and the parent goes on.
+#[cfg(unix)]
+#[test]
+fn a_process_subagent_that_dies_fails_its_task_call() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains(GENERAL_MARKER);
+        let answered = !messages_of(&request(body), "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({"agent": "general", "prompt": "CHILD-TASK", "process": true}),
+            ),
+            // The shell's parent is the child's process.
+            (true, false) => json_tool_call(
+                "call_die",
+                "bash",
+                serde_json::json!({"command": "echo > ran; kill -KILL $PPID; sleep 5"}),
+            ),
+            (true, true) => text_response("CHILD-REPORT: survived"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let joined = Joined::new("task-process-dies");
+
+    let mut cmd = joined.atelier(&mock.base_url());
+    cmd.args(["-p", "--output-format", "stream-json", "go"]);
+    let out = finish(cmd, None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    // The child made its one request and never another; the command ran.
+    assert_eq!(requests_with_system(&mock, GENERAL_MARKER).len(), 1);
+    assert!(joined.dir.join("ran").exists());
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    assert_eq!(parent.len(), 2, "stderr: {stderr}");
+    let results = messages_of(&parent[1], "tool");
+    assert!(
+        results[0].starts_with(
+            "error: the subagent failed: its process ended before it reported (signal: 9"
+        ),
+        "{results:?}"
+    );
+    assert!(results[0].contains("stays done"), "{results:?}");
+
+    let events = json_lines(&out);
+    let ends = of_type(&events, "tool_end");
+    assert_eq!((ends.len(), &ends[0]["ok"]), (1, &serde_json::json!(false)));
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(info.len(), 3, "{info:?}");
+    assert!(
+        info[2].starts_with("⤶ general: failed — its process ended before it reported (signal: 9"),
+        "{info:?}"
+    );
+    assert_eq!(events.last().unwrap()["result"], "parent done");
+}
+
+/// Subagents as processes 5 — in the background. The agent's process
+/// outlives the turn and is listed among the instances while it works;
+/// `/agents stop` reaches it (the parent lets go of it), it ends at its next
+/// step without another request, and what comes back is marked as stopped —
+/// all as for a background agent on a thread.
+#[cfg(unix)]
+#[test]
+fn a_background_process_subagent_is_listed_and_stopped_like_any_other() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let req = request(body);
+        let results = messages_of(&req, "tool").len();
+        if system_message(body).contains(GENERAL_MARKER) {
+            return match results {
+                0 => gated_bash("call_gate"),
+                _ => text_response("CHILD-REPORT: released"),
+            };
+        }
+        let users = messages_of(&req, "user");
+        match results {
+            _ if users.last().unwrap().contains("second prompt") => text_response("seen"),
+            0 => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "CHILD-TASK",
+                    "background": true,
+                    "process": true,
+                }),
+            ),
+            _ => text_response("started"),
+        }
+    }));
+    let joined = Joined::new("task-process-bg");
+    let mut repl = LiveRepl::spawn(joined.atelier(&mock.base_url()));
+
+    repl.line("first prompt");
+    repl.wait_for("started");
+    wait_for_gate(&joined.dir);
+    repl.line("/agents");
+    repl.wait_for("  agent-1  general — CHILD-TASK · running ");
+    repl.line("/peers");
+    repl.wait_for("proj.general — working, mock, in ");
+    repl.wait_for(", subagent of proj");
+
+    repl.line("/agents stop agent-1");
+    repl.wait_for("stopping agent-1 (general)");
+    std::fs::write(joined.dir.join("go"), "").unwrap();
+    repl.type_until("/agents", "⤶ general agent-1: stopped (1 step)");
+    // It never sent the result of the call it was in.
+    assert_eq!(requests_with_system(&mock, GENERAL_MARKER).len(), 1);
+
+    repl.line("second prompt");
+    let (stdout, stderr) = repl.finish();
+    let last = mock.body(mock.requests() - 1);
+    let users = messages_of(&request(&last), "user");
+    let prompt = users.last().unwrap();
+    assert!(
+        prompt
+            .contains("<subagent id=\"agent-1\" agent=\"general\" status=\"stopped\" steps=\"1\">"),
+        "{prompt}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(prompt.contains("stopped before it finished"), "{prompt}");
+    assert!(!prompt.contains("CHILD-REPORT"), "{prompt}");
+}
+
+/// Subagents as processes 6 — siblings talk. Two agents started in one
+/// step, each a process: `alice` asks `bob` a question by his instance name
+/// (`peer_ask`, which her parent approves like any call of hers), `bob` is
+/// shown it at his next step and answers (`peer_answer`), and the answer is
+/// alice's tool result — the coordinator's ordinary routing, between two
+/// children.
+#[cfg(unix)]
+#[test]
+fn sibling_process_subagents_ask_and_answer_each_other() {
+    let since = Instant::now();
+    let mock = Mock::by_body(Arc::new(move |body| {
+        let req = request(body);
+        let system = system_message(body);
+        let tools = messages_of(&req, "tool");
+        let late = since.elapsed() > PATIENCE;
+        if system.contains("ALICE-PROMPT") {
+            return match tools.last() {
+                // Bob has not joined yet: once more, a little later.
+                None => json_tool_call(
+                    "call_ask_0",
+                    "peer_ask",
+                    serde_json::json!({"to": "proj.bob", "question": "what is the word?"}),
+                ),
+                Some(last) if last.contains("no instance named") && !late => {
+                    thread::sleep(Duration::from_millis(20));
+                    json_tool_call(
+                        &format!("call_ask_{}", tools.len()),
+                        "peer_ask",
+                        serde_json::json!({"to": "proj.bob", "question": "what is the word?"}),
+                    )
+                }
+                Some(last) => text_response(&format!("ALICE-REPORT: bob said {last}")),
+            };
+        }
+        if system.contains("BOB-PROMPT") {
+            let asked = messages_of(&req, "user")
+                .iter()
+                .any(|m| m.contains("<peer-question id=\"q1\" from=\"proj.alice\""));
+            let answered = tools
+                .iter()
+                .any(|t| t.contains("answer sent to proj.alice"));
+            return match (asked, answered) {
+                (_, true) => text_response("BOB-REPORT: told alice"),
+                (true, false) => json_tool_call(
+                    "call_answer",
+                    "peer_answer",
+                    serde_json::json!({"id": "q1", "answer": "SHIBBOLETH"}),
+                ),
+                // Busy with something else until the question arrives.
+                (false, false) if !late => {
+                    thread::sleep(Duration::from_millis(20));
+                    json_tool_call(
+                        &format!("call_busy_{}", tools.len()),
+                        "read",
+                        serde_json::json!({"path": "busy.txt"}),
+                    )
+                }
+                (false, false) => text_response("BOB-REPORT: nobody asked"),
+            };
+        }
+        match tools.len() {
+            0 => tool_calls_response(&[
+                (
+                    "call_alice",
+                    "task",
+                    serde_json::json!({"agent": "alice", "prompt": "ask bob for the word"}),
+                ),
+                (
+                    "call_bob",
+                    "task",
+                    serde_json::json!({"agent": "bob", "prompt": "answer alice"}),
+                ),
+            ]),
+            _ => text_response("parent done"),
+        }
+    }));
+    let joined = Joined::new("task-process-siblings");
+    std::fs::write(joined.dir.join("busy.txt"), "busy\n").unwrap();
+    let agents = joined.dir.join(".atelier/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    for (name, tools, prompt) in [
+        ("alice", "peer_ask", "ALICE-PROMPT"),
+        ("bob", "read, peer_answer", "BOB-PROMPT"),
+    ] {
+        let file = format!(
+            "---\ndescription: {name}\ntools: {tools}\nmax_steps: 2000\nprocess: true\n---\n{prompt}"
+        );
+        std::fs::write(agents.join(format!("{name}.md")), file).unwrap();
+    }
+
+    let mut cmd = joined.atelier(&mock.base_url());
+    cmd.args(["-p", "--output-format", "stream-json", "go"]);
+    let out = finish(cmd, None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = messages_of(parent.last().unwrap(), "tool");
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].starts_with("ALICE-REPORT: bob said SHIBBOLETH\n\n[alice#1: "),
+        "{results:?}"
+    );
+    assert!(
+        results[1].starts_with("BOB-REPORT: told alice\n\n[bob#2: "),
+        "{results:?}"
+    );
+    // The user saw the question arrive at bob, among his lines.
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        info.contains(&"  ⤷ bob#2 · ✉ proj.alice asks (q1): what is the word?"),
+        "{info:?}"
+    );
+}
+
+/// Subagents as processes 7 — in a worktree. The two combine: the process
+/// works in the worktree made for it (its instance says so), reads the
+/// project's instructions from there, and what it wrote is described at the
+/// end of its report by the parent, as for any isolated agent.
+#[cfg(unix)]
+#[test]
+fn a_process_subagent_in_a_worktree_works_there_and_its_changes_are_reported() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains(GENERAL_MARKER);
+        let results = messages_of(&request(body), "tool").len();
+        match (child, results) {
+            (false, 0) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({
+                    "agent": "general",
+                    "prompt": "CHILD-TASK",
+                    "isolation": "worktree",
+                    "process": true,
+                }),
+            ),
+            (true, 0) => json_tool_call(
+                "call_write",
+                "write",
+                serde_json::json!({"path": "made.txt", "content": "WRITTEN-BY-THE-AGENT\n"}),
+            ),
+            (true, 1) => json_tool_call("call_peers", "peers", serde_json::json!({})),
+            (true, _) => text_response("CHILD-REPORT"),
+            (false, _) => text_response("parent done"),
+        }
+    }));
+    let joined = Joined::new("task-process-worktree");
+    git_out(&joined.dir, &["init", "--quiet"]);
+    std::fs::write(joined.dir.join("AGENTS.md"), "COMMITTED-RULES").unwrap();
+    git_out(&joined.dir, &["add", "--all"]);
+    git_out(&joined.dir, &["commit", "--quiet", "-m", "base"]);
+
+    let mut cmd = joined.atelier(&mock.base_url());
+    cmd.args(["-p", "--output-format", "stream-json", "go"]);
+    let out = finish(cmd, None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    let worktree = joined.dir.join(".atelier/worktrees/agent-1");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("made.txt")).unwrap(),
+        "WRITTEN-BY-THE-AGENT\n"
+    );
+    assert!(!joined.dir.join("made.txt").exists());
+    let child = requests_with_system(&mock, GENERAL_MARKER);
+    assert_eq!(child.len(), 3, "stderr: {stderr}");
+    let system = child[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("COMMITTED-RULES"), "{system}");
+    let did = messages_of(&child[2], "tool");
+    assert!(
+        did[1].contains(&format!(
+            "proj.general (you) — working, mock, in {}, subagent of proj",
+            worktree.display()
+        )),
+        "{did:?}"
+    );
+
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let report = messages_of(&parent[1], "tool").remove(0);
+    assert!(
+        report.starts_with("CHILD-REPORT\n\n[general: 3 steps"),
+        "{report}"
+    );
+    assert!(
+        report.contains("\n\n[worktree: .atelier/worktrees/agent-1 — "),
+        "{report}"
+    );
+    assert!(report.contains(" made.txt | 1 +"), "{report}");
+    let events = json_lines(&out);
+    let info: Vec<&str> = of_type(&events, "info")
+        .iter()
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        info.last().unwrap(),
+        &"⤶ general: done (3 steps) — changes left in .atelier/worktrees/agent-1",
+        "{info:?}"
+    );
+}
+
+/// Subagents as processes 8 — the coordinator restarts mid-task. It is
+/// killed outright while the child is in a tool call; parent and child each
+/// find the next one, and the child's report — sent when neither may have
+/// rejoined yet — is retried until it arrives. The task call never notices.
+#[cfg(unix)]
+#[test]
+fn a_process_subagent_reports_through_a_coordinator_that_was_replaced() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let child = system_message(body).contains(GENERAL_MARKER);
+        let answered = !messages_of(&request(body), "tool").is_empty();
+        match (child, answered) {
+            (false, false) => json_tool_call(
+                "call_task",
+                "task",
+                serde_json::json!({"agent": "general", "prompt": "CHILD-TASK", "process": true}),
+            ),
+            (true, false) => gated_bash("call_gate"),
+            (true, true) => text_response("CHILD-REPORT: released"),
+            (false, true) => text_response("parent done"),
+        }
+    }));
+    let joined = Joined::new("task-process-restart");
+    let (dir, coord) = (joined.dir.clone(), joined.coord.clone());
+    let killer = thread::spawn(move || {
+        wait_for_gate(&dir);
+        let status = coordinator(&coord, "status");
+        let pid = status
+            .split("(pid ")
+            .nth(1)
+            .and_then(|s| s.split(')').next());
+        let pid = pid.unwrap_or_else(|| panic!("no coordinator: {status}"));
+        let killed = Command::new("kill").args(["-9", pid]).status().unwrap();
+        assert!(killed.success());
+        std::fs::write(dir.join("go"), "").unwrap();
+        pid.to_string()
+    });
+
+    let mut cmd = joined.atelier(&mock.base_url());
+    cmd.args(["-p", "--output-format", "stream-json", "go"]);
+    let out = finish(cmd, None);
+    let first = killer.join().expect("the coordinator was killed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    let parent = requests_with_system(&mock, PARENT_MARKER);
+    let results = messages_of(&parent[1], "tool");
+    assert!(
+        results[0].starts_with("CHILD-REPORT: released\n\n[general: 2 steps"),
+        "{results:?}"
+    );
+    let events = json_lines(&out);
+    assert_eq!(events.last().unwrap()["result"], "parent done");
+    // It was another coordinator that carried the report.
+    let status = coordinator(&joined.coord, "status");
+    assert!(
+        status.contains("(pid ") && !status.contains(&format!("(pid {first})")),
+        "{status}"
+    );
 }
 
 /// `/loop` at a real prompt, with no coordinator: the session, left idle,

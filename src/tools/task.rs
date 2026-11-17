@@ -50,6 +50,9 @@ pub struct TaskCall {
     /// Where it works: what the call asks for, else what the agent's
     /// definition says.
     pub isolation: Isolation,
+    /// Run it as an atelier process of its own, an instance on the
+    /// coordinator: when the call or the agent's definition asks for it.
+    pub process: bool,
 }
 
 impl TaskCall {
@@ -101,12 +104,16 @@ impl TaskCall {
             Some(Ok(Isolation::Worktree)) => Isolation::Worktree,
             Some(Err(e)) => return Err(format!("error: {e}")),
         };
+        // Likewise: a call may ask for a process of its own, and cannot take
+        // one away.
+        let process = agent.process || args.get("process").and_then(Value::as_bool) == Some(true);
         Ok(Self {
             agent: agent.clone(),
             prompt: prompt.to_string(),
             description,
             background,
             isolation,
+            process,
         })
     }
 }
@@ -154,7 +161,12 @@ impl Tool for TaskTool {
             where the worktree is, a diff summary and the command to bring the changes \
             over; nothing is merged for you. It needs a git repository with at least one \
             commit, and fails without one. Use it for agents that write, above all in the \
-            background.\n\nAgents:"
+            background.\n\nWith `process: true` the agent runs as a separate atelier \
+            instance, named `<your instance>.<agent>` among the peers (see the peers tool): \
+            other instances — the agents you start alongside it, too — can then message and \
+            ask it by that name, and it can hold advisory locks of its own. Its report, its \
+            limits and what it may do are the same; use it when agents working at the same \
+            time need to talk to each other, not otherwise.\n\nAgents:"
             .to_string();
         for a in &found.agents {
             description.push_str(&format!("\n- {}: {}", a.name, a.description));
@@ -187,6 +199,10 @@ impl Tool for TaskTool {
                         "type": "string",
                         "enum": ["worktree"],
                         "description": "\"worktree\": run the agent in its own git worktree at HEAD (uncommitted changes are not carried over)."
+                    },
+                    "process": {
+                        "type": "boolean",
+                        "description": "Run the agent as a separate atelier instance that the other instances can message (default false)."
                     }
                 },
                 "required": ["agent", "prompt"]
@@ -239,8 +255,10 @@ mod tests {
         let call = TaskCall::parse(r#"{"agent":"general","prompt":"Fix it.\nMore."}"#, &found);
         let call = call.ok().unwrap();
         assert_eq!(call.description, "Fix it.");
-        assert!(!call.background);
+        assert!(!call.background && !call.process);
         assert_eq!(call.isolation, Isolation::Shared);
+        let asked = r#"{"agent":"explore","prompt":"x","process":true}"#;
+        assert!(TaskCall::parse(asked, &found).ok().unwrap().process);
         let isolated = |value: &str| {
             let args = format!(r#"{{"agent":"explore","prompt":"x","isolation":"{value}"}}"#);
             TaskCall::parse(&args, &found).map(|call| call.isolation)
