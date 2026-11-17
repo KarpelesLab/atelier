@@ -27,8 +27,8 @@
 //! - **What the session reports goes to everybody.** The front calls
 //!   [`Hub::event`] next to drawing each thing itself, and every remote is
 //!   sent the notification. The events of the turn in progress are kept
-//!   ([`Replay`]), so a remote that attaches in the middle of one is sent
-//!   it from its start; what came before that it asks for
+//!   ([`Replay`]) — all but what a command printed on its terminal — so a
+//!   remote that attaches in the middle of one is sent it from its start; what came before that it asks for
 //!   (`session/history`), answered from the copy the front leaves here
 //!   whenever the session comes to rest ([`Hub::publish`]).
 //! - **What a remote asks is answered here when it can be** — the status,
@@ -66,12 +66,16 @@
 //! stopped and the process ends there. The remotes are told at once
 //! (`session/closed`) and let go.
 
+// The front's side is the terminal interface's: a build without it has
+// nobody to call it, and its owners take no remote.
+#![cfg_attr(not(tui), allow(dead_code))]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -159,7 +163,7 @@ pub(crate) struct Snapshot {
 
 /// Who did something, as events name them: the owner's own terminal, or a
 /// remote by its number.
-fn origin(by: Option<u64>) -> String {
+pub(crate) fn origin(by: Option<u64>) -> String {
     match by {
         None => "terminal".to_string(),
         Some(remote) => format!("remote-{remote}"),
@@ -168,7 +172,9 @@ fn origin(by: Option<u64>) -> String {
 
 /// One connection's way out.
 struct Remote {
-    id: u64,
+    /// Its number among the remotes, from the moment it attaches (0 until
+    /// then: a connection that only asks who the owner is has none).
+    number: AtomicU64,
     out: Mutex<UnixStream>,
     /// It asked for the running command's terminal (`initialize`).
     terminal: AtomicBool,
@@ -176,6 +182,10 @@ struct Remote {
 }
 
 impl Remote {
+    fn id(&self) -> u64 {
+        self.number.load(Ordering::Relaxed)
+    }
+
     /// Write one message. A remote that cannot be written to — gone, or
     /// not reading — is let go of: its reader sees the socket close.
     fn send(&self, line: &str) {
@@ -299,7 +309,8 @@ struct State {
     /// The interface takes remotes ([`Hub::serve_remotes`]).
     front: bool,
     remotes: BTreeMap<u64, Arc<Remote>>,
-    connections: u64,
+    /// Remotes attached so far; the last one's number.
+    attached: u64,
     running: Option<Running>,
     turns: u64,
     snapshot: Snapshot,
@@ -432,13 +443,8 @@ impl Hub {
             return;
         };
         let _ = out.set_write_timeout(Some(WRITE));
-        let id = {
-            let mut state = lock(&self.state);
-            state.connections += 1;
-            state.connections
-        };
         let remote = Arc::new(Remote {
-            id,
+            number: AtomicU64::new(0),
             out: Mutex::new(out),
             terminal: AtomicBool::new(false),
             gone: AtomicBool::new(false),
@@ -513,7 +519,7 @@ impl Hub {
             return Err(Failure::new(code::NOT_INITIALIZED, "initialize first"));
         }
         let mut state = lock(&self.state);
-        let from = remote.id;
+        let from = remote.id();
         let free = |state: &State| state.running.map_or(Ok(()), |r| Err(busy(r)));
         match method {
             "turn/start" => {
@@ -676,6 +682,8 @@ impl Hub {
             return Err(Failure::new(code::NO_REMOTE, why));
         }
         remote.terminal.store(terminal, Ordering::Relaxed);
+        state.attached += 1;
+        remote.number.store(state.attached, Ordering::Relaxed);
         let turn = match state.running {
             Some(Running::Turn(turn)) => Value::from(turn),
             _ => Value::Null,
@@ -701,7 +709,7 @@ impl Hub {
                     "shared": true,
                 },
                 "shared": {
-                    "remote": remote.id,
+                    "remote": remote.id(),
                     "owner": {
                         "pid": self.record.pid,
                         "kind": self.record.kind.name(),
@@ -732,7 +740,7 @@ impl Hub {
         for pending in state.pending.values() {
             remote.send(&pending.line);
         }
-        state.remotes.insert(remote.id, Arc::clone(remote));
+        state.remotes.insert(remote.id(), Arc::clone(remote));
         let name = match params["client"]["name"].as_str() {
             Some(name) => format!(
                 "{name} {}",
@@ -741,7 +749,7 @@ impl Hub {
             None => "a client".to_string(),
         };
         state.inbox.push_back(Inbound::Joined {
-            remote: remote.id,
+            remote: remote.id(),
             name,
         });
         *attached = true;
@@ -751,15 +759,17 @@ impl Hub {
     /// A remote went away: whatever it held is let go.
     fn detach(&self, remote: &Remote) {
         let mut state = lock(&self.state);
-        if state.remotes.remove(&remote.id).is_none() {
+        if state.remotes.remove(&remote.id()).is_none() {
             return;
         }
         if let Some(keys) = state.command.as_mut()
-            && keys.holders.contains(&remote.id)
+            && keys.holders.contains(&remote.id())
         {
-            keys.queue.push((remote.id, CommandInput::Detach));
+            keys.queue.push((remote.id(), CommandInput::Detach));
         }
-        state.inbox.push_back(Inbound::Left { remote: remote.id });
+        state.inbox.push_back(Inbound::Left {
+            remote: remote.id(),
+        });
     }
 
     /// A remote's answer to a request put to all: for whoever waits.
@@ -771,7 +781,7 @@ impl Hub {
                 Some(result) => Answered::Result(result.clone()),
                 None => Answered::Error,
             };
-            let _ = pending.answers.send((remote.id, answer));
+            let _ = pending.answers.send((remote.id(), answer));
         }
     }
 
@@ -822,7 +832,13 @@ impl Hub {
             // What `main` does on the way out, which this exit skips.
             crate::tools::bash::kill_all();
             crate::lsp::kill_all();
-            std::process::exit(0);
+            // A script's run was cut short, and should hear of it; the
+            // others ended as on a quit.
+            let status = match hub.record.kind {
+                super::Kind::Print => crate::headless::EXIT_ERROR,
+                _ => 0,
+            };
+            std::process::exit(status.into());
         });
     }
 
@@ -900,8 +916,22 @@ impl Hub {
     }
 
     /// Leave the session as it is now, for what is answered without it.
+    /// When what it is has changed — the model, the mode, the tools — the
+    /// remotes are told (`session/updated`), whoever changed it.
     pub(super) fn publish(&self, snapshot: Snapshot) {
-        lock(&self.state).snapshot = snapshot;
+        let (line, targets) = {
+            let mut state = lock(&self.state);
+            let changed = state.snapshot.describe != snapshot.describe;
+            state.snapshot = snapshot;
+            if !changed || state.remotes.is_empty() {
+                return;
+            }
+            let updated = notification("session/updated", state.snapshot.status.clone());
+            (updated, state.targets(false))
+        };
+        for remote in targets {
+            remote.send(&line);
+        }
     }
 
     /// What remotes asked for since last looked.
@@ -966,7 +996,7 @@ impl Hub {
         };
         if let (Some(remote), Some((id, mut result))) = (by, answer) {
             result["turn"] = Value::from(turn);
-            if let Some(remote) = targets.iter().find(|r| r.id == remote) {
+            if let Some(remote) = targets.iter().find(|r| r.id() == remote) {
                 remote.respond(id, result);
             }
         }
@@ -1014,7 +1044,12 @@ impl Hub {
                 }
             };
             if matches!(state.running, Some(Running::Turn(_))) {
-                state.replay.push(&line, terminal);
+                // What a command printed on its terminal is for whoever
+                // was looking: it may hold the echo of what was typed to
+                // it, and is kept nowhere.
+                if kind != "command_output" {
+                    state.replay.push(&line, terminal);
+                }
                 if kind == "delivered" {
                     state.queued = state.queued.saturating_sub(1);
                 }

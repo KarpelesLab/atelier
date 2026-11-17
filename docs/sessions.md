@@ -58,8 +58,9 @@ A session is already running in this directory:
   pid 4021 · the terminal interface on /dev/pts/3 · started 37 min ago
   now: a turn in progress · 1 background job · 2 subagents
 ? What do you want to do?
-  1. Take over — stop that atelier and everything it is running, and continue its session here
-  2. Cancel — leave it alone and exit
+  1. Remote control — this terminal becomes a second front end of that session; it keeps running there
+  2. Take over — stop that atelier and everything it is running, and continue its session here
+  3. Cancel — leave it alone and exit
   (answer with a number)
 ```
 
@@ -68,6 +69,77 @@ The question is answered on the input line, like one the
 Ctrl-D are "cancel". If the other atelier ends while the question is up,
 there is nothing left to ask, and this one starts as on any other day
 (`the other atelier (pid 4021) has ended: starting normally`).
+
+### Remote control
+
+This terminal becomes a second front end of the session that is running.
+Nothing is started here — no session, no instance among the
+[coordinator](coordinator.md)'s (the session keeps its one name in
+`/peers`), no hook — and nothing is stopped there.
+
+```text
+atelier — remote control of the session of pid 4021 on /dev/pts/3
+/help for commands · Ctrl-D leaves this remote, and the session goes on
+── the conversation so far ──
+› now fix the off-by-one
+⚙ edit {"path":"src/parser.rs","old_string":"depth > 8","new_string":"depth >= 8"}
+✓ replaced 1 occurrence(s) in src/parser.rs
+Fixed the off-by-one in `parser::nested`.
+── now ──
+```
+
+- **It shows the conversation so far** (the last 200 items), then
+  everything as it happens: the turn in progress from its start, and from
+  there what the model says and does, whoever asked.
+- **Both terminals work, on one session.** A prompt typed at either is a
+  turn of the same conversation, and each shows what the other typed,
+  marked: `› run the tests  ← remote 2` at the owner's,
+  `› run the tests  ← the owner's terminal` at the remote.
+- **During a turn** a line typed at the remote joins it, as at the owner's
+  (`(queued)`, then delivered at the turn's next step); a slash command
+  waits for the turn's end, with what is typed behind it. Ctrl-C on an
+  empty line drops what is waiting, or else stops the turn — from either
+  terminal.
+- **An approval or a question** (`⚠ allow tool 'bash'?`, the
+  [`ask` tool](tools.md#ask)) is put to both. Whoever answers first has
+  answered; the other terminal takes its prompt down with a line saying so
+  (`↳ allowed once at remote 2`, `↳ denied at the owner's terminal`).
+- **A command that waits for input** says so at both, and Ctrl-T hands it
+  the keyboard of the terminal it is pressed at (see [A command you can
+  type to](tools.md#a-command-you-can-type-to)). What is typed goes to the
+  command and nowhere else: not to the model, as always, and not to the
+  other terminal — which sees what the command's terminal prints only if it
+  took the keyboard too (the echo of the keys with it, where the program
+  leaves echo on; a password is read without).
+- **Slash commands run in the owner**, where the session and its settings
+  live: `/model`, `/mode`, `/compact`, `/new`, `/mcp add`, `/agents`, a
+  custom command — each changes the one session, for both terminals. Three
+  are the terminal's own: `/quit` (also `/exit`, `/detach`, Ctrl-D) leaves
+  the remote and nothing else, and `/config` says that the settings screen
+  is the owner terminal's.
+- **Leaving ends nothing**: quit, Ctrl-D, a closed terminal, a killed
+  remote — the session, the turn in progress and everything it runs go on,
+  and the owner's transcript notes `· remote 2 detached`.
+- **When the owner ends, the remote says how and exits**: it quit, it was
+  taken over (by whom), or it is gone without a word (killed). It does not
+  carry the session on by itself; `atelier --continue` in the same
+  directory does, from what was saved.
+
+Several remotes may be attached at once; each is numbered, and they see
+one another's lines as they see the owner's.
+
+Remote control is offered when the owner is a **terminal interface**. A
+session an editor or a program drives (`serve`, `acp`), a `--print` run and
+the line REPL take no remote: the question then offers the other two
+choices and says why. The remote is the same user on the same machine —
+the owner's socket is the only gate (see [How it is
+recorded](#how-it-is-recorded)) — so it may do what the owner's terminal
+may.
+
+A program attaches the same way, through `atelier serve --attach`: see
+[A session shared with its terminal](protocol.md#a-session-shared-with-its-terminal).
+
+### Take over
 
 **Take over** stops the other process and everything it has going — the
 turn in progress, the command it is running, its background jobs, its
@@ -100,13 +172,21 @@ The new owner then says what was done (`took over the session of pid 4021
 takes the old one's place among the instances of the
 [coordinator](coordinator.md): same name, no trace of the old one or of the
 locks it held. A subagent's worktree is left as a stop leaves it when the
-owner could stop by itself; after a signal it stays behind, locked by a
-process that no longer exists, for `/agents clean` to remove.
+owner could stop by itself in time. An owner that was cut short — it ended
+where it was, or was signalled — leaves the worktree behind, locked for a
+process that no longer exists; `/agents clean` removes it as it does any
+other.
 
 If the owner is an `atelier serve` or `atelier acp` — a session an editor
 or another program drives — the question says so: taking it over ends that
 program's session with it (a `serve` client is sent
-[`session/closed`](protocol.md#sessionclosed) first).
+[`session/closed`](protocol.md#sessionclosed) first; an ACP editor sees its
+agent exit). A `--print --continue` run that is taken over ends with status
+1, its last line on stderr saying why.
+
+A remote attached to the session that is taken is told, and exits.
+
+### Cancel
 
 **Cancel** exits with status 8. Nothing was read, written or started: no
 session opened, no instance joined, no hook run.
@@ -119,13 +199,15 @@ exits with **status 7**, having changed nothing. Say beforehand what to do:
 
 | Flag | When a session is already running here |
 |------|------------------------------------------|
+| `--attach` | Join it as a remote, as above: for the terminal interface, and for `serve` (whose client then speaks to the owner). With an owner that takes no remote, exit with status 7 |
 | `--take-over` | Take it over, as above, and continue it |
 | `--cancel` | Leave it alone and exit (status 8) |
 
-With no session running, the flags change nothing: the run starts as it
-would without them (`--take-over` does not by itself resume a saved
-session; `--continue` does). `atelier serve` puts the question to its
-client instead of exiting ([A session that is in
+The flags also answer the question beforehand at a terminal: `atelier
+--attach` joins without asking. With no session running they change
+nothing: the run starts as it would without them (`--take-over` does not by
+itself resume a saved session; `--continue` does). `atelier serve` puts the
+question to its client instead of exiting ([A session that is in
 use](protocol.md#a-session-that-is-in-use)); `atelier acp` refuses the
 editor's `session/new` with the same message unless it was started with
 `--take-over`.
@@ -174,9 +256,9 @@ the lock held it is a leftover, and with it the pid is checked against
 `socket` is where the owner answers: what it is doing (for the question),
 the request to yield, and — when the owner is the terminal interface — the
 [session itself, shared](protocol.md#a-session-shared-with-its-terminal)
-with the front ends that attach to it. It is a Unix socket in the directory the
-coordinator's is in (`$XDG_RUNTIME_DIR/atelier`, else
-`~/.local/state/atelier`), protected as
+with the front ends that attach to it. It is a Unix socket in the directory
+the coordinator's is in (`$ATELIER_COORDINATOR_DIR`, else
+`$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier`), protected as
 [`serve --listen`'s](protocol.md#who-may-connect): a directory only you can
 enter, mode `0600`, no TCP. Whoever can open it is you, on this machine;
 that is the only gate, and it is the one your files have. Without such a

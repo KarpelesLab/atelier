@@ -329,6 +329,15 @@ line you typed that is at least four characters long, replaced with
 command. A shorter answer (`y`, `2`) is not searched for: it is no secret,
 and its echo is withheld all the same.
 
+With a second terminal attached to the session as its
+[remote control](sessions.md#remote-control), either can take the keyboard
+(Ctrl-T at the one you are at), and the command's timeout stands still
+while one of them has it. What is typed at one is not sent to the other as
+such. A terminal that has taken the keyboard is shown what the command's
+terminal prints, and that includes the echo of the keys where the program
+leaves echo on; a password, read without echo, appears at neither, and a
+terminal that has not taken the keyboard is shown none of it.
+
 **Why a terminal for every command, and what it changes.** A command
 cannot be moved onto a terminal once it runs, and the programs this is for
 prompt on the terminal (`/dev/tty`), often only when they see one. So it is

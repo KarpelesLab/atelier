@@ -62,6 +62,17 @@ pub fn start_token(pid: u32) -> Option<String> {
     (!started.is_empty()).then(|| started.to_string())
 }
 
+/// Whether a process `pid` is there at all, where that is all there is to
+/// know of it.
+pub fn exists(pid: u32) -> bool {
+    let probe = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    probe.is_ok_and(|s| s.success())
+}
+
 /// Every process there is.
 fn table() -> Vec<Proc> {
     if has_proc() {

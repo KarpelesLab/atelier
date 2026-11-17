@@ -9,12 +9,15 @@
 //! [`end_turn`] around what it shows of a turn; [`request`] and [`settle`]
 //! around what it asks its user.
 
+// Called by the terminal interface, which not every build has.
+#![cfg_attr(not(tui), allow(dead_code, unused_imports))]
+
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use super::hub::Hub;
-pub(crate) use super::hub::{Answered, Asked, Inbound, Snapshot};
+pub(crate) use super::hub::{Answered, Asked, Inbound, Snapshot, origin};
 use crate::rpc::{Failure, Id};
 use crate::tools::terminal::{CommandEvent, CommandInput};
 

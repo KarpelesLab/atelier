@@ -37,6 +37,12 @@ An instance is named after its project directory (`atelier`, and
 too, named after its parent and its agent (`atelier.explore`) and listed as
 `subagent of atelier`; it is there for as long as its task takes.
 
+One instance is one session. A second terminal attached to a session as its
+[remote control](sessions.md#remote-control) is not an instance — it is
+another way into the one there is — and an atelier that
+[takes a session over](sessions.md#take-over) joins under the name the old
+owner had, once that one is gone with the locks it held.
+
 A message that arrives is shown in the receiving instance (`✉ name: …`)
 and handed to its agent: at the agent's next step if it is working, or
 together with your next prompt if it is idle. **An idle instance does not

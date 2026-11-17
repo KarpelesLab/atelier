@@ -46,7 +46,8 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   if needed, older turns become a structured hand-off summary (`/compact` on
   demand, `/context` to see where the window goes). One atelier at a time
   owns a project's session; a second one started there says who has it and
-  offers to take it over. Requests are laid out so
+  offers to join it as a remote control, or to take it over. Requests are
+  laid out so
   each is a prefix of the next, which keeps the inference server's prompt
   cache warm from turn to turn.
 - **A parallel reviewer, opt-in.** Turn on the "subconscious" (`/review on`)
@@ -112,7 +113,7 @@ first conversation, the REPL/TUI fallback).
 | [As a library](docs/library.md) | atelier is a Rust library its own program consumes: depend on it, implement `Ui`, open a `Session` and run turns in your own process — `examples/embed.rs` |
 | [Embedding protocol](docs/protocol.md) | `atelier serve`: the session as JSON-RPC 2.0 over stdio, for editors and other front ends — start, steer and interrupt turns, answer approvals and questions, run commands; events, error codes, how ACP maps onto it; `--listen`: the same on a Unix socket or on loopback (lines or WebSocket, behind a token), a session per connection |
 | [Editors (ACP)](docs/acp.md) | `atelier acp`: atelier as an [Agent Client Protocol](https://agentclientprotocol.com) agent for Zed and other ACP editors — setup, tool calls and diffs, permission requests, modes, slash commands, files through the editor; what is and isn't supported |
-| [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, automatic compaction |
+| [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, one owner per project (remote control, take over, `--attach`/`--take-over`/`--cancel`), automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`, `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
 | [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |

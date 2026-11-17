@@ -131,7 +131,7 @@ where [it can be typed to](tools.md#a-command-you-can-type-to).
 
 | 5 | — | [`atelier review --fail-on`](#atelier-review) only: the review ran and reported a finding at or above that severity |
 | 6 | `goal_unmet` | [`--goal`](#goals): the condition still did not hold when the goal's bounds were reached |
-| 7 | — | `--print --continue` only: another atelier [owns the session](sessions.md#one-session-one-owner) of this directory, and no flag said what to do. Nothing was run or changed; `--take-over` takes the session, `--cancel` leaves with status 8 |
+| 7 | — | `--print --continue` only: another atelier [owns the session](sessions.md#one-session-one-owner) of this directory, and no flag said what to do. Nothing was run or changed; `--take-over` takes the session, `--cancel` leaves with status 8. Also an interactive start or `serve` with `--attach`, when the owner takes no remote |
 | 8 | — | The same, with `--cancel`: the session was left alone |
 
 A denied tool call is not a failure by itself: the model sees the denial

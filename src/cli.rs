@@ -25,7 +25,8 @@ use crate::permissions::Mode;
 
 /// What a usage error prints after its message, and `--help` on its own.
 pub const USAGE: &str = "\
-usage: atelier [--claude | --local] [--continue] [--mode MODE] [--take-over | --cancel]
+usage: atelier [--claude | --local] [--continue] [--mode MODE]
+               [--attach | --take-over | --cancel]
        atelier --print [options] [--] [prompt...]
        atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
        atelier debug prompt [prompt...]
@@ -47,10 +48,12 @@ usage: atelier [--claude | --local] [--continue] [--mode MODE] [--take-over | --
       --claude               use the Claude Code backend
       --mode MODE            how much runs without asking: plan (read-only),
                              ask-edits, auto-edit (default), or yolo
-      --take-over            when a session is already running in this
-                             directory: stop it and what it runs, and continue
-                             it here (without a flag, a terminal is asked and
-                             anything else exits with status 7)
+      --attach               when a session is already running in this
+                             directory: join it from here as a remote control
+                             (without a flag, a terminal is asked and anything
+                             else exits with status 7)
+      --take-over            ... or stop it and what it runs, and continue it
+                             here
       --cancel               ... or leave it alone and exit (status 8)
   -V, --version              print the version
   -h, --help                 print this help
@@ -97,8 +100,9 @@ pub struct Cli {
     pub resume: bool,
     /// `--help`/`-h`.
     pub help: bool,
-    /// `--take-over`, `--cancel`: what to do when another atelier owns
-    /// this directory's session (see `own`). `None` asks, where it can.
+    /// `--attach`, `--take-over`, `--cancel`: what to do when another
+    /// atelier owns this directory's session (see `own`). `None` asks,
+    /// where it can.
     pub live: Option<crate::own::Choice>,
     /// `--mode`: the permission mode to start in.
     pub mode: Option<Mode>,
@@ -189,13 +193,17 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // Not in the usage: the listener's word to the sessions it
             // starts.
             "--connection" if serve => connection = true,
-            "--take-over" | "--cancel" => {
+            "--attach" | "--take-over" | "--cancel" => {
                 let choice = match flag {
+                    "--attach" => crate::own::Choice::Attach,
                     "--take-over" => crate::own::Choice::TakeOver,
                     _ => crate::own::Choice::Cancel,
                 };
                 if live.is_some_and(|other| other != choice) {
-                    return Err("--take-over and --cancel are two answers; pick one".to_string());
+                    return Err(
+                        "--attach, --take-over and --cancel are three answers; pick one"
+                            .to_string(),
+                    );
                 }
                 live = Some(choice);
             }
@@ -251,6 +259,13 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "{} only applies to sessions on the saved one: serve --listen needs --continue for it",
             choice.flag()
         ));
+    }
+    // A remote is a front end: a person's terminal, or a program's `serve`.
+    if live == Some(crate::own::Choice::Attach) && (print || acp || listen.is_some()) {
+        return Err(
+            "--attach is for the terminal interface and for serve: a remote is a front end"
+                .to_string(),
+        );
     }
     if serve && print {
         return Err("serve and --print are two ways to run; pick one".to_string());
@@ -470,7 +485,21 @@ mod tests {
             parse_ok(&["-c", "-p", "--take-over", "go"]).live,
             Some(Choice::TakeOver)
         );
+        assert_eq!(parse_ok(&["--attach"]).live, Some(Choice::Attach));
+        assert_eq!(parse_ok(&["serve", "--attach"]).live, Some(Choice::Attach));
         assert!(parse_err(&["--take-over", "--cancel"]).contains("pick one"));
+        assert!(parse_err(&["--attach", "--take-over"]).contains("pick one"));
+        // A remote is a front end.
+        for args in [
+            &["-c", "-p", "--attach", "go"][..],
+            &["acp", "--attach"],
+            &["serve", "--listen", "unix:/run/x/a.sock", "-c", "--attach"],
+        ] {
+            assert!(
+                parse_err(args).contains("a remote is a front end"),
+                "{args:?}"
+            );
+        }
         // Only for a run that would own the saved session.
         assert!(parse_err(&["-p", "--take-over", "go"]).contains("--print needs --continue"));
         let listen = ["serve", "--listen", "unix:/run/x/a.sock", "--cancel"];

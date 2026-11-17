@@ -93,6 +93,16 @@ of `session/new`, opens the session there, and refuses a second
 `session/new` with error `1001` and a message that says why. A client that
 wants another session starts another `atelier acp`.
 
+The session is also the directory's: one atelier at a time
+[owns a project's session](sessions.md#one-session-one-owner). When another
+one is running in `cwd` — a terminal, another editor's agent — `session/new`
+fails with `-32603` and a message naming it (pid, kind, what it is doing),
+and nothing there is touched; an editor cannot be asked the question a
+terminal is. Start the agent as `atelier acp --take-over` to have it stop
+the other one and continue its session instead (`--cancel` is the default
+spelled out). An ACP session takes no remote, and is not attached to one:
+`--attach` is refused. Taken over in its turn, the agent process exits.
+
 ### Prompts
 
 | Content block | Becomes |

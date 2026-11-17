@@ -14,6 +14,10 @@ use crate::tools::ask::{Choice as Option_, Question};
 /// What a choice reads as at the prompt.
 fn option(choice: Choice) -> Option_ {
     let (label, description) = match choice {
+        Choice::Attach => (
+            "Remote control",
+            "this terminal becomes a second front end of that session; it keeps running there",
+        ),
         Choice::TakeOver => (
             "Take over",
             "stop that atelier and everything it is running, and continue its session here",
@@ -27,8 +31,14 @@ fn option(choice: Choice) -> Option_ {
 }
 
 /// The choices offered about `live`, in the order they are numbered.
-fn choices(_live: &Live) -> Vec<Choice> {
-    vec![Choice::TakeOver, Choice::Cancel]
+/// Remote control only where it can be had: of an owner that takes
+/// remotes, from a build that has the terminal interface to be one with.
+fn choices(live: &Live) -> Vec<Choice> {
+    let mut choices = vec![Choice::TakeOver, Choice::Cancel];
+    if cfg!(tui) && super::takes_remotes(live) {
+        choices.insert(0, Choice::Attach);
+    }
+    choices
 }
 
 /// `n` of something, in words.
@@ -118,6 +128,14 @@ pub(super) fn ask(live: &Live, gone: &mut dyn FnMut() -> bool) -> Result<Asked> 
     let choices = choices(live);
     let mut intro = vec!["A session is already running in this directory:".to_string()];
     intro.extend(describe(live).into_iter().map(|l| format!("  {l}")));
+    if !choices.contains(&Choice::Attach) {
+        let why = match live.record.kind {
+            Kind::Terminal if cfg!(tui) => "it does not answer as one that takes remotes",
+            Kind::Terminal => "this build has no terminal interface to be a remote with",
+            _ => "only a terminal interface takes remotes",
+        };
+        intro.push(format!("  (remote control is not offered: {why})"));
+    }
     let question = Question {
         question: "What do you want to do?".to_string(),
         options: choices.iter().map(|c| option(*c)).collect(),

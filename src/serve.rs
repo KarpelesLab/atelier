@@ -185,13 +185,20 @@ pub fn in_use(
     let refusal = |live: &crate::own::Live| Failure {
         code: code::SESSION_IN_USE,
         message: format!(
-            "a session is already running in this directory (pid {}): take it over with \
+            "a session is already running in this directory (pid {}): {}take it over with \
              session/take_over, or leave with shutdown",
-            live.record.pid
+            live.record.pid,
+            match crate::own::takes_remotes(live) {
+                true => "join it with session/attach, ",
+                false => "",
+            }
         ),
         data: Some(json!({
             "owner": owner_data(live),
-            "choices": ["take_over", "cancel"],
+            "choices": match crate::own::takes_remotes(live) {
+                true => json!(["attach", "take_over", "cancel"]),
+                false => json!(["take_over", "cancel"]),
+            },
         })),
     };
     wire.log(&crate::own::in_use_message(&live));
@@ -213,11 +220,33 @@ pub fn in_use(
         };
         let id = message.get("id").cloned();
         match message["method"].as_str() {
+            // From here the client speaks to the owner: its next line is
+            // the `initialize` that makes it a remote.
+            Some("session/attach") => match act(Choice::Attach) {
+                Ok(Start::Attach(live)) => {
+                    wire.respond(&id, json!({ "attached": true }));
+                    return Start::Attach(live);
+                }
+                // The session went free meanwhile, and is this process's.
+                Ok(Start::Go { took_over }) => {
+                    wire.respond(&id, json!({ "attached": false }));
+                    return Start::Go { took_over };
+                }
+                Ok(_) => {
+                    let why = "the session's owner takes no remote";
+                    wire.fail(&id, Failure::new(code::NO_REMOTE, why));
+                }
+                Err(e) => wire.fail(
+                    &id,
+                    Failure::new(rpc::code::INTERNAL_ERROR, format!("{e:#}")),
+                ),
+            },
             Some("session/take_over") => match act(Choice::TakeOver) {
                 Ok(Start::Go { took_over }) => {
                     wire.respond(&id, json!({ "took_over": took_over }));
                     return Start::Go { took_over };
                 }
+                Ok(Start::Attach(_)) => {}
                 // Not the session that was there any more: the choice is
                 // put again, about the one that is.
                 Ok(Start::InUse(now)) => {
@@ -256,6 +285,7 @@ fn owner_data(live: &crate::own::Live) -> Value {
         "jobs": of("jobs"),
         "agents": of("agents"),
         "client": of("client"),
+        "remote": crate::own::takes_remotes(live),
     })
 }
 

@@ -1419,7 +1419,7 @@ fn the_question_is_asked_at_a_terminal_and_cancel_touches_nothing() {
     assert!(asked.contains("? What do you want to do?"), "{asked}");
     assert!(asked.contains("Take over — stop that atelier"), "{asked}");
     assert!(
-        asked.contains("Cancel — leave it alone and exit"),
+        asked.contains("3. Cancel — leave it alone and exit"),
         "{asked}"
     );
     // An answer that is none of the options is asked again.
@@ -1458,7 +1458,7 @@ fn take_over_from_the_question_leaves_the_old_terminal_a_line() {
 
     let mut next = Term::start(&mock, &dir, &[]);
     next.wait_for("(answer with a number)");
-    next.line("1");
+    next.line("take over");
     assert_eq!(owner.exit(), 0);
     let left = owner.text();
     assert!(
@@ -1713,6 +1713,15 @@ impl Drop for Remote {
     }
 }
 
+/// Wait until the owner in `dir` says no turn is running: a turn's answer
+/// is on the screen a moment before the turn is over.
+fn wait_idle(dir: &Path) {
+    let mut asking = Remote::connect(dir);
+    wait_until("the owner to be idle", || {
+        asking.result("owner/status", json!({}))["busy"] == false
+    });
+}
+
 /// A `bash` call that says it started (`started`) and waits for the test
 /// to let it go (`go`).
 fn gated_bash(id: &str) -> Vec<u8> {
@@ -1734,9 +1743,7 @@ fn a_remote_sees_the_conversation_and_drives_the_session() {
     let mut owner = Term::owner(&mock, &dir, &[]);
     owner.line("say one");
     owner.wait_for("re: one");
-    wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
-    });
+    wait_idle(&dir);
 
     let mut remote = Remote::connect(&dir);
     // Before it has said who it is, it is nobody.
@@ -1815,12 +1822,18 @@ fn a_remote_sees_the_conversation_and_drives_the_session() {
     // Settings live in the owner's process and are changed there.
     let ran = remote.result("command/run", json!({"line": "/mode plan"}));
     assert_eq!(ran, json!({"handled": true, "kind": "handled"}));
+    assert_eq!(
+        remote.notification("event/input"),
+        json!({"text": "/mode plan", "from": format!("remote-{number}")})
+    );
     assert!(
         remote.notification("event/info")["text"]
             .as_str()
             .unwrap()
             .contains("mode: plan")
     );
+    // What the session is has changed, and every remote is told.
+    assert_eq!(remote.notification("session/updated")["mode"], "plan");
     let status = remote.result("session/status", json!({}));
     assert_eq!(status["mode"], "plan");
     assert_eq!(
@@ -2211,5 +2224,419 @@ fn a_command_is_typed_to_from_a_remote() {
     assert!(!saved.contains("sesame-4242"), "{saved}");
     owner.keys(b"\x7f");
     owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+// ================================================== remote control
+
+/// The first choice at the question: this terminal becomes a second front
+/// end of the session. It is shown the conversation so far, then what
+/// happens; each terminal marks what the other typed; settings are changed
+/// in the owner; leaving ends nothing; and the remote is nobody among the
+/// coordinator's instances.
+#[test]
+fn remote_control_makes_a_second_terminal_of_the_same_session() {
+    let mock = echo();
+    let dir = project("control");
+    let coord = dir.with_extension("run");
+    let joined = |args: &[&str]| {
+        let mut cmd = atelier(&mock.base_url(), &dir, args);
+        cmd.env("ATELIER_COORDINATOR_DIR", &coord)
+            .env_remove("ATELIER_NO_COORDINATOR");
+        cmd
+    };
+    let instances = || -> usize {
+        let status = coordinator(&coord, "status");
+        status.lines().skip(1).filter(|l| l.contains(" — ")).count()
+    };
+    let mut owner = Term::spawn(joined(&[]));
+    wait_owner(&dir, owner.pid());
+    owner.wait_for("/help for commands");
+    owner.line("say one");
+    owner.wait_for("re: one");
+    wait_idle(&dir);
+    wait_until("the owner to be an instance", || instances() == 1);
+
+    let mut remote = Term::spawn(joined(&[]));
+    remote.wait_for("(answer with a number)");
+    let asked = remote.text();
+    assert!(
+        asked.contains("1. Remote control — this terminal becomes a second front end"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains("2. Take over") && asked.contains("3. Cancel"),
+        "{asked}"
+    );
+    remote.line("1");
+    remote.wait_for(&format!(
+        "remote control of the session of pid {} on /dev/pts/",
+        owner.pid()
+    ));
+    // The conversation so far.
+    remote.wait_for("── the conversation so far ──");
+    remote.wait_for("› say one");
+    remote.wait_for("re: one");
+    remote.wait_for("── now ──");
+    remote.wait_for(&format!(" remote of pid {}", owner.pid()));
+    owner.wait_for("attached (atelier ");
+
+    // Typed at the remote: served by the owner, shown at both.
+    remote.line("say two");
+    remote.wait_for("re: two");
+    owner.wait_for("› say two  ← remote ");
+    owner.wait_for("re: two");
+    // Typed at the owner: shown at the remote, as the other terminal's.
+    owner.line("say three");
+    remote.wait_for("› say three  ← the owner's terminal");
+    remote.wait_for("re: three");
+    assert_eq!(mock.requests(), 3);
+    assert!(mock.body(2).contains("re: two"), "one conversation");
+
+    // A setting is changed where it lives, and both strips show it.
+    remote.line("/mode plan");
+    remote.wait_for("mode: plan");
+    remote.wait_for("· plan");
+    owner.wait_for("› /mode plan  ← remote ");
+    owner.wait_for("· plan");
+    // A command typed at the owner's terminal is shown at the remote with
+    // its output, as the other terminal's.
+    owner.line("/mode ask-edits");
+    remote.wait_for("› /mode ask-edits  ← the owner's terminal");
+    remote.wait_for("mode: ask-edits");
+    remote.wait_for("· ask-edits");
+    // What cannot be done from here says so.
+    remote.line("/config");
+    remote.wait_for("the settings screen is the owner terminal's");
+
+    // One owner, one instance: the remote is nobody among them.
+    assert_eq!(instances(), 1);
+    assert_eq!(record(&dir).unwrap()["pid"], owner.pid());
+    assert_eq!(ateliers_in(&dir).len(), 2);
+
+    // Leaving ends the remote, and nothing else.
+    remote.line("/quit");
+    assert_eq!(remote.exit(), 0);
+    owner.wait_for("detached");
+    owner.line("/mode auto-edit");
+    owner.line("say four");
+    owner.wait_for("re: four");
+    // Ctrl-D leaves too.
+    let mut remote = Term::spawn(joined(&["--attach"]));
+    remote.wait_for("re: four");
+    remote.keys(b"\x04");
+    assert_eq!(remote.exit(), 0);
+    owner.wait_times("detached", 2);
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+    coordinator(&coord, "stop");
+}
+
+/// `--attach`: the same without the question. From the remote terminal a
+/// turn is steered and stopped and an approval answered — and one answered
+/// at the owner's terminal is taken down at the remote.
+#[test]
+fn a_remote_terminal_answers_steers_and_stops() {
+    let mock = Mock::scripted(|n, body| {
+        let said = last_user(body);
+        if after_tool(body) {
+            return answer("done");
+        }
+        if said.contains("hold") {
+            return gated_bash(&format!("call_{n}"));
+        }
+        if said.contains("run") {
+            return tool_calls(&[("call_1", "bash", json!({"command": "echo ran >> ran.txt"}))]);
+        }
+        answer(&format!(
+            "heard: {}",
+            said.split_whitespace().last().unwrap_or("")
+        ))
+    });
+    let dir = project("answers");
+    let mut cmd = atelier(&mock.base_url(), &dir, &[]);
+    cmd.env_remove("ATELIER_APPROVE");
+    let mut owner = Term::spawn(cmd);
+    wait_owner(&dir, owner.pid());
+    owner.wait_for("/help for commands");
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    remote.wait_for("remote control of the session");
+
+    // Asked of both; answered at the remote.
+    owner.line("run it");
+    owner.wait_for("allow tool 'bash'?");
+    remote.wait_for("› run it  ← the owner's terminal");
+    remote.wait_for("allow tool 'bash'?");
+    remote.wait_for("approval needed [y/a/n]");
+    remote.keys(b"y");
+    owner.wait_for("↳ allowed once at remote ");
+    remote.wait_for("done");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("ran.txt")).unwrap(),
+        "ran\n"
+    );
+
+    // Asked from the remote; answered at the owner's terminal.
+    remote.line("run it again");
+    remote.wait_times("allow tool 'bash'?", 2);
+    owner.wait_times("allow tool 'bash'?", 2);
+    owner.keys(b"n");
+    remote.wait_for("↳ denied at the owner's terminal");
+    remote.wait_times("done", 2);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("ran.txt")).unwrap(),
+        "ran\n"
+    );
+
+    // A line typed at the remote during a turn joins it.
+    remote.line("/mode yolo");
+    remote.wait_for("· yolo");
+    remote.line("hold");
+    wait_until("the command to start", || dir.join("started").exists());
+    remote.wait_times("echo > started", 1);
+    remote.line("and lemons");
+    remote.wait_for("› and lemons  (queued)");
+    owner.wait_for("› and lemons  (queued · remote ");
+    // A command waits for the turn to end, and is served then.
+    remote.line("/help");
+    remote.wait_for("› /help  (queued)");
+    assert!(!remote.text().contains("show this help"));
+    std::fs::write(dir.join("go"), "").unwrap();
+    remote.wait_for("heard: lemons");
+    owner.wait_for("heard: lemons");
+    remote.wait_for("show this help");
+
+    // Ctrl-C at the remote stops the turn.
+    std::fs::remove_file(dir.join("go")).unwrap();
+    std::fs::remove_file(dir.join("started")).unwrap();
+    remote.line("hold");
+    wait_until("the command to start", || dir.join("started").exists());
+    remote.wait_times("echo > started", 2);
+    remote.keys(b"\x03");
+    remote.wait_for("! stopping…");
+    owner.wait_for("! stopping… (asked at remote ");
+    // Both are back at their prompts: the next line is a turn of its own.
+    owner.line("say after");
+    owner.wait_for("heard: after");
+    remote.wait_for("heard: after");
+    remote.line("/quit");
+    assert_eq!(remote.exit(), 0);
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+/// A command that asks for something is typed to from the remote terminal
+/// (Ctrl-T), and what is typed there is not shown at the owner's.
+#[test]
+fn a_remote_terminal_types_to_a_command() {
+    let mock = Mock::scripted(|_, body| match after_tool(body) {
+        false => tool_calls(&[(
+            "call_1",
+            "bash",
+            json!({"command": "printf 'Code: '; read -r code; echo \"got ${#code} characters\""}),
+        )]),
+        true => answer("thanks"),
+    });
+    let dir = project("ctrl-t");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    remote.wait_for("remote control of the session");
+    remote.line("ask me");
+    remote.wait_for("⌨ the command is waiting for input: Code:");
+    owner.wait_for("⌨ the command is waiting for input: Code:");
+    remote.keys(b"\x14");
+    remote.wait_for("your keys now go to the command");
+    remote.keys(b"sesame-4242\r");
+    remote.wait_for("thanks");
+    owner.wait_for("thanks");
+    assert!(
+        mock.body(1).contains("got 11 characters"),
+        "{}",
+        mock.body(1)
+    );
+    assert!(!mock.body(1).contains("sesame-4242"));
+    assert!(!owner.text().contains("sesame-4242"), "{}", owner.text());
+    remote.line("/quit");
+    assert_eq!(remote.exit(), 0);
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+}
+
+/// A remote terminal learns how the owner ended, says so, and exits; and a
+/// remote terminal that dies in the middle of a turn takes nothing with it.
+#[test]
+fn a_remote_terminal_outlives_nothing_and_ends_nothing() {
+    let mock = Mock::scripted(|n, body| {
+        if after_tool(body) {
+            return answer("finished anyway");
+        }
+        match last_user(body).contains("hold") {
+            true => gated_bash(&format!("call_{n}")),
+            false => answer("re"),
+        }
+    });
+    let dir = project("ends");
+
+    // The remote dies mid-turn: the turn goes on.
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    remote.wait_for("remote control of the session");
+    remote.line("hold");
+    wait_until("the command to start", || dir.join("started").exists());
+    Command::new("kill")
+        .args(["-9", &remote.pid().to_string()])
+        .status()
+        .unwrap();
+    assert_eq!(remote.exit(), -1);
+    owner.wait_for("detached");
+    std::fs::write(dir.join("go"), "").unwrap();
+    owner.wait_for("finished anyway");
+
+    // The owner quits: the remote says so and ends.
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    remote.wait_for("finished anyway");
+    owner.line("/quit");
+    assert_eq!(owner.exit(), 0);
+    remote.wait_for("has quit: this remote has ended");
+    remote.wait_for("atelier --continue");
+    assert_eq!(remote.exit(), 0);
+
+    // The owner is taken over: the remote says by whom.
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    remote.wait_for("remote control of the session");
+    let mut taker = Piped::spawn(atelier(&mock.base_url(), &dir, &["--take-over"]));
+    remote.wait_for(&format!(
+        "another atelier (pid {}) took the session over",
+        taker.pid()
+    ));
+    assert_eq!(remote.exit(), 0);
+    assert_eq!(owner.exit(), 0);
+    wait_owner(&dir, taker.pid());
+    assert_eq!(taker.finish(), 0);
+
+    // The owner is killed: the remote notices, and says that too.
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    remote.wait_for("remote control of the session");
+    Command::new("kill")
+        .args(["-9", &owner.pid().to_string()])
+        .status()
+        .unwrap();
+    remote.wait_for("is gone without a word");
+    assert_eq!(remote.exit(), 0);
+    assert_eq!(owner.exit(), -1);
+    assert!(ateliers_in(&dir).is_empty());
+}
+
+/// `--attach` where it cannot be had: an owner that takes no remote is
+/// left alone, with the reason; and with no session running there is
+/// nothing to attach to, so the run starts as it would without the flag.
+#[test]
+fn attach_needs_an_owner_that_takes_remotes() {
+    let mock = echo();
+    let dir = project("no-remote");
+    let mut owner = Piped::repl(&mock, &dir, &[]);
+    let mut remote = Term::start(&mock, &dir, &["--attach"]);
+    assert_eq!(remote.exit(), EXIT_IN_USE);
+    let said = remote.text();
+    assert!(
+        said.contains("it takes no remote: only a terminal interface does"),
+        "{said}"
+    );
+    assert!(said.contains(&format!("pid {}", owner.pid())), "{said}");
+    // The question does not offer it either, and says why.
+    let mut asking = Term::start(&mock, &dir, &[]);
+    asking.wait_for("(answer with a number)");
+    let asked = asking.text();
+    assert!(!asked.contains("Remote control —"), "{asked}");
+    assert!(
+        asked.contains("1. Take over") && asked.contains("2. Cancel"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains("(remote control is not offered: only a terminal interface takes remotes)"),
+        "{asked}"
+    );
+    asking.line("2");
+    assert_eq!(asking.exit(), EXIT_CANCELLED);
+    // `serve --attach` is told the same.
+    let (code, out, err) = run(&mock, &dir, &["serve", "--attach"], "");
+    assert_eq!(code, EXIT_IN_USE, "{err}");
+    assert!(
+        out.is_empty() && err.contains("it takes no remote"),
+        "{err}"
+    );
+    assert_eq!(owner.finish(), 0);
+
+    let mut alone = Term::start(&mock, &dir, &["--attach"]);
+    alone.wait_for("/help for commands");
+    wait_owner(&dir, alone.pid());
+    alone.line("/quit");
+    assert_eq!(alone.exit(), 0);
+}
+
+/// A program attaches through `serve`: with `--attach`, or by choosing
+/// `session/attach` when its `initialize` was refused. From there it speaks
+/// to the owner, and its going away ends nothing.
+#[test]
+fn serve_attaches_its_client_to_the_running_session() {
+    let mock = echo();
+    let dir = project("serve-attach");
+    let mut owner = Term::owner(&mock, &dir, &[]);
+    owner.line("say one");
+    owner.wait_for("re: one");
+    wait_idle(&dir);
+
+    let mut client = Client::spawn(&mock, &dir, &[]);
+    let refused = client.call("initialize", json!({}));
+    assert_eq!(refused["error"]["code"], SESSION_IN_USE, "{refused}");
+    let data = &refused["error"]["data"];
+    assert_eq!(data["choices"], json!(["attach", "take_over", "cancel"]));
+    assert_eq!(data["owner"]["remote"], true);
+    assert_eq!(
+        client.result("session/attach", json!({})),
+        json!({"attached": true})
+    );
+    let hello = client.result(
+        "initialize",
+        json!({"client": {"name": "ui", "version": "2"}}),
+    );
+    assert_eq!(hello["capabilities"]["shared"], true, "{hello}");
+    assert_eq!(hello["shared"]["owner"]["pid"], owner.pid());
+    owner.wait_for("attached (ui 2)");
+    let history = client.result("session/history", json!({}));
+    assert_eq!(history["total"], 2);
+    let started = client.result("turn/start", json!({"text": "say two"}));
+    assert_eq!(started["turn"], 2);
+    assert_eq!(
+        client.notification("turn/started")["from"],
+        hello["shared"]["remote"]
+            .as_u64()
+            .map(|n| format!("remote-{n}"))
+            .unwrap()
+    );
+    assert_eq!(client.notification("event/text")["text"], "re: two");
+    assert_eq!(client.notification("turn/ended")["status"], "completed");
+    owner.wait_for("re: two");
+    // Its shutdown is a detach.
+    client.result("shutdown", json!({}));
+    assert_eq!(client.piped.exit(), 0);
+    owner.wait_for("detached");
+    assert_eq!(record(&dir).unwrap()["pid"], owner.pid());
+
+    // With the flag there is nothing to choose; and a client that just
+    // goes away is a remote that left.
+    let mut client = Client::spawn(&mock, &dir, &["--attach"]);
+    let hello = client.result("initialize", json!({}));
+    assert_eq!(hello["shared"]["owner"]["kind"], "terminal");
+    assert_eq!(client.piped.finish(), 0);
+    owner.wait_times("detached", 2);
+    // And the owner's end is the relay's.
+    let mut client = Client::spawn(&mock, &dir, &["--attach"]);
+    client.result("initialize", json!({}));
+    owner.line("/quit");
+    assert_eq!(client.notification("session/closed")["reason"], "ended");
+    assert_eq!(client.piped.exit(), 0);
     assert_eq!(owner.exit(), 0);
 }

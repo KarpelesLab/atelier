@@ -7,6 +7,15 @@
 //! for as long as it lives, and one started later finds out and is given
 //! the choice (see [`start`]): join it as a remote, take it over, or leave.
 //!
+//! # Remote control
+//!
+//! Joining is being a second front end of the owner's live session, over
+//! the owner's socket (see [`hub`] for the owner's side, and
+//! `docs/protocol.md`). The newcomer opens no session of its own — it
+//! reads no configuration, joins no coordinator, runs no hook — and is
+//! either the terminal interface as a client (`tui::remote`) or, for
+//! `serve`, a pipe between its own client and the owner ([`relay`]).
+//!
 //! # The record
 //!
 //! Ownership is an exclusive advisory lock on `.atelier/session.lock`
@@ -141,6 +150,8 @@ pub struct Live {
 /// the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
+    /// Be a second front end of the owner's session (remote control).
+    Attach,
     /// Stop the owner and what it runs, and continue its session here.
     TakeOver,
     /// Leave it alone and exit.
@@ -151,6 +162,7 @@ impl Choice {
     /// The flag that picks it.
     pub fn flag(self) -> &'static str {
         match self {
+            Choice::Attach => "--attach",
             Choice::TakeOver => "--take-over",
             Choice::Cancel => "--cancel",
         }
@@ -173,6 +185,8 @@ pub enum Start {
     /// another: the saved conversation is then resumed, as `--continue`
     /// does.
     Go { took_over: bool },
+    /// Be a remote of this live session: no session is opened here.
+    Attach(Live),
     /// Leave, with this exit status. What there was to say has been said.
     Exit(u8),
     /// Another atelier owns the session, nothing chose what to do about it
@@ -208,12 +222,58 @@ mod imp {
         let mut lines = vec!["a session is already running in this directory:".to_string()];
         lines.extend(describe(live).into_iter().map(|l| format!("  {l}")));
         lines.push(
-            "say what to do about it: --take-over (stop it and what it runs, and continue its \
-             session here) or --cancel (leave it and exit)."
+            "say what to do about it: --attach (join it from here, as a remote control), \
+             --take-over (stop it and what it runs, and continue its session here) or --cancel \
+             (leave it and exit)."
                 .to_string(),
         );
         lines.push(format!("nothing was changed (exit status {EXIT_IN_USE})."));
         lines.join("\n")
+    }
+
+    /// Whether the owner of `live` takes remotes: it is a terminal
+    /// interface, up, and said so when asked.
+    pub fn takes_remotes(live: &Live) -> bool {
+        live.status.as_ref().is_some_and(|s| s["remote"] == true)
+    }
+
+    /// A connection to the socket of the owner `record` describes.
+    pub fn connect(record: &Record) -> Result<std::os::unix::net::UnixStream> {
+        hub::connect(record)
+    }
+
+    /// `atelier serve` as a remote: carry the lines between this process's
+    /// client (stdin, stdout) and the owner's socket, until either end
+    /// closes. The client speaks to the owner from its `initialize` on (see
+    /// "A session shared with its terminal" in `docs/protocol.md`).
+    pub fn relay(live: &Live) -> Result<u8> {
+        use std::io::{BufRead, BufReader};
+        let stream = connect(&live.record)?;
+        let mut to_owner = stream.try_clone()?;
+        let closing = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match std::io::stdin().lock().read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if to_owner.write_all(&line).is_err() {
+                    break;
+                }
+            }
+            // The client is gone: so is this remote, and nothing else.
+            let _ = closing.shutdown(std::net::Shutdown::Both);
+        });
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            let mut out = std::io::stdout().lock();
+            if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+                break;
+            }
+        }
+        Ok(0)
     }
 
     /// This process's ownership, once it has one.
@@ -259,8 +319,15 @@ mod imp {
     }
 
     /// The record's process is the one that wrote it, and is still there.
+    /// (An owner on a system that could not tell it when it started wrote
+    /// no start time: there the process being there has to do, next to the
+    /// lock it is seen to hold.)
     pub(super) fn genuine(record: &Record) -> bool {
-        proc::start_token(record.pid).as_deref() == Some(record.started.as_str())
+        match (proc::start_token(record.pid), record.started.as_str()) {
+            (Some(now), then) if !then.is_empty() => now == then,
+            (_, "") => proc::exists(record.pid),
+            _ => false,
+        }
     }
 
     /// The socket a record names, if it is where an owner's socket goes:
@@ -305,9 +372,16 @@ mod imp {
                         return Ok(Claimed::Live(Live { record, status }));
                     }
                     if Instant::now() >= deadline {
+                        // Held, and not by a process the record names:
+                        // something an atelier that is gone had started,
+                        // that kept its files open.
+                        let was = read_record(&mut file).map_or_else(String::new, |r| {
+                            format!(" (the atelier that took it, pid {}, is gone)", r.pid)
+                        });
                         anyhow::bail!(
-                            "{} is locked by a process that does not say who it is; \
-                             nothing was changed",
+                            "{} is locked{was}, and whatever holds it does not say who it \
+                             is. Nothing was changed. Stop what is left of that atelier, or \
+                             remove the file and start again",
                             root.join(LOCK_FILE).display()
                         );
                     }
@@ -421,6 +495,34 @@ mod imp {
                 None => return Ok(Start::InUse(live)),
             };
             match choice {
+                Choice::Attach => {
+                    // Only what can be a front end, of an owner that
+                    // takes them.
+                    let unable = if !matches!(kind, Kind::Terminal | Kind::Serve) {
+                        Some("--attach needs a terminal (or serve, for a program) to attach from")
+                    } else if !takes_remotes(&live) {
+                        Some("it takes no remote: only a terminal interface does")
+                    } else {
+                        None
+                    };
+                    let Some(why) = unable else {
+                        // It may have ended since it was described.
+                        if try_own(root, kind) {
+                            eprintln!(
+                                "the other atelier (pid {}) has ended: starting normally.",
+                                live.record.pid
+                            );
+                            return Ok(Start::Go { took_over: false });
+                        }
+                        return Ok(Start::Attach(live));
+                    };
+                    eprintln!(
+                        "atelier: a session is already running in this directory:\n  {}\n{why}. \
+                         Nothing was changed (--take-over takes it, --cancel leaves it).",
+                        describe(&live).join("\n  ")
+                    );
+                    return Ok(Start::Exit(EXIT_IN_USE));
+                }
                 Choice::Cancel => {
                     if !interactive {
                         eprintln!(
@@ -519,6 +621,12 @@ mod imp {
     }
     pub fn in_use_message(_: &Live) -> String {
         String::new()
+    }
+    pub fn takes_remotes(_: &Live) -> bool {
+        false
+    }
+    pub fn relay(_: &Live) -> Result<u8> {
+        anyhow::bail!("not supported on this platform")
     }
 
     pub fn live_elsewhere(_: &Path) -> bool {

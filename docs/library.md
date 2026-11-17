@@ -95,8 +95,11 @@ cargo run --example embed -- "what does this project do?"
   it ([One session, one owner](sessions.md#one-session-one-owner)).
   `open_session` does not: a host that wants the same calls
   `atelier::own::start(&root, kind, choice, interactive)` first and goes on
-  when it answers `Start::Go`; one that does not is a run beside the owner,
-  and should call `Session::leave_saved_session` when
+  when it answers `Start::Go` (`Start::InUse` describes the owner there is,
+  for an interface that asks in its own way; `Start::Attach` is the user's
+  choice of remote control, which `atelier::tui::remote` and
+  `atelier::own::relay` carry out); one that does not is a run beside the
+  owner, and should call `Session::leave_saved_session` when
   `atelier::own::live_elsewhere(&root)`.
 - **Helper processes.** atelier starts copies of the running program for
   the coordinator, the local model's server, the Claude relay, the

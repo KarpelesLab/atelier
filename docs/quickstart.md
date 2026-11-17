@@ -191,8 +191,9 @@ are compacted automatically — once the context grows past a threshold, old
 tool output is pruned and, if that isn't enough, older turns are summarized —
 so you don't need to manage this by hand (`/compact` does it on demand).
 One atelier at a time works on a project's session: start a second one in
-the same directory and it tells you who has it and asks whether to take it
-over or leave ([One session, one owner](sessions.md#one-session-one-owner)).
+the same directory and it tells you who has it and asks whether to join it
+as a remote control — a second terminal on the same live session — take it
+over, or leave ([One session, one owner](sessions.md#one-session-one-owner)).
 Add `.atelier/` to your project's `.gitignore`. See
 [Sessions](sessions.md) for the full picture.
 

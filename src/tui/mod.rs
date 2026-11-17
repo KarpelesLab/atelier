@@ -94,11 +94,14 @@
 //! What is typed there goes to the command through a queue the worker
 //! drains ([`Ui::command_input`]) and is kept nowhere.
 
+mod client;
 mod config;
 mod host;
 mod input;
 mod term;
 
+/// The interface as a remote of a session another atelier owns.
+pub use client::run as remote;
 /// The terminal window's size, for `atelier doctor`.
 pub use term::size as window_size;
 
@@ -178,14 +181,17 @@ pub fn run(mut session: Session) -> Result<()> {
     let mut r = Renderer::new();
     let mut turn: u32 = 0;
     r.status = build_status(&session, turn);
+    // A session this process owns is shared with the remotes that attach
+    // to it (see `host`), from before the first line is on the screen: what
+    // one asks while the servers connect waits for the loop below.
+    remote::serve();
+    host::publish(&session);
     r.push_line("atelier — /help for commands, /quit to exit".into(), true);
     for line in session.connect_configured_mcp() {
         r.push_line(line, true);
     }
     r.refresh()?;
-    // A session this process owns is shared with the remotes that attach
-    // to it (see `host`).
-    remote::serve();
+    // (Again: the servers' tools are the session's now.)
     host::publish(&session);
 
     // Who took the session over, when that is why the loop ended.
@@ -233,6 +239,18 @@ pub fn run(mut session: Session) -> Result<()> {
             continue;
         }
 
+        // A command line is shown to the other front ends as it was typed
+        // (a prompt is, by the turn it starts).
+        if trimmed.starts_with('/') && !matches!(from, From::Session) {
+            let by = match &from {
+                From::Remote(asked) => Some(asked.remote),
+                From::Typed | From::Session => None,
+            };
+            remote::event(
+                "input",
+                || serde_json::json!({ "text": trimmed, "from": remote::origin(by) }),
+            );
+        }
         // A remote's `turn/start` is a prompt whatever it looks like, and
         // may come with images.
         let mut as_is = matches!(from, From::Session);

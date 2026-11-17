@@ -6,7 +6,7 @@ another program driving an agent — lives *outside* atelier and talks to it
 through this protocol.
 
 ```sh
-atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS] [--take-over | --cancel]
+atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS] [--attach | --take-over | --cancel]
 atelier serve --listen WHERE [--allow-origin ORIGIN]... [--max-sessions N] [the flags above]
 ```
 
@@ -24,7 +24,7 @@ slash commands.
 | `-c`, `--continue` | Resume this directory's saved session first (see [Sessions](sessions.md)) |
 | `--mode MODE` | The [permission mode](permissions.md) to start in: `plan`, `ask-edits`, `auto-edit` (default), `yolo` |
 | `--approval-timeout SECS` | How long an [`approval/request`](#approvalrequest) or a [`question/request`](#questionrequest) waits for the client's answer. Without it they wait for as long as it takes |
-| `--take-over`, `--cancel` | What to do when another atelier is already running this directory's session: take it over, or exit with status 8. Without either, the client is asked: see [A session that is in use](#a-session-that-is-in-use) |
+| `--attach`, `--take-over`, `--cancel` | What to do when another atelier is already running this directory's session: join it as a [remote](#a-session-shared-with-its-terminal), take it over, or exit with status 8. Without any, the client is asked: see [A session that is in use](#a-session-that-is-in-use) |
 
 Everything else — the model, the endpoint, `atelier.toml`, instruction
 files, hooks, MCP servers — is configured as for any other run (see
@@ -95,13 +95,22 @@ client                                   atelier
   │◀──────────────────────────────── result  │
 ```
 
+or, to join the session rather than take it:
+
+```
+  │ session/attach ─────────────────────────▶│
+  │◀────────────────── result {attached}     │   from here: the owner speaking
+  │ initialize ─────────────────────────────▶│
+  │◀───────────────────── result {shared}    │   a remote of its session
+```
+
 - **`initialize` fails with `-32010`**, and so does every other method,
   until a choice is made. `data` is what a client needs to ask its user:
 
   ```json
   {"owner":{"pid":4021,"kind":"terminal","tty":"/dev/pts/3","since":1767225600,"version":"0.1.2",
-            "answers":true,"busy":true,"jobs":1,"agents":0,"client":null},
-   "choices":["take_over","cancel"]}
+            "answers":true,"busy":true,"jobs":1,"agents":0,"client":null,"remote":true},
+   "choices":["attach","take_over","cancel"]}
   ```
 
   | Field | Meaning |
@@ -110,7 +119,19 @@ client                                   atelier
   | `owner.answers` | It answered when asked what it is doing. `false`: the four fields below are `null` |
   | `owner.busy`, `jobs`, `agents` | A turn is in progress; background `bash` jobs running; background subagents running |
   | `owner.client` | For a `serve` owner, the client driving it (`name version`), which a take-over cuts off |
-  | `choices` | The methods that go on from here: `take_over` is [`session/take_over`](#a-session-that-is-in-use), `cancel` is `shutdown` |
+  | `owner.remote` | It takes remotes: it is a terminal interface |
+  | `choices` | What can be done from here: `attach` is `session/attach` (only when `owner.remote`), `take_over` is `session/take_over`, `cancel` is `shutdown` |
+
+- **`session/attach`** (no params) makes this process a pipe to the owner
+  and answers `{"attached": true}`. Everything the client writes after it
+  goes to the owner, and everything the owner says comes back: the client
+  is a remote of the running session, and starts over with `initialize`
+  ([A session shared with its terminal](#a-session-shared-with-its-terminal)).
+  The process ends when either side closes — status 0, the session's fate
+  being the owner's. It fails with `-32011` when the owner takes no remote.
+  If the owner ended in the meantime there is nothing to attach to: the
+  answer is `{"attached": false}`, the session is this process's own, and
+  `initialize` goes on as on any other day.
 
 - **`session/take_over`** (no params) stops the owner and what it runs, as
   [take over](sessions.md#one-session-one-owner) does from a terminal — it
@@ -123,8 +144,11 @@ client                                   atelier
 - **`shutdown`**, or closing the input, leaves: nothing was touched. The
   process exits with status 8 after `shutdown`, 7 at the end of input.
 
-Started with `--take-over` or `--cancel`, `serve` does not ask: it takes
-the session before `initialize` is answered, or exits with status 8.
+Started with `--attach`, `--take-over` or `--cancel`, `serve` does not
+ask: the client's first line is already the owner's to answer; or the
+session is taken before `initialize` is answered; or the process exits with
+status 8. (`--attach` with an owner that takes no remote exits with status
+7.)
 
 A served session can be taken over in its turn. Its client is then sent
 [`session/closed`](#sessionclosed), and the process exits.
@@ -868,6 +892,7 @@ One per thing the session reports. Events of a turn carry its id as
 | `request/cancelled` | `id`, `reason` | A request atelier made no longer needs an answer |
 | `session/closed` | `reason`, `by` | The session is no longer this process's; see below |
 | `turn/started` | `turn`, `text`, `from` | [Shared sessions](#a-session-shared-with-its-terminal) only: a turn started, with this prompt, typed at the owner's terminal or sent by a remote |
+| `session/updated`, `event/input` | | Shared sessions only: the model or the mode changed; a slash command was entered at another front end |
 
 The payloads are those of the [`stream-json` events](headless.md#events-stream-json)
 of the same name (`text`, `tool_start`, `tool_end`, `file_change`, …): the
@@ -1008,6 +1033,10 @@ None of it starts a turn; the model hears of it with the next prompt.
 `{"id": 7, "reason": "timeout"}` or `"interrupted"`: the request with that
 id (an `approval/request` or `question/request`) was given up on, and was
 taken as a refusal. Take the prompt down; an answer sent anyway is ignored.
+
+On a [shared session](#requests-are-put-to-everybody) there is a third
+reason, `"answered"`: another front end answered it, and the notification
+says which and what.
 
 ### `session/closed`
 
@@ -1280,6 +1309,12 @@ everything not named here is as above.
 
 ### Connecting
 
+The simple way is not to: **`atelier serve --attach`** in the project
+directory (or [`session/attach`](#a-session-that-is-in-use) after a
+refused `initialize`) is a pipe to the owner, and the client it was
+launched by is the remote, on stdin and stdout as ever. A program can also
+open the socket itself.
+
 The owner's record, `.atelier/session.lock` in the project, names its
 socket (`socket`; see [How it is recorded](sessions.md#how-it-is-recorded)).
 It is a Unix socket, mode `0600`, in a directory only its user can enter:
@@ -1322,7 +1357,10 @@ running now. `session` is as of the last time the session was idle.
   `initialize` result: its `turn/started`, then every event it produced so
   far, in order. (The last 2 MiB of them; when more than that was dropped,
   an `event/notice` behind `turn/started` says so.) Live events follow
-  without a gap or a repeat.
+  without a gap or a repeat. The one thing not kept is
+  `event/command_output`: what a running command printed on its terminal
+  before the remote attached was for whoever was looking then — it may
+  hold the echo of what they typed.
 - **What is waiting for an answer** — an `approval/request` or a
   `question/request` nobody has answered yet — is sent to a remote that
   attaches while it waits.
@@ -1337,7 +1375,9 @@ running now. `session` is as of the last time the session was idle.
 | `turn/ended` | Sent to every remote. No `undelivered` |
 | `command/run` | The command runs **in the owner's process**, which is where the session's settings live: `/model`, `/mode`, `/mcp add`, `/compact`, `/new` change the one session for everybody. With `"start": true`, a line that is a prompt (or a command that stands for one) is sent at once, on the model the command asks for, and the result is `{"handled": true, "kind": "prompt" \| "expanded", "turn": 7}`; without it the line is handed back, as usual. `/config` and `/quit` come back as `config` and `quit`: the settings screen is the owner terminal's, and leaving is `shutdown` |
 | `event/*` between turns | `event/idle`, which also carries the output of commands typed at the owner's terminal |
+| `event/input` | A slash command was entered at another front end: `{"text": "/mode plan", "from": "terminal"}`, ahead of its output. (Inside `event/idle`, with `kind: "input"`, when it was typed at the owner's terminal; a prompt is announced by its `turn/started` instead) |
 | `session/status` | Also `remotes`: how many are attached |
+| `session/updated` | A notification: what the session is has changed — its model, its mode, its tools — at the owner's terminal or from a remote (`/model`, `/mode`, a setting, an MCP server added). The params are `session/status`'s, less `busy`, `turn` and `queued` |
 | `shutdown` | **Detaches** this remote (`{}`, then the connection is closed). `force` means nothing: the session is not a remote's to end, and neither it nor its turn, its jobs or its agents are touched — as when the connection just closes |
 
 A remote may start a turn while the owner's user is typing: the session
@@ -1402,3 +1442,7 @@ told and the connection is closed:
 | `{"reason": "taken_over", "by": "pid 4188 on /dev/pts/5"}` | Another atelier took the session over; attach to that one, if it takes remotes |
 
 An owner that is killed says nothing: the connection just closes.
+
+A remote must keep reading. One that lets what it is sent pile up for five
+seconds is taken for gone and disconnected, so that it cannot hold up the
+session for everybody else.

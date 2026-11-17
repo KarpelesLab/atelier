@@ -222,7 +222,7 @@ pub fn run(args: &[String]) -> Result<u8> {
                     "{}\n(start the agent as `atelier acp --take-over` to take it over)",
                     own::in_use_message(&live)
                 ),
-                own::Start::Exit(_) => {
+                own::Start::Exit(_) | own::Start::Attach(_) => {
                     anyhow::bail!("a session is already running in this directory; left alone")
                 }
             };
@@ -265,6 +265,9 @@ pub fn run(args: &[String]) -> Result<u8> {
         };
         match start {
             own::Start::Go { took_over } => resume |= took_over,
+            // A remote of the session that is running: none is opened here.
+            own::Start::Attach(live) if kind == own::Kind::Serve => return own::relay(&live),
+            own::Start::Attach(live) => return attach(&live),
             own::Start::InUse(live) => {
                 eprintln!("atelier: {}", own::in_use_message(&live));
                 return Ok(own::EXIT_IN_USE);
@@ -447,6 +450,17 @@ fn open(
         session.use_chatgpt(tokens, None);
     }
     Ok(session)
+}
+
+/// The terminal interface as a remote of the live session `live`.
+fn attach(live: &own::Live) -> Result<u8> {
+    #[cfg(tui)]
+    return tui::remote(live);
+    #[cfg(not(tui))]
+    {
+        let _ = live;
+        anyhow::bail!("this build has no terminal interface to be a remote with")
+    }
 }
 
 /// On the way out: stop the `bash` tool's background jobs and the language
