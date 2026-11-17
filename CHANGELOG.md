@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/atelier/compare/v0.1.2...v0.1.3) - 2026-11-17
+
+### Added
+
+- tool calls a model writes as text are run, not shown
+- claude's subagents show what they do, and /models lists what claude offers
+- the sandbox shows the guest what is kept for the project outside it, read-only
+- atelier writes nothing in the project — its state moves to a per-user directory
+- node gets fs.promises, top-level await, and outside paths by approval
+- a complex bash command's prompt carries the model's reading of it
+- with the sandbox on, diagnostics checkers run in the guest
+- with the sandbox on, the project's hooks run in the guest
+- a command in the sandbox's guest can be given an environment and an input
+- the coordinator says who owns a session — no lock file, nothing in the project
+- remote control — a second terminal on the session that is running
+- the terminal interface shares its live session with remotes on its socket
+- one owner per project session — a second atelier is told, and may take it over
+- bash — a command the user can type to, on a terminal of its own
+- bash — tail, head and grep as parameters, and kept output to look at again
+- the compaction threshold follows the model's context window
+- subagents as coordinator instances — task's process: true
+- the sandbox reaches the hosts it is allowed — [sandbox] network, by name
+- git works in a linked worktree and in a submodule in the sandbox
+- background jobs and command-file shell lines run in the sandbox
+- the sandbox on nixvm 0.0.7 — git commit, cargo and make -j work in the guest
+- atelier is a library its program consumes
+- serve --listen — the protocol on a Unix socket or loopback, a session per connection
+- serve — queries that answer with data where a slash command prints
+- settings over the protocol — settings/get and settings/set
+- serve — session/history and edits as diffs (event/file_change)
+- a model on this machine — atelier --local runs oxinfer
+- pre_tool hooks see a command file's shell lines before they run
+
+### Fixed
+
+- a coordinator whose socket is gone stops, instead of waiting for a connection that cannot come
+- /agents stop reaches a process subagent at once, not at its parent's next look
+- bash — the status line after the rebase, and a test that raced a job's two streams
+- symbols — search with rust-analyzer finds functions, not types alone
+- /mcp lists the servers the client attached to the session
+- symbols — search on a server just started, the project's symbols only, references less the declaration
+- symbols — a server's error without its stack trace, and time to settle after a file is opened
+- a slow local model no longer times out while it reads the prompt
+
+### Other
+
+- M7 text tool-call dialects; M7 done
+- Claude backend subagent activity and /models
+- the roadmap follows the state directory and what now runs in the guest
+- where a project's state is kept, now that it is not in the project
+- M8 async fs and approved outside paths
+- M9 pre-flight summary
+- a closure handed to map_err as itself, as clippy 1.99 asks
+- what runs in the sandbox and what stays on the host, and why
+- mark built milestones, record settled decisions
+- the roadmap records one session per directory, held by the coordinator
+- roadmap — what landed on 2026-11-17, and what is next
+- the sandbox on nixvm 0.0.8
+- web_search — SearXNG as run against a real instance
+- claude — the live tests as run on 2026-11-17, and what they do not reach
+- acp — what was tried against the protocol's own client library
+- symbols against real language servers, opt-in, and what they showed
+- the prompt cache's benefit, measured against a live endpoint
+- roadmap — the sandbox after nixvm 0.0.7, and what is next
+- the 27B at 3 bits, for machines with less memory
+- roadmap — M24, a backend for other interfaces
+- the local model — why the 27B, and that smaller ones do poorly
+- wait for the client to read the server's status in the symbols test
+
 ## [0.1.2](https://github.com/KarpelesLab/atelier/compare/v0.1.1...v0.1.2) - 2026-11-13
 
 ### Added
