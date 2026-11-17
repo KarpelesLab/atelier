@@ -1764,7 +1764,8 @@ mod tests {
             fstate: &mut fstate,
             approved: false,
         };
-        let id = start(&mut ctx, "seq 1 100; echo 'fatal: no' >&2; exit 1");
+        // One stream: a job's two are read as they come, in no fixed order.
+        let id = start(&mut ctx, "seq 1 100; echo 'fatal: no'; exit 1");
         let out = BashOutputTool
             .call(&mut ctx, json!({"id": id, "wait_ms": 20000, "head": 2}))
             .unwrap();

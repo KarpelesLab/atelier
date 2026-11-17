@@ -302,7 +302,7 @@ allowed), and listening for connections from outside.
 refused, so the agent can tell you which host to add rather than guess:
 
 ```
-[exit status: exit status: 1]
+[exit status: 1]
 [stderr]
 wget: bad address 'static.crates.io'
 [sandbox: the sandbox's network reaches only the hosts on its allowlist, and
