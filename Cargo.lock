@@ -81,12 +81,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bitflags"
-version = "2.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -137,9 +131,9 @@ checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "cacrt"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "883da6debf9bb96b0d591bb1589ad98b7428bd142f8acf4a014a8034fcab743d"
+checksum = "de50c589220a5516d733d43e585df9489cd93f373e6f8deead9d16c50d3fa30d"
 
 [[package]]
 name = "cbc"
@@ -155,12 +149,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "cfg_aliases"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cipher"
@@ -189,6 +177,12 @@ name = "compcol"
 version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6f29da98742f258743e8bb44b09f0cc1cbca2591e709b1bb85ccd6e9111f431"
+
+[[package]]
+name = "compcol"
+version = "0.7.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbe9a1760292869e621e78fe025e3588acfbf29b2947758aacd2eb31cc179dd3"
 
 [[package]]
 name = "compcol"
@@ -484,6 +478,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "fstool"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d7c7d42941820c9bd638a04ad817d77c72dd3ec864c20452872e134aad79e6"
+dependencies = [
+ "compcol 0.7.9",
+ "uuid",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -536,6 +540,17 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
 ]
 
 [[package]]
@@ -645,6 +660,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5bfae726bb3f672d4f4b1f29cee6c74898a35230a4c794d8292c21129107f21"
 
 [[package]]
+name = "intl"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb4842b834ce672019651d2dab56a63cb3ab07d222d892eecbf90b45f21256b8"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,24 +736,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "nix"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags",
- "cfg-if",
- "cfg_aliases",
- "libc",
-]
-
-[[package]]
 name = "nixvm"
 version = "0.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b0ae7af4e079c0f76fe509cd74a6338f70e9aba725596858ce798f08f182fe1"
+source = "git+https://github.com/KarpelesLab/nixvm?rev=7761ff88002762428700f37a42cfdacb0b827920#7761ff88002762428700f37a42cfdacb0b827920"
 dependencies = [
+ "compcol 0.7.9",
+ "fstool",
  "purecrypto 0.10.6",
+ "rsurl",
 ]
 
 [[package]]
@@ -878,7 +889,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1764ecf10b8dccd0f5d772d087b019fa7e0817ffef63ad8aacffb836030ae3db"
 dependencies = [
- "intl",
+ "intl 0.4.1",
  "oxideav-core",
  "oxideav-otf",
  "oxideav-png",
@@ -1027,6 +1038,7 @@ version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36f943243cf00add6222fc0decfc3a17f37942bd82e8465a9d354eeb13822263"
 dependencies = [
+ "cacrt",
  "compcol 0.8.0",
 ]
 
@@ -1038,15 +1050,13 @@ checksum = "9bf29cee9bbf0341c2ea7871d76b84a6e9216fdcf46a57fe60bd04396c55d7dc"
 
 [[package]]
 name = "puressh"
-version = "0.1.6"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4c129b4ac51fa6b0fac1e26cc2462dc16866041813984be54184345b28879ac"
+checksum = "f01cf7f3c71453d6a4621225bea4633860aa7d94a23e420c4487e6b098e90eb5"
 dependencies = [
- "compcol 0.6.11",
+ "compcol 0.7.9",
  "libc",
- "nix",
- "purecrypto 0.8.1",
- "zeroize",
+ "purecrypto 0.10.6",
 ]
 
 [[package]]
@@ -1057,6 +1067,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
@@ -1084,7 +1100,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
- "getrandom",
+ "getrandom 0.2.17",
 ]
 
 [[package]]
@@ -1163,17 +1179,17 @@ dependencies = [
 
 [[package]]
 name = "rsurl"
-version = "0.1.12"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cb2d44df3303ec4545043be177cb5fbce16c87d4324b158e44ee874fdd8c712"
+checksum = "2773f0e438b9d774d83cca63021d6b265b2a31b7e8eb2085d46a56648f2d888b"
 dependencies = [
- "compcol 0.6.11",
+ "compcol 0.7.9",
  "futures-channel",
  "futures-util",
- "intl",
+ "intl 0.6.5",
  "js-sys",
  "psl2",
- "purecrypto 0.8.1",
+ "purecrypto 0.10.6",
  "puressh",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1442,6 +1458,17 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "uuid"
+version = "1.29.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "version_check"

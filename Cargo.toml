@@ -30,11 +30,14 @@ regex = "1"
 ignore = "0.4"
 globset = "0.4"
 # The sandbox the `bash` tool can run commands in (see `src/sandbox.rs`), with
-# the `sandbox` feature. Pinned exactly: atelier assembles the guest from
-# nixvm's kernel, loader and filesystem modules, which no 0.0.x release
-# promises to keep as they are. No default features: the library alone, which
-# has no dependencies of its own.
-nixvm = { version = "=0.0.8", default-features = false, optional = true }
+# the `sandbox` feature. No default features (they are nixvm's command line);
+# `images` is its registry client and squashfs reader, for the root image
+# atelier fetches (docs/sandbox.md, "Builds", says what that links).
+#
+# TEMPORARY: nixvm's master, by revision, until 0.0.9 is on crates.io. This
+# line is all there is to change then: `version = "0.0.9"` in place of `git`
+# and `rev`.
+nixvm = { git = "https://github.com/KarpelesLab/nixvm", rev = "7761ff88002762428700f37a42cfdacb0b827920", default-features = false, features = ["images"], optional = true }
 
 [features]
 default = ["tui"]
