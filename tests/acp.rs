@@ -1501,6 +1501,18 @@ IFS= read -r _end
         "{}",
         mock.body(1)
     );
+
+    // `/mcp` lists it: it is in no file, and it is what the session uses.
+    // (With the SDK's client the answer was "no MCP servers configured"
+    // and no more, in a session using twenty of the client's tools.)
+    let prompt = client.prompt("/mcp");
+    assert_eq!(client.stopped(&prompt), "end_turn");
+    let said = client.text();
+    assert!(said.contains("no MCP servers configured"), "{said}");
+    assert!(
+        said.contains("for this session:\n  my_tools → (from the client)"),
+        "{said}"
+    );
 }
 
 /// `--max-turns` bounds a prompt, which then ends as `max_turn_requests`.

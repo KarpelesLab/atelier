@@ -823,13 +823,21 @@ fn dispatch_peers(session: &mut Session, cmd: &str, args: &[&str], ui: &mut dyn 
 fn dispatch_mcp(session: &mut Session, args: &[&str], ui: &mut dyn Ui) {
     match args.first().copied() {
         None => {
-            let list = session.mcp_list();
-            if list.is_empty() {
+            let (configured, attached) = session.mcp_list();
+            if configured.is_empty() {
                 ui.info("no MCP servers configured. add one:");
                 ui.info("  /mcp add <name> <command> [args...]");
             } else {
                 ui.info("configured MCP servers:");
-                for l in list {
+                for l in configured {
+                    ui.info(&format!("  {l}"));
+                }
+            }
+            // An editor's own servers (ACP `session/new`): in no file, and
+            // in use.
+            if !attached.is_empty() {
+                ui.info("for this session:");
+                for l in attached {
                     ui.info(&format!("  {l}"));
                 }
             }
@@ -1691,10 +1699,13 @@ impl Session {
         n
     }
 
-    /// One display line per configured MCP server (stdio and HTTP).
-    pub fn mcp_list(&self) -> Vec<String> {
-        let configured = self.mcp_servers().into_iter().filter(|s| s.configured);
-        configured.map(|s| s.line()).collect()
+    /// One display line per MCP server: the configured ones (stdio and
+    /// HTTP), and those the client attached to this session.
+    pub fn mcp_list(&self) -> (Vec<String>, Vec<String>) {
+        let (configured, attached): (Vec<_>, Vec<_>) =
+            (self.mcp_servers().into_iter()).partition(|s| s.configured);
+        let lines = |servers: Vec<query::McpServer>| servers.iter().map(|s| s.line()).collect();
+        (lines(configured), lines(attached))
     }
 
     /// Whether any configured MCP server (stdio or HTTP) already uses `name`.
