@@ -151,6 +151,12 @@ messages against the real CLI, and `cargo test --test claude_live -- --ignored` 
 tools through the relay and as replacements — reading, images, background
 jobs, approval policy (both run a few cheap Haiku turns on your account).
 
+Both were last run on 2026-11-17, against Claude Code 2.1.326 on Linux:
+their seven tests passed. Those seven are the only tests there are against
+the real CLI: what they do not reach — permission rules over claude's
+built-ins, hooks, subagents, the approval reviewer, `atelier acp --claude`
+and `atelier serve` on this backend — is tested without it, or not at all.
+
 ## Permissions
 
 atelier's own tools run under atelier's [permission rules and
