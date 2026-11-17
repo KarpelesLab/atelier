@@ -11,25 +11,59 @@ directory and a userland image, and nothing else of the machine; of the
 network, only the hosts you list, and none unless you list some. A command
 that cannot leave the project needs no approval, so `bash` stops prompting.
 
-This is a first implementation, **off by default and not in the release
-binaries**. It isolates what it says it isolates (the tests check), but the
+This is a first implementation, **off by default**; the x86-64 release
+binary has it compiled in, the arm64 one does not ([builds](#builds)). It
+isolates what it says it isolates (the tests check), but the
 guest cannot yet do everything an agent's shell is asked to do — see
 [what works](#what-works-in-the-guest-and-what-doesnt) before relying on it,
 and [what nixvm needs next](#what-nixvm-needs-next) for where this is going.
 
 ## Turning it on
 
-1. **Build with the feature.** `cargo build --release --features sandbox`.
-   It needs a Unix target with a libc (tried on Linux x86-64 with glibc
-   only); in a fullrust build the feature compiles but reports itself
-   unavailable ([why](#builds)).
+1. **Have a build with it.** The x86-64 release binary has; from source,
+   `cargo build --release --features sandbox` (Linux x86-64 with glibc and
+   with [fullrust](#builds) were tried; `atelier sandbox status` says if a
+   build cannot).
 
-2. **Provide a root filesystem**: a directory holding a Linux userland.
-   atelier looks at `ATELIER_SANDBOX_ROOT`, then `[sandbox] root` in the
-   *user-global* `atelier.toml`, then
-   `$XDG_DATA_HOME/atelier/sandbox/rootfs` (`~/.local/share/…`). Nothing is
-   downloaded for you. An Alpine minirootfs (3.5 MB to download, 9 MB
-   unpacked) is enough to start:
+2. **A root filesystem** — the guest's userland. If you name none, atelier
+   fetches one the first time a guest needs it: the official Alpine image
+   (3.22, pinned by digest: `docker.io/library/alpine:3.22@sha256:49340b34…`),
+   pulled from Docker Hub over HTTPS, each part checked against its digest —
+   3.5 MB, once, into `$XDG_DATA_HOME/atelier/sandbox/image`
+   (`~/.local/share/…`). That download is the only thing the sandbox ever
+   fetches by itself. It happens only with the sandbox enabled and no root
+   of yours configured; it is said in the result of the command that
+   caused it (`atelier: sandbox: … fetching the image … from its registry,
+   once, into …`), and `atelier sandbox status` says beforehand that it
+   will. `atelier sandbox fetch` does it at a moment you choose. Without a
+   network the command fails saying so, nothing runs on the host instead,
+   and the next command tries again.
+
+   That image is busybox and `apk`, nothing else. **Add the tools your
+   projects use** with the two switches that exist for this and only for
+   this — `--rw-root`, which keeps what the command changes in the root,
+   and `--net`, the host's network:
+
+   ```sh
+   atelier sandbox run --net --rw-root -- apk add git make python3 ripgrep
+   ```
+
+   What it installs goes to a layer of its own on disk
+   (`…/sandbox/image/layers/<image>`) and is there for every guest from
+   then on, in every project. One such command at a time (a second is told
+   so); other guests go on reading the layer meanwhile. The files are yours
+   on the host, where nobody can hand them to root: atelier shows them to
+   the guest as root's, and takes a `chown` the host refuses as done — so
+   `apk add` succeeds rather than installing everything and exiting with an
+   error per file. (Git with make is 25 MB; adding Python, Node, gcc and
+   Rust comes to about 950 MB.)
+
+   **A root of your own** is used instead if you name one: a directory
+   holding a Linux userland, in `ATELIER_SANDBOX_ROOT` or `[sandbox] root`
+   of the *user-global* `atelier.toml` — or one unpacked at
+   `$XDG_DATA_HOME/atelier/sandbox/rootfs`. Then nothing is downloaded, and
+   a root you named that is not there is an error, not a reason to fetch
+   one:
 
    ```sh
    root=~/.local/share/atelier/sandbox/rootfs
@@ -38,19 +72,10 @@ and [what nixvm needs next](#what-nixvm-needs-next) for where this is going.
      | tar xz -C "$root"
    ```
 
-   That is busybox and `apk`, nothing else. Add the tools your projects use
-   by running `apk` in the guest, with the two switches that exist for this
-   and only for this — the root mounted read-write, and the host's network:
-
-   ```sh
-   atelier sandbox run --net --rw-root -- apk add git make python3 ripgrep
-   ```
-
-   (`apk` complains that it cannot set ownership — the files belong to you,
-   not to root — and installs anyway. Git with make is 25 MB; adding
-   Python, Node, gcc and Rust brings the root to about 950 MB.) Use the
-   image's architecture that matches the machine: only then can nixvm use
-   hardware virtualization.
+   With a directory, `--rw-root` writes into the directory itself, and
+   `apk` complains that it cannot set ownership (and exits with an error)
+   while installing all the same. Use the architecture that matches the
+   machine: only then can nixvm use hardware virtualization.
 
 3. **Enable it**, per project or for yourself:
 
@@ -69,9 +94,10 @@ and [what nixvm needs next](#what-nixvm-needs-next) for where this is going.
    The same goes for `network` ([below](#the-network)).
 
 `atelier sandbox status` says what will happen in the current directory —
-whether it is on, which root, which CPU backend, what is read-only, which
-hosts can be reached — and `atelier sandbox run -- <command>` runs one
-command the way the tool would.
+whether it is on and what then runs in it, which root (and whether it is
+still to be fetched), which CPU backend, what is read-only, which hosts can
+be reached — and `atelier sandbox run -- <command>` runs one command the way
+the tool would (with your terminal's input as its stdin).
 
 ## What changes for `bash`
 
@@ -170,9 +196,10 @@ there](hooks.md#how-a-hook-answers). What differs:
   never run on the host instead. A hook that guards something (`exit 2`)
   therefore guards nothing until the sandbox works or is switched off;
   `bash` refuses its commands in that state too.
-- The event's JSON travels in the guest's command line. Past 96 KiB (a
-  `write` of a large file) it goes through a file at the top of the
-  project, `.atelier-sandbox-input-<pid>-<n>`, removed when the hook ends.
+- The event's JSON is the hook's stdin and the `ATELIER_*` variables its
+  environment, as on the host: handed to the process that runs the guest,
+  not written into a command line or a file. Nothing is created in the
+  project for a hook to run.
 
 Project hooks still need [the project trusted](trust.md) before they run at
 all; the sandbox adds to that, it replaces none of it. `/hooks` says where
@@ -209,16 +236,14 @@ once the image has cargo (`apk add cargo`), and none before.
 
 **MCP servers.** A stdio server is a long-lived process that atelier talks
 to over its stdin and stdout, usually an `npx` or `uvx` package that calls a
-service with a token from your environment. In the guest it would have no
-stdin (a guest's is empty: tried, a line written to `atelier sandbox run`
-does not arrive), none of your environment, an empty home, no network
-beyond the allowlist, and no `node` unless the image has one — and a fresh
-guest per command, where a server needs one for the session. Servers are
+service with a token from your environment. In the guest it would have none of your environment, an empty home, no
+network beyond the allowlist, and no `node` unless the image has one — and
+a fresh guest per command, where a server needs one for the session. Servers are
 not the project's content either: `[[mcp]]` names a command, which
 [trust](trust.md) gates, and `atelier.toml` is read-only in the guest, so a
-sandboxed command cannot add or change one. *It would take:* a guest stdin
-and environment (nixvm's "run this command" API, [below](#what-nixvm-needs-next)),
-a guest that lives as long as the session, and a per-server network list —
+sandboxed command cannot add or change one. *It would take:* a guest that lives as long as the session, with the
+server's stdin and stdout streamed (a guest now has a stdin and an
+environment, which hooks use), and a per-server network list —
 and would be worth it for a server the project ships in its own tree (`command
 = "./tools/server.py"`), which today runs on the host with the project's
 code. That case is not covered: trust such a project knowing it.
@@ -252,7 +277,7 @@ itself are claude's, on the host, under its own rules.
 
 | Guest path | What it is |
 |---|---|
-| `/` | the root filesystem, read-only, under a writable layer in memory |
+| `/` | the root filesystem — the fetched image with the packages you installed over it, or your directory — read-only, under a writable layer in memory |
 | the project's own absolute path | the project, read-write; the working directory |
 | where the project's `.git` file points | in a linked worktree or a submodule: the git directory, and only that ([below](#linked-worktrees-and-submodules)) |
 | `tool-output/` and `worktrees/` of the project's [state directory](sessions.md#where-atelier-keeps-a-projects-state), at their own absolute paths | **read-only**, when they exist: the output of tools that was too long for the conversation, which results name by path, and the worktrees of the project's [isolated subagents](agents.md#worktree-isolation), which a subagent's report names in the command that brings its changes over. Nothing else of the state directory (the session, memory) |
@@ -335,8 +360,13 @@ read-only. The repository's `config` is readable, as an ordinary
 project's is: a token written into a remote's URL is in it.
 
 Nothing persists between commands except what was written in the project:
-the next command starts in a fresh guest (`/tmp`, installed packages and
-environment are gone).
+the next command starts in a fresh guest (`/tmp`, the environment, and
+whatever the command itself installed are gone). Packages that stay are the
+ones *you* install with `atelier sandbox run --rw-root`
+([above](#turning-it-on)). An agent's `apk add` lasts for its command, on
+purpose: the root is shared by every project, so a command that could
+change it for good could leave a `git` of its own making for the next
+project's commands to run — unasked, with that project's files and network.
 
 Each command runs in a process of its own (`atelier sandbox-exec`), killed if
 it outlives its timeout by three seconds, so a guest that wedges the emulator
@@ -456,7 +486,7 @@ unfiltered, for preparing the root filesystem by hand.
 
 ## What works in the guest, and what doesn't
 
-Measured with nixvm 0.0.7 (this is now built on 0.0.8, where the tests pass; the figures were not taken again) and Alpine 3.22
+Measured with nixvm 0.0.7 (this is now built on nixvm's master of 2026-11-18, to become 0.0.9, where the tests pass; the figures here and under [Speed](#speed) were not taken again) and Alpine 3.22
 x86-64 on KVM.
 
 | | |
@@ -517,20 +547,26 @@ for an image of the other architecture. atelier gives the guest one vCPU.
 
 ## Builds
 
-nixvm as a library has no dependencies (measured with 0.0.5); the feature adds 3.4 MB to the
-release binary (18.3 → 21.8 MB; 15.0 → 17.8 MB stripped) and about 35 s to a
-release build. The default build is unchanged: the code that touches nixvm is
-compiled only with the feature, on `cfg(unix)`.
+The feature adds 5.0 MB to the x86-64 release binary (25.2 → 30.2 MB,
+measured on the fullrust build with nixvm at 7761ff8). A build without it
+is unchanged: the code that touches nixvm is compiled only with the
+feature, on Unix and on fullrust.
 
-**fullrust.** nixvm builds for `x86_64-unknown-linux-fullrust` and boots
-Alpine there from an image unpacked into memory — but its host-directory
-filesystem (`fs::Passthrough`) is `#[cfg(unix)]` and calls libc's `openat`,
-`readdir` and friends through `extern "C"`, and KVM is gated on
-`target_os = "linux"`. fullrust is neither `unix` nor `linux` and has no
-libc, so in a fullrust build there is no way to mount the project, and no
-hardware virtualization. `--features sandbox` still compiles there, and
-`atelier sandbox status` says the sandbox is unavailable in this build. This
-is the first thing to fix for the sandbox to ship in the release binaries.
+What it links: nixvm, and through nixvm's `images` feature — the registry
+client and the squashfs reader the fetched root needs — `fstool` (with
+`uuid` and `getrandom` 0.4 behind it), `compcol` 0.7 and `intl` 0.6, with
+`rsurl` and `purecrypto` 0.10, which atelier links anyway. All Rust, none
+needing a libc. nixvm asks for `rsurl` 0.1.22, which is also atelier's own
+HTTP client (it was 0.1.12).
+
+**fullrust.** The x86-64 release binary is built for
+`x86_64-unknown-linux-fullrust`, which has no libc. Since nixvm makes
+Linux's system calls itself there (host directories, KVM, sockets), the
+sandbox is in that binary: built with the fullrust 1.99 toolchain, it ran
+guests on KVM and passes the sandbox's tests, the live ones included. The
+arm64 release binary (musl) is built without the feature: it compiles
+there, but nixvm has no hardware virtualization on arm64 Linux yet and it
+was not run.
 
 ## What is not done
 
@@ -546,28 +582,35 @@ is the first thing to fix for the sandbox to ship in the release binaries.
 - **Typing to a command in the guest.** On the host a foreground command
   runs on a terminal you can be handed
   ([A command you can type to](tools.md#a-command-you-can-type-to)); in the
-  guest it has neither a terminal nor a stdin, through the helper process
-  that runs it. A command that stops at a prompt there is reported to the
+  guest a `bash` command has no terminal and an empty stdin. A command that stops at a prompt there is reported to the
   model as having asked for input, and `interactive: true` as not honoured;
   `"sandbox": false` runs it on the host, with approval.
 - **MCP servers, language servers and the Claude backend run on the host**,
   as do your own hooks ([what runs where](#what-runs-where)). Of these,
   language servers and an MCP server that lives in the project's tree run
-  the project's code there. Running them in a guest needs a stdin, an
-  environment and a guest that outlives one command.
+  the project's code there. Running them in a guest needs a guest that
+  outlives one command.
 - **The `node` tool's `fs` is not held to the guest's read-only paths**
   (`.git/hooks`, `.git/config`, `atelier.toml`): it writes them on the
   host, unasked, sandbox or not.
 - **A hook that must run on the host cannot be a project hook** while the
   sandbox is on: there is no per-hook switch, only your own file.
-- **`atelier sandbox status` does not list** where hooks and checkers run;
-  `/hooks` does for hooks.
+- **Packages an agent installs do not stay**, and there is one layer of
+  yours for all projects, not one per project
+  ([what the guest sees](#what-the-guest-sees)). A guest started while
+  `--rw-root` is installing reads a layer that is changing under it.
+- **The fetched image is Alpine for this machine's architecture, from
+  Docker Hub**: no mirror is tried when Docker Hub refuses (its anonymous
+  rate limit), no proxy setting, no other distribution. A root of your own
+  is the way round each.
+- **The layer does not record ownership**: everything in it is root's to
+  the guest, including files a package meant for a service account.
 
 ## What nixvm needs next
 
 In the order that unblocks atelier, with what atelier does once each lands.
 
-1. **A host-directory filesystem without libc, and KVM on fullrust.**
+1. *(Done in nixvm's master, nixvm #13: the release binary has the sandbox.)* **A host-directory filesystem without libc, and KVM on fullrust.**
    `fs::Passthrough` on raw system calls (or on `std::os::fd` where std
    suffices) and gated on something fullrust satisfies; the same for
    `vcpu::kvm`'s `target_os = "linux"` and `kernel::egress`'s `setsockopt`.
@@ -586,7 +629,7 @@ In the order that unblocks atelier, with what atelier does once each lands.
    open them non-blocking; and enforce `Limits::wall_time` from outside the
    thread that may be stuck. *Then:* atelier could drop the kill-the-helper
    fallback (it will keep the helper process for the reasons below).
-5. **An embedding API for "run this command"**, so atelier stops assembling
+5. *(Done in nixvm's master, nixvm #14: atelier's guest is `Sandbox::execute`. Left over: the builder takes a root that is a directory, a squashfs or an image name, not a filesystem of the embedder's — atelier mounts its own at `/` over the empty one, which works because the later of two mounts at one path wins.)* **An embedding API for "run this command"**, so atelier stops assembling
    the guest from `Kernel`, `MountTable`, `loader` and `vcpu` by hand (about
    80 lines that track nixvm's internals, hence the exact version pin):
    `SandboxBuilder` with the working directory, binds at arbitrary guest
@@ -606,7 +649,7 @@ In the order that unblocks atelier, with what atelier does once each lands.
    environment variables change a library's behaviour from outside
    (atelier clears the helper's environment). *Then:* the pin becomes a
    normal version requirement.
-6. **Read-only paths inside a writable host directory**, including single
+6. *(Done in nixvm's master, nixvm #15: atelier's path filter is gone; `Passthrough::protect` keeps them.)* **Read-only paths inside a writable host directory**, including single
    files, that survive a rename of a parent. Mounts are matched by path, so
    a read-only mount at `.git/hooks` is defeated by `mv .git g` (tested);
    atelier wraps `Passthrough` in a filter of its own instead. A
@@ -631,7 +674,7 @@ In the order that unblocks atelier, with what atelier does once each lands.
      answers "Network unreachable" and reports the refusal out of band.
 
    *Then:* an allowlist exact by name rather than by address.
-8. **A released root image and a fetch that needs no C**: today the image is
+8. *(Done in nixvm's master, nixvm #16: `image::pull` and `Overlay::persistent`. Left over: a persistent layer in a directory of a user who is not root cannot record ownership — atelier papers over it, see [turning it on](#turning-it-on) — and the layer has one writer and no way to be read safely while written.)* **A released root image and a fetch that needs no C**: today the image is
    the user's to download and unpack. A pinned, digest-verified Alpine (plus
    a "dev" variant with git, make, a C compiler) that nixvm or atelier can
    fetch with a pure-Rust client and read without unpacking (squashfs is

@@ -120,7 +120,7 @@ record a decision outside both files.
 | `ATELIER_SEARCH_URL`      | *(unset)*                        | `web_search` tool | Base URL of the SearXNG instance (required for `searxng`); for the other providers, replaces their endpoint. Overrides `[search] url` |
 | `ATELIER_SEARCH_KEY`      | *(unset)*                        | `web_search` tool | API key for `brave` or `tavily`. Overrides the variable named by `[search] key_env` |
 | `ATELIER_SANDBOX`         | *(unset)*                        | `sandbox::state` | `1`/`true`/`on` runs `bash` commands in the [sandbox](sandbox.md), `0`/`false`/`off` does not, whatever `[sandbox] enabled` says. Needs a build with the `sandbox` feature |
-| `ATELIER_SANDBOX_ROOT`    | `$XDG_DATA_HOME/atelier/sandbox/rootfs` | `sandbox::state` | The sandbox guest's root filesystem (a directory holding a Linux userland). Overrides the user-global `[sandbox] root` |
+| `ATELIER_SANDBOX_ROOT`    | `$XDG_DATA_HOME/atelier/sandbox/rootfs` if there is one, else the [image atelier fetches](sandbox.md#turning-it-on) | `sandbox::state` | The sandbox guest's root filesystem (a directory holding a Linux userland). Overrides the user-global `[sandbox] root` |
 | `ATELIER_SANDBOX_INTERP`  | *(unset)*                        | `sandbox::state` | `1` runs the guest on nixvm's software CPU even where hardware virtualization is available |
 | `ATELIER_TEXT_TOOL_CALLS` | *(unset)*                        | `provider::dialect` | `0`, `off`, `no` or `false` stops atelier from recovering [tool calls a model writes as text](#tool-calls-written-as-text); the answer is then left as the model sent it |
 | `ATELIER_TRACE`           | *(unset)*                        | `provider` | File path to append a JSONL trace to, one line per model request (messages, tool calls, usage), for debugging |
@@ -880,7 +880,7 @@ network = ["crates.io", "*.crates.io"]
 | Field       | Type    | Meaning |
 |-------------|---------|---------|
 | `enabled`   | bool    | Route foreground `bash` commands through the sandbox. The project's file wins over the user-global one — once the project is [trusted](trust.md), not before; `ATELIER_SANDBOX` wins over both |
-| `root`      | string  | The guest's root filesystem. **User-global file only** — in a project's `atelier.toml` it is ignored, since it decides what of the host the guest can read. Default `$XDG_DATA_HOME/atelier/sandbox/rootfs`; `ATELIER_SANDBOX_ROOT` wins |
+| `root`      | string  | The guest's root filesystem. **User-global file only** — in a project's `atelier.toml` it is ignored, since it decides what of the host the guest can read. Default `$XDG_DATA_HOME/atelier/sandbox/rootfs` if there is one, else the [image atelier fetches](sandbox.md#turning-it-on); `ATELIER_SANDBOX_ROOT` wins |
 | `memory_mb` | integer | Guest RAM ceiling in MiB (default 4096) |
 | `network`   | array   | The hosts the guest may reach, over TCP; none when empty. An entry is a name (`crates.io`), `*.` and a name for everything under it (`*.crates.io`, which does not cover `crates.io`), or an IP address. The user-global list and the project's add up — the project's once the project is [trusted](trust.md), not before. What it holds against and what it does not: [the network](sandbox.md#the-network) |
 
