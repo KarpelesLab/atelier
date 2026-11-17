@@ -391,6 +391,15 @@ A daemon that connects every atelier running on the machine
 - ✅ **Surfaces**: `peers`/`peer_send` tools, `/peers`, `/send`,
   `/subscribe`; peers' messages are shown and reach the model mid-turn or
   with the next prompt, marked as another agent's.
+- ✅ **One session per directory**: an owning start claims its directory
+  with the daemon, on a connection of its own; the claim ends with the
+  connection, and nothing is written in the project for it. A start that
+  finds the directory held offers three things: remote control of the
+  running session (`--attach`), take over (`--take-over`, which stops the
+  owner and its tasks), or cancel. With the coordinator off there is no
+  detection. Open: `acp` does not claim a second `session/new` in another
+  directory; a take-over across a daemon restart has no process-level
+  test; the delay the claim adds to a start is not measured.
 - ⏳ Continued in M18 (subagents ride the coordinator): waking an idle
   instance on a message, `call` handlers that reach the agent, advisory
   locks. Also open: a non-Unix transport.
