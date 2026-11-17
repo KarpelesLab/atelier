@@ -40,6 +40,9 @@ use crate::update::{VERSION, parse_version};
 const IDLE: Duration = Duration::from_secs(60);
 /// How long a starting daemon waits for a dying one to release the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
+/// How often the accept loop looks for a connection, and at whether to stop.
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
 /// Housekeeping period: call deadlines, idleness.
 const TICK: Duration = Duration::from_millis(250);
 /// How often the executable is checked for replacement.
@@ -379,11 +382,24 @@ pub fn run(cfg: Config) -> Result<()> {
     std::thread::spawn(move || ticker.housekeeping(idle, watch));
 
     let mut next_conn = 0u64;
-    for stream in listener.incoming() {
+    // Looked at between connections rather than woken by one: a daemon whose
+    // socket file is gone (its directory removed) cannot be connected to,
+    // and would otherwise wait here for good.
+    let _ = listener.set_nonblocking(true);
+    loop {
         if daemon.lock().stopping.is_some() {
             break;
         }
-        let Ok(stream) = stream else { continue };
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        // Where a connection takes after its listener.
+        let _ = stream.set_nonblocking(false);
         next_conn += 1;
         let (d, conn) = (Arc::clone(&daemon), next_conn);
         std::thread::spawn(move || d.serve(conn, stream));
@@ -427,8 +443,6 @@ impl Daemon {
             }
             st.stopping = Some(reason.to_string());
         }
-        // The accept loop only looks at the flag when a connection arrives.
-        let _ = super::connect(&self.dir);
     }
 
     fn housekeeping(&self, idle: Duration, mut watch: Option<ExeWatch>) {
@@ -459,6 +473,9 @@ impl Daemon {
             drop(st);
             if idle_out {
                 return self.stop("idle");
+            }
+            if !super::socket_path(&self.dir).exists() {
+                return self.stop("its socket is gone");
             }
             if last_exe_check.elapsed() >= EXE_CHECK {
                 last_exe_check = now;
