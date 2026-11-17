@@ -272,6 +272,10 @@ pub struct ProviderConfig {
     /// Connect timeout in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// The context window of the models served here, in tokens, for the
+    /// compaction threshold to follow (see `agent::limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 /// `[models]`: a model per role, each `provider/model` or a bare model name
@@ -735,6 +739,7 @@ base_url = "http://127.0.0.1:1/v1"
 api_key_env = "LOCAL_KEY"
 headers = { "X-Org" = "abc" }
 timeout_secs = 60
+context_window = 32768
 
 [[provider]]
 name = "hosted"
@@ -764,6 +769,8 @@ cached = 0.3
             assert_eq!(local.api_key_env.as_deref(), Some("LOCAL_KEY"));
             assert_eq!(local.headers["X-Org"], "abc");
             assert_eq!(local.timeout_secs, Some(60));
+            assert_eq!(local.context_window, Some(32768));
+            assert_eq!(hosted.context_window, None);
             assert_eq!(hosted.api_key_command.as_deref(), Some("pass show llm"));
             assert_eq!(s.models.main.as_deref(), Some("local/qwen3-coder:30b#high"));
             assert!(s.models.summary.is_none());

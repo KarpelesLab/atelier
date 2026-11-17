@@ -1504,7 +1504,9 @@ fn a_setting_is_written_applied_and_read_back() {
     let hello = client.ok("initialize", json!({}));
     assert_eq!(hello["session"]["model"], "next-model");
     let status = client.ok("session/status", json!({}));
-    assert_eq!(status["context_limit"], 8000);
+    // Unset again, the threshold is the default for a model whose context
+    // window nobody stated.
+    assert_eq!(status["context_limit"], 24000);
     drop(client);
 
     // Where something stronger decides, the value is written and the

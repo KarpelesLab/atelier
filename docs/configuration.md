@@ -40,7 +40,7 @@ other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
 | `ATELIER_API_KEY`         | *(unset)*                        | `Config::from_env` | Bearer token of the `env` provider; sent to it as `Authorization: Bearer <key>` when set to a non-empty value |
 | `ATELIER_APPROVE`         | *(unset)*                        | `agent::Session::new` | `all`, `yes`, or `1` disables every approval prompt for the session: the `yolo` [mode](permissions.md#modes). Meant for headless/CI runs — `--print` asks nobody, so without it (or an allow rule) a call that needs approval is denied |
 | `ATELIER_MODE`            | *(unset)*                        | `main`, `permissions::Mode::from_env` | The permission [mode](permissions.md#modes) to start in: `plan`, `ask-edits`, `auto-edit` (the default) or `yolo`. Overridden by `--mode`; overrides `ATELIER_APPROVE` and `[defaults] mode`. Any other value is an error |
-| `ATELIER_CONTEXT_LIMIT`   | `8000`                           | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. Must be a positive integer or the default is used — see [Sessions](sessions.md) |
+| `ATELIER_CONTEXT_LIMIT`   | *(unset)*                        | `agent::Session::new` | Token threshold (last request's total tokens) past which older history is compacted into a summary. A positive integer; anything else is ignored. Unset, the threshold follows the model's context window — 80% of it where atelier knows it, else 24,000 — see [Sessions](sessions.md#compaction) |
 | `ATELIER_PARALLEL_TOOLS`  | *(unset)*                        | `agent::batch` | `0`, `off`, `no` or `false` runs the read-only tool calls of one model step one after the other instead of [at the same time](tools.md#read-only-calls-run-in-parallel); any other value turns that on. Overrides `[defaults] parallel_tools` |
 | `ATELIER_REVIEW`          | *(unset)*                        | `agent::Session::new` | `on`, `yes`, `1`, or `true` turns on the parallel "subconscious" reviewer for the session, overriding `[review].enabled` — see [Review mode](review.md) |
 | `ATELIER_TRUST_PROJECT`   | *(unset)*                        | `trust::Store::from_env` | `1` accepts the [gated settings](trust.md) of the project's `atelier.toml` (MCP servers, checkers, providers, allow rules, a `yolo` default, hooks) for this run without recording anything — for headless runs (`--print`), which never ask and otherwise skip them. Only for checkouts you control |
@@ -209,7 +209,7 @@ model = "qwen3-coder:30b"   # overridden by ATELIER_MODEL, and by [models] main
 provider = "local"          # the provider a bare model name is on (default: env)
 approve = false             # overridden by ATELIER_APPROVE
 mode = "auto-edit"          # overridden by ATELIER_MODE and --mode
-context_limit = 8000        # overridden by ATELIER_CONTEXT_LIMIT
+context_limit = 60000       # overridden by ATELIER_CONTEXT_LIMIT
 mcp_tool_budget = 8192      # no environment variable
 parallel_tools = true       # overridden by ATELIER_PARALLEL_TOOLS
 ```
@@ -261,6 +261,7 @@ base_url = "https://api.example.com/v1"
 api_key_env = "HOSTED_API_KEY"        # the key is in this environment variable
 headers = { "X-Org" = "abc" }         # optional, sent with every request
 timeout_secs = 20                     # optional connect timeout
+context_window = 131072               # optional: tokens its models take
 
 [[provider]]
 name = "work"
@@ -276,6 +277,7 @@ api_key_command = "pass show work/llm"   # or: the key is this command's output
 | `api_key_command` | string  | Shell command (`sh -c`, run in the project directory) whose standard output, trimmed, is the bearer token. It runs at the first request and the result is kept for the rest of the process; when the endpoint answers 401 it is run again and the request retried once — so a helper that mints short-lived tokens just works. Its standard error is discarded |
 | `headers`         | table   | Extra request headers |
 | `timeout_secs`    | integer | Connect timeout (default 60 s for a completion, 15 s for `/models`); `ATELIER_HTTP_TIMEOUT_MS` wins |
+| `context_window`  | integer | The context window of the models served here, in tokens — what a local server was started with (`llama-server -c 32768`). The [compaction threshold](sessions.md#compaction) is 80% of it unless `context_limit` sets one. Unset, atelier goes by what the endpoint says (`GET /models`, or a refusal), else by a default |
 
 Set at most one of `api_key_env` and `api_key_command`; with neither, no
 `Authorization` header is sent. **The key itself never goes in

@@ -151,14 +151,16 @@ impl Session {
             }
             return lines;
         }
-        report(
+        let mut lines = report(
             &self.standing,
             self.summary.as_deref(),
             &self.tools.specs(),
             &self.history,
-            self.compact_threshold as usize,
+            self.compact_threshold() as usize,
             self.usage_ctx,
-        )
+        );
+        lines.push(self.threshold_note());
+        lines
     }
 }
 

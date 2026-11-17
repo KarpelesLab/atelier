@@ -27,6 +27,7 @@ mod goal;
 mod idle;
 mod init;
 mod jobs;
+mod limit;
 mod loops;
 mod prompt;
 mod query;
@@ -86,11 +87,6 @@ const CONTEXT_TOKEN_BUDGET: usize = 2_000;
 /// Title of the context item that states the permission mode to the model
 /// (see [`Mode::note`]).
 const MODE_NOTE: &str = "permission mode";
-
-/// Default context-size threshold (last request's total tokens) past which the
-/// conversation is compacted (see [`compact`]). Override with
-/// `ATELIER_CONTEXT_LIMIT`.
-pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 8_000;
 
 /// OpenAI API base for the Sign-in-with-ChatGPT (Responses API) backend.
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
@@ -970,8 +966,12 @@ pub struct Session {
     standing: Vec<ContextItem>,
     /// Rolling summary of older turns that have been compacted out of `history`.
     summary: Option<String>,
-    /// Compact when the last request's total tokens exceed this.
-    compact_threshold: u32,
+    /// The compaction threshold the user set (`ATELIER_CONTEXT_LIMIT`,
+    /// `[defaults] context_limit`, `/config`); unset, it follows the model's
+    /// context window (see [`limit`]).
+    context_limit: Option<u32>,
+    /// What the session learned about that window.
+    learned: limit::Learned,
     /// Whether the parallel "subconscious" reviewer runs.
     review_enabled: bool,
     /// Pending background reviews; drained (non-blocking) between steps.
@@ -1053,12 +1053,11 @@ impl Session {
         // env wins; else the project's [defaults] — which get to choose
         // `yolo` only in a trusted project; else the built-in default.
         let mode = Mode::configured(&trust.effective(&settings).defaults);
-        let compact_threshold = std::env::var("ATELIER_CONTEXT_LIMIT")
+        let context_limit = std::env::var("ATELIER_CONTEXT_LIMIT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&n| n > 0)
-            .or(settings.defaults.context_limit.filter(|&n| n > 0))
-            .unwrap_or(DEFAULT_CONTEXT_LIMIT);
+            .or(settings.defaults.context_limit.filter(|&n| n > 0));
         let review_enabled = match std::env::var("ATELIER_REVIEW") {
             Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
             Err(_) => settings.review.enabled,
@@ -1100,7 +1099,8 @@ impl Session {
             last_ctx: HashMap::new(),
             standing: Vec::new(),
             summary: None,
-            compact_threshold,
+            context_limit,
+            learned: limit::Learned::default(),
             review_enabled,
             reviews: Vec::new(),
             chatgpt: None,
@@ -1296,8 +1296,10 @@ impl Session {
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
     }
+    /// The compaction threshold in force: what was set, else what follows
+    /// from the model's context window (see [`limit`]).
     pub fn context_limit(&self) -> u32 {
-        self.compact_threshold
+        self.compact_threshold()
     }
     pub fn review_enabled(&self) -> bool {
         self.review_enabled
@@ -1315,8 +1317,8 @@ impl Session {
     }
     #[allow(dead_code)] // used by the /config screen
     pub fn set_context_limit(&mut self, n: u32) {
-        self.compact_threshold = n.max(1);
-        self.settings.defaults.context_limit = Some(self.compact_threshold);
+        self.context_limit = Some(n.max(1));
+        self.settings.defaults.context_limit = self.context_limit;
     }
     pub fn set_review_enabled(&mut self, on: bool) {
         self.review_enabled = on;
@@ -1993,6 +1995,9 @@ impl Session {
             let mut completion = match self.request(&messages, &specs, &mut on_event) {
                 Err(e) if !overflow_retried && provider::is_context_overflow(&e) => {
                     overflow_retried = true;
+                    // The model's window is smaller than was thought: the
+                    // threshold follows (see `limit`).
+                    self.note_refusal(&e);
                     ui.notice(&format!("{e:#} — compacting and retrying"));
                     if !self.compact(compact::Trigger::Overflow, None, ui) {
                         return Err(e);

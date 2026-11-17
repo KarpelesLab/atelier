@@ -198,7 +198,7 @@ Answered at once, also in the middle of a turn.
 
 ```json
 {"model":"qwen3-coder","backend":"openai","mode":"plan","cwd":"/home/me/project",
- "usage":{"context_tokens":5210,"output_tokens":1873},"context_limit":8000,
+ "usage":{"context_tokens":5210,"output_tokens":1873},"context_limit":24000,
  "busy":true,"turn":2,"queued":0,"background":0}
 ```
 
@@ -207,7 +207,7 @@ Answered at once, also in the middle of a turn.
 | `model`, `backend`, `mode`, `cwd` | As in `initialize`, kept current (`/model`, `/mode`) |
 | `usage.context_tokens` | Context size of the latest model request |
 | `usage.output_tokens` | Output tokens generated this session |
-| `context_limit` | The context size past which the conversation is compacted |
+| `context_limit` | The context size past which the conversation is compacted: what is set, else what follows from the model's context window (see [compaction](sessions.md#compaction)) — so it can change during a session, when atelier learns the window |
 | `busy` | A turn or a command is running |
 | `turn` | The running turn's id, or `null` |
 | `queued` | Steering messages the running turn has not taken yet |
@@ -318,7 +318,7 @@ a command runs.
     "description":"Tokens in a request past which older history is compacted into a summary",
     "settable":true,"scopes":["project"],"env":"ATELIER_CONTEXT_LIMIT",
     "value":4000,"source":"project",
-    "layers":[{"source":"project","value":4000},{"source":"default","value":8000}]},
+    "layers":[{"source":"project","value":4000},{"source":"default","value":24000}]},
    {"key":"defaults.mode","type":"string","values":["plan","ask-edits","auto-edit","yolo"],
     "description":"The permission mode sessions start in; `yolo` is honoured in a trusted project only",
     "settable":false,"scopes":[],"env":"ATELIER_MODE",

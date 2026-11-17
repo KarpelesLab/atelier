@@ -1651,6 +1651,12 @@ fn raw_messages(body: &str) -> &str {
     &body[start..end]
 }
 
+/// What follows the `messages` array in a chat request body, as it was
+/// sent: the model, the request options and the tool list.
+fn after_messages(body: &str) -> &str {
+    &body[body.rfind(r#","model":"#).expect("model follows messages")..]
+}
+
 /// The parsed `messages` of a chat request body.
 fn messages(body: &str) -> Vec<serde_json::Value> {
     let request: serde_json::Value = serde_json::from_str(body).expect("request body is JSON");
@@ -1762,6 +1768,14 @@ fn each_request_is_a_prefix_of_the_next() {
             "request {} does not start with the bytes of request {n}:\n{raw_before}\n{raw_after}",
             n + 1
         );
+        // Likewise what follows the messages — the model, the options and
+        // the tool list, which a chat template may well render first.
+        assert_eq!(
+            after_messages(&pair[0]),
+            after_messages(&pair[1]),
+            "the rest of the body, request {}",
+            n + 1
+        );
     }
 
     // The context is in the user turn it was gathered for: everything with
@@ -1833,9 +1847,11 @@ fn a_request_rejected_as_too_long_is_compacted_and_retried() {
     });
     let mock = Mock::start(responder);
     let dir = unique_dir("overflow");
-    // Larger than the recent tail kept verbatim (a share of the default
-    // threshold), yet small enough that the tool result `--print` echoes on
-    // stderr fits the pipe `run_print` only reads at exit.
+    // Larger than the recent tail kept verbatim — a share of the threshold,
+    // which the refusal brings down to the 4,096 tokens it states (at the
+    // default the whole file would be tail, and nothing could be pruned) —
+    // yet small enough that the tool result `--print` echoes on stderr fits
+    // the pipe `run_print` only reads at exit.
     let big: String = (1..=400)
         .map(|i| format!("line {i} of the big file, padded out a little\n"))
         .collect();
@@ -2047,6 +2063,99 @@ fn passing_the_threshold_summarizes_older_turns_after_the_turn() {
     assert!(bodies[3].contains("second prompt") && bodies[3].contains("third prompt"));
 }
 
+/// Case 9b — with no threshold set, atelier compacts at the fallback only
+/// once the endpoint had its say: the first time a request passes it,
+/// `GET /models` is asked for the model's context window. An endpoint that
+/// gives one moves the threshold to its share of that window, and the
+/// conversation, well within it, is left alone.
+#[test]
+fn the_endpoints_window_is_asked_before_compacting_at_the_fallback() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => answer_with_usage("one", 1_000),
+        1 => answer_with_usage("two", 30_000),
+        2 => json_response(
+            r#"{"object":"list","data":[{"id":"other","context_length":4096},{"id":"mock","context_length":100000}]}"#,
+        ),
+        _ => answer_with_usage("three", 31_000),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("window-asked");
+
+    let mut repl = Repl::start(&mock.base_url(), &dir, &[]);
+    repl.line("first prompt");
+    wait_requests(&mock, 1);
+    repl.line("second prompt");
+    // The second answer passes 24,000 tokens: the endpoint is asked.
+    wait_requests(&mock, 3);
+    repl.line("third prompt");
+    wait_requests(&mock, 4);
+    repl.line("/context");
+    let (stdout, stderr) = repl.finish();
+
+    // Asked once: the third turn's answer, larger still, asks nothing.
+    assert_eq!(mock.requests(), 4, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        mock.head(2).starts_with("get /v1/models "),
+        "{}",
+        mock.head(2)
+    );
+    assert!(!stdout.contains("compacted:"), "{stdout}");
+    assert!(
+        mock.body(3).contains("first prompt"),
+        "nothing was summarized away"
+    );
+    assert!(
+        stdout.contains("share of the compaction threshold (80,000)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "compaction threshold: 80,000 — from the model's context window of 100,000 tokens \
+             (as the endpoint lists it)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Case 9c — an endpoint whose `GET /models` gives no size leaves the
+/// fallback standing, and the conversation is compacted at it.
+#[test]
+fn without_a_known_window_the_fallback_threshold_compacts() {
+    let responder: Responder = Arc::new(|n| match n {
+        0 => answer_with_usage("one", 1_000),
+        1 => answer_with_usage("two", 30_000),
+        2 => json_response(r#"{"object":"list","data":[{"id":"mock","owned_by":"library"}]}"#),
+        3 => answer_response("FALLBACK-NOTES-7c"),
+        _ => answer_response("three"),
+    });
+    let mock = Mock::start(responder);
+    let dir = unique_dir("window-unknown");
+
+    let mut repl = Repl::start(&mock.base_url(), &dir, &[]);
+    // A first turn larger than the recent tail kept verbatim (two fifths of
+    // the threshold): some 15,000 tokens.
+    repl.line(&format!("first prompt {}", "pad ".repeat(15_000)));
+    wait_requests(&mock, 1);
+    repl.line("second prompt");
+    // The answer, the question to the endpoint, the summary request.
+    wait_requests(&mock, 4);
+    repl.line("third prompt");
+    let bodies = wait_requests(&mock, 5);
+    let (stdout, stderr) = repl.finish();
+
+    assert_eq!(bodies.len(), 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        mock.head(2).starts_with("get /v1/models "),
+        "{}",
+        mock.head(2)
+    );
+    assert!(
+        stdout.contains("compacted: summarized 2 earlier message(s)"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(system_message(&bodies[4]).ends_with("FALLBACK-NOTES-7c"));
+}
+
 /// Case 10 — `/context` accounts for the window: before any turn only the
 /// fixed parts, afterwards also the standing instructions, the turn's
 /// context block by item, the conversation by role, and the endpoint's own
@@ -2073,8 +2182,13 @@ fn context_command_shows_where_the_window_goes() {
     assert_eq!(reports.len(), 2, "stdout: {stdout}\nstderr: {stderr}");
     let (before, after) = (reports[0], reports[1]);
 
+    // Nothing sets a threshold and the mock says nothing of its window.
     assert!(
-        before.contains("share of the compaction threshold (8,000)"),
+        before.contains("share of the compaction threshold (24,000)"),
+        "{before}"
+    );
+    assert!(
+        before.contains("compaction threshold: 24,000 — the default while"),
         "{before}"
     );
     assert!(before.contains("  system prompt "), "{before}");

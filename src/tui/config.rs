@@ -261,12 +261,16 @@ fn handle_key(state: &mut State, k: Key) -> bool {
     false
 }
 
-/// Apply the edited values back onto the session (unconditionally — the setters
-/// are cheap and idempotent).
+/// Apply the edited values back onto the session (the setters are cheap and
+/// idempotent; the context limit alone is only set when it was changed).
 fn apply(session: &mut Session, state: &State) {
     session.set_default_model(&state.model);
     session.set_auto_approve(state.auto_approve);
-    session.set_context_limit(state.context_limit);
+    // Unchanged, the threshold stays what follows from the model's context
+    // window rather than becoming a setting.
+    if state.context_limit != session.context_limit() {
+        session.set_context_limit(state.context_limit);
+    }
     session.set_review_enabled(state.review);
 }
 

@@ -407,6 +407,51 @@ impl HttpError {
     }
 }
 
+/// The wordings after which a refusal gives the window's size ("maximum
+/// context length is 8192 tokens", "the available context size (8192
+/// tokens)", "exceed context window of 8192"), matched in lowercase.
+const WINDOW_PHRASES: &[&str] = &[
+    "maximum context",
+    "context length",
+    "context size",
+    "context window",
+];
+
+/// How far after such a wording the figure may be (" length is ", " of ").
+const WINDOW_FIGURE_WITHIN: usize = 16;
+
+/// The smallest figure taken for a context window: anything below is some
+/// other number the message happened to hold.
+const MIN_STATED_WINDOW: u32 = 1_000;
+
+impl HttpError {
+    /// The size of the model's context window, in tokens, where a refusal
+    /// for overflowing it ([`is_context_overflow`](Self::is_context_overflow))
+    /// says it: the number that closely follows the first of
+    /// [`WINDOW_PHRASES`]. `None` for any other error, and for a refusal
+    /// that gives no figure.
+    pub fn stated_window(&self) -> Option<u32> {
+        if !self.is_context_overflow() {
+            return None;
+        }
+        let text = self.body.to_lowercase();
+        let (at, phrase) = WINDOW_PHRASES
+            .iter()
+            .filter_map(|p| text.find(p).map(|at| (at, p)))
+            .min_by_key(|&(at, _)| at)?;
+        let after = &text[at + phrase.len()..];
+        let start = after.find(|c: char| c.is_ascii_digit())?;
+        if start > WINDOW_FIGURE_WITHIN {
+            return None;
+        }
+        let digits: String = after[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok().filter(|&n| n >= MIN_STATED_WINDOW)
+    }
+}
+
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "provider returned HTTP {}", self.status)?;
@@ -426,6 +471,13 @@ impl std::error::Error for HttpError {}
 pub fn is_context_overflow(err: &anyhow::Error) -> bool {
     err.downcast_ref::<HttpError>()
         .is_some_and(HttpError::is_context_overflow)
+}
+
+/// The context window a refusal states, if `err` is one that does (see
+/// [`HttpError::stated_window`]).
+pub fn stated_window(err: &anyhow::Error) -> Option<u32> {
+    err.downcast_ref::<HttpError>()
+        .and_then(HttpError::stated_window)
 }
 
 /// An incremental piece of a streamed response.
@@ -935,6 +987,46 @@ pub fn list_models(provider: &Provider) -> Result<Vec<String>> {
 /// [`list_models`] with the connect timeout given by the caller, for
 /// `atelier doctor`, which is not prepared to wait as long.
 pub fn list_models_within(provider: &Provider, timeout: Duration) -> Result<Vec<String>> {
+    let list = fetch_models(provider, timeout)?;
+    Ok(list.data.into_iter().map(|m| m.id).collect())
+}
+
+/// The fields of a `GET /models` entry that give the size of the context
+/// window the server accepts for the model, in tokens: OpenRouter's and
+/// others' `context_length`, Groq's `context_window`, vLLM's
+/// `max_model_len`, and the spellings a few more use. Not llama.cpp's
+/// `meta.n_ctx_train`: that is what the model was trained with, not what
+/// the server was started with.
+const WINDOW_FIELDS: &[&str] = &[
+    "context_length",
+    "context_window",
+    "max_model_len",
+    "max_context_length",
+    "max_input_tokens",
+];
+
+/// The context window the endpoint's `GET /models` gives for the target's
+/// model, where it gives one (see [`WINDOW_FIELDS`]). Many servers don't —
+/// OpenAI's and Ollama's list only names — and `None` is also the answer
+/// when the endpoint can't be asked: this is a hint, never an error.
+pub fn advertised_window(target: &Target) -> Option<u32> {
+    let timeout = connect_timeout(&target.provider, DEFAULT_LIST_MODELS_TIMEOUT_MS);
+    let list = fetch_models(&target.provider, timeout).ok()?;
+    let entry = list.data.iter().find(|m| m.id == target.model)?;
+    entry_window(&entry.rest)
+}
+
+/// See [`advertised_window`].
+fn entry_window(entry: &serde_json::Map<String, Value>) -> Option<u32> {
+    WINDOW_FIELDS
+        .iter()
+        .find_map(|field| entry.get(*field)?.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0)
+}
+
+/// `GET /models`, parsed (see [`list_models`]).
+fn fetch_models(provider: &Provider, timeout: Duration) -> Result<ModelList> {
     let url = provider.endpoint("models");
     let key = provider.key()?;
     let mut attempt: u32 = 0;
@@ -961,8 +1053,7 @@ pub fn list_models_within(provider: &Provider, timeout: Duration) -> Result<Vec<
     if !(200..300).contains(&resp.status) {
         bail!("provider returned HTTP {}", resp.status);
     }
-    let list: ModelList = serde_json::from_slice(&resp.body).context("parsing models")?;
-    Ok(list.data.into_iter().map(|m| m.id).collect())
+    serde_json::from_slice(&resp.body).context("parsing models")
 }
 
 #[derive(Deserialize)]
@@ -974,6 +1065,9 @@ struct ModelList {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+    /// What else the server says about the model.
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
 }
 
 #[cfg(test)]
@@ -1276,6 +1370,81 @@ mod tests {
         assert!(!is_context_overflow(&anyhow::anyhow!(
             "context length exceeded"
         )));
+    }
+
+    /// A refusal that says how large the window is gives that figure; one
+    /// that doesn't, or an error of another kind, gives none.
+    #[test]
+    fn a_refusal_states_the_window_where_it_gives_a_figure() {
+        let stated = |status: u16, message: &str| {
+            let body = json!({"error": {"message": message}}).to_string();
+            let err: anyhow::Error = HttpError::read(status, body.as_bytes()).into();
+            stated_window(&err)
+        };
+        for (message, window) in [
+            (
+                "This model's maximum context length is 8192 tokens. However, your messages \
+                 resulted in 9000 tokens.",
+                Some(8192),
+            ),
+            (
+                "request (9000 tokens) exceeds the available context size (32768 tokens), try \
+                 increasing it",
+                Some(32768),
+            ),
+            (
+                "Requested tokens (9000) exceed context window of 4096",
+                Some(4096),
+            ),
+            // No figure, or none that follows the wording closely.
+            (
+                "the request exceeds the available context size, try increasing it",
+                None,
+            ),
+            (
+                "context length exceeded; this deployment was created on 20260101",
+                None,
+            ),
+            // Too small to be a window.
+            ("context window of 4 slots is full", None),
+        ] {
+            assert_eq!(stated(400, message), window, "{message}");
+        }
+        // Not a refusal for length: whatever it says is not about the window.
+        assert_eq!(stated(500, "maximum context length is 8192 tokens"), None);
+        assert_eq!(
+            stated_window(&anyhow::anyhow!("context length is 8192")),
+            None
+        );
+    }
+
+    /// The window is read from the `GET /models` entry's own fields, in the
+    /// spellings servers use; the size a model was trained with is not it.
+    #[test]
+    fn the_models_entry_gives_the_window_in_several_spellings() {
+        let window = |entry: Value| {
+            let entry: ModelEntry = serde_json::from_value(entry).unwrap();
+            entry_window(&entry.rest)
+        };
+        assert_eq!(
+            window(json!({"id": "m", "context_length": 131072})),
+            Some(131072)
+        );
+        assert_eq!(
+            window(json!({"id": "m", "max_model_len": 32768})),
+            Some(32768)
+        );
+        assert_eq!(
+            window(json!({"id": "m", "context_window": 8192})),
+            Some(8192)
+        );
+        assert_eq!(window(json!({"id": "m", "owned_by": "library"})), None);
+        assert_eq!(window(json!({"id": "m", "context_length": 0})), None);
+        assert_eq!(window(json!({"id": "m", "context_length": "large"})), None);
+        assert_eq!(
+            window(json!({"id": "m", "meta": {"n_ctx_train": 262144}})),
+            None
+        );
     }
 
     #[test]

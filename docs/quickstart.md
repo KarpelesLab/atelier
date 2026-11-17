@@ -169,7 +169,7 @@ stdin to EOF. You don't need to select this explicitly.
 | `ATELIER_MODEL`           | `qwen3.8-unc:q4`                 | Model id to request |
 | `ATELIER_API_KEY`         | *(unset)*                        | Optional bearer token sent as `Authorization: Bearer <key>` |
 | `ATELIER_APPROVE`         | *(unset)*                        | Set to `all`, `yes`, or `1` to auto-approve every tool call (headless/CI runs, or `--print` with unconfined tools) |
-| `ATELIER_CONTEXT_LIMIT`   | `8000`                           | Token threshold past which older history is compacted into a summary (see [Sessions](sessions.md)) |
+| `ATELIER_CONTEXT_LIMIT`   | *(unset)*                        | Token threshold past which older history is compacted into a summary. Unset, it follows the model's context window, or is 24,000 where that is not known (see [Sessions](sessions.md#compaction)) |
 | `ATELIER_REVIEW`          | *(unset)*                        | Set to `on`, `yes`, `1`, or `true` to turn on the parallel "subconscious" reviewer (see [Review mode](review.md)) |
 | `ATELIER_HTTP_TIMEOUT_MS` | *(unset)*                        | Overrides the HTTP connect timeout (ms) for both chat streaming (default 60000ms) and `GET /models` (default 15000ms). Ignored if not a positive integer |
 | `ATELIER_DEBUG`           | *(unset)*                        | If set (to anything), prints the raw outgoing chat-completion request JSON to stderr |

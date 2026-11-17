@@ -236,7 +236,6 @@ pub const SPECS: &[Spec] = &[
         "Tokens in a request past which older history is compacted into a summary",
     )
     .env("ATELIER_CONTEXT_LIMIT")
-    .default(Builtin::Int(crate::agent::DEFAULT_CONTEXT_LIMIT as u64))
     .screen("context limit", &[Scope::Project]),
     spec(
         "review.enabled",
@@ -766,6 +765,12 @@ impl<'a> View<'a> {
             self.file_layers(role, true, &mut layers);
         }
         self.file_layers(spec, false, &mut layers);
+        // Unset, the threshold follows the model's context window: the
+        // default is the session's to say (see `agent::limit`).
+        if spec.key == "defaults.context_limit" {
+            let default = self.session.default_context_limit();
+            layers.push(Layer::new("default", Value::from(default)));
+        }
         match spec.default {
             Builtin::Unset => {}
             Builtin::Bool(b) => layers.push(Layer::new("default", Value::Bool(b))),

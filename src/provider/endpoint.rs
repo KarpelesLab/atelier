@@ -45,6 +45,9 @@ pub struct Provider {
     pub headers: Vec<(String, String)>,
     /// Connect timeout in milliseconds, when the provider sets one.
     pub timeout_ms: Option<u64>,
+    /// The context window of its models, in tokens, when the provider's
+    /// table says (`context_window`).
+    pub context_window: Option<u32>,
 }
 
 /// Where a provider's bearer token comes from.
@@ -95,6 +98,7 @@ impl Provider {
             key: api_key.map_or(KeySource::None, KeySource::Fixed),
             headers: Vec::new(),
             timeout_ms: None,
+            context_window: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl Provider {
             // long prompt takes minutes. Giving up sooner would send the
             // request again on top of the one still being worked on.
             timeout_ms: Some(LOCAL_TIMEOUT_MS),
+            context_window: None,
         }
     }
 
@@ -146,6 +151,7 @@ impl Provider {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             timeout_ms: cfg.timeout_secs.map(|s| s.saturating_mul(1000)),
+            context_window: cfg.context_window.filter(|&n| n > 0),
         })
     }
 
@@ -250,6 +256,7 @@ mod tests {
             api_key_command: None,
             headers: Default::default(),
             timeout_secs: None,
+            context_window: None,
         }
     }
 

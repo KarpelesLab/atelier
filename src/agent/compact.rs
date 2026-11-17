@@ -382,9 +382,16 @@ impl Session {
 
     /// After a turn: compact if the last request passed the threshold.
     pub(super) fn maybe_compact(&mut self, ui: &mut dyn Ui) {
-        if self.usage_ctx > self.compact_threshold {
-            self.compact(Trigger::Auto, None, ui);
+        if self.usage_ctx <= self.compact_threshold() {
+            return;
         }
+        // Before compacting at a threshold that is only the fallback: the
+        // endpoint may know the model's window (see `limit`), and the
+        // conversation may be well within it.
+        if self.ask_window() && self.usage_ctx <= self.compact_threshold() {
+            return;
+        }
+        self.compact(Trigger::Auto, None, ui);
     }
 
     /// `/compact [instructions]`: compact now, and save the result.
@@ -409,7 +416,7 @@ impl Session {
         instructions: Option<&str>,
         ui: &mut dyn Ui,
     ) -> bool {
-        let limit = self.compact_threshold as usize;
+        let limit = self.compact_threshold() as usize;
         let fixed = self.fixed_tokens();
         let before = fixed + history_tokens(&self.history);
         let mut keep = keep_tail(limit, fixed);
@@ -760,7 +767,7 @@ mod tests {
             crate::settings::Settings::default(),
             trust,
         );
-        session.compact_threshold = threshold;
+        session.context_limit = Some(threshold);
         session
     }
 
