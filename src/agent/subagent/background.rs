@@ -119,6 +119,16 @@ struct State {
     tokens_out: u64,
 }
 
+impl Entry {
+    /// Set the agent's flag, and do what it asked to have done then.
+    fn tell_to_stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(hook) = self.on_stop.take() {
+            hook();
+        }
+    }
+}
+
 struct Entry {
     agent: String,
     description: String,
@@ -126,6 +136,9 @@ struct Entry {
     /// The last thing it did, as its activity line.
     activity: String,
     stop: Arc<AtomicBool>,
+    /// What to do the moment it is told to stop, for an agent that does
+    /// not see the flag itself (see [`Seat::on_stop`]).
+    on_stop: Option<Box<dyn FnOnce() + Send>>,
     /// Where it works, when that is a worktree of its own.
     worktree: Option<PathBuf>,
     /// How it ended; `None` while it runs.
@@ -206,6 +219,7 @@ impl Roster {
                 started: Instant::now(),
                 activity: "starting".to_string(),
                 stop: Arc::clone(&stop),
+                on_stop: None,
                 worktree: None,
                 ended: None,
             },
@@ -294,11 +308,11 @@ impl Roster {
 
     /// `/agents stop <id>`: ask a running agent to stop. The line to show.
     pub(super) fn stop(&self, id: &str) -> String {
-        let state = self.lock();
-        let found = state.agents.iter().find(|(n, _)| id_of(**n) == id);
+        let mut state = self.lock();
+        let found = state.agents.iter_mut().find(|(n, _)| id_of(**n) == id);
         match found {
             Some((_, entry)) if entry.ended.is_none() => {
-                entry.stop.store(true, Ordering::Relaxed);
+                entry.tell_to_stop();
                 format!(
                     "stopping {id} ({}) — it ends at its next step and reports where it got to",
                     entry.agent
@@ -311,8 +325,8 @@ impl Roster {
 
     /// Ask every running agent to stop.
     fn stop_all(&self) {
-        for entry in self.lock().agents.values() {
-            entry.stop.store(true, Ordering::Relaxed);
+        for entry in self.lock().agents.values_mut() {
+            entry.tell_to_stop();
         }
     }
 
@@ -398,6 +412,21 @@ impl Seat {
     /// The flag that tells this agent to stop.
     pub(super) fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
+    }
+
+    /// Have `hook` run when the agent is told to stop — at that moment, on
+    /// the thread that tells it; at once if it already was. For an agent
+    /// that cannot look at the flag (a process of its own): by the time
+    /// `/agents stop` has answered, the word is on its way.
+    pub(super) fn on_stop(&self, hook: Box<dyn FnOnce() + Send>) {
+        let mut state = self.roster.lock();
+        match state.agents.get_mut(&self.number) {
+            Some(entry) if !self.stop.load(Ordering::Relaxed) => entry.on_stop = Some(hook),
+            _ => {
+                drop(state);
+                hook();
+            }
+        }
     }
 
     /// Note where the agent works, when that is a worktree of its own.

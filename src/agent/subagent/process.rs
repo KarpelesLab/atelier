@@ -252,8 +252,12 @@ impl Process {
         let label = &job.label;
 
         // Held open for as long as the child is to go on (see the module
-        // docs).
-        let mut leash = child.stdin.take();
+        // docs). A background agent's is let go by whoever stops it, there
+        // and then: found out here a moment later, the child could be a
+        // step further by the time it hears.
+        let leash = Arc::new(Mutex::new(child.stdin.take()));
+        let cut = Arc::clone(&leash);
+        job.link.on_stop(move || drop(lock(&cut).take()));
         let started = Instant::now();
         let mut taken = false;
         let mut stopped: Option<Instant> = None;
@@ -303,7 +307,7 @@ impl Process {
                     "report" => {
                         let outcome = outcome_from(&params);
                         let _ = reply.answer(Ok(json!({})));
-                        drop(leash.take());
+                        drop(lock(&leash).take());
                         reap(&mut child, EXIT_GRACE);
                         return Ok(outcome);
                     }
@@ -349,7 +353,7 @@ impl Process {
                 ));
             }
             if stopped.is_none() && job.link.stop.load(Ordering::Relaxed) {
-                drop(leash.take());
+                drop(lock(&leash).take());
                 stopped = Some(Instant::now());
             }
             if stopped.is_some_and(|at| at.elapsed() > STOP_GRACE + KILL_AFTER) {

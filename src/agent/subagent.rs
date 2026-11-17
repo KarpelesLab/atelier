@@ -176,6 +176,16 @@ impl Link {
         }
     }
 
+    /// Have `hook` run the moment this child is told to stop, where that
+    /// moment is somebody's act (`/agents stop`, the session ending: a
+    /// background agent's seat). Elsewhere the flag is all there is, and
+    /// whoever needs it looks at it.
+    pub(super) fn on_stop(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Parent::Detached { seat, .. } = &self.to {
+            seat.on_stop(Box::new(hook));
+        }
+    }
+
     /// A line of the child's progress.
     fn activity(&self, text: String) {
         match &self.to {
