@@ -182,8 +182,13 @@ impl ServerSpec {
         match Path::new(program).file_name().and_then(|n| n.to_str()) {
             // rust-analyzer would otherwise run `cargo check` as it starts
             // and hold the build directory's lock against the agent's own
-            // builds — to produce diagnostics nobody here reads.
-            Some("rust-analyzer") => json!({ "checkOnSave": false }),
+            // builds — to produce diagnostics nobody here reads. And its
+            // `workspace/symbol` answers with types alone unless told
+            // otherwise: `search` for a function found nothing.
+            Some("rust-analyzer") => json!({
+                "checkOnSave": false,
+                "workspace": { "symbol": { "search": { "kind": "all_symbols" } } },
+            }),
             // gopls would otherwise answer `workspace/symbol` from the
             // standard library and every dependency as well, and spend its
             // cap of 100 answers on those.
@@ -631,11 +636,11 @@ mod tests {
     #[test]
     fn rust_analyzer_is_told_not_to_run_cargo_check() {
         let options = |command: &str| ServerSpec::detected(&KNOWN[0], command).options();
-        assert_eq!(options("rust-analyzer"), json!({ "checkOnSave": false }));
-        assert_eq!(
-            options("/opt/bin/rust-analyzer --log-file x"),
-            json!({ "checkOnSave": false })
-        );
+        let ours = options("rust-analyzer");
+        assert_eq!(ours["checkOnSave"], false);
+        // And to search functions too, not types alone (its default).
+        assert_eq!(ours["workspace"]["symbol"]["search"]["kind"], "all_symbols");
+        assert_eq!(options("/opt/bin/rust-analyzer --log-file x"), ours);
         // And gopls to keep `workspace/symbol` to the project.
         assert_eq!(options("gopls"), json!({ "symbolScope": "workspace" }));
         assert_eq!(options("clangd"), Value::Null);

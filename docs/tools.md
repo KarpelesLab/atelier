@@ -427,7 +427,8 @@ would be passed on as fact), for at most 20 seconds in all (`timeout_secs`
 of a `[[lsp]]` entry). A server that dies is started again once; it is
 stopped, with everything it started, when atelier exits. rust-analyzer is
 started with `checkOnSave` off, so it does not run `cargo check` beside your
-own builds.
+own builds, and with `workspace.symbol.search.kind` set to `all_symbols`:
+left to itself it answers `search` with types only.
 
 **A language server runs the project's code** — rust-analyzer runs build
 scripts and proc macros, the TypeScript server loads the `typescript` in
@@ -459,13 +460,14 @@ project's own [checkers](configuration.md#diagnostics).
 ### Tried against
 
 The tool was written against rust-analyzer and a fake server. On 2026-11-17
-it was run against four more, on Linux, each on a project of three files in
-a directory whose name has a space and an accent, the symbol asked about
-sitting after `"é𝄞日本"` on its line, and the first call a `search` on a
-server just started:
+it was run against rust-analyzer again and four more, on Linux, each on a
+project of three files in a directory whose name has a space and an accent,
+the symbol asked about sitting after `"é𝄞日本"` on its line, and the first
+call a `search` on a server just started:
 
 | Server | Version | What it showed |
 |--------|---------|----------------|
+| rust-analyzer | 1.97.1 | `search` found types and no functions: `gree` matched `Greeter` and not `greet` |
 | clangd | 22.1.8 | A first `search` found nothing: clangd indexes when a file is opened. `search` also listed `std::greater_equal` |
 | gopls | 0.23.0, Go 1.26.5 | `search` for `gree` returned 100 symbols, 96 of them the standard library's; a name gopls had qualified was qualified twice. Also run on a 30-file module (BurntSushi/toml 1.6.0): 49 references across its packages, cold, in under a second |
 | typescript-language-server | 6.1.0, TypeScript 5.9.3 | A first `search` failed with "No Project" and twenty lines of stack trace, which went into the note. `references` asked right after a file was first opened listed that file's only. The declaration was among the references unless asked at it. `search` placed a symbol at the start of its declaration, not at its name |

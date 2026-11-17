@@ -13,7 +13,7 @@
 //! differ there. The first call of every test is a `search`, on a server
 //! that has just started and been given no file.
 //!
-//! What these found when first run (clangd 22.1, gopls 0.23,
+//! What these found when first run (rust-analyzer 1.97, clangd 22.1, gopls 0.23,
 //! typescript-language-server 6.1, pyright 1.1.414) is in the tests beside
 //! this file, against the fake server: they are the regression tests, these
 //! are the way to find the next difference.
@@ -58,6 +58,84 @@ fn run(tool: &SymbolsTool, root: &Path, args: Value) -> String {
 
 fn at(action: &str, path: &str, line: u64, symbol: &str) -> Value {
     json!({ "action": action, "path": path, "line": line, "symbol": symbol })
+}
+
+/// The server the tool was written against, for what the others changed:
+/// a file opened before `search`, the declaration taken out here.
+#[test]
+#[ignore]
+fn rust_analyzer() {
+    let Some(tool) = tool_with("rust-analyzer") else {
+        return;
+    };
+    let root = project(
+        "rust",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"greet\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "/// Says hello.\npub fn greet(name: &str) -> String {\n    \
+                 format!(\"hello {name}\")\n}\n\npub struct Greeter;\n\nimpl Greeter {\n    \
+                 pub fn run(&self) -> String {\n        let s = \"é𝄞日本\"; greet(s)\n    }\n}\n",
+            ),
+            (
+                "src/main.rs",
+                "fn main() {\n    println!(\"{}\", greet::greet(\"x\"));\n}\n",
+            ),
+        ],
+    );
+    // It loads the standard library first, which can outlast one call: the
+    // answer is then the textual one, and says so.
+    let search = json!({ "action": "search", "query": "gree" });
+    let mut found = run(&tool, &root, search.clone());
+    for _ in 0..5 {
+        if !found.starts_with("textual approximation") {
+            break;
+        }
+        assert!(
+            found.contains("rust-analyzer did not answer within 20s"),
+            "{found}"
+        );
+        found = run(&tool, &root, search.clone());
+    }
+    assert!(found.starts_with("symbols matching `gree` — "), "{found}");
+    assert!(found.contains("(rust-analyzer)\n"), "{found}");
+    assert!(
+        found.contains("\nsrc/lib.rs:2:8  function  greet  — "),
+        "{found}"
+    );
+    assert!(
+        found.contains("\nsrc/lib.rs:6:12  struct  Greeter  — "),
+        "{found}"
+    );
+
+    let uses = "src/lib.rs:10:25  — let s = \"é𝄞日本\"; greet(s)\n\
+                src/main.rs:2:27  — println!(\"{}\", greet::greet(\"x\"));";
+    for line in [10, 2] {
+        let found = run(&tool, &root, at("references", "src/lib.rs", line, "greet"));
+        let mut lines: Vec<&str> = found.lines().collect();
+        assert_eq!(
+            lines.remove(0),
+            "references to `greet` (its declaration aside) — 2 locations (rust-analyzer)"
+        );
+        lines.sort_unstable();
+        assert_eq!(lines.join("\n"), uses, "asked at line {line}");
+    }
+    assert_eq!(
+        run(
+            &tool,
+            &root,
+            at("definition", "src/main.rs", 2, "greet::greet")
+        ),
+        "definition of `greet` — 1 location (rust-analyzer)\n\
+         src/lib.rs:2:8  fn  greet  — pub fn greet(name: &str) -> String {"
+    );
+    let hover = run(&tool, &root, at("hover", "src/lib.rs", 10, "greet"));
+    assert!(hover.contains("Says hello."), "{hover}");
+    tool.servers.kill_all();
 }
 
 #[test]
