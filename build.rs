@@ -11,10 +11,10 @@
 //! - `pty`: the target is one of those same systems, on which a `bash`
 //!   command can be run on a pseudo-terminal (`src/tools/pty.rs`) and so be
 //!   handed the user's keyboard. Elsewhere commands run on pipes.
-//! - `sandbox`: the `sandbox` feature is on and the target is in the `unix`
-//!   family proper, which nixvm needs to mount a host directory in its guest
-//!   (it calls libc's `*at` functions, and fullrust has no libc). Elsewhere
-//!   the feature compiles to "not available in this build".
+//! - `sandbox`: the `sandbox` feature is on and the target is one nixvm can
+//!   mount a host directory from — Unix, or fullrust, where it makes Linux's
+//!   system calls itself. Elsewhere the feature compiles to "not available
+//!   in this build".
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
@@ -31,7 +31,7 @@ fn main() {
         println!("cargo::rustc-cfg=unixlike");
     }
     if std::env::var_os("CARGO_FEATURE_SANDBOX").is_some()
-        && std::env::var_os("CARGO_CFG_UNIX").is_some()
+        && (std::env::var_os("CARGO_CFG_UNIX").is_some() || os == "fullrust")
     {
         println!("cargo::rustc-cfg=sandbox");
     }
