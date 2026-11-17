@@ -226,11 +226,16 @@ Also landed alongside M6: **vision input** (`/image <path>` attaches an image to
 the next message — OpenAI multimodal content parts) and a **`multiedit`** tool
 (atomic multi-edit of one file).
 
-### M7 — Hardening & polish
+### M7 — Hardening & polish ✅
 - ✅ Provider quirks: missing SSE fields, retries, backoff, timeouts
   (`send_reader_retrying`); `ATELIER_DEBUG` dumps raw provider traffic.
-- ⏳ Per-model tool-calling dialects (models that emit tool calls as text,
-  e.g. `<tool_call>` blocks, instead of structured `tool_calls`).
+- ✅ Tool calls written as text (`provider::dialect`): Hermes/Qwen
+  `<tool_call>`, Qwen3-Coder `<function=…>` (including Ollama's eaten-opener
+  leftovers), Mistral `[TOOL_CALLS]` and whole-answer Llama JSON are
+  recovered as real calls when no structured ones came — offered tools
+  only, markup kept out of the streamed answer.
+  `ATELIER_TEXT_TOOL_CALLS=off` disables it. Verified live with
+  `qwen3-coder:30b`.
 - ✅ Config UX (`/config`), `/` commands, `--print`/`-p` pipe-friendly
   headless mode (one-shot prompt from args or stdin; answer on stdout,
   everything else stderr).
