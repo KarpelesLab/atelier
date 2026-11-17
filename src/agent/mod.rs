@@ -3295,7 +3295,7 @@ pub fn repl(mut session: Session) -> Result<()> {
     }
 
     loop {
-        if let Some(notice) = crate::update::take_notice() {
+        if let Some(notice) = crate::update::take_notice().or_else(crate::own::take_notice) {
             eprintln!("{notice}");
         }
         print!("› ");
@@ -3473,6 +3473,7 @@ mod tests {
                 dir: dir.clone(),
                 idle: std::time::Duration::from_secs(60),
                 watch_exe: false,
+                settle: std::time::Duration::ZERO,
             };
             std::thread::spawn(move || coord::daemon::run(cfg));
             Self(dir)

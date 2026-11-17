@@ -874,7 +874,7 @@ impl Server {
         let mut ui = ServeUi::new(&self.shared, &self.session, Scope::Idle);
         self.session.poll_background(&mut ui);
         self.session.poll_peers(&mut ui);
-        if let Some(notice) = crate::update::take_notice() {
+        if let Some(notice) = crate::update::take_notice().or_else(crate::own::take_notice) {
             ui.notice(&notice);
         }
         self.publish();

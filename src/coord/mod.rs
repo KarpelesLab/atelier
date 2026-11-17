@@ -3,7 +3,8 @@
 //!
 //! Each atelier process (an *instance*) keeps a connection to the
 //! coordinator over a Unix socket in a private directory and speaks
-//! newline-delimited JSON-RPC 2.0 with it. The coordinator only routes; it
+//! newline-delimited JSON-RPC 2.0 with it. The coordinator routes, and
+//! keeps two tables in memory that those who filled them can fill again; it
 //! holds no durable state, so it can go away and come back at any time:
 //!
 //! - **Launch.** There is no service to install. An instance that finds no
@@ -14,7 +15,8 @@
 //!   every instance notices the closed connection, and the first to retry
 //!   starts a new one; all of them reconnect under the same identity,
 //!   re-subscribe to their topics and announce the locks they hold again
-//!   ([`client`]). The coordinator also ends
+//!   ([`client`]), and the owner of a session claims it again ([`claims`]).
+//!   The coordinator also ends
 //!   itself when its executable is replaced on disk (a self-update, a
 //!   rebuild), when a newer atelier says hello, and when no instance has
 //!   been connected for a while ([`daemon`]).
@@ -37,9 +39,10 @@
 //! Another, `task`, is how a subagent that runs as a process of its own
 //! talks to the instance that started it (`agent::subagent`).
 //!
-//! The coordinator also keeps one table: the advisory locks, by which an
+//! The coordinator also keeps two tables: the advisory locks, by which an
 //! instance says which paths it is working on ([`locks`], the `peer_lock`
-//! tool).
+//! tool), and the session claims, by which it is settled which atelier owns
+//! the session of a project directory ([`claims`], `crate::own`).
 //!
 //! An idle instance holds what it receives for its user's next prompt,
 //! unless it is set to wake ([`Wake`]; the rules are in `agent::idle`). For
@@ -48,9 +51,13 @@
 //! the coordinator passes on untouched.
 //!
 //! Unix only (`cfg(unixlike)`, see `build.rs`): elsewhere [`start`] returns
-//! `None` and atelier runs alone.
+//! `None` and atelier runs alone. So it does when the coordinator is
+//! switched off ([`ENV_DISABLE`]) — instances, messages and session claims
+//! alike: there is one switch.
 
 pub mod ask;
+#[cfg(unixlike)]
+pub mod claims;
 #[cfg(unixlike)]
 pub mod client;
 #[cfg(not(unixlike))]
@@ -79,8 +86,15 @@ pub use client::Client;
 /// lock table (`lock`, `unlock`, `locks`, and `locks` in `hello`). An
 /// instance built with these must not be served by a coordinator without
 /// them, which would answer `lock` with "method not found".
-pub const PROTO: u64 = 2;
-/// Set (to anything but `0`) to run without the coordinator.
+///
+/// 3: the session claims (`claim`, `unclaim`, `claims`, the `claimed`
+/// notification). What is built on them — one owner per project session —
+/// only holds if the coordinator has them, so one that does not is made to
+/// step down.
+pub const PROTO: u64 = 3;
+/// Set (to anything but `0`) to run without the coordinator: no instance,
+/// no `peer*` tools, and no session claim — an atelier started where
+/// another is running is then not told (see `crate::own`).
 pub const ENV_DISABLE: &str = "ATELIER_NO_COORDINATOR";
 /// Overrides the directory holding the socket, lock and log.
 pub const ENV_DIR: &str = "ATELIER_COORDINATOR_DIR";
@@ -216,7 +230,7 @@ fn connect(dir: &Path) -> Result<std::os::unix::net::UnixStream> {
 }
 
 /// Whether the user turned the coordinator off.
-fn disabled() -> bool {
+pub(crate) fn disabled() -> bool {
     std::env::var_os(ENV_DISABLE).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
@@ -305,6 +319,10 @@ pub fn run_command(args: &[String]) -> Result<()> {
                         );
                         let list = client::control(&dir, "list")?;
                         for line in tools::render_instances(&list) {
+                            println!("{line}");
+                        }
+                        let claims = client::control(&dir, "claims")?;
+                        for line in claims::render(&claims) {
                             println!("{line}");
                         }
                     }

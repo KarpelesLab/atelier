@@ -5,6 +5,11 @@
 //! REPL or a protocol will do and on pseudo-terminals where the terminal
 //! interface is the subject.
 //!
+//! Who owns a session is the coordinator's to say, so every test has a
+//! coordinator of its own, in a directory beside its project; it is asked
+//! who the owner is as atelier asks it (`claims`), and stopped when the
+//! test is over.
+//!
 //! Nothing sleeps to let something happen: a test waits for a line, a file,
 //! a process to be gone, each with a deadline. The process table is read
 //! from `/proc`, so this is Linux's.
@@ -234,6 +239,8 @@ impl std::ops::Deref for Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
+        // The test's coordinator goes with it, passed or not.
+        stop_coordinator(&self.0);
         if thread::panicking() {
             return;
         }
@@ -255,9 +262,49 @@ fn project(name: &str) -> Project {
     Project(dir)
 }
 
+/// Where the coordinator of the project in `dir` is, and its owners'
+/// sockets: a directory of the test's own.
+fn coord_dir(dir: &Path) -> PathBuf {
+    dir.with_extension("run")
+}
+
+/// One request to the coordinator of the project in `dir`, if one is
+/// running: its result.
+fn ask_coordinator(dir: &Path, method: &str, params: Value) -> Option<Value> {
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(coord_dir(dir).join("coordinator.sock")).ok()?;
+    stream.set_read_timeout(Some(PATIENCE)).ok()?;
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    (&stream)
+        .write_all(format!("{request}\n").as_bytes())
+        .ok()?;
+    let mut line = String::new();
+    BufReader::new(&stream).read_line(&mut line).ok()?;
+    let answer: Value = serde_json::from_str(&line).ok()?;
+    answer.get("result").cloned()
+}
+
+/// The pid of the coordinator of the project in `dir`, if one is running.
+fn coordinator_pid(dir: &Path) -> Option<u32> {
+    let status = ask_coordinator(dir, "status", json!({}))?;
+    status["pid"].as_u64().map(|pid| pid as u32)
+}
+
+/// End the coordinator of the project in `dir`, and see it gone.
+fn stop_coordinator(dir: &Path) {
+    let Some(pid) = coordinator_pid(dir) else {
+        return;
+    };
+    ask_coordinator(dir, "shutdown", json!({}));
+    let deadline = Instant::now() + PATIENCE;
+    while alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// `atelier <args>` in `cwd` against the mock, with nothing of the outer
-/// environment or the real home leaking in, and its sockets in a directory
-/// of the test's own.
+/// environment or the real home leaking in, and its coordinator and
+/// sockets in a directory of the test's own.
 fn atelier(base_url: &str, cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.args(args)
@@ -265,7 +312,7 @@ fn atelier(base_url: &str, cwd: &Path, args: &[&str]) -> Command {
         .env("ATELIER_BASE_URL", base_url)
         .env("ATELIER_MODEL", "mock")
         .env("ATELIER_APPROVE", "all")
-        .env("ATELIER_NO_COORDINATOR", "1")
+        .env("ATELIER_COORDINATOR_DIR", coord_dir(cwd))
         .env("ATELIER_NO_UPDATE", "1")
         .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env("XDG_STATE_HOME", cwd.with_extension("state"))
@@ -273,7 +320,8 @@ fn atelier(base_url: &str, cwd: &Path, args: &[&str]) -> Command {
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
         .env("HOME", cwd.with_extension("home"))
         .env("TERM", "xterm")
-        .env_remove("ATELIER_COORDINATOR_DIR")
+        .env_remove("ATELIER_NO_COORDINATOR")
+        .env_remove("ATELIER_COORDINATOR_WAKE")
         .env_remove("ATELIER_TRUST_HOOKS")
         .env_remove("ATELIER_TRUST_PROJECT")
         .env_remove("ATELIER_API_KEY")
@@ -287,9 +335,13 @@ fn atelier(base_url: &str, cwd: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-/// The owner's record in `dir`'s lock file, if it holds one.
+/// The record of the owner of the session in `dir`, as the coordinator has
+/// it — if the session has one.
 fn record(dir: &Path) -> Option<Value> {
-    serde_json::from_str(&std::fs::read_to_string(dir.join(".atelier/session.lock")).ok()?).ok()
+    let real = dir.canonicalize().ok()?;
+    let claims = ask_coordinator(dir, "claims", json!({ "dir": real }))?;
+    let owner = claims["claims"][0]["owner"].clone();
+    owner.is_object().then_some(owner)
 }
 
 /// Wait until `pid` owns the session in `dir`, and return its record.
@@ -833,10 +885,10 @@ fn runs_that_do_not_own_the_session_are_never_blocked() {
     );
 }
 
-/// An owner killed outright leaves its record behind; the next start sees
-/// that nobody holds the lock, and starts as if there were none.
+/// An owner killed outright leaves nothing behind: its claim ends with its
+/// connection, and the next start is the owner without a word.
 #[test]
-fn a_record_left_by_a_killed_owner_is_replaced_silently() {
+fn an_owner_killed_outright_leaves_nothing_behind() {
     let mock = echo();
     let dir = project("stale");
     let mut owner = Piped::repl(&mock, &dir, &[]);
@@ -848,7 +900,7 @@ fn a_record_left_by_a_killed_owner_is_replaced_silently() {
         .status()
         .unwrap();
     assert_eq!(owner.exit(), -1);
-    assert_eq!(record(&dir).unwrap(), old, "the record outlives its writer");
+    wait_until("the session to be nobody's", || record(&dir).is_none());
 
     let mut next = Piped::repl(&mock, &dir, &[]);
     assert!(!socket.exists(), "the dead owner's socket is taken away");
@@ -860,6 +912,166 @@ fn a_record_left_by_a_killed_owner_is_replaced_silently() {
         !err.contains("already running") && !err.contains("took over"),
         "{err}"
     );
+}
+
+/// Owning a session writes nothing in the project: an atelier started and
+/// quit in a fresh directory, no turn taken, leaves it as it found it.
+#[test]
+fn starting_and_quitting_leaves_the_directory_as_it_was() {
+    let mock = echo();
+    let dir = project("clean");
+    let mut repl = Piped::repl(&mock, &dir, &[]);
+    assert_eq!(repl.finish(), 0, "{}", repl.stderr());
+    let mut term = Term::start(&mock, &dir, &[]);
+    term.wait_for("/help for commands");
+    wait_owner(&dir, term.pid());
+    term.line("/quit");
+    assert_eq!(term.exit(), 0);
+    // A start that is refused, and one that only looks.
+    let mut owner = Piped::repl(&mock, &dir, &[]);
+    let (code, ..) = run(&mock, &dir, &[], "");
+    assert_eq!(code, EXIT_IN_USE);
+    let (code, ..) = run(&mock, &dir, &["doctor", "--offline"], "");
+    assert_eq!(code, 0);
+    assert_eq!(owner.finish(), 0);
+
+    let left: Vec<_> = std::fs::read_dir(&*dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "left in the project: {left:?}");
+    assert_eq!(mock.requests(), 0);
+}
+
+/// The coordinator is killed under an owner. The owner finds the next one
+/// — here the one a newcomer starts — and claims its session again before
+/// the newcomer is given it: the newcomer is refused as on any other day.
+#[test]
+fn an_owner_keeps_its_session_across_coordinators() {
+    let mock = echo();
+    let dir = project("restart");
+    let mut owner = Piped::repl(&mock, &dir, &[]);
+    for round in 0..3 {
+        let daemon = coordinator_pid(&dir).expect("a coordinator");
+        Command::new("kill")
+            .args(["-9", &daemon.to_string()])
+            .status()
+            .unwrap();
+        wait_until("the coordinator to be gone", || !alive(daemon));
+
+        let (code, _, err) = run(&mock, &dir, &[], "say two\n");
+        assert_eq!(code, EXIT_IN_USE, "round {round}: {err}");
+        assert!(err.contains(&format!("pid {}", owner.pid())), "{err}");
+        assert_ne!(coordinator_pid(&dir), Some(daemon));
+        assert_eq!(wait_owner(&dir, owner.pid())["kind"], "repl");
+    }
+    // And one that is stopped, with nobody arriving: the owner starts the
+    // next one itself.
+    let daemon = coordinator_pid(&dir).expect("a coordinator");
+    stop_coordinator(&dir);
+    wait_owner(&dir, owner.pid());
+    assert_ne!(coordinator_pid(&dir), Some(daemon));
+
+    owner.line("say one");
+    owner.wait_for("re: one");
+    assert_eq!(owner.finish(), 0);
+    let err = owner.stderr();
+    assert!(!err.contains("another atelier"), "{err}");
+    assert_eq!(mock.requests(), 1);
+}
+
+/// With the coordinator switched off nobody says whose the session is: a
+/// second atelier starts as it did before there were owners — no question,
+/// no refusal — and no coordinator is started to ask.
+#[test]
+fn without_a_coordinator_nothing_is_asked() {
+    let mock = echo();
+    let dir = project("alone");
+    let alone = |args: &[&str]| {
+        let mut cmd = atelier(&mock.base_url(), &dir, args);
+        cmd.env("ATELIER_NO_COORDINATOR", "1");
+        cmd
+    };
+    let mut first = Piped::spawn(alone(&[]));
+    first.line("say one");
+    first.wait_for("re: one");
+    let mut second = Piped::spawn(alone(&["--take-over"]));
+    second.line("say two");
+    second.wait_for("re: two");
+    // A terminal is asked nothing either.
+    let mut third = Term::spawn(alone(&[]));
+    third.wait_for("/help for commands");
+    third.line("/quit");
+    assert_eq!(third.exit(), 0);
+    assert!(!third.text().contains("already running"));
+
+    assert_eq!(first.finish(), 0);
+    assert_eq!(second.finish(), 0);
+    for err in [first.stderr(), second.stderr()] {
+        assert!(
+            !err.contains("already running") && !err.contains("took over"),
+            "{err}"
+        );
+    }
+    assert_eq!(coordinator_pid(&dir), None);
+    assert!(!coord_dir(&dir).join("coordinator.sock").exists());
+}
+
+/// Two owners that could not see each other when they started — there was
+/// no coordinator to be had — meet when one comes up: the first to claim
+/// the session has it, the other is told, and neither is stopped.
+#[test]
+fn two_owners_that_meet_later_are_told_and_left_running() {
+    let mock = echo();
+    let dir = project("meet");
+    // Where the coordinator would be is a file: none can start.
+    std::fs::write(coord_dir(&dir), "in the way").unwrap();
+    let mut both: Vec<Piped> = (0..2)
+        .map(|_| Piped::spawn(atelier(&mock.base_url(), &dir, &[])))
+        .collect();
+    for one in &mut both {
+        one.wait_for("the coordinator cannot be reached");
+        one.line("say one");
+        one.wait_for("re: one");
+    }
+    assert_eq!(coordinator_pid(&dir), None);
+
+    std::fs::remove_file(coord_dir(&dir)).unwrap();
+    wait_until("one of them to own the session", || record(&dir).is_some());
+    let owner = record(&dir).unwrap()["pid"].as_u64().unwrap() as u32;
+    let other = both.iter().position(|p| p.pid() != owner).unwrap();
+    let mut other = both.remove(other);
+    let mut owner = both.remove(0);
+    // Said where the interface next looks: at its prompt.
+    let told = |one: &mut Piped, what: &str| {
+        wait_until(what, || {
+            let answered = one.stdout().matches("re: more").count();
+            one.line("say more");
+            wait_until("an answer", || {
+                one.stdout().matches("re: more").count() > answered
+            });
+            one.stderr().contains(what)
+        });
+    };
+    told(
+        &mut other,
+        &format!("another atelier (pid {}) has a session", owner.pid()),
+    );
+    owner.line("say more");
+    owner.wait_for("re: more");
+    assert!(!owner.stderr().contains("has a session open"));
+    assert!(alive(owner.pid()) && alive(other.pid()));
+
+    // A newcomer is told of the one the coordinator has; and when that one
+    // ends, the session is the other's.
+    let (code, _, err) = run(&mock, &dir, &[], "");
+    assert_eq!(code, EXIT_IN_USE, "{err}");
+    assert!(err.contains(&format!("pid {}", owner.pid())), "{err}");
+    assert_eq!(owner.finish(), 0);
+    wait_owner(&dir, other.pid());
+    told(&mut other, "the only one here again");
+    assert_eq!(other.finish(), 0);
 }
 
 /// Of two started together in a free directory, one owns the session and
@@ -1070,13 +1282,8 @@ fn take_over_stops_a_process_subagent_and_takes_its_place_among_the_instances() 
         )])
     });
     let dir = project("sub");
-    let coord = dir.with_extension("run");
-    let joined = |args: &[&str]| {
-        let mut cmd = atelier(&mock.base_url(), &dir, args);
-        cmd.env("ATELIER_COORDINATOR_DIR", &coord)
-            .env_remove("ATELIER_NO_COORDINATOR");
-        cmd
-    };
+    let coord = coord_dir(&dir);
+    let joined = |args: &[&str]| atelier(&mock.base_url(), &dir, args);
     let name = dir.file_name().unwrap().to_str().unwrap().to_string();
     let instances = || -> Vec<String> {
         let status = coordinator(&coord, "status");
@@ -1124,7 +1331,6 @@ fn take_over_stops_a_process_subagent_and_takes_its_place_among_the_instances() 
         "the coordinator was not the old owner's to stop"
     );
     assert_eq!(next.finish(), 0);
-    coordinator(&coord, "stop");
 }
 
 /// An owner that cannot be asked — stopped, here, so that it answers
@@ -2238,13 +2444,8 @@ fn a_command_is_typed_to_from_a_remote() {
 fn remote_control_makes_a_second_terminal_of_the_same_session() {
     let mock = echo();
     let dir = project("control");
-    let coord = dir.with_extension("run");
-    let joined = |args: &[&str]| {
-        let mut cmd = atelier(&mock.base_url(), &dir, args);
-        cmd.env("ATELIER_COORDINATOR_DIR", &coord)
-            .env_remove("ATELIER_NO_COORDINATOR");
-        cmd
-    };
+    let coord = coord_dir(&dir);
+    let joined = |args: &[&str]| atelier(&mock.base_url(), &dir, args);
     let instances = || -> usize {
         let status = coordinator(&coord, "status");
         status.lines().skip(1).filter(|l| l.contains(" — ")).count()

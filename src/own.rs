@@ -16,21 +16,29 @@
 //! either the terminal interface as a client (`tui::remote`) or, for
 //! `serve`, a pipe between its own client and the owner ([`relay`]).
 //!
-//! # The record
+//! # The claim
 //!
-//! Ownership is an exclusive advisory lock on `.atelier/session.lock`
-//! ([`LOCK_FILE`]), taken when the session starts and held until the
-//! process ends — the way the coordinator and the local model's supervisor
-//! hold theirs. The kernel lets go of it however the process dies, so a
-//! crash leaves nothing to clean up: the next start takes the lock and is
-//! the owner. Of two that start together one gets it.
+//! Who owns the session of a directory is the coordinator's to say (see
+//! [`crate::coord::claims`]): a run that would own it *claims* the
+//! directory, by its real path, on a connection it then keeps open, and is
+//! told that the session is its own or whose it is. The coordinator answers
+//! one request at a time, so of two that start together one is the owner.
+//! The claim ends with the connection, however the process went, and
+//! nothing is written anywhere — not in the project, not beside the
+//! coordinator — so a crash leaves nothing to clean up.
 //!
-//! The file's content is the [`Record`]: the owner's pid and when that
+//! With the claim goes the [`Record`]: the owner's pid and when that
 //! process started, when the session did, what kind of run it is, the
-//! terminal it is on, and the socket it listens on. The record is written
-//! by whoever holds the lock and is never believed on its own: a newcomer
-//! that finds the lock held checks that the pid is still the process that
-//! wrote it (its start time), and checks again before every signal.
+//! terminal it is on, and the socket it listens on. A newcomer told the
+//! session is somebody's is handed that record. Before every signal it
+//! checks that the pid is still the process the record describes (its start
+//! time).
+//!
+//! Without a coordinator there is nobody to say, and every run starts as
+//! if it were alone: when it is switched off (`ATELIER_NO_COORDINATOR`)
+//! nothing is asked at all, and when none can be reached or started the
+//! run says so, starts, and claims the session once one answers (see
+//! `keep`, which also holds the claim across coordinators).
 //!
 //! # The socket
 //!
@@ -43,12 +51,14 @@
 //!
 //! # Taking over
 //!
-//! See [`takeover`]: the owner is asked to stop, save and exit; if the lock
-//! is not free a few seconds later it is signalled (TERM, then KILL), and
-//! what it had started is stopped with it.
+//! See [`takeover`]: the newcomer takes the place behind the owner in the
+//! coordinator's table, and the owner is asked to stop, save and exit; if
+//! it has not a few seconds later it is signalled (TERM, then KILL), and
+//! what it had started is stopped with it. The claim passes from the one to
+//! the other with nobody in between.
 //!
-//! Unix only (`cfg(unixlike)`), like the sockets and the locks it is made
-//! of: elsewhere [`start`] always says go, and nothing is recorded.
+//! Unix only (`cfg(unixlike)`), like the sockets and the coordinator it is
+//! made of: elsewhere [`start`] always says go, and nothing is recorded.
 
 #[cfg(unixlike)]
 mod hub;
@@ -66,9 +76,6 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-/// The lock file and record, relative to the project root.
-pub const LOCK_FILE: &str = ".atelier/session.lock";
 
 /// Exit status: a session is live in this directory and nothing said what
 /// to do about it (a start that cannot ask, without `--attach`,
@@ -117,7 +124,8 @@ impl Kind {
     }
 }
 
-/// What the lock file holds: the live owner, as it described itself.
+/// What the coordinator holds of a session's owner: the owner, as it
+/// described itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub pid: u32,
@@ -133,7 +141,7 @@ pub struct Record {
     /// The socket it answers on, when it could open one.
     #[serde(default)]
     pub socket: Option<String>,
-    /// The atelier that wrote it.
+    /// The atelier it is.
     #[serde(default)]
     pub version: String,
 }
@@ -206,11 +214,12 @@ pub use imp::*;
 #[cfg(unixlike)]
 mod imp {
     use super::*;
-    use std::fs::File;
-    use std::io::{Read, Seek, Write};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime};
+
+    use crate::coord::claims::{self, Answer, How};
 
     /// The one-line description of a live session: who, since when, doing what.
     pub fn describe(live: &Live) -> Vec<String> {
@@ -247,7 +256,7 @@ mod imp {
     /// closes. The client speaks to the owner from its `initialize` on (see
     /// "A session shared with its terminal" in `docs/protocol.md`).
     pub fn relay(live: &Live) -> Result<u8> {
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Write};
         let stream = connect(&live.record)?;
         let mut to_owner = stream.try_clone()?;
         let closing = stream.try_clone()?;
@@ -283,45 +292,25 @@ mod imp {
         OWNER.get()
     }
 
-    /// What trying for the lock found.
-    pub(super) enum Claimed {
-        /// The lock is this process's: it owns the session.
-        Owner,
-        /// Another process holds it.
-        Live(Live),
-        /// There is no telling here (a directory that cannot be written, a
-        /// file system without locks): go on as atelier always did.
-        Unknown,
+    /// What the owner has to tell its user, when its interface next looks.
+    static NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn notice(line: String) {
+        NOTICES.lock().unwrap_or_else(|p| p.into_inner()).push(line);
     }
 
-    fn open_lock(root: &Path) -> Option<File> {
-        let path = root.join(LOCK_FILE);
-        std::fs::create_dir_all(path.parent()?).ok()?;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .ok()
-    }
-
-    fn read_record(file: &mut File) -> Option<Record> {
-        let mut text = String::new();
-        file.rewind().ok()?;
-        file.read_to_string(&mut text).ok()?;
-        serde_json::from_str(&text).ok()
-    }
-
-    /// The record in `root`'s lock file, whoever holds the lock.
-    pub(super) fn record_of(root: &Path) -> Option<Record> {
-        read_record(&mut File::open(root.join(LOCK_FILE)).ok()?)
+    /// Something about the ownership of this session that its user should
+    /// read (see [`keep`]), once: for the interfaces to show where they
+    /// wait.
+    pub fn take_notice() -> Option<String> {
+        let mut notices = NOTICES.lock().unwrap_or_else(|p| p.into_inner());
+        (!notices.is_empty()).then(|| notices.remove(0))
     }
 
     /// The record's process is the one that wrote it, and is still there.
     /// (An owner on a system that could not tell it when it started wrote
     /// no start time: there the process being there has to do, next to the
-    /// lock it is seen to hold.)
+    /// claim it is seen to hold.)
     pub(super) fn genuine(record: &Record) -> bool {
         match (proc::start_token(record.pid), record.started.as_str()) {
             (Some(now), then) if !then.is_empty() => now == then,
@@ -348,109 +337,255 @@ mod imp {
         }
     }
 
-    /// Try for the lock on `root`'s session.
-    pub(super) fn claim(root: &Path, kind: Kind) -> Result<Claimed> {
-        let Some(mut file) = open_lock(root) else {
-            return Ok(Claimed::Unknown);
-        };
-        match file.try_lock() {
-            Ok(()) => {
-                // Whatever the file says is of a process that is gone.
-                if let Some(stale) = read_record(&mut file) {
-                    remove_socket(&stale);
-                }
-                own(file, kind);
-                Ok(Claimed::Owner)
+    /// What claiming the session found.
+    pub(super) enum Claimed {
+        /// The claim is this process's: it owns the session.
+        Owner,
+        /// Another process owns it.
+        Live(Live),
+        /// There is no telling, and why: no coordinator answers.
+        Unknown(String),
+    }
+
+    /// Whose turn it is when a take-over waits (see [`Seat::next`]).
+    pub(super) enum Turn {
+        /// The session is this process's.
+        Mine,
+        /// It is still the owner's, and this process's next.
+        Waiting,
+        /// It is another atelier's now, or about to be: not what this was
+        /// about. In a sentence.
+        Changed(String),
+    }
+
+    /// A start that would own the session, until it does or gives up: its
+    /// connection to the coordinator, what it says of itself, and the
+    /// socket it will answer on.
+    pub(super) struct Seat {
+        link: claims::Link,
+        record: Record,
+        socket: Bound,
+        /// The coordinator said the session is this process's.
+        mine: bool,
+    }
+
+    /// A socket bound and not answered on yet: taken away again if it
+    /// never is (the run was not the owner after all).
+    struct Bound(Option<(UnixListener, PathBuf)>);
+
+    impl Drop for Bound {
+        fn drop(&mut self) {
+            if let Some((_, path)) = self.0.take() {
+                let _ = std::fs::remove_file(path);
             }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                // The owner writes its record right after taking the lock:
-                // one read too early is read again.
-                let deadline = Instant::now() + Duration::from_secs(2);
-                loop {
-                    if let Some(record) = read_record(&mut file).filter(genuine) {
-                        let status = hub::ask(&record, "owner/status", Value::Null).ok();
-                        return Ok(Claimed::Live(Live { record, status }));
-                    }
-                    if Instant::now() >= deadline {
-                        // Held, and not by a process the record names:
-                        // something an atelier that is gone had started,
-                        // that kept its files open.
-                        let was = read_record(&mut file).map_or_else(String::new, |r| {
-                            format!(" (the atelier that took it, pid {}, is gone)", r.pid)
-                        });
-                        anyhow::bail!(
-                            "{} is locked{was}, and whatever holds it does not say who it \
-                             is. Nothing was changed. Stop what is left of that atelier, or \
-                             remove the file and start again",
-                            root.join(LOCK_FILE).display()
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                    // The lock may have been let go meanwhile.
-                    if file.try_lock().is_ok() {
-                        own(file, kind);
+        }
+    }
+
+    impl Seat {
+        fn new(link: claims::Link, kind: Kind) -> Seat {
+            let pid = std::process::id();
+            let socket = hub::bind(pid);
+            let record = Record {
+                pid,
+                started: proc::start_token(pid).unwrap_or_default(),
+                since: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                kind,
+                tty: proc::terminal(),
+                socket: socket.as_ref().map(|(_, path)| path.display().to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            Seat {
+                link,
+                record,
+                socket: Bound(socket),
+                mine: false,
+            }
+        }
+
+        fn value(&self) -> Value {
+            serde_json::to_value(&self.record).unwrap_or_default()
+        }
+
+        /// Claim the session.
+        fn claim(&mut self) -> Result<Claimed> {
+            // An owner that has just died is still the owner until the
+            // coordinator has seen its connection close: asked again.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let owner = match self.link.claim(&self.value(), How::Fresh) {
+                    Ok(Answer::Mine) => {
+                        self.mine = true;
                         return Ok(Claimed::Owner);
                     }
+                    Ok(Answer::Held { owner, .. }) => owner,
+                    Err(e) => return Ok(Claimed::Unknown(format!("{e:#}"))),
+                };
+                let record: Record = serde_json::from_value(owner).map_err(|e| {
+                    anyhow::anyhow!(
+                        "a session is already running in this directory, and what the \
+                         coordinator says of its owner cannot be read ({e}). Nothing was changed"
+                    )
+                })?;
+                // A process that cannot be seen from here (another pid
+                // namespace) is the owner all the same: it holds the claim.
+                if genuine(&record) || Instant::now() >= deadline {
+                    let status = hub::ask(&record, "owner/status", Value::Null).ok();
+                    return Ok(Claimed::Live(Live { record, status }));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// Claim the session if it is free now; `false` while it is not.
+        fn try_claim(&mut self) -> bool {
+            if !self.mine {
+                self.mine = matches!(self.link.claim(&self.value(), How::Fresh), Ok(Answer::Mine));
+            }
+            self.mine
+        }
+
+        /// Take the place behind `owner`: the session is this process's
+        /// when that one's claim ends, and nobody else's in between.
+        pub(super) fn queue(&mut self, owner: &Record) -> Result<Turn> {
+            Ok(match self.link.claim(&self.value(), How::Wait)? {
+                Answer::Mine => {
+                    self.mine = true;
+                    Turn::Mine
+                }
+                Answer::Held {
+                    owner: now,
+                    waiting,
+                    ..
+                } if waiting && now["pid"] == owner.pid && now["started"] == owner.started => {
+                    Turn::Waiting
+                }
+                // Another owner than the one this started from, or another
+                // atelier already waiting behind it.
+                Answer::Held {
+                    owner: now, heir, ..
+                } => {
+                    self.link.let_go();
+                    Turn::Changed(match heir["pid"].as_u64() {
+                        Some(pid) if now["pid"] == owner.pid => {
+                            format!(
+                                "another atelier (pid {pid}) is already taking the session over"
+                            )
+                        }
+                        _ => format!(
+                            "the session was taken by another atelier (pid {}) meanwhile",
+                            now["pid"]
+                        ),
+                    })
+                }
+            })
+        }
+
+        /// Where a take-over of `owner` stands, waiting up to `within` for
+        /// the coordinator's word. A coordinator that was replaced
+        /// meanwhile is asked anew.
+        pub(super) fn next(&mut self, owner: &Record, within: Duration) -> Result<Turn> {
+            if self.mine {
+                return Ok(Turn::Mine);
+            }
+            match self.link.granted(within) {
+                Ok(true) => {
+                    self.mine = true;
+                    Ok(Turn::Mine)
+                }
+                Ok(false) => Ok(Turn::Waiting),
+                Err(_) => self.queue(owner),
+            }
+        }
+
+        /// Give up the claim, or the place in line.
+        pub(super) fn let_go(&mut self) {
+            self.mine = false;
+            self.link.let_go();
+        }
+
+        /// Become the owner: open the socket to whoever asks, and keep the
+        /// claim for as long as the process lives.
+        fn own(self) {
+            let value = self.value();
+            let Seat {
+                link,
+                record,
+                mut socket,
+                mine,
+            } = self;
+            let hub = hub::Hub::start(record, socket.0.take());
+            let _ = OWNER.set(hub);
+            std::thread::spawn(move || keep(link, &value, mine));
+        }
+    }
+
+    /// How often an owner that found the session claimed by another asks
+    /// again.
+    const CONTEST: Duration = Duration::from_secs(2);
+    /// The pause before looking for a coordinator again: the first, and
+    /// the cap it doubles up to.
+    const RETRY_MIN: Duration = Duration::from_millis(100);
+    const RETRY_MAX: Duration = Duration::from_secs(5);
+
+    /// The owner's side of the claim, for the life of the process: when the
+    /// connection that holds it ends — the coordinator was replaced, or
+    /// killed — find the next coordinator (starting it, as instances do)
+    /// and claim again.
+    ///
+    /// Two owners of one directory can meet there: they started while no
+    /// coordinator could be reached, or one arrived in the moment the
+    /// other was between two coordinators. The first to claim has it. The
+    /// other is not stopped — nothing is, without somebody asking — but
+    /// says so to its user, and keeps asking, so that it is the owner once
+    /// the first one ends.
+    fn keep(mut link: claims::Link, record: &Value, mut claimed: bool) {
+        let mut rival = None;
+        let mut delay = RETRY_MIN;
+        loop {
+            if claimed {
+                link.watch();
+            }
+            match link.claim(record, How::Again) {
+                Ok(Answer::Mine) => {
+                    claimed = true;
+                    delay = RETRY_MIN;
+                    if rival.take().is_some() {
+                        notice(
+                            "the other atelier in this directory has ended: this session is \
+                             the only one here again."
+                                .to_string(),
+                        );
+                    }
+                }
+                Ok(Answer::Held { owner, .. }) => {
+                    claimed = false;
+                    let pid = owner["pid"].as_u64();
+                    if rival != Some(pid) {
+                        rival = Some(pid);
+                        notice(format!(
+                            "another atelier (pid {}) has a session open in this directory \
+                             too: the two could not see each other when they started. Both \
+                             go on, and both write the saved session — quit one of them.",
+                            pid.map_or_else(|| "?".to_string(), |p| p.to_string())
+                        ));
+                    }
+                    std::thread::sleep(CONTEST);
+                }
+                Err(_) => {
+                    claimed = false;
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(RETRY_MAX);
                 }
             }
-            Err(std::fs::TryLockError::Error(_)) => Ok(Claimed::Unknown),
         }
-    }
-
-    /// Take the lock if it is free, and own the session; `false` while
-    /// another process holds it.
-    fn try_own(root: &Path, kind: Kind) -> bool {
-        let Some(file) = open_lock(root) else {
-            return false;
-        };
-        let free = file.try_lock().is_ok();
-        if free {
-            own(file, kind);
-        }
-        free
-    }
-
-    /// Become the owner: `lock` is held. Open the socket, write the record.
-    pub(super) fn own(mut lock: File, kind: Kind) {
-        let pid = std::process::id();
-        let socket = hub::bind(pid);
-        let record = Record {
-            pid,
-            started: proc::start_token(pid).unwrap_or_default(),
-            since: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-            kind,
-            tty: proc::terminal(),
-            socket: socket.as_ref().map(|(_, path)| path.display().to_string()),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        };
-        let written = lock
-            .set_len(0)
-            .and_then(|()| lock.rewind())
-            .and_then(|()| lock.write_all(serde_json::to_string(&record).unwrap().as_bytes()))
-            .and_then(|()| lock.flush());
-        if let Err(e) = written {
-            eprintln!("warning: writing {LOCK_FILE}: {e}");
-        }
-        let hub = hub::Hub::start(record, lock, socket);
-        let _ = OWNER.set(hub);
     }
 
     /// Whether another atelier owns the session in `root` right now. For a
     /// run that does not own it and must not write it.
     pub fn live_elsewhere(root: &Path) -> bool {
-        if owner().is_some() {
-            return false;
-        }
-        let Ok(file) = File::open(root.join(LOCK_FILE)) else {
-            return false;
-        };
-        match file.try_lock_shared() {
-            Ok(()) => false,
-            Err(std::fs::TryLockError::WouldBlock) => true,
-            Err(std::fs::TryLockError::Error(_)) => false,
-        }
+        owner().is_none() && claims::owner_of(root).is_some()
     }
 
     /// Start a run of `kind` that owns the session in `root`: take the
@@ -462,25 +597,39 @@ mod imp {
         choice: Option<Choice>,
         interactive: bool,
     ) -> Result<Start> {
+        // Already this process's (an editor's second `session/new`).
+        if owner().is_some() {
+            return Ok(Start::Go { took_over: false });
+        }
+        // Without a coordinator nobody says whose the session is: the run
+        // starts as if it were alone.
+        let Some(link) = claims::Link::open(root) else {
+            return Ok(Start::Go { took_over: false });
+        };
+        let mut seat = Seat::new(link, kind);
         let mut took_over = false;
         loop {
-            let live = match claim(root, kind)? {
-                Claimed::Owner | Claimed::Unknown => return Ok(Start::Go { took_over }),
+            let live = match seat.claim()? {
+                Claimed::Owner => {
+                    seat.own();
+                    return Ok(Start::Go { took_over });
+                }
+                Claimed::Unknown(why) => {
+                    eprintln!(
+                        "atelier: the coordinator cannot be reached ({why}): whether another \
+                         atelier is running in this directory is not known. Starting."
+                    );
+                    seat.own();
+                    return Ok(Start::Go { took_over });
+                }
                 Claimed::Live(live) => live,
             };
-            if took_over {
-                // Somebody else was quicker to the session just freed.
-                eprintln!(
-                    "atelier: the session was taken by another atelier (pid {}) meanwhile.",
-                    live.record.pid
-                );
-            }
             let choice = match choice {
                 Some(choice) => choice,
                 None if interactive => {
                     // While the question is up, the owner may end: then
                     // there is nothing to ask about.
-                    let mut gone = || try_own(root, kind);
+                    let mut gone = || seat.try_claim();
                     match prompt::ask(&live, &mut gone)? {
                         prompt::Asked::Choice(choice) => choice,
                         prompt::Asked::Gone => {
@@ -488,6 +637,7 @@ mod imp {
                                 "the other atelier (pid {}) has ended: starting normally.",
                                 live.record.pid
                             );
+                            seat.own();
                             return Ok(Start::Go { took_over: false });
                         }
                     }
@@ -507,11 +657,12 @@ mod imp {
                     };
                     let Some(why) = unable else {
                         // It may have ended since it was described.
-                        if try_own(root, kind) {
+                        if seat.try_claim() {
                             eprintln!(
                                 "the other atelier (pid {}) has ended: starting normally.",
                                 live.record.pid
                             );
+                            seat.own();
                             return Ok(Start::Go { took_over: false });
                         }
                         return Ok(Start::Attach(live));
@@ -533,32 +684,30 @@ mod imp {
                     }
                     return Ok(Start::Exit(EXIT_CANCELLED));
                 }
-                Choice::TakeOver => match takeover::run(&live, root)? {
-                    takeover::Outcome::Done { lock, notes } => {
+                Choice::TakeOver => match takeover::run(&live, &mut seat)? {
+                    takeover::Outcome::Done { notes } => {
                         for note in notes {
                             eprintln!("{note}");
                         }
-                        own(lock, kind);
+                        seat.own();
                         return Ok(Start::Go { took_over: true });
                     }
-                    takeover::Outcome::Changed => {
-                        took_over = true;
+                    takeover::Outcome::Changed(how) => {
                         if !interactive {
                             // A flag was about the session that was there.
-                            let now = record_of(root).map_or(0, |r| r.pid);
-                            eprintln!(
-                                "atelier: the session was taken by another atelier (pid {now}) \
-                                 meanwhile; nothing more was done."
-                            );
+                            eprintln!("atelier: {how}; nothing more was done.");
                             return Ok(Start::Exit(EXIT_IN_USE));
                         }
+                        // Asked again, about the session as it is now.
+                        eprintln!("atelier: {how}.");
+                        took_over = true;
                     }
                 },
             }
         }
     }
 
-    /// On the way out: take the socket away. The lock goes with the
+    /// On the way out: take the socket away. The claim goes with the
     /// process.
     pub fn release() {
         if let Some(hub) = owner() {
@@ -634,6 +783,9 @@ mod imp {
     }
     pub fn start(_: &Path, _: Kind, _: Option<Choice>, _: bool) -> Result<Start> {
         Ok(Start::Go { took_over: false })
+    }
+    pub fn take_notice() -> Option<String> {
+        None
     }
     pub fn release() {}
     pub fn yielding() -> Option<String> {

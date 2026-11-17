@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::ask::Outcome;
+use super::claims::{self, Answer, How, Link};
 use super::client::{self, Client, Options};
 use super::{Message, daemon, socket_path};
 
@@ -32,10 +33,17 @@ impl Drop for Dir {
 }
 
 fn spawn_daemon(dir: &Path, idle: Duration) -> JoinHandle<()> {
+    spawn_settling(dir, idle, Duration::ZERO)
+}
+
+/// A daemon that, if it follows another, keeps unclaimed sessions from
+/// newcomers for `settle`.
+fn spawn_settling(dir: &Path, idle: Duration, settle: Duration) -> JoinHandle<()> {
     let cfg = daemon::Config {
         dir: dir.to_path_buf(),
         idle,
         watch_exe: false,
+        settle,
     };
     let handle = std::thread::spawn(move || daemon::run(cfg).expect("daemon"));
     wait_for("the socket", || super::connect(dir).is_ok());
@@ -812,6 +820,15 @@ fn steps_down_for_a_newer_atelier_and_refuses_an_older_protocol() {
     // An older protocol is refused; the coordinator stays.
     let r = raw(&dir.0, hello("0.0.1", 0));
     assert_eq!(r["error"]["code"], super::ERR_INCOMPATIBLE);
+    // A claim is an instance's first word as much as `hello` is.
+    let claim = |version: &str, proto: u64| {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "claim",
+               "params": {"dir": "/work/x", "record": {"pid": 1},
+                          "version": version, "proto": proto}})
+    };
+    let r = raw(&dir.0, claim("0.0.1", super::PROTO - 1));
+    assert_eq!(r["error"]["code"], super::ERR_INCOMPATIBLE);
+    assert_eq!(claims::owner_in(&dir.0, Path::new("/work/x")), None);
     assert!(client::control(&dir.0, "status").is_ok());
 
     // A newer atelier makes it step down.
@@ -819,6 +836,295 @@ fn steps_down_for_a_newer_atelier_and_refuses_an_older_protocol() {
     assert_eq!(r["error"]["code"], super::ERR_SUPERSEDED);
     daemon.join().unwrap();
     assert!(client::control(&dir.0, "status").is_err());
+
+    // And so does one that claims a session.
+    let daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let r = raw(&dir.0, claim("0.0.1", super::PROTO + 1));
+    assert_eq!(r["error"]["code"], super::ERR_SUPERSEDED);
+    daemon.join().unwrap();
+}
+
+/// What a claim meets in a coordinator from before there were claims: it
+/// is told to say hello first, and its hello — a newer protocol's — makes
+/// that coordinator step down, as an instance's would.
+#[test]
+fn a_coordinator_without_claims_is_made_to_step_down() {
+    let dir = Dir::new("old");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(socket_path(&dir.0)).unwrap();
+    let socket = socket_path(&dir.0);
+    let old = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
+        let mut answer = |code: i64, message: &str| {
+            let request: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            let error = json!({ "code": code, "message": message });
+            let reply = json!({"jsonrpc": "2.0", "id": request["id"], "error": error});
+            writeln!(&stream, "{reply}").unwrap();
+            request
+        };
+        let claim = answer(-32000, "claim: say hello first");
+        let hello = answer(super::ERR_SUPERSEDED, "restarting");
+        std::fs::remove_file(socket).unwrap();
+        (claim, hello)
+    });
+    let mut link = claimant(&dir.0, "proj");
+    // (No atelier is named to start the next coordinator from.)
+    let err = link.claim(&json!({ "pid": 1 }), How::Fresh).unwrap_err();
+    assert!(format!("{err:#}").contains("no coordinator"), "{err:#}");
+    let (claim, hello) = old.join().unwrap();
+    assert_eq!(claim["method"], "claim");
+    assert_eq!(hello["method"], "hello");
+    assert_eq!(hello["params"]["proto"], super::PROTO);
+    assert_eq!(hello["params"]["version"], crate::update::VERSION);
+}
+
+/// A link that claims the session of `/work/<project>`.
+fn claimant(dir: &Path, project: &str) -> Link {
+    Link::at(dir.to_path_buf(), None, &Path::new("/work").join(project))
+}
+
+fn pid_of(answer: &Answer) -> Option<u64> {
+    match answer {
+        Answer::Mine => None,
+        Answer::Held { owner, .. } => owner["pid"].as_u64(),
+    }
+}
+
+/// The session of a directory has one owner: the first to claim it, for as
+/// long as its connection lasts, and whoever claims it next is handed that
+/// one's record.
+#[test]
+fn a_session_is_its_first_claimants_until_its_connection_ends() {
+    let dir = Dir::new("claim");
+    let daemon = spawn_daemon(&dir.0, Duration::from_millis(300));
+    let (mut a, mut b) = (claimant(&dir.0, "proj"), claimant(&dir.0, "proj"));
+    let record = |pid: u64| json!({"pid": pid, "kind": "repl", "socket": "/s"});
+
+    assert!(matches!(
+        a.claim(&record(1), How::Fresh).unwrap(),
+        Answer::Mine
+    ));
+    let held = b.claim(&record(2), How::Fresh).unwrap();
+    assert_eq!(pid_of(&held), Some(1));
+    assert!(matches!(held, Answer::Held { waiting: false, .. }));
+    // Another directory is another session.
+    let mut other = claimant(&dir.0, "other");
+    assert!(matches!(
+        other.claim(&record(3), How::Fresh).unwrap(),
+        Answer::Mine
+    ));
+
+    // Asked by anybody: the record as the owner gave it, and gave it last.
+    let project = Path::new("/work/proj");
+    assert_eq!(claims::owner_in(&dir.0, project), Some(record(1)));
+    assert!(matches!(
+        a.claim(&record(11), How::Fresh).unwrap(),
+        Answer::Mine
+    ));
+    assert_eq!(claims::owner_in(&dir.0, project), Some(record(11)));
+    let all = client::control(&dir.0, "claims").unwrap();
+    assert_eq!(
+        claims::render(&all),
+        [
+            "session in /work/other: pid 3 (repl)",
+            "session in /work/proj: pid 11 (repl)"
+        ]
+    );
+    let status = client::control(&dir.0, "status").unwrap();
+    assert_eq!(
+        (&status["sessions"], &status["instances"]),
+        (&json!(2), &json!(0))
+    );
+
+    // An owner is no instance, and keeps the coordinator up all the same.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        client::control(&dir.0, "list").unwrap()["instances"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // The connection ends, however: the session is the next one's to claim.
+    drop(a);
+    wait_for("the session to be free", || {
+        claims::owner_in(&dir.0, project).is_none()
+    });
+    assert!(matches!(
+        b.claim(&record(2), How::Fresh).unwrap(),
+        Answer::Mine
+    ));
+    assert_eq!(claims::owner_in(&dir.0, project), Some(record(2)));
+
+    // With nothing claimed and nobody connected, the coordinator ends.
+    drop((b, other));
+    daemon.join().unwrap();
+}
+
+/// A take-over: the claim passes from the owner to the one waiting behind
+/// it when the owner's connection ends, and at no time to a third.
+#[test]
+fn a_claim_passes_to_the_one_waiting_and_to_nobody_else() {
+    let dir = Dir::new("heir");
+    let daemon = spawn_daemon(&dir.0, Duration::from_secs(60));
+    let record = |pid: u64| json!({ "pid": pid });
+    let mut owner = claimant(&dir.0, "proj");
+    let mut taker = claimant(&dir.0, "proj");
+    assert!(matches!(
+        owner.claim(&record(1), How::Fresh).unwrap(),
+        Answer::Mine
+    ));
+
+    let queued = taker.claim(&record(2), How::Wait).unwrap();
+    assert!(matches!(queued, Answer::Held { waiting: true, .. }));
+    assert_eq!(pid_of(&queued), Some(1));
+    assert!(!taker.granted(Duration::from_millis(50)).unwrap());
+    // There is one place behind an owner.
+    let mut late = claimant(&dir.0, "proj");
+    match late.claim(&record(3), How::Wait).unwrap() {
+        Answer::Held {
+            owner,
+            heir,
+            waiting: false,
+        } => assert_eq!((&owner["pid"], &heir["pid"]), (&json!(1), &json!(2))),
+        other => panic!("{other:?}"),
+    }
+
+    // While the owner goes, a third keeps asking: it is never given it.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (stop, asked) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let (stopping, asking, coord) = (Arc::clone(&stop), Arc::clone(&asked), dir.0.clone());
+    let third = std::thread::spawn(move || {
+        let mut third = claimant(&coord, "proj");
+        let mut seen = Vec::new();
+        while !stopping.load(Ordering::Relaxed) {
+            let answer = third.claim(&record(4), How::Fresh).unwrap();
+            let owner = pid_of(&answer).expect("never the third's");
+            if seen.last() != Some(&owner) {
+                seen.push(owner);
+            }
+            asking.fetch_add(1, Ordering::Relaxed);
+        }
+        seen
+    });
+    wait_for("the third to be asking", || {
+        asked.load(Ordering::Relaxed) > 0
+    });
+    drop(owner);
+    assert!(taker.granted(Duration::from_secs(10)).unwrap());
+    wait_for("the claim to be the taker's", || {
+        claims::owner_in(&dir.0, Path::new("/work/proj")) == Some(record(2))
+    });
+    let so_far = asked.load(Ordering::Relaxed);
+    wait_for("the third to have asked since", || {
+        asked.load(Ordering::Relaxed) > so_far + 1
+    });
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(third.join().unwrap(), [1, 2]);
+    assert_eq!(
+        pid_of(&late.claim(&record(3), How::Fresh).unwrap()),
+        Some(2)
+    );
+
+    // One that waited and gave up inherits nothing.
+    assert!(matches!(
+        late.claim(&record(3), How::Wait).unwrap(),
+        Answer::Held { waiting: true, .. }
+    ));
+    late.let_go();
+    wait_for("the place behind to be free", || {
+        client::control(&dir.0, "claims").unwrap()["claims"][0]["heir"].is_null()
+    });
+    drop(taker);
+    wait_for("the session to be free", || {
+        claims::owner_in(&dir.0, Path::new("/work/proj")).is_none()
+    });
+
+    client::control(&dir.0, "shutdown").unwrap();
+    daemon.join().unwrap();
+}
+
+/// A coordinator that ends with sessions claimed hands none of them over,
+/// and the one that follows it keeps them for their owners: a newcomer is
+/// put off until those have had the time to claim again.
+#[test]
+fn owners_claim_again_with_the_next_coordinator_before_newcomers_may() {
+    let dir = Dir::new("reclaim");
+    let record = |pid: u64| json!({ "pid": pid });
+    let fresh = |pid: u64| {
+        let params = json!({"dir": "/work/proj", "record": record(pid),
+                            "version": crate::update::VERSION, "proto": super::PROTO});
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "claim", "params": params});
+        raw(&dir.0, request)["result"].clone()
+    };
+    let first = spawn_daemon(&dir.0, Duration::from_secs(60));
+    // The first coordinator there ever was has nobody to wait for.
+    assert_eq!(fresh(9)["claimed"], true);
+    let mut owner = claimant(&dir.0, "proj");
+    wait_for("the session to be free", || {
+        matches!(owner.claim(&record(1), How::Fresh), Ok(Answer::Mine))
+    });
+    let mut taker = claimant(&dir.0, "proj");
+    assert!(matches!(
+        taker.claim(&record(2), How::Wait).unwrap(),
+        Answer::Held { waiting: true, .. }
+    ));
+
+    client::control(&dir.0, "shutdown").unwrap();
+    first.join().unwrap();
+    // The owner's connection was closed, by a coordinator that was ending:
+    // the one behind it is told nothing but that.
+    assert!(taker.granted(Duration::from_secs(10)).is_err());
+    owner.watch();
+    assert!(owner.claim(&record(1), How::Again).is_err(), "none to ask");
+    assert!(socket_path(&dir.0).exists(), "left for the next to find");
+
+    let second = spawn_settling(&dir.0, Duration::from_secs(60), Duration::from_secs(3600));
+    let put_off = fresh(3);
+    assert_eq!(put_off["claimed"], false);
+    assert!(put_off["settling_ms"].as_u64().unwrap() > 0, "{put_off}");
+    assert!(matches!(
+        owner.claim(&record(1), How::Again).unwrap(),
+        Answer::Mine
+    ));
+    let told = fresh(3);
+    assert_eq!(
+        (&told["claimed"], &told["owner"]),
+        (&json!(false), &record(1))
+    );
+    // The one that was taking over is behind it again.
+    assert!(matches!(
+        taker.claim(&record(2), How::Wait).unwrap(),
+        Answer::Held { waiting: true, .. }
+    ));
+    // Two owners of one session, each from before: the first has it, the
+    // other is told whose it is.
+    let mut rival = claimant(&dir.0, "proj");
+    assert_eq!(
+        pid_of(&rival.claim(&record(5), How::Again).unwrap()),
+        Some(1)
+    );
+
+    // A coordinator that ends with nothing claimed leaves no sign, and the
+    // next one puts nobody off.
+    drop((owner, taker, rival));
+    wait_for("the session to be free", || {
+        claims::owner_in(&dir.0, Path::new("/work/proj")).is_none()
+    });
+    client::control(&dir.0, "shutdown").unwrap();
+    second.join().unwrap();
+    assert!(!socket_path(&dir.0).exists());
+    let third = spawn_settling(&dir.0, Duration::from_secs(60), Duration::from_secs(3600));
+    assert_eq!(fresh(3)["claimed"], true);
+    wait_for("the session to be free", || {
+        claims::owner_in(&dir.0, Path::new("/work/proj")).is_none()
+    });
+    client::control(&dir.0, "shutdown").unwrap();
+    third.join().unwrap();
 }
 
 #[test]
@@ -830,6 +1136,7 @@ fn only_one_coordinator_serves_and_it_leaves_when_idle() {
         dir: dir.0.clone(),
         idle: Duration::from_secs(60),
         watch_exe: false,
+        settle: Duration::ZERO,
     };
     let t0 = Instant::now();
     daemon::run(cfg).unwrap();

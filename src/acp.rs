@@ -691,7 +691,7 @@ impl<F: FnMut() -> anyhow::Result<Session>> Agent<F> {
         let mut ui = AcpUi::new(&self.shared, current, client, Scope::Idle, 0);
         current.session.poll_background(&mut ui);
         current.session.poll_peers(&mut ui);
-        if let Some(notice) = crate::update::take_notice() {
+        if let Some(notice) = crate::update::take_notice().or_else(crate::own::take_notice) {
             ui.notice(&notice);
         }
     }

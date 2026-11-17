@@ -5,21 +5,32 @@ a small background process, the **coordinator**. It lets the instances see
 each other and talk — you to an agent in another terminal, or the agents
 among themselves.
 
+It is also what knows **which atelier owns the session of a project
+directory**, so that a second one started there is told instead of writing
+over the first (see [One session, one
+owner](sessions.md#one-session-one-owner)).
+
 There is nothing to install or start. The first atelier you launch starts
-the coordinator; the others find it. It holds no state worth keeping, so it
-can end at any time and be replaced:
+the coordinator; the others find it. It keeps nothing on disk, and what it
+holds in memory each atelier can tell it again, so it can end at any time
+and be replaced:
 
 - **It ended** (crashed, was killed): every instance notices, the first one
   to retry starts a new coordinator, and they all rejoin it under the same
-  names, with the same topic subscriptions and locks. This takes a fraction of a
-  second and needs nothing from you.
+  names, with the same topic subscriptions and locks, each owner claiming
+  its session again. This takes a fraction of a second and needs nothing
+  from you.
 - **atelier was updated**: the coordinator ends by itself when its
   executable is replaced on disk (a self-update, a rebuild), and when a
   newer atelier connects to it. The next one runs the new version.
-- **Nobody is left**: it ends a minute after the last instance exits.
+- **Nobody is left**: it ends a minute after the last instance exits and
+  the last session is given up.
 
 While the coordinator is away, `/peers`, `/send` and the agent's tools fail
-with a message saying so; nothing else in atelier depends on it.
+with a message saying so, and an atelier started in a directory where
+another is running is not told ([Without the
+coordinator](sessions.md#without-the-coordinator) says what happens in
+each case). Nothing else in atelier depends on it.
 
 ## Using it
 
@@ -194,7 +205,7 @@ start — so they never overlap: one turn at a time, a wake before a loop.
 From a shell:
 
 ```sh
-atelier coordinator status   # is one running, and who is connected
+atelier coordinator status   # is one running, who is connected, which sessions are owned
 atelier coordinator stop     # end it (instances will start another)
 ```
 
@@ -202,9 +213,9 @@ atelier coordinator stop     # end it (instances will start another)
 
 | Variable | |
 |---|---|
-| `ATELIER_NO_COORDINATOR` | Any non-empty value other than `0`: this atelier runs alone — it neither joins nor starts a coordinator, and has none of the `peer*` tools |
+| `ATELIER_NO_COORDINATOR` | Any non-empty value other than `0`: this atelier runs alone — it neither joins nor starts a coordinator, has none of the `peer*` tools, and neither claims the session of its directory nor finds out that another atelier has it: it starts next to one [as if it were not there](sessions.md#without-the-coordinator) |
 | `ATELIER_COORDINATOR_WAKE` | `never`, `questions` or `always`: what [wakes](#waking-an-idle-instance) this instance when idle, overriding `[coordinator] wake`. Any other value means `never` |
-| `ATELIER_COORDINATOR_DIR` | Directory for the coordinator's socket, lock and log. Default: `$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier`. Instances only meet if they use the same directory |
+| `ATELIER_COORDINATOR_DIR` | Directory for the coordinator's socket, lock and log, and for the sockets of session owners. Default: `$XDG_RUNTIME_DIR/atelier`, else `~/.local/state/atelier`. Instances only meet — and a session only has one owner — among ateliers that use the same directory |
 
 The coordinator is available on Unix systems. Its log is
 `coordinator.log` in that directory.
@@ -235,6 +246,9 @@ coordinator answers with the name it gets. After that:
 | `unlock {path?}` | Release the caller's lock on `path`, or all its locks. `{released: n}` |
 | `locks` | The lock table: `{locks: [{holder, holder_id, path, note, since}]}` |
 | `status`, `shutdown` | About the coordinator itself; allowed without `hello` |
+| `claim {dir, record, version, proto, wait?, again?}` | Claim the session of the project directory `dir` for this connection (see [below](#session-claims)); allowed without `hello` |
+| `unclaim {dir?}` | Give up the caller's claim on `dir`, or its place behind one — all of them without `dir`. `{released: n}` |
+| `claims {dir?}` | The sessions that are owned: `{claims: [{dir, owner, heir}]}`; allowed without `hello` |
 
 Deliveries arrive as a `message` notification (`from`, `body`, `topic` or
 `broadcast`, and the sender's `wake_depth`, which the coordinator passes on
@@ -245,14 +259,56 @@ disconnects (error `-32004`) or takes longer than `timeout_ms` (error
 `info`, `ask` and `task` — `call` is the extension point for richer
 instance-to-instance requests (`Client::handle` in `src/coord/client.rs`).
 
-The lock table is the one thing the coordinator keeps, and it keeps it in
-memory. Whenever it changes — an acquire, a release, a holder
+The lock table is one of the two things the coordinator keeps, and it
+keeps it in memory. Whenever it changes — an acquire, a release, a holder
 disconnecting — every instance is sent the whole table in a `locks`
 notification and keeps that copy, so looking a path up (which every edit
 does) costs no request. An instance's `hello` lists the locks it holds
 (`locks: [{path, note, since}]`), which is how the table survives a
 coordinator restart, and the answer to `hello` carries the table as it then
 stands (`src/coord/locks.rs`).
+
+### Session claims
+
+The other table is who owns the session of each project directory
+(`src/coord/claims.rs`; what is built on it is in
+[sessions](sessions.md#one-session-one-owner)). Unlike the locks it is not
+advice: the coordinator is what guarantees that a directory's session has
+one owner.
+
+A run that works on a project's saved session opens a connection for it —
+separate from its instance's, without `hello`: it has no name, is not
+listed and receives no message — and sends `claim` with the project's real
+path as `dir`, what it says of itself as `record` (kept as given), and its
+`version` and `proto`, checked as `hello`'s are. The answer is one of:
+
+| Answer | |
+|---|---|
+| `{claimed: true}` | The session is this connection's, until the connection ends. Claiming it again replaces the record |
+| `{claimed: false, owner, heir, waiting}` | It is somebody else's: `owner` is that one's record. `heir` is the record of the connection waiting behind it, if any, and `waiting` whether that is the caller |
+| `{claimed: false, settling_ms}` | Nobody holds it, but this coordinator has just replaced another and the owner it may have had is given `settling_ms` more to come back. Ask again |
+
+Requests are handled one at a time, so two claims on a free directory
+cannot both succeed. A claim ends when its connection does, and only then;
+nothing is stored, so nothing is ever stale.
+
+`wait: true` is a **take-over**: when the directory is somebody's and
+nobody waits behind it yet, the caller takes that place (`waiting: true`).
+When the owner's connection ends, the claim becomes the waiting
+connection's — under the same lock, with no moment in which the directory
+is free — and it is sent a `claimed {dir}` notification. Closing the
+connection, or `unclaim`, gives the place up. A coordinator that is ending
+hands nothing over: the connections it closes are of owners still running.
+
+`again: true` is an owner **claiming again** after the coordinator was
+replaced. A coordinator that finds its predecessor's socket still there —
+one that was killed, or that ended with sessions claimed, which leaves the
+socket for this — refuses, for its first second, to give an unclaimed
+directory to anyone who does not say `again`, so that a newcomer cannot get
+in before the owner is back. If two owners claim the same directory again
+(they could not see each other when they started), the first has it and the
+second is answered `claimed: false` like anybody else; it is for that
+atelier to say so to its user, and it keeps running.
 
 The answer to a `call` need not be ready when its handler returns. Handlers
 run on the thread that reads the connection and must not hold it up, so one
@@ -284,4 +340,5 @@ passes on (`src/agent/subagent/process.rs`).
 The code is in `src/coord/`: `daemon.rs` (the coordinator), `client.rs`
 (an instance's connection, reconnection and launch of the coordinator),
 `ask.rs` (questions awaiting this instance's agent), `locks.rs` (the
-advisory locks), `tools.rs` (the agent's tools).
+advisory locks), `claims.rs` (the session claims), `tools.rs` (the agent's
+tools).

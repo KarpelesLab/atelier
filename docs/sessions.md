@@ -51,7 +51,10 @@ the resumed conversation's events; it asks for it with
 
 A project has one saved session, so one atelier at a time works on it. The
 first to start **owns** it for as long as it runs; one started in the same
-directory while it does is told so, and chooses.
+directory while it does is told so, and chooses. (Which atelier that is,
+the [coordinator](coordinator.md) knows; nothing is written in the project
+for it — see [How it is recorded](#how-it-is-recorded) and [Without the
+coordinator](#without-the-coordinator).)
 
 ```text
 A session is already running in this directory:
@@ -158,9 +161,12 @@ session here, from what was saved, as `--continue` does. In order:
    written in place).
 2. If the session is not free two seconds after that, the owner is
    **signalled**: TERM, then KILL. Never before checking that the process
-   with that pid is still the one that wrote the record (by its start
-   time), and that the session is still that owner's: a recycled pid is not
-   signalled, and a session a third atelier took meanwhile is left to it.
+   with that pid is still the one the owner's record describes (by its
+   start time): a recycled pid is not signalled. Nor is anything done to a
+   session that is no longer that owner's, or that another atelier is
+   already taking over: the newcomer says so and leaves it (status 7 when
+   it was started with `--take-over`; at a terminal, the question is asked
+   again about the session as it now is).
 3. What the owner **left running** is stopped: every process it had started,
    directly or not, noted before it was asked and stopped now if still
    there (TERM, then KILL). The [coordinator](coordinator.md) and the
@@ -233,14 +239,22 @@ to an atelier that does, it leaves the saved session alone: a one-shot
 
 ### How it is recorded
 
-Ownership is an exclusive lock (`flock`) on `.atelier/session.lock`, held
-from the start of the session to the end of the process. The kernel drops
-it however the process ends, so there is nothing to clean up after a crash:
-the next start finds the lock free and is the owner, without a word. Of two
-that start together, one gets the lock and the other is told about it.
+Nowhere on disk. Who owns the session of a directory is the
+[coordinator](coordinator.md)'s to say — the background process every
+atelier on the machine is connected to. A run that would own a session
+connects to it (starting it if it is the first) and **claims** the
+directory, by its real path; the coordinator answers that the session is
+its own, or whose it is. It answers one request at a time, so of two that
+start together one is the owner and the other is told about it.
 
-The file holds the owner's record — a line of JSON — for whoever finds the
-lock held:
+The claim lasts as long as the connection it was made on, which the owner
+keeps open until its process ends — a quit, a crash, a `kill -9`: the
+connection is closed with it and the session is free, without a word from
+the next start. No lock file, nothing written in the project, nothing to
+clean up.
+
+With its claim the owner gives its record, which the coordinator hands to
+whoever finds the directory claimed:
 
 ```json
 {"pid":4021,"started":"8812345","since":1767225600,"kind":"terminal",
@@ -249,9 +263,9 @@ lock held:
 
 `started` is when that process started as the system counts it, which tells
 it from a later process with the same pid; `kind` is `terminal`, `repl`,
-`print`, `serve` or `acp`. The record is never believed on its own: without
-the lock held it is a leftover, and with it the pid is checked against
-`started` before anything is done to it.
+`print`, `serve` or `acp`. The pid is checked against `started` before
+anything is done to it. `atelier coordinator status` lists the sessions
+that are owned, after the instances.
 
 `socket` is where the owner answers: what it is doing (for the question),
 the request to yield, and — when the owner is the terminal interface — the
@@ -265,8 +279,31 @@ that is the only gate, and it is the one your files have. Without such a
 directory the session is owned all the same, and can be taken over by
 signal only.
 
-Not on Windows, where atelier has neither the socket nor the process table:
-there every start proceeds as it always did.
+A take-over is settled there too: the newcomer takes the one place behind
+the owner in the coordinator's table, and the claim passes to it the moment
+the owner's connection ends. A third atelier started in between finds the
+session owned throughout — by the old owner, then by the new one.
+
+### Without the coordinator
+
+The coordinator is what makes the owner the only one, so where there is
+none, nothing is detected:
+
+| | What happens |
+|---|---|
+| `ATELIER_NO_COORDINATOR` is set | Nobody is asked. Every start proceeds as it did before sessions had owners — no question, no refusal, `--attach`, `--take-over` and `--cancel` change nothing — and two ateliers in one directory both write the saved session, the last to finish a turn winning. This is the one switch: there is no setting that keeps the detection and drops the rest |
+| No coordinator can be reached or started (its directory cannot be written, the socket path is too long, the one running is of a newer atelier than this one) | The run says so (`the coordinator cannot be reached (…): whether another atelier is running in this directory is not known. Starting.`) and starts. It keeps looking, and claims its session when a coordinator answers |
+| The coordinator ends while sessions are owned (it was killed, stopped, or replaced by a newer one) | Nothing changes for the owners: each finds the next coordinator — starting it if nobody has — and claims its session again, within a fraction of a second. The new coordinator knows it follows another, and for its first second gives a session nobody has claimed again only to an owner coming back, so a newcomer arriving in that moment waits for it and is then told of the owner as usual |
+| Two owners of one directory meet at a coordinator — both started while none could be reached, or one slipped in during a restart the other was slow to notice | The first to claim has the session; a newcomer is told of that one. The other is **not stopped** and nothing is taken from it: it says, at its next prompt, `another atelier (pid …) has a session open in this directory too: … Both go on, and both write the saved session — quit one of them.`, and becomes the owner when the first one ends |
+| Ateliers with different `ATELIER_COORDINATOR_DIR`s (or different users, or one inside a container that does not share the directory) | Different coordinators, which know nothing of each other: each has its own owner for the directory |
+| An atelier from before sessions were claimed this way is still running | It claims nothing (and its coordinator is replaced by the first newer atelier to start): it is not seen. Quit it |
+
+It is not on Windows either, where atelier has neither the coordinator nor
+the process table: there every start proceeds as it always did.
+
+The claim is made on a connection of its own, before the session is opened:
+it is not the [instance](coordinator.md#using-it) the same atelier is among
+its peers, has no name and receives no message.
 
 ## Starting over: `/new`
 

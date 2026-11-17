@@ -71,7 +71,6 @@
 #![cfg_attr(not(tui), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -285,12 +284,11 @@ struct Keys {
     partial: Vec<u8>,
 }
 
-/// This process's ownership of the session: the lock, the socket, and what
-/// the interfaces told it about themselves.
+/// This process's ownership of the session: the socket, and what the
+/// interfaces told it about themselves. (The claim itself is a connection
+/// to the coordinator, kept by `keep` in [`super`].)
 pub(super) struct Hub {
     record: Record,
-    /// Held for as long as the process lives: this is the ownership.
-    _lock: File,
     socket: Option<PathBuf>,
     state: Mutex<State>,
 }
@@ -413,15 +411,10 @@ enum Accepted {
 }
 
 impl Hub {
-    pub(super) fn start(
-        record: Record,
-        lock: File,
-        socket: Option<(UnixListener, PathBuf)>,
-    ) -> Arc<Hub> {
+    pub(super) fn start(record: Record, socket: Option<(UnixListener, PathBuf)>) -> Arc<Hub> {
         let (listener, path) = socket.unzip();
         let hub = Arc::new(Hub {
             record,
-            _lock: lock,
             socket: path,
             state: Mutex::new(State::default()),
         });
@@ -881,8 +874,7 @@ impl Hub {
     }
 
     /// The process is on its way out: the remotes are told, the socket
-    /// goes now, the lock when the process does. The record stays, true
-    /// until then and stale after.
+    /// goes now, the claim when the process does.
     pub(super) fn close(&self) {
         self.close_remotes("ended", None);
         if let Some(path) = &self.socket {
@@ -1187,13 +1179,6 @@ mod tests {
     use super::*;
 
     fn hub() -> Arc<Hub> {
-        let path = std::env::temp_dir().join(format!(
-            "atelier-hub-{}-{:?}.lock",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let lock = File::create(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
         let record = Record {
             pid: std::process::id(),
             started: String::new(),
@@ -1203,7 +1188,7 @@ mod tests {
             socket: None,
             version: String::new(),
         };
-        Hub::start(record, lock, None)
+        Hub::start(record, None)
     }
 
     #[test]

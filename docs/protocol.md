@@ -1315,8 +1315,11 @@ refused `initialize`) is a pipe to the owner, and the client it was
 launched by is the remote, on stdin and stdout as ever. A program can also
 open the socket itself.
 
-The owner's record, `.atelier/session.lock` in the project, names its
-socket (`socket`; see [How it is recorded](sessions.md#how-it-is-recorded)).
+The owner's record names its socket (`socket`). The record is the
+[coordinator](coordinator.md#how-it-works)'s to give: `claims {"dir": "<the
+project's real path>"}` on the coordinator's socket answers `{"claims":
+[{"dir", "owner": {…, "socket"}, "heir"}]}` — empty when nobody owns the
+session there (see [How it is recorded](sessions.md#how-it-is-recorded)).
 It is a Unix socket, mode `0600`, in a directory only its user can enter:
 **whoever can connect is the same user on the same machine, and that is the
 only gate** — no token, and no TCP. JSON-RPC lines, as on stdio.
@@ -1326,7 +1329,7 @@ Two methods are answered on any owner's socket, without `initialize`:
 | Method | Result |
 |--------|--------|
 | `owner/status` | `{"pid", "kind", "since", "tty", "version", "busy", "jobs", "agents", "client", "remote", "remotes"}`: who the owner is and what it has going, as [`-32010`'s `owner`](#a-session-that-is-in-use) reports it; `remote` says whether it takes remotes, `remotes` how many are attached |
-| `session/yield` | Params `{"by": "who asks"}`. The owner stops, saves and exits within two seconds (`{"grace_ms": 2000}`): the first step of a [take-over](sessions.md#one-session-one-owner). The session is free when the lock on `.atelier/session.lock` is |
+| `session/yield` | Params `{"by": "who asks"}`. The owner stops, saves and exits within two seconds (`{"grace_ms": 2000}`): the first step of a [take-over](sessions.md#one-session-one-owner). The session is free when the owner's claim on the directory has ended, which is when its process has |
 
 `initialize` makes the connection a remote. Only a **terminal interface**
 takes remotes: an owner that is the line REPL, `serve`, `acp` or a `--print`

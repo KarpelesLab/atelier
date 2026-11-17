@@ -834,7 +834,7 @@ impl Shared {
 /// Launch `atelier coordinator`, detached: in its own process group (the
 /// terminal's signals don't reach it) with its output in a log file. If
 /// another instance won the race, this one notices and exits by itself.
-fn spawn_daemon(exe: &Path, dir: &Path) -> Result<()> {
+pub(super) fn spawn_daemon(exe: &Path, dir: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -871,10 +871,15 @@ fn spawn_daemon(exe: &Path, dir: &Path) -> Result<()> {
 /// instance — for `atelier coordinator status|stop`. Never starts a
 /// coordinator.
 pub fn control(dir: &Path, method: &str) -> Result<Value> {
+    control_with(dir, method, json!({}))
+}
+
+/// [`control`], with the request's parameters.
+pub fn control_with(dir: &Path, method: &str, params: Value) -> Result<Value> {
     let stream = super::connect(dir).context("connecting to the coordinator")?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     let mut out = stream.try_clone()?;
-    let line = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+    let line = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     out.write_all(format!("{line}\n").as_bytes())?;
     let mut answer = String::new();
     BufReader::new(stream).read_line(&mut answer)?;

@@ -5,21 +5,23 @@
 //! so routing never blocks on a slow peer. All routing state sits behind a
 //! single mutex and is lost when the daemon ends — instances bring it back
 //! when they reconnect (identity, topic subscriptions, the advisory locks
-//! they hold — see [`super::locks`]).
+//! they hold — see [`super::locks`] — and the sessions they own, see
+//! [`super::claims`]).
 //!
 //! The daemon ends on its own when:
 //! - an instance newer than it says hello (`superseded`): the instance then
 //!   starts its own, newer coordinator;
 //! - its executable changes on disk (a self-update or a rebuild), so the
 //!   next one runs the new code;
-//! - no instance has been connected for [`Config::idle`];
+//! - no instance has been connected, and no session owned, for
+//!   [`Config::idle`];
 //! - it is asked to (`shutdown`, i.e. `atelier coordinator stop`).
 //!
 //! Exclusivity comes from an advisory lock on `coordinator.lock`, held for
 //! the daemon's lifetime and released by the kernel however it dies, so a
 //! stale socket file can be replaced without racing another daemon.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -49,12 +51,19 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`super::ask`]): an answer that takes a model's turn, not a function's.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT_MAX: Duration = super::ask::MAX_TIMEOUT;
+/// How long a coordinator that replaces another puts new claims off, for
+/// the owners the other one knew to come back first (see [`Config::settle`]).
+const SETTLE: Duration = Duration::from_secs(1);
 
 pub struct Config {
     pub dir: PathBuf,
     pub idle: Duration,
     /// End when the daemon's executable is replaced on disk.
     pub watch_exe: bool,
+    /// When this coordinator follows one that may have had sessions claimed
+    /// (it finds that one's socket still there), how long a session nobody
+    /// has claimed again yet is kept from a newcomer.
+    pub settle: Duration,
 }
 
 impl Config {
@@ -63,6 +72,7 @@ impl Config {
             dir,
             idle: IDLE,
             watch_exe: true,
+            settle: SETTLE,
         }
     }
 }
@@ -112,6 +122,17 @@ struct Held {
     since: u64,
 }
 
+/// A session that is owned (see [`super::claims`]).
+struct Claim {
+    /// The owner's connection: the claim lasts as long as it does.
+    conn: u64,
+    /// The owner, as it described itself.
+    record: Value,
+    /// Who gets the claim when the owner's connection ends (a take-over):
+    /// its connection and its record.
+    heir: Option<(u64, Value)>,
+}
+
 /// A `call` forwarded to its target, awaiting the answer.
 struct Call {
     caller: u64,
@@ -130,7 +151,12 @@ struct State {
     next_call: u64,
     /// The advisory locks, oldest first.
     locks: Vec<Held>,
-    /// When the last instance left (or the daemon started).
+    /// The sessions that are owned, by project directory.
+    claims: BTreeMap<String, Claim>,
+    /// Until when a session nobody holds is kept for the owner it had under
+    /// the coordinator before this one.
+    settling: Option<Instant>,
+    /// When the last instance or owner left (or the daemon started).
     last_active: Option<Instant>,
     /// Why the daemon is ending, once it is.
     stopping: Option<String>,
@@ -172,6 +198,63 @@ impl State {
             }
         }
         self.calls.retain(|_, c| c.caller != conn);
+        self.drop_claims(conn, None);
+    }
+
+    /// The connection `conn` is gone, or lets go of `only` (of everything
+    /// without one): a session it owned is its heir's if it has one, and
+    /// nobody's otherwise; one it was waiting for is no longer waited for.
+    /// Returns how many claims and waits that ended.
+    fn drop_claims(&mut self, conn: u64, only: Option<&str>) -> usize {
+        let mut dropped = 0;
+        let mut inherited = Vec::new();
+        // A coordinator that is ending hands nothing over: the owners it is
+        // closing the connections of are still running.
+        let ending = self.stopping.is_some();
+        self.claims.retain(|dir, claim| {
+            if only.is_some_and(|o| o != dir) {
+                return true;
+            }
+            if claim.heir.as_ref().is_some_and(|(heir, _)| *heir == conn) {
+                claim.heir = None;
+                dropped += 1;
+            }
+            if claim.conn != conn {
+                return true;
+            }
+            dropped += 1;
+            match claim.heir.take().filter(|_| !ending) {
+                Some((heir, record)) => {
+                    claim.conn = heir;
+                    claim.record = record;
+                    inherited.push((heir, dir.clone()));
+                    true
+                }
+                None => false,
+            }
+        });
+        for (heir, dir) in inherited {
+            self.send(heir, notification("claimed", json!({ "dir": dir })));
+        }
+        if dropped > 0 {
+            self.last_active = Some(Instant::now());
+        }
+        dropped
+    }
+
+    /// The claims as `claims` lists them: all, or the one on `dir`.
+    fn claim_table(&self, dir: Option<&str>) -> Value {
+        self.claims
+            .iter()
+            .filter(|(d, _)| dir.is_none_or(|only| only == d.as_str()))
+            .map(|(d, c)| {
+                json!({
+                    "dir": d,
+                    "owner": c.record,
+                    "heir": c.heir.as_ref().map(|(_, record)| record),
+                })
+            })
+            .collect()
     }
 
     /// The connection of the instance called `to` (a name or an id).
@@ -267,7 +350,10 @@ pub fn run(cfg: Config) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let _ = std::fs::remove_file(&socket); // stale, since we hold the lock
+    // Stale, since we hold the lock — and the sign of a coordinator that
+    // ended with sessions claimed (or was killed): their owners are on
+    // their way back, and are given a moment to say so.
+    let follows = std::fs::remove_file(&socket).is_ok();
     let listener = {
         let (path, _handle) = super::reachable_socket(&cfg.dir)?;
         UnixListener::bind(path).with_context(|| format!("binding {}", socket.display()))?
@@ -281,6 +367,7 @@ pub fn run(cfg: Config) -> Result<()> {
     let daemon = Arc::new(Daemon {
         state: Mutex::new(State {
             last_active: Some(Instant::now()),
+            settling: follows.then(|| Instant::now() + cfg.settle),
             ..State::default()
         }),
         dir: cfg.dir.clone(),
@@ -301,12 +388,17 @@ pub fn run(cfg: Config) -> Result<()> {
         let (d, conn) = (Arc::clone(&daemon), next_conn);
         std::thread::spawn(move || d.serve(conn, stream));
     }
+    // Nobody is answered from here on: better refused than kept waiting.
+    drop(listener);
 
     // Tell everyone, close every connection, and give the writers a moment
-    // to get that out before the process ends.
-    let _ = std::fs::remove_file(&socket);
+    // to get that out before the process ends. The socket is left behind
+    // when sessions are claimed, for the next coordinator to know of them.
     {
         let mut st = daemon.lock();
+        if st.claims.is_empty() {
+            let _ = std::fs::remove_file(&socket);
+        }
         let reason = st.stopping.clone().unwrap_or_default();
         log(&format!("coordinator stopping: {reason}"));
         let bye = notification("shutdown", json!({ "reason": reason }));
@@ -360,6 +452,7 @@ impl Daemon {
                 }
             }
             let idle_out = st.peers.is_empty()
+                && st.claims.is_empty()
                 && st
                     .last_active
                     .is_some_and(|t| now.duration_since(t) >= idle);
@@ -470,6 +563,7 @@ impl Daemon {
                     "pid": std::process::id(),
                     "uptime_secs": self.started.elapsed().as_secs(),
                     "instances": st.peers.len(),
+                    "sessions": st.claims.len(),
                 })));
             }
             "list" => {
@@ -487,6 +581,17 @@ impl Daemon {
             }
             "shutdown" => return Reply::ThenStop(Ok(json!({})), "requested".into()),
             "hello" => return hello(st, conn, p),
+            // The sessions owned (see `super::claims`): asked for by runs
+            // that are not instances, or not yet.
+            "claims" => {
+                let table = st.claim_table(p["dir"].as_str());
+                return Reply::Now(Ok(json!({ "claims": table })));
+            }
+            "claim" => return claim(st, conn, p),
+            "unclaim" => {
+                let released = st.drop_claims(conn, p["dir"].as_str());
+                return Reply::Now(Ok(json!({ "released": released })));
+            }
             _ => {}
         }
 
@@ -673,8 +778,10 @@ impl Daemon {
     }
 }
 
-/// Register (or re-register) the connection as an instance.
-fn hello(st: &mut State, conn: u64, p: &Value) -> Reply {
+/// Turn away a caller this coordinator cannot serve: one that is newer
+/// (and then end, for a newer coordinator to start), or one that speaks an
+/// older protocol.
+fn admit(p: &Value) -> Option<Reply> {
     let version = p["version"].as_str().unwrap_or_default();
     let proto = p["proto"].as_u64().unwrap_or(0);
     let newer = matches!(
@@ -684,14 +791,70 @@ fn hello(st: &mut State, conn: u64, p: &Value) -> Reply {
     if newer || proto > PROTO {
         let why = format!("superseded by atelier {version}");
         let msg = format!("coordinator {VERSION} is older than atelier {version}; restarting");
-        return Reply::ThenStop(Err((ERR_SUPERSEDED, msg)), why);
+        return Some(Reply::ThenStop(Err((ERR_SUPERSEDED, msg)), why));
     }
     if proto != PROTO {
         let msg = format!(
             "atelier {version} speaks coordinator protocol {proto}, but coordinator {VERSION} \
              is running (protocol {PROTO}); update this atelier"
         );
-        return Reply::Now(Err((ERR_INCOMPATIBLE, msg)));
+        return Some(Reply::Now(Err((ERR_INCOMPATIBLE, msg))));
+    }
+    None
+}
+
+/// Claim the session of a project directory for the connection, which
+/// need not be an instance's (see [`super::claims`]).
+fn claim(st: &mut State, conn: u64, p: &Value) -> Reply {
+    if let Some(refusal) = admit(p) {
+        return refusal;
+    }
+    let Some(dir) = p["dir"].as_str().filter(|d| Path::new(d).is_absolute()) else {
+        return fail("claim: 'dir' must be an absolute path");
+    };
+    if !p["record"].is_object() {
+        return fail("claim: 'record' is required");
+    }
+    let record = p["record"].clone();
+    let Some(held) = st.claims.get_mut(dir) else {
+        // Nobody's — unless this coordinator has only just replaced another
+        // and the owner it had is still to say so (`again`).
+        let left = st
+            .settling
+            .and_then(|until| until.checked_duration_since(Instant::now()));
+        if let Some(left) = left.filter(|_| p["again"] != true) {
+            let ms = left.as_millis().max(1) as u64;
+            return Reply::Now(Ok(json!({ "claimed": false, "settling_ms": ms })));
+        }
+        let heir = None;
+        st.claims
+            .insert(dir.to_string(), Claim { conn, record, heir });
+        return Reply::Now(Ok(json!({ "claimed": true })));
+    };
+    if held.conn == conn {
+        // Claimed again: the same owner, as it describes itself now.
+        held.record = record;
+        return Reply::Now(Ok(json!({ "claimed": true })));
+    }
+    // Somebody else's. One that is taking it over waits for it: it is the
+    // owner the moment the owner's connection ends, and nobody gets in
+    // between. There is one such place.
+    if p["wait"] == true && held.heir.is_none() {
+        held.heir = Some((conn, record));
+    }
+    let waiting = held.heir.as_ref().is_some_and(|(heir, _)| *heir == conn);
+    Reply::Now(Ok(json!({
+        "claimed": false,
+        "owner": held.record,
+        "heir": held.heir.as_ref().map(|(_, record)| record),
+        "waiting": waiting,
+    })))
+}
+
+/// Register (or re-register) the connection as an instance.
+fn hello(st: &mut State, conn: u64, p: &Value) -> Reply {
+    if let Some(refusal) = admit(p) {
+        return refusal;
     }
     let Some(id) = p["id"].as_str().filter(|s| !s.is_empty()) else {
         return fail("hello: 'id' is required");

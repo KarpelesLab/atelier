@@ -472,7 +472,7 @@ fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Idle>
             if session.poll_peers(&mut TuiUi { r: &mut *r }) {
                 r.refresh()?;
             }
-            if let Some(notice) = crate::update::take_notice() {
+            if let Some(notice) = crate::update::take_notice().or_else(crate::own::take_notice) {
                 r.push_line(format!("! {notice}"), true);
                 r.refresh()?;
             }
