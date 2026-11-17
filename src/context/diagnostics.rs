@@ -31,6 +31,7 @@
 //!   [`crate::trust`]).
 
 use super::{ContextItem, ContextProvider};
+use crate::sandbox::project;
 use crate::settings::DiagnosticCheck;
 use crate::trust::Trust;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -89,8 +90,19 @@ impl DiagnosticsProvider {
     /// The checkers for `root`: the configured ones, else the detected ones.
     fn checkers(&self, root: &Path) -> Vec<Checker> {
         if self.configured.is_empty() {
-            return detect(root, &on_path, &|| {
-                *self.pyflakes.get_or_init(|| python_with_pyflakes(root))
+            // A checker is "installed" where it will run: in the sandbox's
+            // image when the sandbox is on, whatever the host has. (On but
+            // unavailable, the host says what the project would have, and
+            // each is then reported as not run.)
+            let sandbox = crate::sandbox::state(root);
+            let in_guest = |program: &str| match &sandbox {
+                crate::sandbox::State::Ready(setup) => project::in_image(setup, program),
+                _ => on_path(program),
+            };
+            return detect(root, &in_guest, &|| {
+                *self
+                    .pyflakes
+                    .get_or_init(|| python_with_pyflakes(root, &in_guest))
             });
         }
         self.configured
@@ -250,9 +262,9 @@ pub fn on_path(program: &str) -> bool {
 
 /// The Python on `PATH` that can import pyflakes, if any. Importing it runs
 /// none of the project's code.
-fn python_with_pyflakes(root: &Path) -> Option<&'static str> {
+fn python_with_pyflakes(root: &Path, has: &dyn Fn(&str) -> bool) -> Option<&'static str> {
     ["python3", "python"].into_iter().find(|python| {
-        on_path(python)
+        has(python)
             && matches!(
                 run_command(
                     root,
@@ -390,6 +402,16 @@ fn run_command(root: &Path, command: &str, timeout: Duration) -> RunOutcome {
         Ok(_) => return RunOutcome::Unavailable("empty command".to_string()),
         Err(e) => return RunOutcome::Unavailable(e.to_string()),
     };
+    // A checker runs the project (`cargo check` its build scripts, `npx`
+    // its `node_modules`), which a sandboxed `bash` may have rewritten
+    // unasked: with the sandbox on it runs where `bash` does, or not at all.
+    match crate::sandbox::state(root) {
+        crate::sandbox::State::Off => {}
+        crate::sandbox::State::Ready(setup) => return run_in_guest(root, &argv, &setup, timeout),
+        crate::sandbox::State::Unavailable(why) => {
+            return RunOutcome::Unavailable(project::unavailable("checkers", &why));
+        }
+    }
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(root)
@@ -498,6 +520,57 @@ fn run_command(root: &Path, command: &str, timeout: Duration) -> RunOutcome {
             }
         }
         Err(e) => RunOutcome::Unavailable(e.to_string()),
+    }
+}
+
+/// [`run_command`] in the sandbox's guest: the same words, run as they are
+/// (quoted for the guest's shell, which expands none of them), in the
+/// project as the guest sees it, with the image's tools and not the host's.
+///
+/// A program the image does not have is a checker that cannot start, as a
+/// missing one is on the host. Any other failure that looks like the
+/// sandbox's doing — no network to fetch dependencies with, say — is said
+/// first in the output, where a run with no diagnostics to show is quoted
+/// from.
+fn run_in_guest(
+    root: &Path,
+    argv: &[String],
+    setup: &crate::sandbox::Setup,
+    timeout: Duration,
+) -> RunOutcome {
+    use crate::sandbox::Outcome;
+    let out = match crate::sandbox::run(&project::join(argv), root, setup, timeout) {
+        Ok(out) => out,
+        Err(e) => return RunOutcome::Unavailable(format!("the sandbox did not start: {e:#}")),
+    };
+    let blame = crate::sandbox::diagnose(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match &out.outcome {
+        Outcome::Exited(code @ (126 | 127)) => RunOutcome::Unavailable(format!(
+            "in the sandbox: exit {code}{}{}",
+            stderr
+                .trim()
+                .lines()
+                .next()
+                .map_or_else(String::new, |line| format!(", {}", clip(line))),
+            blame.map_or_else(String::new, |b| format!("; {b}")),
+        )),
+        Outcome::Exited(code) => {
+            let mut output = blame.map_or_else(String::new, |b| format!("[sandbox: {b}]\n"));
+            output.push_str(&String::from_utf8_lossy(&out.stdout));
+            if !stderr.is_empty() {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&stderr);
+            }
+            RunOutcome::Finished {
+                output,
+                success: *code == 0,
+            }
+        }
+        Outcome::TimedOut => RunOutcome::TimedOut,
+        Outcome::Failed(why) => RunOutcome::Unavailable(format!("the sandbox failed: {why}")),
     }
 }
 
@@ -1024,6 +1097,142 @@ Found 2 errors.
         assert!(body.starts_with("lint: could not run `atelier-no-such-checker --flag`"));
         assert_eq!(body.lines().count(), 1);
         assert!(provider.gather(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the sandbox on and unable to run, a checker is not run on the
+    /// host instead: it is reported, once, as not run.
+    #[cfg(unixlike)]
+    #[test]
+    fn a_sandbox_that_cannot_run_keeps_checkers_off_the_host() {
+        use crate::sandbox;
+        let dir = temp_dir("sbx-off-host");
+        let provider = provider(&dir, vec![lint("sh -c 'touch ran; echo a.rs:1:1: x'", &[])]);
+        {
+            let _reset = sandbox::testing::set(sandbox::State::Unavailable("no root".into()));
+            let body = provider.gather(&dir).unwrap().body;
+            assert!(
+                body.contains("with the sandbox on, checkers run in it")
+                    && body.contains("unavailable here (no root)")
+                    && body.contains("skipped for this session"),
+                "{body}"
+            );
+            assert_eq!(body.lines().count(), 1);
+            assert!(provider.gather(&dir).is_none());
+        }
+        assert!(!dir.join("ran").exists(), "the checker ran on the host");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through a real guest (see `sandbox::testing::live_setup`): a checker
+    /// runs there with its words as they are, one whose program the image
+    /// lacks is reported as the sandbox's doing, and detection goes by what
+    /// the image has.
+    #[cfg(unixlike)]
+    #[test]
+    fn checkers_run_in_the_guest_with_the_images_tools() {
+        use crate::sandbox;
+        let Some(setup) = sandbox::testing::live_setup() else {
+            return;
+        };
+        let dir = std::fs::canonicalize(temp_dir("sbx-live")).unwrap();
+        let _reset = sandbox::testing::set(sandbox::State::Ready(setup.clone()));
+
+        let command = "sh -c 'uname -n > where.txt; echo \"a.rs:1:1: error: $0 *\"; exit 1' it''s";
+        let body = provider(&dir, vec![lint(command, &[])])
+            .gather(&dir)
+            .unwrap()
+            .body;
+        assert_eq!(
+            body,
+            "lint: 1 error(s), 0 warning(s)\na.rs:1:1: error: its *"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("where.txt")).unwrap(),
+            "nixvm\n"
+        );
+
+        // The host has `env`; so has the image, but not this.
+        let missing = provider(&dir, vec![lint("atelier-no-such-checker --flag", &[])]);
+        let body = missing.gather(&dir).unwrap().body;
+        assert!(
+            body.starts_with(
+                "lint: could not run `atelier-no-such-checker --flag` (in the sandbox: exit 127"
+            ) && body.contains("a program it needs is not in the sandbox's image")
+                && body.ends_with("skipped for this session"),
+            "{body}"
+        );
+        assert!(missing.gather(&dir).is_none());
+
+        // A failure the sandbox explains says so before the output.
+        let offline = "sh -c 'echo \"wget: bad address\"; exit 1'";
+        let body = provider(&dir, vec![lint(offline, &[])])
+            .gather(&dir)
+            .unwrap()
+            .body;
+        assert!(
+            body.contains("[sandbox: the sandbox has no network]"),
+            "{body}"
+        );
+
+        // Detection: a Rust project gets `cargo check` if the image has
+        // cargo, whatever the host has.
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        let detected = provider(&dir, Vec::new()).checkers(&dir);
+        assert_eq!(
+            detected.iter().any(|c| c.name == "cargo check"),
+            project::in_image(&setup, "cargo"),
+            "{detected:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through a real guest whose image has the tools (each half is skipped
+    /// where it has not): the detected checkers find what is wrong with a
+    /// Python and a Rust project, running the image's `python3` and `cargo`.
+    #[cfg(unixlike)]
+    #[test]
+    fn detected_checkers_run_in_the_guest() {
+        use crate::sandbox;
+        let Some(setup) = sandbox::testing::live_setup() else {
+            return;
+        };
+        let _reset = sandbox::testing::set(sandbox::State::Ready(setup.clone()));
+
+        let dir = std::fs::canonicalize(temp_dir("sbx-python")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "").unwrap();
+        std::fs::write(dir.join("a.py"), "import os\n").unwrap();
+        let python = provider(&dir, Vec::new());
+        if python.checkers(&dir).iter().any(|c| c.name == "pyflakes") {
+            let body = python.gather(&dir).unwrap().body;
+            assert!(
+                body.contains("a.py:1:1: 'os' imported but unused"),
+                "{body}"
+            );
+        } else {
+            eprintln!("skipped: no python3 with pyflakes (or it has ruff) in the image");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = std::fs::canonicalize(temp_dir("sbx-cargo")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> u8 { \"no\" }\n").unwrap();
+        if project::in_image(&setup, "cargo") {
+            let body = provider(&dir, Vec::new()).gather(&dir).unwrap().body;
+            assert!(
+                body.starts_with("cargo check: 1 error(s)") && body.contains("src/lib.rs:1:"),
+                "{body}"
+            );
+            // In the project, as on the host.
+            assert!(dir.join("target").is_dir());
+        } else {
+            eprintln!("skipped: no cargo in the image");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
