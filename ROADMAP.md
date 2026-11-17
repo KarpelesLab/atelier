@@ -291,7 +291,11 @@ prompt, analyze what a script will do before running it.
 
 **Exit (v1 met):** a risky `bash` command is flagged with *why* at the prompt
 (rm -rf, sudo, `curl|sh`, out-of-project paths, force-push, …), not just an
-opaque string. Verified live. A model-based pre-flight summary is a later add.
+opaque string. Verified live.
+- ✅ **Pre-flight summary** (opt-in: `[review] preflight`, `ATELIER_PREFLIGHT`,
+  `/config`): a complex `bash` command's prompt also shows the review-role
+  model's plain-language reading of it — advisory, 5 s budget, silent on
+  failure; the command is sent as quoted data, never as instructions.
 
 ### M10 — Subconscious reviewer & settings screen ✅
 
