@@ -208,7 +208,9 @@ from built-in tools to the agent.
 ### M6 — Session & context management ✅
 Make long sessions durable.
 
-- ✅ Persist conversation to `.atelier/session.json` after each turn; resume
+- ✅ Persist conversation to `session.json` in the project's state directory
+  (`~/.local/state/atelier/projects/<path with / as ->/`; atelier writes
+  nothing in the project, docs/sessions.md) after each turn; resume
   with `--continue`; `/new` starts fresh. Verified: a fact stated in one run is
   recalled after `--continue`.
 - ✅ Cost/usage accounting surfaced (TUI status strip + REPL line).
@@ -503,10 +505,14 @@ In order; the first waits on nixvm, the rest are atelier's own.
 1. **The sandbox in the release binaries.** Waits on nixvm: a host-directory
    filesystem and KVM that need no libc, so the fullrust build can mount the
    project (docs/sandbox.md, "What nixvm needs next"; nixvm #13).
-2. **The rest of the sandbox**: the commands of the `node` tool, hooks,
-   diagnostics checkers, MCP servers and the Claude backend, which run on
-   the host; a command the user can type to, which the host has and the
-   guest has not; a network allowlist that is exact by name rather than by
+2. **The rest of the sandbox**: project hooks, diagnostics checkers and
+   the `node` tool's commands now run in the guest; still on the host, and
+   the ways out that remain, are language servers, MCP servers (one shipped
+   in the project runs project code), the Claude backend and `node`'s own
+   `fs` (docs/sandbox.md, "What runs where") — the first two need a guest
+   with a stdin that lasts the session; a hook's large input still passes
+   through a file in the project for want of a guest stdin; a command the
+   user can type to, which the host has and the guest has not; a network allowlist that is exact by name rather than by
    address (nixvm #18); a root image atelier fetches, and packages that
    stay installed (nixvm #16); nixvm's "run this command" API, to drop the
    exact version pin (nixvm #14).
