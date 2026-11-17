@@ -101,6 +101,70 @@ The [Claude backend](claude.md) is not concerned: claude assembles and caches
 its own prompt, and atelier only prefixes an `<atelier-context>` block to
 your message.
 
+### What the cache is worth
+
+Measured on 2026-11-17 against the development server: `qwen3.8-unc:q4` (a
+27B at 4 bits) behind an Ollama-compatible endpoint on the local network. It
+evaluates a prompt at roughly 3,000–4,000 tokens/s and reports what it
+reused (`usage.prompt_tokens_details.cached_tokens`); its hardware was not
+recorded. One scripted session, run through the `atelier` binary of a debug
+build: five prompts that make the model read a 360-line file, edit it,
+search it, write a note and read the note back. That is ten or eleven
+requests, and the prompt grows from 7,450 tokens (the system message and the
+22 built-in tools) to 16,000. Three sessions per arm, the arms taking turns;
+the figures are for the requests after each session's first (27 to 29 per
+arm), which meets whatever the server evaluated last.
+
+| Requests | Prompt tokens from the cache | First token after: median (mean) | Waiting for first tokens, per session |
+|---|---|---|---|
+| as atelier sends them, each a prefix of the next | 93.7% | 0.71 s (1.05 s) | 10 s |
+| the system message changes with every request | 49.1% | 2.65 s (2.81 s) | 25 s |
+| the tool list changes as well: nothing to reuse | 0% | 4.51 s (4.57 s) | 44 s |
+
+- **The first row** is atelier. What the server still evaluates there is
+  what is new: after the model read the file, 5,469 of 12,912 tokens (first
+  token after 1.9 s); on the next request, 109 of 13,017 (1.05 s).
+- **The second row** is what a prompt that carries per-turn context in its
+  system message costs — atelier's before requests were laid out this way.
+  Here it loses half rather than everything, because the Qwen chat template
+  renders the tool list *before* the system message: the tools stay cached
+  (6,947 to 7,286 tokens, as the server reported), and all that follows
+  them, the whole conversation, is evaluated again on every request. A template that puts the system message
+  first loses the tools too, which is the third row.
+- **"First token"** is the first streamed piece of any kind, reasoning
+  included, counted from the request being sent. This server delivers a
+  tool call in one piece, so on a step that only calls a tool the figure
+  includes generating the call — in every row alike.
+- **The saving is the prompt not evaluated**: 13,000 to 16,000 tokens a
+  request here, about 4 s of every request on this server, and 34 s of a
+  44 s session's waiting. It grows with the conversation and with a slower
+  machine. At a tenth of this speed — a 27B on a CPU or a small GPU — the
+  same arithmetic gives some 40 s a request; that was not measured.
+- **The same session before the threshold followed the window** (a default
+  of 8,000 tokens, of which the fixed part took 7,450; on a six-line file):
+  two compactions in five prompts, each a summary request of its own and a
+  rewritten prompt. With the present default there was none.
+- **The cache is the server's**, and one prompt deep on this one: a session
+  whose predecessor on the server was something else starts cold (2.5 s for
+  the 7,450 tokens), and so would a request made in between by anything
+  else that uses the same model — the [reviewer](review.md), another
+  session.
+
+To repeat it, against the endpoint and model of `ATELIER_BASE_URL` and
+`ATELIER_MODEL`:
+
+```sh
+cargo test --test cache_live -- --ignored --nocapture
+```
+
+`tests/cache_live.rs` puts a recorder between atelier and the endpoint. It
+times each response, reads the endpoint's usage figures, and in the two
+control arms writes a different tag at the start of the system message (and
+of the first tool's description) of every request. It also checks on the
+real traffic that each request starts with the bytes of the one before and
+carries the same tool list, as `tests/e2e.rs` does against the mock; that
+held in every session.
+
 ## Compaction
 
 As a conversation grows, the request sent to the model on every turn (system
@@ -115,13 +179,54 @@ of asking you to manage this by hand.
 - **when the endpoint refuses a request as too long** (HTTP 413, or a 400
   whose body speaks of the context length): the conversation is compacted and
   the request sent again, once per turn, instead of the turn failing. This is
-  what happens when the threshold is set above the model's real window, or
-  the endpoint reports no usage.
+  what happens when the threshold is above the model's real window, or the
+  endpoint reports no usage.
 
-**Threshold:** 8,000 tokens by default; set it with `ATELIER_CONTEXT_LIMIT`
-(a positive integer; anything else falls back to the default),
-`[defaults] context_limit` in `atelier.toml`, or `/config`. Set it somewhat
-below your model's context window.
+**Threshold.** What you set is the threshold, as it is:
+`ATELIER_CONTEXT_LIMIT` (a positive integer; anything else is ignored),
+`[defaults] context_limit` in `atelier.toml`, or `/config`. Set nothing and
+it follows the model's context window (`agent::limit`):
+
+- **80% of the window**, where atelier knows it. The threshold is compared
+  with the last request's prompt and answer together; the rest is room for
+  what the next request adds to that — the results of the tools just called,
+  and its own answer.
+- **24,000 tokens** while it does not: inside the 32k window that is the
+  least a model fit for this work is served with.
+- **Never less than twice the fixed part of a request** — the system message
+  and the tool list, which every request carries before the conversation
+  starts. With the built-in tools alone that is about 7,500 tokens (7,485 as
+  the server counted them for `qwen3.8`, 2026-11-17: 22 tools, 28 kB of
+  JSON), and each MCP server adds to it; with 20,000 tokens of tools the
+  threshold is 40,000. A threshold close to the fixed part compacts after
+  nearly every turn — which is what the former fixed default of 8,000 did
+  ([measured](#what-the-cache-is-worth)) — and each compaction is a model
+  request and a prompt the server evaluates again. A known window caps the
+  floor: a window too small for twice the
+  fixed part is too small for the work.
+
+atelier keeps no table of models and their windows. It learns one from, the
+most telling first:
+
+1. **a refusal.** An endpoint that refuses a request as too long often says
+   how large its window is (`maximum context length is 8192 tokens`, `the
+   available context size (8192 tokens)`). That figure — or, when it gives
+   none, the estimated size of the request it refused — is the window from
+   then on, so the next compaction comes before the next refusal.
+2. **the provider's table**: `context_window` on a
+   [`[[provider]]`](configuration.md#provider--named-endpoints), for a
+   server you started with a size of your choosing.
+3. **the endpoint**: the model's entry in `GET /models`, where it has one of
+   `context_length`, `context_window`, `max_model_len`, `max_context_length`
+   or `max_input_tokens` (OpenRouter, Groq, vLLM and others; not OpenAI or
+   Ollama, whose lists hold only names, and not llama.cpp's `n_ctx_train`,
+   which is what the model was trained with rather than what the server was
+   started with). It is asked once per model, and only when it matters: the
+   first time a request passes the 24,000 tokens, before compacting there.
+
+What was learned is about one model, and is forgotten when `/model` picks
+another. The last line of [`/context`](#where-the-window-goes-context) says
+which of these the threshold comes from.
 
 **The recent tail stays verbatim.** The most recent part of the conversation
 is never touched: about 40% of the threshold, measured in estimated tokens
@@ -207,21 +312,22 @@ turns went with them, so the next turn's block carries every item again.
 an estimated token count and its share of the compaction threshold:
 
 ```text
-context window — estimated tokens, and their share of the compaction threshold (8,000)
-  system prompt                               80    1.0%
-  standing: project instructions             412    5.2%
-  standing: memory                            96    1.2%
-  summary of earlier turns                   211    2.6%
-  tool list (17 tool(s))                   4,281   53.5%
-  turn context (3 block(s))                  640    8.0%
-    git status (×3)                          118    1.5%
-    project layout                           402    5.0%
-    environment                                9    0.1%
-  history: user (4)                           61    0.8%
-  history: assistant (9)                     350    4.4%
-  history: tool results (6)                1,204   15.1%
-  total                                    7,259   90.7%
-last request: 7,804 tokens as counted by the endpoint (prompt + completion)
+context window — estimated tokens, and their share of the compaction threshold (24,000)
+  system prompt                               80    0.3%
+  standing: project instructions             412    1.7%
+  standing: memory                            96    0.4%
+  summary of earlier turns                   211    0.9%
+  tool list (22 tool(s))                   6,430   26.8%
+  turn context (3 block(s))                  640    2.7%
+    git status (×3)                          118    0.5%
+    project layout                           402    1.7%
+    environment                                9    0.0%
+  history: user (4)                           61    0.3%
+  history: assistant (9)                     350    1.5%
+  history: tool results (6)                1,204    5.0%
+  total                                    9,484   39.5%
+last request: 10,655 tokens as counted by the endpoint (prompt + completion)
+compaction threshold: 24,000 — the default while the model's context window is not known (set context_limit, or context_window on its provider)
 ```
 
 - **standing** rows are the items of the system message besides the prompt;
@@ -236,6 +342,9 @@ last request: 7,804 tokens as counted by the endpoint (prompt + completion)
   is the endpoint's own count for the last request, when it reports usage (it
   is cleared by a compaction until the next request). If the two differ a
   lot, trust the endpoint — it is what triggers compaction.
+- The **compaction threshold** line says where the threshold comes from:
+  your setting, the model's context window and how atelier knows it, or the
+  default (see [Compaction](#compaction)).
 
 A large tool list is a fixed cost on every request; removing an MCP server
 you don't use (`/mcp remove`) is how to shrink it. Before the first message
