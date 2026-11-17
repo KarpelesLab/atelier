@@ -92,7 +92,7 @@ command the way the tool would.
 - **A failure that looks like the sandbox's doing says so**, e.g.
 
   ```
-  [exit status: exit status: 127]
+  [exit status: 127]
   [stderr]
   /bin/sh: cargo: not found
   [sandbox: a program it needs is not in the sandbox's image (the host's
@@ -408,6 +408,13 @@ is the first thing to fix for the sandbox to ship in the release binaries.
 - **`[sandbox] root` from a project file** is ignored on purpose: the root is
   what the guest can read, and a cloned repository naming `/` would hand it
   the machine.
+- **Typing to a command in the guest.** On the host a foreground command
+  runs on a terminal you can be handed
+  ([A command you can type to](tools.md#a-command-you-can-type-to)); in the
+  guest it has neither a terminal nor a stdin, through the helper process
+  that runs it. A command that stops at a prompt there is reported to the
+  model as having asked for input, and `interactive: true` as not honoured;
+  `"sandbox": false` runs it on the host, with approval.
 - **The Claude backend's and the `node` tool's commands**, hooks, diagnostics
   checkers and MCP servers are not sandboxed; only the `bash` tool is.
 

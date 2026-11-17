@@ -385,6 +385,15 @@ impl Ui for Unseen<'_> {
     fn interrupted(&mut self) -> bool {
         self.0.interrupted()
     }
+    fn command_console(&mut self) -> bool {
+        self.0.command_console()
+    }
+    fn command_event(&mut self, event: crate::tools::terminal::CommandEvent) {
+        self.0.command_event(event);
+    }
+    fn command_input(&mut self) -> Vec<crate::tools::terminal::CommandInput> {
+        self.0.command_input()
+    }
 }
 
 #[cfg(test)]

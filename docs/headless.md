@@ -109,6 +109,16 @@ The last event of each prompt in `stream-json`, and the whole output in
 
 Usage numbers are 0 when the endpoint doesn't report usage.
 
+## Commands that ask for input
+
+Nobody is there to type, so a `bash` command runs with no terminal and no
+stdin, as it always has: a read gets end of file at once. When a command
+fails or times out with its output ending at what reads like a prompt
+(`Enter the 6 digit code:`), its result tells the model that the command
+seems to have asked for input and could not be answered, so that the answer
+says so instead of guessing. Run such a command in the terminal interface,
+where [it can be typed to](tools.md#a-command-you-can-type-to).
+
 ## Exit status
 
 | Status | `subtype` | Meaning |

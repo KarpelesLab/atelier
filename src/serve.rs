@@ -40,6 +40,12 @@
 //! cancels it when the turn is interrupted. So a turn waiting on an answer
 //! can still be steered, interrupted, or asked for its status.
 //!
+//! A `bash` command the client's user can type to works the same way: the
+//! session thread runs it (inside [`Ui::command_input`]'s caller, see
+//! [`crate::tools::terminal`]) and polls a queue the reader thread fills
+//! from `command/input`. What is typed crosses atelier in that queue and
+//! nowhere else: it is not logged, and no event repeats it.
+//!
 //! What only the session can answer waits for it: `session/history` (see
 //! [`history`]) is a job, refused while a turn or a command runs.
 //!
@@ -73,6 +79,7 @@ use crate::rpc::{self, Failure, Id, Reply, Scope as Asked, Why, Wire, lock};
 use crate::settings::Permissions;
 use crate::tools::ask::{Answer, Question};
 use crate::tools::change::FileChange;
+use crate::tools::terminal::{self, CommandEvent, CommandInput};
 
 mod history;
 
@@ -102,6 +109,8 @@ mod code {
     pub const BACKGROUND_RUNNING: i64 = -32004;
     /// `initialize`, a second time.
     pub const ALREADY_INITIALIZED: i64 = -32005;
+    /// `command/input` with no command running that can be typed to.
+    pub const NO_COMMAND: i64 = -32006;
 }
 
 /// `atelier serve`, as asked for on the command line (see `cli`).
@@ -127,9 +136,11 @@ pub fn run(session: Session, opts: Options) -> u8 {
             turns: 0,
             status: Value::Null,
             queue: VecDeque::new(),
+            command: None,
         }),
         started: Condvar::new(),
         stop: AtomicBool::new(false),
+        terminal: AtomicBool::new(false),
         wire: Wire::new("serve"),
     });
     let (jobs_tx, jobs_rx) = mpsc::channel();
@@ -214,6 +225,10 @@ struct State {
     status: Value,
     /// Messages for the running turn (`turn/steer`), until it takes them.
     queue: VecDeque<String>,
+    /// While a `bash` command runs on a terminal the client's user can
+    /// type to: what they did (`command/input`), until the command takes
+    /// it. `None` when no such command is running.
+    command: Option<Vec<CommandInput>>,
 }
 
 /// The session is not idle: the refusal for what needs it to be.
@@ -255,6 +270,9 @@ struct Shared {
     /// Set by `turn/interrupt`, read by the running turn through
     /// [`Ui::interrupted`], cleared when a turn is accepted.
     stop: AtomicBool,
+    /// The client said, in `initialize`, that it shows a running command's
+    /// terminal to somebody who can type to it (`"terminal": true`).
+    terminal: AtomicBool,
     /// stdout, and the requests made of the client that it has not answered.
     wire: Wire,
 }
@@ -303,6 +321,11 @@ impl Shared {
             }
             if !(params["protocol"].is_null() || params["protocol"].as_u64().is_some()) {
                 return Err(Failure::params("\"protocol\" must be a version number"));
+            }
+            match &params["terminal"] {
+                Value::Null => {}
+                Value::Bool(terminal) => self.terminal.store(*terminal, Ordering::Relaxed),
+                _ => return Err(Failure::params("\"terminal\" must be true or false")),
             }
             state.phase = Phase::Starting;
             let client = params["client"].clone();
@@ -386,6 +409,18 @@ impl Shared {
                 self.wire.cancel_turn();
                 Ok(Accepted {
                     reply: Some(json!({ "turn": turn })),
+                    ..Accepted::default()
+                })
+            }
+            "command/input" => {
+                let input = command_input(params)?;
+                let Some(queue) = state.command.as_mut() else {
+                    let why = "no command is running that can be typed to";
+                    return Err(Failure::new(code::NO_COMMAND, why));
+                };
+                queue.extend(input);
+                Ok(Accepted {
+                    reply: Some(json!({})),
                     ..Accepted::default()
                 })
             }
@@ -493,6 +528,49 @@ impl Shared {
             }
         }
     }
+}
+
+/// What a `command/input` asks for, in the order it is applied: the
+/// keyboard taken, the window's size, the keys, the keyboard given back.
+fn command_input(params: &Value) -> Result<Vec<CommandInput>, Failure> {
+    let mut input = Vec::new();
+    let attached = match &params["attached"] {
+        Value::Null => None,
+        Value::Bool(attached) => Some(*attached),
+        _ => return Err(Failure::params("\"attached\" must be true or false")),
+    };
+    if attached == Some(true) {
+        input.push(CommandInput::Attach);
+    }
+    let size = |name: &str| match &params[name] {
+        Value::Null => Ok(None),
+        v => match v.as_u64().and_then(|n| u16::try_from(n).ok()) {
+            Some(n) if n > 0 => Ok(Some(n)),
+            _ => Err(Failure::params(format!(
+                "\"{name}\" must be a positive number"
+            ))),
+        },
+    };
+    match (size("cols")?, size("rows")?) {
+        (Some(cols), Some(rows)) => input.push(CommandInput::Resize { cols, rows }),
+        (None, None) => {}
+        _ => return Err(Failure::params("\"cols\" and \"rows\" go together")),
+    }
+    match &params["data"] {
+        Value::Null => {}
+        Value::String(data) if data.is_empty() => {}
+        Value::String(data) => input.push(CommandInput::Bytes(data.as_bytes().to_vec())),
+        _ => return Err(Failure::params("\"data\" must be a string")),
+    }
+    if attached == Some(false) {
+        input.push(CommandInput::Detach);
+    }
+    if input.is_empty() {
+        return Err(Failure::params(
+            "nothing to do: give \"data\", \"attached\", or \"cols\" and \"rows\"",
+        ));
+    }
+    Ok(input)
 }
 
 /// A required, non-empty string parameter.
@@ -610,6 +688,7 @@ impl Server {
                 "commands": true,
                 "history": true,
                 "file_changes": true,
+                "command_input": terminal::supported(),
                 "queries": query::METHODS,
                 "approval_timeout": self.shared.approval_timeout.map(|t| t.as_secs()),
             },
@@ -790,6 +869,9 @@ struct ServeUi<'a> {
     /// The last `approval/request` got no answer from the client — an
     /// error, or `--approval-timeout` ran out — rather than a decision.
     unanswered: bool,
+    /// The end of a command's output that stops in the middle of a
+    /// character, until the rest of it comes.
+    partial: Vec<u8>,
 }
 
 impl<'a> ServeUi<'a> {
@@ -802,6 +884,7 @@ impl<'a> ServeUi<'a> {
             permissions: session.settings().permissions.clone(),
             stopped: false,
             unanswered: false,
+            partial: Vec::new(),
         }
     }
 
@@ -978,5 +1061,60 @@ impl Ui for ServeUi<'_> {
         let stop = matches!(self.scope, Scope::Turn(_)) && self.shared.stop.load(Ordering::Relaxed);
         self.stopped |= stop;
         stop
+    }
+
+    /// Only for a client that said it has a terminal to show and somebody
+    /// to type (`initialize`'s `"terminal": true`), and in a turn: nobody
+    /// can be reached with `command/input` outside one.
+    fn command_console(&mut self) -> bool {
+        matches!(self.scope, Scope::Turn(_)) && self.shared.terminal.load(Ordering::Relaxed)
+    }
+
+    /// `event/command_started`, `event/command_output`,
+    /// `event/input_wanted`, `event/command_ended`. The start opens the
+    /// queue `command/input` fills, the end closes it.
+    fn command_event(&mut self, event: CommandEvent) {
+        match event {
+            CommandEvent::Started {
+                command,
+                interactive,
+            } => {
+                lock(&self.shared.state).command = Some(Vec::new());
+                self.partial.clear();
+                let started = json!({ "command": command, "interactive": interactive });
+                self.emit("command_started", started);
+            }
+            CommandEvent::Output(bytes) => {
+                self.partial.extend_from_slice(bytes);
+                // Whole characters only; the start of one waits for its end.
+                let whole = match std::str::from_utf8(&self.partial) {
+                    Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                    _ => self.partial.len(),
+                };
+                let data: Vec<u8> = self.partial.drain(..whole).collect();
+                if !data.is_empty() {
+                    let data = String::from_utf8_lossy(&data);
+                    self.emit("command_output", json!({ "data": data }));
+                }
+            }
+            CommandEvent::InputWanted { prompt } => {
+                self.emit("input_wanted", json!({ "prompt": prompt }));
+            }
+            CommandEvent::Ended => {
+                // Closed before the client is told, so that an input sent
+                // after the event is refused rather than dropped.
+                lock(&self.shared.state).command = None;
+                self.emit("command_ended", json!({}));
+            }
+        }
+    }
+
+    fn command_input(&mut self) -> Vec<CommandInput> {
+        let mut state = lock(&self.shared.state);
+        state
+            .command
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 }

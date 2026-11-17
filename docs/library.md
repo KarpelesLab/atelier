@@ -57,6 +57,17 @@ fn main() -> std::process::ExitCode {
   questions from the model (`ask_user`), messages typed mid-turn
   (`take_queued`) and interruption (`interrupted`). Seven methods are
   required; the rest have defaults.
+
+  An interface whose user can type to a running command says so with
+  `command_console` (the default declines, and `bash` runs commands with no
+  terminal and no input). It is then told what the command prints and when
+  it seems to wait for input (`command_event`, a `CommandEvent`), and is
+  polled for what the user did — took the keyboard, typed, gave it back,
+  resized (`command_input`, a list of `CommandInput`). What it returns
+  there goes to the command and nowhere else. See
+  [A command you can type to](tools.md#a-command-you-can-type-to) for what
+  that makes of `bash`, and `src/tui` or `src/serve.rs` for the two
+  implementations.
 - **[`Session`]** is the conversation. `send` runs a turn and returns when
   it is over; `agent::dispatch` runs a line that may be a slash command.
   The rest is what atelier's own interfaces use: `set_model`, `set_mode`,
@@ -93,7 +104,7 @@ cargo run --example embed -- "what does this project do?"
   need the same (`tools` to register a tool, `provider` to call a model,
   `permissions`, `mcp`, `coord`, …). What is meant to stay put is what the
   crate root re-exports: `Session`, `Ui`, `Approval`, `Question`, `Answer`,
-  `FileChange`, `Config`, `Settings`, `Mode`, and the `app` functions named
+  `FileChange`, `CommandEvent`, `CommandInput`, `Config`, `Settings`, `Mode`, and the `app` functions named
   here. There is no semver promise before 1.0.
 
 ## Or a protocol

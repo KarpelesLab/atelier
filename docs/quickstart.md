@@ -151,7 +151,10 @@ agent loop:
   one thing: clear the input if it has text, else drop queued messages if
   any, else **stop the turn** (at the next streamed chunk or between tool
   calls; with the [Claude backend](claude.md), background agents keep
-  running).
+  running). While a `bash` command runs, **Ctrl-T** hands it your keyboard —
+  to type a password or a 2FA code it asks for — and **Ctrl-]** takes it
+  back; a command that seems to be waiting for input says so. See
+  [A command you can type to](tools.md#a-command-you-can-type-to).
 - **Plain REPL** (`src/agent::repl`) — reads lines from stdin with a `›`
   prompt and prints straight to stdout, no raw mode, no redraw. Used for
   headless/scripted runs.

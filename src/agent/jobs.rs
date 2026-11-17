@@ -165,4 +165,13 @@ impl Ui for JobsUi<'_> {
     fn interrupted(&mut self) -> bool {
         self.inner.interrupted()
     }
+    fn command_console(&mut self) -> bool {
+        self.inner.command_console()
+    }
+    fn command_event(&mut self, event: crate::tools::terminal::CommandEvent) {
+        self.inner.command_event(event);
+    }
+    fn command_input(&mut self) -> Vec<crate::tools::terminal::CommandInput> {
+        self.inner.command_input()
+    }
 }

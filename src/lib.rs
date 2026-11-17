@@ -66,3 +66,4 @@ pub use permissions::Mode;
 pub use settings::Settings;
 pub use tools::ask::{Answer, Question};
 pub use tools::change::FileChange;
+pub use tools::terminal::{CommandEvent, CommandInput};

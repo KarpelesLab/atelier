@@ -200,7 +200,12 @@ Paths are confined to the session's directory exactly as without a client
 (see [Tools](tools.md)); the client's own checks come on top.
 
 ACP's `terminal/*` methods are not used: atelier's `bash` tool runs commands
-itself, with its own sandbox, background jobs and permission rules.
+itself, with its own sandbox, background jobs and permission rules. They
+would not help with a command that asks its user something either
+([A command you can type to](tools.md#a-command-you-can-type-to)): a
+client's terminal can be created, read, waited for and killed, but ACP has
+no method to send it input. So over ACP a command runs with no terminal and
+no stdin, and one that stops at a prompt is reported to the model as such.
 
 ### Questions
 
@@ -238,6 +243,7 @@ the capability, a paragraph in the answer.
 | `session/load`, `session/resume`, `session/list`, `session/close`, `session/delete` | Not advertised. atelier keeps one saved conversation per directory (`--continue`), with no id a client could ask for, and cannot replay it as updates |
 | Several sessions in one process | See above |
 | `terminal/*` | Never used |
+| Typing to a running command | No mechanism in ACP: commands are not interactive (`atelier serve` has [one](protocol.md#typing-to-a-command)) |
 | `authenticate`, `logout` | No authentication methods |
 | `audio` content, the `sse` MCP transport | Not advertised; refused |
 | `session/set_config_option` (config options) | Modes are offered the older way only (`modes`, `session/set_mode`) |

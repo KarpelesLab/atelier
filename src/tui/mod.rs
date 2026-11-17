@@ -71,6 +71,28 @@
 //! answer that can't be understood prints the hint again and keeps waiting,
 //! and Ctrl-C on an empty line dismisses the question (the turn goes on, and
 //! the model is told the user declined).
+//!
+//! ## Typing to a running command
+//!
+//! A `bash` command runs on a terminal of its own (see
+//! [`crate::tools::terminal`]), and the keyboard can be handed to it:
+//! **Ctrl-T** while a command runs, or by itself when the model said the
+//! command is interactive and the input line is empty. A command seen
+//! waiting for input says so in the scrollback and in the status strip, and
+//! waits for Ctrl-T: keys are never redirected under the user's fingers.
+//!
+//! While the command has the keyboard ([`Renderer::attach`]) the live
+//! region is gone: what the command prints is written to the terminal as
+//! it comes, below the scrollback and as part of it, and every key goes to
+//! the command as the terminal sent it — Ctrl-C included, which is then the
+//! command's interrupt and not the turn's. **Ctrl-]** gives the keyboard
+//! back ([`Renderer::detach`]), and so does the command's end; the live
+//! region is drawn again under what was printed. Nothing is redrawn and no
+//! screen is switched: the append-only invariant holds, with the command
+//! doing the appending for a while.
+//!
+//! What is typed there goes to the command through a queue the worker
+//! drains ([`Ui::command_input`]) and is kept nowhere.
 
 mod config;
 mod input;
@@ -91,6 +113,7 @@ use anyhow::Result;
 use crate::agent::{self, Session, Ui};
 use crate::permissions::Mode;
 use crate::tools::ask::{Answer, Question};
+use crate::tools::terminal::{CommandEvent, CommandInput};
 
 use input::LineEditor;
 use term::{Event, Key};
@@ -104,11 +127,25 @@ const PROMPT_COLS: usize = 2;
 /// turn) and the worker's [`ChanUi`] (which drains it between steps).
 type Queue = Arc<Mutex<VecDeque<String>>>;
 
+/// What the user did to the running command — took the keyboard, typed,
+/// gave it back — until the worker's [`ChanUi`] passes it on.
+type Keys = Arc<Mutex<Vec<CommandInput>>>;
+
+/// The key that gives the keyboard back to atelier while a command has it:
+/// Ctrl-], as in telnet — one that programs do not ask for.
+const DETACH: u8 = 0x1d;
+/// The most of a command's unfinished last line that is remembered, to
+/// show it again when the keyboard is handed over.
+const PROMPT_BYTES: usize = 2048;
+
 /// How often the status strip repaints while a turn runs (spinner + elapsed).
 const SPINNER_TICK: Duration = Duration::from_millis(100);
 /// How long one keyboard poll blocks while a turn runs; this is also the pump
 /// loop's sleep, so it bounds output latency.
 const KEY_POLL: Duration = Duration::from_millis(30);
+/// The same while a command has the keyboard: shorter, since it is also how
+/// long the command's echo of a key can wait to be shown.
+const TYPING_POLL: Duration = Duration::from_millis(5);
 /// How long the idle prompt waits for a key before checking for output that
 /// arrived between turns (claude reporting on background work).
 const IDLE_POLL: Duration = Duration::from_millis(200);
@@ -330,9 +367,19 @@ enum UiEvent {
     },
     /// The worker is blocked waiting for the user to answer a question.
     AskUser(Question),
+    /// News of the `bash` command the worker is running.
+    Command(CommandNews),
     /// The turn is over; `Err` carries the rendered error, if any. Always the
     /// last event a worker sends.
     Finished(Result<(), String>),
+}
+
+/// A [`CommandEvent`], owned, to cross to the main thread.
+enum CommandNews {
+    Started { interactive: bool },
+    Output(Vec<u8>),
+    InputWanted(String),
+    Ended,
 }
 
 /// Run one model turn on a scoped worker thread while the main thread keeps
@@ -343,6 +390,7 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
     let (ans_tx, ans_rx) = mpsc::channel::<agent::Approval>();
     let (reply_tx, reply_rx) = mpsc::channel::<Answer>();
     let queue = Arc::clone(&r.queue);
+    let keys = Arc::clone(&r.keys);
     let stop = Arc::clone(&r.stop);
     stop.store(false, Ordering::Relaxed);
 
@@ -358,6 +406,7 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
                 answers: ans_rx,
                 replies: reply_rx,
                 queue,
+                keys,
                 stop,
             };
             let outcome = session.send(input, &mut ui).map_err(|e| format!("{e:#}"));
@@ -373,6 +422,8 @@ fn run_turn(session: &mut Session, r: &mut Renderer, input: &str) -> Result<()> 
     r.working = None;
     r.approval_pending = false;
     r.question = None;
+    // A worker that died mid-command leaves the keyboard here.
+    r.command_ended();
     r.commit_pending_if_any();
     result
 }
@@ -389,10 +440,24 @@ fn pump(
     let mut last_paint = Instant::now();
     loop {
         // Keyboard first; the poll timeout doubles as the loop's sleep.
-        match term::poll(KEY_POLL)? {
+        // While a command has it, the bytes are the command's, unparsed.
+        if r.attached() {
+            match term::poll_raw(TYPING_POLL)? {
+                Some(term::Raw::Bytes(bytes)) => r.typed(bytes)?,
+                Some(term::Raw::Resize) => r.send_size(),
+                None => {}
+            }
+        }
+        let event = match r.attached() {
+            true => None,
+            false => term::poll(KEY_POLL)?,
+        };
+        match event {
             Some(Event::Resize) => r.refresh()?,
             Some(Event::Key(k)) => {
-                if r.approval_pending {
+                if k == Key::Ctrl('t') && r.command.is_some() {
+                    r.attach()?;
+                } else if r.approval_pending {
                     if let Some(a) = approval_key(k) {
                         r.approval_pending = false;
                         let _ = answers.send(a);
@@ -525,6 +590,7 @@ fn apply_event(r: &mut Renderer, ev: UiEvent) {
             r.approval_pending = true;
         }
         UiEvent::AskUser(question) => r.ask(question),
+        UiEvent::Command(news) => r.command_news(news),
         UiEvent::Finished(_) => {} // consumed by the pump
     }
 }
@@ -537,6 +603,7 @@ struct ChanUi {
     answers: Receiver<agent::Approval>,
     replies: Receiver<Answer>,
     queue: Queue,
+    keys: Keys,
     stop: Arc<AtomicBool>,
 }
 
@@ -602,6 +669,21 @@ impl Ui for ChanUi {
     fn interrupted(&mut self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
+    /// Somebody is at the keyboard, and it can be handed over.
+    fn command_console(&mut self) -> bool {
+        true
+    }
+    fn command_event(&mut self, event: CommandEvent) {
+        self.send(UiEvent::Command(match event {
+            CommandEvent::Started { interactive, .. } => CommandNews::Started { interactive },
+            CommandEvent::Output(bytes) => CommandNews::Output(bytes.to_vec()),
+            CommandEvent::InputWanted { prompt } => CommandNews::InputWanted(prompt.to_string()),
+            CommandEvent::Ended => CommandNews::Ended,
+        }));
+    }
+    fn command_input(&mut self) -> Vec<CommandInput> {
+        std::mem::take(&mut *self.keys.lock().unwrap_or_else(|p| p.into_inner()))
+    }
 }
 
 /// Pop queued lines from the front up to (not including) the first slash
@@ -618,6 +700,31 @@ fn take_leading_prompts(q: &mut VecDeque<String>) -> Vec<String> {
 /// Lock the queue, tolerating a poisoned mutex (the data is plain strings).
 fn lock(q: &Queue) -> std::sync::MutexGuard<'_, VecDeque<String>> {
     q.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The `bash` command the worker is running, as the renderer knows it.
+#[derive(Default)]
+struct Running {
+    /// The keyboard is the command's: its output goes straight to the
+    /// terminal and the live region is not drawn.
+    attached: bool,
+    /// It was seen waiting for input and nobody has typed to it since.
+    wants_input: bool,
+    /// Its unfinished last line (a prompt, usually), raw: shown again
+    /// when the keyboard is handed over, since it was printed out of sight.
+    last_line: Vec<u8>,
+}
+
+impl Running {
+    /// Keep the unfinished end of what the command printed.
+    fn remember(&mut self, bytes: &[u8]) {
+        match bytes.iter().rposition(|&b| b == b'\n') {
+            Some(at) => self.last_line = bytes[at + 1..].to_vec(),
+            None => self.last_line.extend_from_slice(bytes),
+        }
+        let over = self.last_line.len().saturating_sub(PROMPT_BYTES);
+        self.last_line.drain(..over);
+    }
 }
 
 /// One committed line of scrollback, remembered until the next [`Renderer::refresh`]
@@ -655,6 +762,10 @@ struct Renderer {
     /// Set by Ctrl-C to stop the running turn; read by the worker through
     /// [`Ui::interrupted`], cleared when a turn starts.
     stop: Arc<AtomicBool>,
+    /// The `bash` command the worker is running, if it is running one.
+    command: Option<Running>,
+    /// What the user did to it, for the worker to pass on.
+    keys: Keys,
 }
 
 impl Renderer {
@@ -671,7 +782,148 @@ impl Renderer {
             question: None,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             stop: Arc::new(AtomicBool::new(false)),
+            command: None,
+            keys: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Whether the running command has the keyboard.
+    fn attached(&self) -> bool {
+        self.command.as_ref().is_some_and(|c| c.attached)
+    }
+
+    /// Something for the worker to pass on to the command.
+    fn send_command(&self, input: CommandInput) {
+        let mut keys = self.keys.lock().unwrap_or_else(|p| p.into_inner());
+        keys.push(input);
+    }
+
+    /// Tell the command the size of the window it is now seen in.
+    fn send_size(&self) {
+        if let Some((cols, rows)) = term::size() {
+            self.send_command(CommandInput::Resize { cols, rows });
+        }
+    }
+
+    /// Hand the keyboard to the running command: take the live region
+    /// down, say how to come back, and show the line the command stopped
+    /// on. From here until [`detach`](Self::detach) its output is written
+    /// as it comes and nothing is redrawn.
+    fn attach(&mut self) -> io::Result<()> {
+        if self.command.is_none() || self.attached() {
+            return Ok(());
+        }
+        self.commit_pending_if_any();
+        self.push_line(
+            "⌨ your keys now go to the command — Ctrl-] gives them back to atelier".into(),
+            true,
+        );
+        let mut out = io::stdout().lock();
+        self.leave_live(&mut out)?;
+        let command = self.command.as_mut().expect("checked above");
+        out.write_all(&command.last_line)?;
+        out.flush()?;
+        command.attached = true;
+        command.wants_input = false;
+        self.send_command(CommandInput::Attach);
+        self.send_size();
+        Ok(())
+    }
+
+    /// Take the keyboard back: end the line the command was on, and let
+    /// the next refresh draw the live region under what it printed.
+    fn detach(&mut self) -> io::Result<()> {
+        let Some(command) = self.command.as_mut().filter(|c| c.attached) else {
+            return Ok(());
+        };
+        command.attached = false;
+        if !command.last_line.is_empty() {
+            let mut out = io::stdout().lock();
+            out.write_all(b"\r\n")?;
+            out.flush()?;
+        }
+        self.send_command(CommandInput::Detach);
+        Ok(())
+    }
+
+    /// Keys typed while the command has the keyboard: its own, up to the
+    /// one that gives the keyboard back.
+    fn typed(&mut self, mut bytes: Vec<u8>) -> io::Result<()> {
+        let back = bytes.iter().position(|&b| b == DETACH);
+        // What was typed after the detach key is nobody's.
+        bytes.truncate(back.unwrap_or(bytes.len()));
+        if !bytes.is_empty() {
+            self.send_command(CommandInput::Bytes(bytes));
+        }
+        if back.is_some() {
+            self.detach()?;
+            self.push_line(
+                "⌨ back to atelier — the command is still running (Ctrl-T to type to it again)"
+                    .into(),
+                true,
+            );
+            self.refresh()?;
+        }
+        Ok(())
+    }
+
+    /// The running command has something to tell (see [`CommandEvent`]).
+    fn command_news(&mut self, news: CommandNews) {
+        match news {
+            CommandNews::Started { interactive } => {
+                self.command = Some(Running::default());
+                // The model said the user will have to type. The keyboard
+                // is handed over at once only if nothing is being typed:
+                // a half-written message must not end up in a program.
+                if interactive && self.editor.is_empty() {
+                    let _ = self.attach();
+                } else if interactive {
+                    self.push_line(
+                        "⌨ this command will need you to type — Ctrl-T to type to it".into(),
+                        false,
+                    );
+                }
+            }
+            CommandNews::Output(bytes) => {
+                let Some(command) = self.command.as_mut() else {
+                    return;
+                };
+                command.remember(&bytes);
+                if command.attached {
+                    let mut out = io::stdout().lock();
+                    let _ = out.write_all(&bytes);
+                    let _ = out.flush();
+                } else {
+                    command.wants_input = false;
+                }
+            }
+            CommandNews::InputWanted(prompt) => {
+                let Some(command) = self.command.as_mut().filter(|c| !c.attached) else {
+                    return;
+                };
+                command.wants_input = true;
+                self.commit_pending_if_any();
+                let what = match prompt.is_empty() {
+                    true => "⌨ the command is waiting for input".to_string(),
+                    false => format!("⌨ the command is waiting for input: {prompt}"),
+                };
+                // With a bell: the user may be looking elsewhere.
+                self.push_line(format!("{what}\x07"), false);
+                self.push_line(
+                    "   Ctrl-T to type to it (Ctrl-] gives the keyboard back)".into(),
+                    false,
+                );
+            }
+            CommandNews::Ended => self.command_ended(),
+        }
+    }
+
+    /// The command is over: the keyboard is atelier's again, and nothing
+    /// typed for it is left waiting.
+    fn command_ended(&mut self) {
+        let _ = self.detach();
+        self.command = None;
+        self.keys.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Queue a line typed while a turn runs, echoing it (dimmed, marked) so
@@ -732,7 +984,9 @@ impl Renderer {
     /// narrow terminal; then the per-turn `status` (model · cwd · …).
     fn status_line(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if self.approval_pending {
+        if self.command.as_ref().is_some_and(|c| c.wants_input) {
+            parts.push("⌨ command waiting for input [Ctrl-T]".into());
+        } else if self.approval_pending {
             parts.push("⚠ approval needed [y/a/n]".into());
         } else if self.question.is_some() {
             parts.push("? waiting for your answer".into());
@@ -804,25 +1058,15 @@ impl Renderer {
     /// scrollback above it. This is the sole routine that upholds the
     /// append-only invariant; see the module docs.
     fn refresh(&mut self) -> io::Result<()> {
+        // While a command has the keyboard the terminal is its to write
+        // on: there is no live region, and committed lines wait.
+        if self.attached() {
+            return Ok(());
+        }
         let width = term::size().map_or(80, |(w, _)| w).max(1);
         let mut out = io::stdout().lock();
-
-        // Walk to the top-left of the previously drawn live region and wipe
-        // it (nothing above it is ever touched).
-        write!(
-            out,
-            "{}{}{}{}",
-            term::HIDE_CURSOR,
-            term::move_up(self.live_height.saturating_sub(1)),
-            term::move_to_column(0),
-            term::CLEAR_DOWN
-        )?;
-
-        // Flush committed lines — printed once here, then immutable scrollback.
-        for line in std::mem::take(&mut self.scroll) {
-            let style = if line.dim { term::DIM } else { "" };
-            write!(out, "{style}{}{}\r\n", line.text, term::RESET)?;
-        }
+        write!(out, "{}", term::HIDE_CURSOR)?;
+        self.leave_live(&mut out)?;
 
         // --- Draw the live region (top to bottom) ---
         let mut height: u16 = 0;
@@ -853,6 +1097,32 @@ impl Renderer {
             term::SHOW_CURSOR
         )?;
         self.live_height = height;
+        out.flush()
+    }
+}
+
+impl Renderer {
+    /// Take the live region down and print the lines committed since it
+    /// was drawn, leaving the cursor at the start of the line below them:
+    /// where the live region is drawn next, or where a command that was
+    /// handed the keyboard goes on printing.
+    fn leave_live(&mut self, out: &mut impl Write) -> io::Result<()> {
+        // Walk to the top-left of the previously drawn live region and wipe
+        // it (nothing above it is ever touched).
+        write!(
+            out,
+            "{}{}{}",
+            term::move_up(self.live_height.saturating_sub(1)),
+            term::move_to_column(0),
+            term::CLEAR_DOWN
+        )?;
+
+        // Flush committed lines — printed once here, then immutable scrollback.
+        for line in std::mem::take(&mut self.scroll) {
+            let style = if line.dim { term::DIM } else { "" };
+            write!(out, "{style}{}{}\r\n", line.text, term::RESET)?;
+        }
+        self.live_height = 0;
         out.flush()
     }
 }

@@ -77,6 +77,16 @@ pub enum Event {
     Resize,
 }
 
+/// What the terminal sent while its keys were somebody else's to read
+/// ([`poll_raw`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Raw {
+    /// Bytes as typed, not parsed into keys.
+    Bytes(Vec<u8>),
+    /// The window changed size.
+    Resize,
+}
+
 // --- The system side: ioctl, and the structures it fills. ---
 
 const STDIN: i32 = 0;
@@ -403,6 +413,21 @@ impl Input {
     }
 }
 
+impl Input {
+    /// [`poll`](Self::poll) without the parsing: whatever bytes are there.
+    fn poll_raw(&mut self, timeout: Duration) -> io::Result<Option<Raw>> {
+        let now = size();
+        if now != self.last_size {
+            self.last_size = now;
+            return Ok(Some(Raw::Resize));
+        }
+        if self.buf.is_empty() && !self.fill(timeout)? {
+            return Ok(None);
+        }
+        Ok(Some(Raw::Bytes(self.buf.drain(..).collect())))
+    }
+}
+
 fn input() -> std::sync::MutexGuard<'static, Input> {
     static INPUT: OnceLock<Mutex<Input>> = OnceLock::new();
     INPUT
@@ -415,6 +440,14 @@ fn input() -> std::sync::MutexGuard<'static, Input> {
 /// terminal's input ends.
 pub fn poll(timeout: Duration) -> io::Result<Option<Event>> {
     input().poll(timeout)
+}
+
+/// What the terminal sent, unparsed, waiting up to `timeout` for it: for
+/// while the keyboard is handed to a running command, which gets the bytes
+/// a terminal would have sent it (an arrow key's escape sequence whole,
+/// Ctrl-C as `0x03`). Fails when the terminal's input ends.
+pub fn poll_raw(timeout: Duration) -> io::Result<Option<Raw>> {
+    input().poll_raw(timeout)
 }
 
 /// The next event, however long it takes.

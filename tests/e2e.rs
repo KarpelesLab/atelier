@@ -4363,7 +4363,7 @@ fn sandboxed_bash_runs_unasked_while_rules_and_the_host_still_ask() {
     let [ran, denied, host] = results.as_slice() else {
         panic!("expected three tool results: {results:?}");
     };
-    assert!(ran.starts_with("[exit status: exit status: 0]"), "{ran}");
+    assert!(ran.starts_with("[exit status: 0]"), "{ran}");
     // The deny rule held although the sandbox would have run it unasked.
     assert!(denied.contains("bash(rm -rf *)"), "{denied}");
     assert!(dir.join("build").is_dir());

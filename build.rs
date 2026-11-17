@@ -1,4 +1,4 @@
-//! Defines three cfgs:
+//! Defines four cfgs:
 //!
 //! - `unixlike`: Unix, or a target whose std offers `std::os::unix` without
 //!   being in the `unix` family — fullrust (`x86_64-unknown-linux-fullrust`),
@@ -8,6 +8,9 @@
 //! - `tui`: the `tui` feature is on and the target is one the terminal
 //!   layer (`src/tui/term.rs`) knows the terminal structures of. Elsewhere
 //!   atelier is built with the line REPL only.
+//! - `pty`: the target is one of those same systems, on which a `bash`
+//!   command can be run on a pseudo-terminal (`src/tools/pty.rs`) and so be
+//!   handed the user's keyboard. Elsewhere commands run on pipes.
 //! - `sandbox`: the `sandbox` feature is on and the target is in the `unix`
 //!   family proper, which nixvm needs to mount a host directory in its guest
 //!   (it calls libc's `*at` functions, and fullrust has no libc). Elsewhere
@@ -18,6 +21,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(unixlike)");
     println!("cargo::rustc-check-cfg=cfg(tui)");
     println!("cargo::rustc-check-cfg=cfg(sandbox)");
+    println!("cargo::rustc-check-cfg=cfg(pty)");
     // Stock rustc doesn't know the fullrust toolchain's `target_os`.
     println!("cargo::rustc-check-cfg=cfg(target_os, values(\"fullrust\"))");
 
@@ -37,5 +41,10 @@ fn main() {
     let terminal = os == "macos" || (generic && (os == "linux" || os == "fullrust"));
     if std::env::var_os("CARGO_FEATURE_TUI").is_some() && terminal {
         println!("cargo::rustc-cfg=tui");
+    }
+    // The same systems, whatever the features: `serve` hands a command's
+    // terminal to its client without the interface being built.
+    if terminal {
+        println!("cargo::rustc-cfg=pty");
     }
 }

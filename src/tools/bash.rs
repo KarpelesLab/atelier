@@ -27,6 +27,15 @@
 //! not something to pipe a command into: see [`filter`], which also says
 //! why, and how a filtered result is kept from hiding a failure.
 //!
+//! # A command the user can type to
+//!
+//! Where somebody is at an interface that can pass keys on, a foreground
+//! command runs on a terminal of its own and can be handed the keyboard at
+//! any point: see [`terminal`], and [`BashTool::call_on`], which is how the
+//! agent runs `bash` when it has such an interface. Everywhere else — and
+//! through [`Tool::call`] — a command runs on pipes with no stdin, as it
+//! always did, and a result that ends at what looks like a prompt says so.
+//!
 //! # The sandbox
 //!
 //! With the sandbox on ([`crate::sandbox`]), a foreground command runs in a
@@ -45,6 +54,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::filter::{self, Filter};
+use super::terminal::{self, Console};
 use super::{Tool, ToolCtx, ToolSpec};
 use crate::sandbox;
 
@@ -72,6 +82,10 @@ pub const NOTICE_OPEN: &str = "<background-job ";
 
 pub struct BashTool;
 
+/// The tool's name: the agent runs it itself, to give it the interface
+/// (see [`BashTool::call_on`]).
+pub const NAME: &str = "bash";
+
 /// Whether the call asks for a background job. `run_in_background` is what
 /// Claude models know it as.
 fn wants_background(args: &Value) -> bool {
@@ -87,7 +101,7 @@ fn wants_host(args: &Value) -> bool {
 
 impl Tool for BashTool {
     fn name(&self) -> &str {
-        "bash"
+        NAME
     }
 
     /// A command the sandbox will run, in the foreground or as a background
@@ -111,7 +125,12 @@ impl Tool for BashTool {
                 `tail`, `head` or `grep` parameter instead: the command runs as it is, its \
                 own exit status is reported, and all of its output is kept, so you can look \
                 at another part of it afterwards (`bash_output` with the id the result \
-                names) without running it again. With `background: true` it \
+                names) without running it again. A command that stops to ask the user \
+                something (a password, a 2FA code, a confirmation) can be answered by them \
+                when they are at a terminal: pass `interactive: true` when you know it will \
+                ask (a login, `sudo`, `ssh` to a new host, a release tool that wants a code), \
+                and never try to answer such a prompt yourself or pipe an answer in. With \
+                `background: true` it \
                 starts as a job instead and returns its id at once. You are told when the \
                 job ends (a <background-job> block), so do not poll it: go on with other \
                 work. Read its output, or wait for it to print something, with \
@@ -142,6 +161,10 @@ impl Tool for BashTool {
                         "type": "boolean",
                         "description": "Run as a background job and return its id immediately (default false)."
                     },
+                    "interactive": {
+                        "type": "boolean",
+                        "description": "The command will need the user to type something (a password, a 2FA code, a login, an editor): they are given its terminal as it starts, with the time to answer. Commands that turn out to ask are noticed anyway; this is for when you know beforehand. Does not change what needs approval."
+                    },
                     "sandbox": {
                         "type": "boolean",
                         "description": "Only when commands run in a sandbox: false runs this one on the host instead, which the user must approve. Use it after a result says the sandbox was in the way, not before."
@@ -157,7 +180,29 @@ impl Tool for BashTool {
         }
     }
 
+    /// On pipes, with nobody to type to the command: what a caller without
+    /// an interface gets (a script, a subagent, a test).
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
+        self.call_on(ctx, args, None)
+    }
+}
+
+/// Whether the call says the user will have to type to the command.
+fn wants_interactive(args: &Value) -> bool {
+    args.get("interactive").and_then(Value::as_bool) == Some(true)
+}
+
+impl BashTool {
+    /// [`call`](Tool::call), with the interface when it is one the user can
+    /// type to a command through (`console`): then a foreground command on
+    /// the host runs on a terminal of its own ([`terminal`]). What needs
+    /// approval is decided before this, and by nothing given here.
+    pub fn call_on(
+        &self,
+        ctx: &mut ToolCtx,
+        args: Value,
+        console: Option<&mut dyn Console>,
+    ) -> Result<String> {
         let command = args
             .get("command")
             .and_then(Value::as_str)
@@ -201,6 +246,9 @@ impl Tool for BashTool {
                 let out = sandbox::run(command, ctx.project_root, &setup, timeout)?;
                 let mut out = format_sandboxed(ctx.project_root, timeout_ms, out, filter.as_ref());
                 append(&mut out, filter::pipe_note(command));
+                if wants_interactive(&args) {
+                    append(&mut out, Some(format!("[{NOT_INTERACTIVE}: {IN_SANDBOX}]")));
+                }
                 return Ok(out);
             }
             // Asked for and not there: refused, not run on the host instead,
@@ -211,6 +259,28 @@ impl Tool for BashTool {
                  user will be asked)."
             ),
             _ => {}
+        }
+
+        // Somebody can type to it: on a terminal, if one can be had.
+        let mut no_terminal = NOBODY.to_string();
+        if let Some(console) = console {
+            match terminal::open() {
+                Ok(term) => {
+                    let interactive = wants_interactive(&args);
+                    let done =
+                        term.run(command, ctx.project_root, timeout, interactive, console)?;
+                    let mut out = format_attended(ctx.project_root, timeout_ms, done, &filter);
+                    append(&mut out, filter::pipe_note(command));
+                    if sandboxed {
+                        append(
+                            &mut out,
+                            Some("[ran on the host, not in the sandbox]".into()),
+                        );
+                    }
+                    return Ok(out);
+                }
+                Err(e) => no_terminal = format!("no terminal could be opened for it ({e})"),
+            }
         }
 
         let child = Command::new("sh")
@@ -225,13 +295,24 @@ impl Tool for BashTool {
         let done = capture(child, timeout)?;
         let status = match done.status {
             _ if done.timed_out => timed_out_line(timeout_ms),
-            Some(status) => format!("[exit status: {status}]\n"),
+            Some(status) => exited_line(status),
             None => "[exit status: unknown]\n".to_string(),
         };
         let failed = !done.status.is_some_and(|s| s.success());
+        let asked = failed
+            .then(|| prompt_left(&done.stdout, &done.stderr))
+            .flatten();
         let output = combine(done.stdout, done.stderr);
         let mut out = format_result(ctx.project_root, status, output, filter.as_ref(), failed);
         append(&mut out, filter::pipe_note(command));
+        if let Some(prompt) = asked {
+            append(&mut out, Some(unanswered(&prompt, &no_terminal)));
+        } else if wants_interactive(&args) {
+            append(
+                &mut out,
+                Some(format!("[{NOT_INTERACTIVE}: {no_terminal}]")),
+            );
+        }
         if sandboxed {
             append(
                 &mut out,
@@ -240,6 +321,74 @@ impl Tool for BashTool {
         }
         Ok(out)
     }
+}
+
+/// Why a command had nobody to type to it.
+const NOBODY: &str = "nobody is at a terminal in this mode";
+const IN_SANDBOX: &str = "a command in the sandbox cannot be typed to yet";
+/// What opens the note on a call that asked for `interactive` in vain.
+const NOT_INTERACTIVE: &str = "interactive was asked for, but the command ran without a terminal";
+
+/// The prompt a command that did not end well seems to have been left at:
+/// the unfinished last line of what it printed, on either stream.
+fn prompt_left(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    [stderr, stdout]
+        .iter()
+        .find_map(|out| terminal::prompt_left(&String::from_utf8_lossy(out)))
+}
+
+/// The note on a result whose command asked something nobody could answer.
+fn unanswered(prompt: &str, why: &str) -> String {
+    format!(
+        "[the command seems to have stopped to ask for input — its output ends with the \
+         prompt {prompt:?} — and could not be answered: {why}. Do not try to answer it \
+         yourself: tell the user, who can run it in atelier's terminal interface (where a \
+         command can be typed to) or by hand.]"
+    )
+}
+
+/// The result of a command that ran on a terminal the user could type to
+/// (see [`terminal`]): one stream, and a line for each thing the model
+/// cannot see for itself — that the user typed, that nobody did.
+fn format_attended(
+    root: &Path,
+    timeout_ms: u64,
+    done: terminal::Finished,
+    filter: &Option<Filter>,
+) -> String {
+    let grace = terminal::ANSWER_GRACE.as_secs();
+    let status = match (done.end, done.status) {
+        (terminal::End::Stopped, _) => "[stopped by the user and killed]\n".to_string(),
+        (terminal::End::TimedOut, _) if done.unanswered.is_some() => {
+            format!("[command killed: it waited {grace}s for input that nobody gave]\n")
+        }
+        (terminal::End::TimedOut, _) => timed_out_line(timeout_ms),
+        (_, Some(status)) => exited_line(status),
+        (_, None) => "[exit status: unknown]\n".to_string(),
+    };
+    let failed = !done.status.is_some_and(|s| s.success());
+    let mut out = format_result(root, status, done.output, filter.as_ref(), failed);
+    if done.typed {
+        append(
+            &mut out,
+            Some(
+                "[the user typed to this command while it ran. What they typed, and the \
+                 terminal's echo of it, is not part of this output]"
+                    .into(),
+            ),
+        );
+    }
+    if let Some(prompt) = done.unanswered {
+        append(
+            &mut out,
+            Some(format!(
+                "[the command was waiting for input at the prompt {prompt:?}. The user was \
+                 told and did not answer in time. Do not try to answer it yourself: tell \
+                 the user, and run it again when they are there to type.]"
+            )),
+        );
+    }
+    out
 }
 
 /// Add the output filter's parameters to a tool's schema.
@@ -311,6 +460,17 @@ pub(crate) fn capture(mut child: Child, timeout: Duration) -> Result<Captured> {
     })
 }
 
+/// The line a result opens with for a command that ended by itself: its
+/// exit status, or the signal that ended it. One wording wherever the
+/// command ran.
+fn exited_line(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("[exit status: {code}]\n"),
+        // `signal: 15 (SIGTERM)`, as `ExitStatus` says it.
+        None => format!("[killed by {status}]\n"),
+    }
+}
+
 fn timed_out_line(timeout_ms: u64) -> String {
     format!("[command timed out after {timeout_ms}ms and was killed]\n")
 }
@@ -325,15 +485,21 @@ fn format_sandboxed(
     filter: Option<&Filter>,
 ) -> String {
     let status = match &out.outcome {
-        // As `ExitStatus` prints it.
-        sandbox::Outcome::Exited(code) => format!("[exit status: exit status: {code}]\n"),
+        // As for a command on the host (`exited_line`).
+        sandbox::Outcome::Exited(code) => format!("[exit status: {code}]\n"),
         sandbox::Outcome::TimedOut => timed_out_line(timeout_ms),
         sandbox::Outcome::Failed(_) => "[not run: the sandbox failed]\n".to_string(),
     };
     let blame = sandbox::diagnose(&out);
     let failed = !matches!(out.outcome, sandbox::Outcome::Exited(0));
+    let asked = failed
+        .then(|| prompt_left(&out.stdout, &out.stderr))
+        .flatten();
     let output = combine(out.stdout, out.stderr);
     let mut text = format_result(root, status, output, filter, failed);
+    if let Some(prompt) = asked {
+        append(&mut text, Some(unanswered(&prompt, IN_SANDBOX)));
+    }
     if let Some(why) = blame {
         if !text.ends_with('\n') {
             text.push('\n');
@@ -1054,6 +1220,30 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_says_once_how_the_command_ended() {
+        let root = tempdir("bash-status");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        let mut run = |command: &str| {
+            let args = json!({"command": command, "timeout_ms": 300});
+            BashTool.call(&mut ctx, args).unwrap()
+        };
+        assert_eq!(run("echo hi"), "[exit status: 0]\nhi\n");
+        assert_eq!(run("exit 3"), "[exit status: 3]\n");
+        // A signal is not a status.
+        assert_eq!(run("kill -TERM $$"), "[killed by signal: 15 (SIGTERM)]\n");
+        assert_eq!(
+            run("echo slow; sleep 20"),
+            "[command timed out after 300ms and was killed]\nslow\n"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn timeout_kills_command() {
         let root = tempdir("bash-timeout");
         let mut fstate = FileState::new();
@@ -1334,10 +1524,7 @@ mod tests {
             .call(&mut ctx, json!({"command": "seq 1 20000; echo oops >&2"}))
             .unwrap();
         assert!(out.len() < MAX_OUTPUT_BYTES, "{} bytes", out.len());
-        assert!(
-            out.starts_with("[exit status: exit status: 0]\n1\n2\n3\n"),
-            "{out}"
-        );
+        assert!(out.starts_with("[exit status: 0]\n1\n2\n3\n"), "{out}");
         // The end is where a command says how it went.
         assert!(out.ends_with("20000\n[stderr]\noops\n"), "{out}");
         assert!(out.contains(" lines omitted (lines "), "{out}");
@@ -1410,7 +1597,7 @@ mod tests {
             )
             .unwrap();
         let mut lines = out.lines();
-        assert_eq!(lines.next(), Some("[exit status: exit status: 3]"));
+        assert_eq!(lines.next(), Some("[exit status: 3]"));
         let header = lines.next().unwrap();
         assert!(
             header.starts_with(
@@ -1433,14 +1620,14 @@ mod tests {
                 json!({"command": "seq 1 300", "grep": "^7$", "context": 1}),
             )
             .unwrap();
-        assert!(out.starts_with("[exit status: exit status: 0]\n[filtered: 3 of 300"));
+        assert!(out.starts_with("[exit status: 0]\n[filtered: 3 of 300"));
         assert!(out.ends_with("]\n6\n7\n8\n"), "{out}");
 
         // Output the filter leaves whole is returned as ever.
         let out = BashTool
             .call(&mut ctx, json!({"command": "echo hi", "tail": 20}))
             .unwrap();
-        assert_eq!(out, "[exit status: exit status: 0]\nhi\n");
+        assert_eq!(out, "[exit status: 0]\nhi\n");
         // A pattern that is not one is the call's mistake, before anything runs.
         let err = BashTool
             .call(&mut ctx, json!({"command": "touch ran", "grep": "("}))
@@ -1466,7 +1653,7 @@ mod tests {
             .call(&mut ctx, json!({"command": failing, "grep": "step 5$"}))
             .unwrap();
         assert!(
-            out.starts_with("[exit status: exit status: 2]\n[filtered: 1 of 102 lines shown"),
+            out.starts_with("[exit status: 2]\n[filtered: 1 of 102 lines shown"),
             "{out}"
         );
         assert!(out.contains("\nstep 5\n[the command failed, and the filter left out the end"));
@@ -1488,7 +1675,7 @@ mod tests {
             .call(&mut ctx, json!({"command": "seq 1 30", "grep": "error"}))
             .unwrap();
         let (status, rest) = out.split_once('\n').unwrap();
-        assert_eq!(status, "[exit status: exit status: 0]");
+        assert_eq!(status, "[exit status: 0]");
         assert!(
             rest.starts_with("[filtered: no line of the 30 lines"),
             "{rest}"
@@ -1613,17 +1800,14 @@ mod tests {
                 json!({"command": "(seq 1 50; exit 3) | tail -n 2"}),
             )
             .unwrap();
-        assert!(
-            out.starts_with("[exit status: exit status: 0]\n49\n50\n"),
-            "{out}"
-        );
+        assert!(out.starts_with("[exit status: 0]\n49\n50\n"), "{out}");
         // A subshell is past what the parser follows: no advice, no harm.
         assert!(!out.contains("[note:"), "{out}");
         let out = BashTool
             .call(&mut ctx, json!({"command": "seq 1 50 | tail -n 2"}))
             .unwrap();
         let (run, note) = out.split_once("[note: ").expect("a note");
-        assert_eq!(run, "[exit status: exit status: 0]\n49\n50\n");
+        assert_eq!(run, "[exit status: 0]\n49\n50\n");
         assert!(
             note.contains("The exit status reported is tail's"),
             "{note}"
@@ -1633,7 +1817,7 @@ mod tests {
         let out = BashTool
             .call(&mut ctx, json!({"command": "seq 1 50 | wc -l"}))
             .unwrap();
-        assert_eq!(out, "[exit status: exit status: 0]\n50\n");
+        assert_eq!(out, "[exit status: 0]\n50\n");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1653,6 +1837,346 @@ mod tests {
         // What was there is still there.
         assert_eq!(BashTool.spec().parameters["required"], json!(["command"]));
         assert!(BashOutputTool.spec().parameters["properties"]["until"].is_object());
+    }
+
+    /// An interface with somebody at it, who does what the test says.
+    #[derive(Default)]
+    struct Typist {
+        /// What to type when the command is seen to want input, and how
+        /// long after.
+        answer: Option<(Duration, Vec<u8>)>,
+        /// Take the keyboard as the command starts, and keep it.
+        attach: bool,
+        /// Stop the turn this long after the command started.
+        stop_after: Option<Duration>,
+        // What was seen.
+        started: Option<(Instant, bool)>,
+        wanted: Vec<String>,
+        wanted_at: Option<Instant>,
+        screen: Vec<u8>,
+        ended: bool,
+    }
+
+    impl Console for Typist {
+        fn event(&mut self, event: terminal::CommandEvent) {
+            match event {
+                terminal::CommandEvent::Started { interactive, .. } => {
+                    self.started = Some((Instant::now(), interactive));
+                }
+                terminal::CommandEvent::Output(bytes) => self.screen.extend_from_slice(bytes),
+                terminal::CommandEvent::InputWanted { prompt } => {
+                    self.wanted.push(prompt.to_string());
+                    self.wanted_at = Some(Instant::now());
+                }
+                terminal::CommandEvent::Ended => self.ended = true,
+            }
+        }
+        fn input(&mut self) -> Vec<terminal::CommandInput> {
+            let mut input = Vec::new();
+            if std::mem::take(&mut self.attach) {
+                input.push(terminal::CommandInput::Attach);
+            }
+            let due = |(wait, _): &(Duration, Vec<u8>)| {
+                self.wanted_at.is_some_and(|at| at.elapsed() >= *wait)
+            };
+            if let Some((_, keys)) = self.answer.take_if(|a| due(a)) {
+                input.push(terminal::CommandInput::Attach);
+                // Key by key, as a person types.
+                input.extend(keys.iter().map(|k| terminal::CommandInput::Bytes(vec![*k])));
+                input.push(terminal::CommandInput::Detach);
+            }
+            input
+        }
+        fn interrupted(&mut self) -> bool {
+            let started = self.started.map(|(at, _)| at);
+            self.stop_after
+                .zip(started)
+                .is_some_and(|(after, at)| at.elapsed() >= after)
+        }
+    }
+
+    /// Run `args` as the agent does when the user can type to commands.
+    fn attended(root: &Path, args: Value, typist: &mut Typist) -> String {
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: root,
+            fstate: &mut fstate,
+            approved: true,
+        };
+        BashTool.call_on(&mut ctx, args, Some(typist)).unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_command_on_a_terminal_reads_as_it_did_on_pipes() {
+        if !terminal::supported() {
+            return;
+        }
+        let root = tempdir("bash-tty-plain");
+        let mut typist = Typist::default();
+        let command = "echo out; echo err >&2; printf '\\033[1;31mred\\033[0m\\n'; \
+                       printf ' 10%%\\r100%%\\n'; test -t 0 && echo \"tty $TERM $PAGER\"; exit 3";
+        let out = attended(&root, json!({"command": command}), &mut typist);
+        // One stream, in order; no colour codes, no carriage returns, the
+        // progress line as it ended; and the command's own status.
+        assert_eq!(out, "[exit status: 3]\nout\nerr\nred\n100%\ntty dumb cat\n");
+        assert_eq!(typist.started.map(|(_, i)| i), Some(false));
+        assert!(typist.ended && typist.wanted.is_empty());
+        // The user's screen got it as the terminal did.
+        let screen = String::from_utf8_lossy(&typist.screen);
+        assert!(screen.contains("\x1b[1;31mred") && screen.contains("out\r\n"));
+
+        // Filters, long output and the pipe note work the same.
+        let out = attended(
+            &root,
+            json!({"command": "seq 1 300 | tail -n 250", "tail": 2}),
+            &mut Typist::default(),
+        );
+        assert!(
+            out.starts_with("[exit status: 0]\n[filtered: 2 of 250 lines shown"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n299\n300\n[note: this command pipes"),
+            "{out}"
+        );
+        assert_eq!(spilled(&root, &out).lines().count(), 250);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_command_that_asks_is_answered_by_the_user_and_the_answer_stays_theirs() {
+        if !terminal::supported() {
+            return;
+        }
+        let root = tempdir("bash-tty-prompt");
+        // As a release tool does it: on the terminal, not on stdin, and
+        // only when there is one.
+        let command = "echo Signing in; printf 'Enter the 6 digit code: ' > /dev/tty; \
+                       read code < /dev/tty; echo \"Verifying $code...\"; \
+                       [ \"$code\" = 424242 ] && echo signed in";
+        let mut typist = Typist {
+            answer: Some((Duration::ZERO, b"4242x\x7f42\r".to_vec())),
+            ..Typist::default()
+        };
+        let out = attended(&root, json!({"command": command}), &mut typist);
+        // Noticed without the model having said anything.
+        assert_eq!(typist.wanted, ["Enter the 6 digit code:"]);
+        // The user saw their code echoed; the model sees neither the echo
+        // nor the code the program printed back.
+        assert!(String::from_utf8_lossy(&typist.screen).contains("Verifying 424242"));
+        assert_eq!(
+            out,
+            "[exit status: 0]\nSigning in\nEnter the 6 digit code: \n\
+             Verifying [typed]...\nsigned in\n\
+             [the user typed to this command while it ran. What they typed, and the \
+             terminal's echo of it, is not part of this output]"
+        );
+        assert!(!out.contains("4242"), "{out}");
+        // Nor is it in anything the call left behind.
+        assert!(!root.join(".atelier").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_typed_secret_is_not_in_the_kept_output_either() {
+        if !terminal::supported() {
+            return;
+        }
+        let root = tempdir("bash-tty-kept");
+        let command = "printf 'Password: '; read p; seq 1 300; echo \"token for $p\"";
+        let mut typist = Typist {
+            answer: Some((Duration::ZERO, b"hunter2\r".to_vec())),
+            ..Typist::default()
+        };
+        let out = attended(&root, json!({"command": command, "tail": 1}), &mut typist);
+        assert!(out.contains("\ntoken for [typed]\n"), "{out}");
+        let kept = spilled(&root, &out);
+        assert!(kept.starts_with("Password: \n1\n2\n"), "{kept}");
+        assert!(!kept.contains("hunter2") && !out.contains("hunter2"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn waiting_for_an_answer_is_not_on_the_commands_clock() {
+        if !terminal::supported() {
+            return;
+        }
+        let root = tempdir("bash-tty-clock");
+        // Seen waiting about a second in; its 1.5s would be over before the
+        // user, who takes two seconds, has typed.
+        let mut typist = Typist {
+            answer: Some((Duration::from_secs(2), b"y\r".to_vec())),
+            ..Typist::default()
+        };
+        let command = "printf 'Continue? [y/N] '; read a; echo \"answered $a\"";
+        let out = attended(
+            &root,
+            json!({"command": command, "timeout_ms": 1500}),
+            &mut typist,
+        );
+        assert!(
+            out.starts_with("[exit status: 0]\nContinue? [y/N] \nanswered y\n"),
+            "{out}"
+        );
+
+        // With the keyboard in the user's hands no time counts at all.
+        let mut typist = Typist {
+            attach: true,
+            ..Typist::default()
+        };
+        let out = attended(
+            &root,
+            json!({"command": "sleep 1; echo done", "timeout_ms": 200}),
+            &mut typist,
+        );
+        assert_eq!(out, "[exit status: 0]\ndone\n");
+
+        // Left alone, a command that asks nothing has the time it was given.
+        let t0 = Instant::now();
+        let out = attended(
+            &root,
+            json!({"command": "echo working; sleep 30", "timeout_ms": 300}),
+            &mut Typist::default(),
+        );
+        assert_eq!(
+            out,
+            "[command timed out after 300ms and was killed]\nworking\n"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stopping_the_turn_kills_the_command() {
+        if !terminal::supported() {
+            return;
+        }
+        let root = tempdir("bash-tty-stop");
+        let mut typist = Typist {
+            stop_after: Some(Duration::from_millis(300)),
+            ..Typist::default()
+        };
+        let t0 = Instant::now();
+        let out = attended(
+            &root,
+            json!({"command": "echo started; sleep 30; echo never"}),
+            &mut typist,
+        );
+        assert_eq!(out, "[stopped by the user and killed]\nstarted\n");
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Where a command can be seen reading its terminal, that is what
+    /// counts: a read with no prompt is noticed, a line left unfinished by
+    /// a command that is busy is not taken for a question.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_command_is_seen_waiting_by_what_it_does_not_by_what_it_printed() {
+        let root = tempdir("bash-tty-seen");
+        let mut typist = Typist {
+            answer: Some((Duration::ZERO, b"go\r".to_vec())),
+            ..Typist::default()
+        };
+        let out = attended(
+            &root,
+            json!({"command": "echo ready; read x; echo \"got $x\""}),
+            &mut typist,
+        );
+        assert_eq!(typist.wanted, [""]);
+        assert!(out.contains("\nready\n\ngot go\n"), "{out}");
+
+        let mut typist = Typist::default();
+        let out = attended(
+            &root,
+            json!({"command": "printf 'Password: '; sleep 2; echo; echo no question"}),
+            &mut typist,
+        );
+        assert!(typist.wanted.is_empty(), "{:?}", typist.wanted);
+        assert!(out.ends_with("Password: \nno question\n"), "{out}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn with_nobody_to_answer_a_command_that_asks_is_reported_as_such() {
+        let root = tempdir("bash-unattended");
+        let mut fstate = FileState::new();
+        let mut ctx = ToolCtx {
+            project_root: &root,
+            fstate: &mut fstate,
+            approved: false,
+        };
+        // No terminal, no stdin: the read fails at once, as it always did.
+        let command = "printf 'Enter the 6 digit code: ' >&2; read code || exit 1; echo in";
+        let out = BashTool
+            .call(&mut ctx, json!({"command": command}))
+            .unwrap();
+        assert!(
+            out.starts_with("[exit status: 1]\n[stderr]\nEnter the 6 digit code: \n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "[the command seems to have stopped to ask for input — its output ends with \
+                 the prompt \"Enter the 6 digit code:\" — and could not be answered: nobody \
+                 is at a terminal in this mode."
+            ),
+            "{out}"
+        );
+        // Asked to be interactive where it cannot be: said, not ignored.
+        let out = BashTool
+            .call(&mut ctx, json!({"command": "echo hi", "interactive": true}))
+            .unwrap();
+        assert_eq!(
+            out,
+            "[exit status: 0]\nhi\n[interactive was asked for, but the command \
+             ran without a terminal: nobody is at a terminal in this mode]"
+        );
+        // A command that just fails, or succeeds with an unfinished line,
+        // gets no such note.
+        for command in ["echo 'error: nope'; exit 1", "printf 'done:'"] {
+            let out = BashTool
+                .call(&mut ctx, json!({"command": command}))
+                .unwrap();
+            assert!(!out.contains("ask for input"), "{out}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn interactive_is_not_a_way_around_approval() {
+        let root = Path::new("/project");
+        let plain = json!({"command": "sudo make install"});
+        let interactive = json!({"command": "sudo make install", "interactive": true});
+        assert!(BashTool.requires_approval_in(&plain, root));
+        assert!(BashTool.requires_approval_in(&interactive, root));
+        // Rules read the command, whatever else the call says.
+        use crate::permissions::{Decision, Policy};
+        let project = crate::settings::Permissions {
+            allow: vec!["bash(make *)".to_string()],
+            ask: Vec::new(),
+            deny: vec!["bash(sudo *)".to_string()],
+            reviewer: None,
+        };
+        let policy = Policy::new(&project, &Default::default(), None);
+        assert_eq!(
+            policy.decide("bash", &interactive, root).decision,
+            Decision::Deny
+        );
+        let unlisted = json!({"command": "fastlane release", "interactive": true});
+        assert_eq!(
+            policy.decide("bash", &unlisted, root).decision,
+            Decision::Default
+        );
+        // In the sandbox, which cannot be typed to, the flag changes nothing
+        // either: the host still takes `"sandbox": false`, and approval.
+        let _reset = sandbox::testing::set(ready());
+        assert!(!BashTool.requires_approval_in(&interactive, root));
+        let host = json!({"command": "sudo x", "interactive": true, "sandbox": false});
+        assert!(BashTool.requires_approval_in(&host, root));
     }
 
     /// A sandbox that says it is ready, for what is decided before any
@@ -1829,7 +2353,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "[exit status: exit status: 0]\n{}\nnixvm\n[stderr]\nwarn\n",
+                "[exit status: 0]\n{}\nnixvm\n[stderr]\nwarn\n",
                 root.display()
             )
         );
@@ -1842,17 +2366,14 @@ mod tests {
         let out = BashTool
             .call(&mut ctx, json!({"command": "echo no; exit 2"}))
             .unwrap();
-        assert_eq!(out, "[exit status: exit status: 2]\nno\n");
+        assert_eq!(out, "[exit status: 2]\nno\n");
 
         // A program the image doesn't have: the sandbox's doing, with the
         // way to the host.
         let out = BashTool
             .call(&mut ctx, json!({"command": "no-such-toolchain build"}))
             .unwrap();
-        assert!(
-            out.starts_with("[exit status: exit status: 127]\n"),
-            "{out}"
-        );
+        assert!(out.starts_with("[exit status: 127]\n"), "{out}");
         assert!(
             out.contains("[sandbox: a program it needs is not in the sandbox's image"),
             "{out}"

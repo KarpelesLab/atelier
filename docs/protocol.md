@@ -93,6 +93,7 @@ need not wait for the result before sending more.
 |-------|-|-|
 | `client` | optional | `{name, version}`: who is connecting (logged to stderr) |
 | `protocol` | optional | The protocol version the client was written for |
+| `terminal` | optional | `true`: the client can show a running command's terminal to somebody who can type to it. See [Typing to a command](#typing-to-a-command). Without it, commands run with no terminal and no input |
 
 Result:
 
@@ -103,6 +104,7 @@ Result:
             "tools":["apply_patch","ask","bash","…"]},
  "capabilities":{"steer":true,"interrupt":true,"approvals":true,"questions":true,
                  "images":true,"commands":true,"history":true,"file_changes":true,
+                 "command_input":true,
                  "approval_timeout":null,
                  "queries":["models/list","mcp/list","peers/list","usage/get",
                             "memory/list","commands/list","jobs/list"]}}
@@ -120,7 +122,10 @@ Result:
 - `capabilities.approval_timeout` is `--approval-timeout` in seconds, or
   `null`. `history` and `file_changes` say this build has
   [`session/history`](#sessionhistory) and sends
-  [`event/file_change`](#eventfile_change).
+  [`event/file_change`](#eventfile_change). `command_input` says this build
+  can run a command on a terminal and takes
+  [`command/input`](#commandinput) (false on a system without
+  pseudo-terminals; absent from a server older than the method).
 - `capabilities.queries` names the [queries](#queries) this build answers.
   A server from before they existed has no such field, and answers them
   with `-32601`.
@@ -162,8 +167,10 @@ the stop was *requested*; the turn has ended when `turn/ended` arrives, with
 status `interrupted`. Fails with `-32003` when no turn is running.
 
 - The turn stops at its next opportunity: the next streamed chunk, or
-  between tool calls. A tool that is already running finishes, and a model
-  request still waiting for its first byte is not cut short.
+  between tool calls. A tool that is already running finishes — except a
+  `bash` command running [on a terminal](#typing-to-a-command), which is
+  killed — and a model request still waiting for its first byte is not cut
+  short.
 - A pending `approval/request` or `question/request` is cancelled (deny /
   declined) and the client is told with
   [`request/cancelled`](#requestcancelled).
@@ -191,6 +198,27 @@ Params: `{"line": "/mode plan"}`.
 
 Fails with `-32001` while a turn or another command runs. A command may
 itself ask for approval (a custom command's `` !`shell` `` lines do).
+
+### `command/input`
+
+Type to the `bash` command that is running, take its keyboard or give it
+back, or say what size it is shown in — for a client that asked for the
+terminal in `initialize`. Answered at once, in the middle of the turn. See
+[Typing to a command](#typing-to-a-command) for the whole exchange.
+
+| Param | | |
+|-------|-|-|
+| `data` | optional | What was typed, as a terminal sends it: text, Enter as `"\r"`, Ctrl-C as `"\u0003"`, an arrow key as its escape sequence |
+| `attached` | optional | `true`: the user took the keyboard — from here the command's timeout does not run. `false`: they gave it back |
+| `cols`, `rows` | optional, together | The size of the terminal the command is shown in |
+
+At least one of them; several are applied in the order attached, size,
+data, detached. Result: `{}`. Fails with `-32006` when no command is
+running on a terminal (none has started, or it has ended —
+`event/command_ended` comes first).
+
+`data` goes to the command and nowhere else: atelier does not log it, no
+event repeats it, and it is not in the tool's result.
 
 ### `session/status`
 
@@ -779,13 +807,71 @@ One per thing the session reports. Events of a turn carry its id as
 | `event/review` | `turn`, `text` | A note from the [parallel reviewer](review.md) |
 | `event/approval` | `turn`, `tool`, `arguments`, `decision`, `by`, `reason`, `risk`? | The [approval reviewer](permissions.md#the-approval-reviewer)'s verdict on a call (`"by": "reviewer"`): `decision` is `"allowed"`, `"denied"` or `"escalated"` (left to the client, or — after an `approval/request` went unanswered — refused). With `when = "always"` it precedes the `approval/request`; by default it comes only after one the client answered with an error or let time out |
 | `event/delivered` | `turn`, `text` | A `turn/steer` message just reached the model |
+| `event/command_started` | `turn`, `command`, `interactive` | A `bash` command started on a terminal: [`command/input`](#commandinput) reaches it from here. `interactive`: the model expects the user to have to type |
+| `event/command_output` | `turn`, `data` | What the command printed, raw, as a terminal is sent it (escape sequences, `\r\n`). For the user's screen: it may hold the echo of what they typed |
+| `event/input_wanted` | `turn`, `prompt` | The command seems to be waiting for input. `prompt` is its unfinished last line, or empty |
+| `event/command_ended` | `turn` | The command is over; `event/tool_end` follows with the result |
 | `event/idle` | `kind`, … | Output between turns; see below |
 | `turn/ended` | see below | The turn is over |
 | `request/cancelled` | `id`, `reason` | A request atelier made no longer needs an answer |
 
 The payloads are those of the [`stream-json` events](headless.md#events-stream-json)
 of the same name (`text`, `tool_start`, `tool_end`, `file_change`, …): the
-two interfaces share one vocabulary.
+two interfaces share one vocabulary. The four `command_*`/`input_wanted`
+events are this protocol's alone, and are sent only to a client that asked
+for the terminal.
+
+### Typing to a command
+
+A command that stops to ask its user something — a 2FA code, a password, a
+confirmation — needs a terminal and somebody at it. A client that has both
+says `"terminal": true` in `initialize`; then every foreground `bash`
+command on the host runs on a pseudo-terminal (see
+[A command you can type to](tools.md#a-command-you-can-type-to) for what
+that changes and what it does not), and the client is the terminal's
+screen and keyboard:
+
+```
+client                                         atelier
+  │◀───────────── event/tool_start {bash}        │
+  │◀──── event/command_started {interactive}     │   command/input works from here
+  │◀──────────── event/command_output {data}     │   …as it prints
+  │◀── event/input_wanted {prompt:"Code:"}       │   quiet, and reading its terminal
+  │ command/input {attached:true,cols,rows} ───▶│   the user took the keyboard
+  │ command/input {data:"424242\r"} ───────────▶│
+  │◀──────────── event/command_output {data}     │   the echo, and what follows
+  │◀──────────────────── event/command_ended     │
+  │◀───────────── event/tool_end {output}        │   what the model is given
+```
+
+- **Show `event/command_output` in a terminal emulator** (or strip the
+  escape sequences): it is what a terminal would be sent. A client need not
+  show it before the user asks; it should keep the last line, which is the
+  prompt.
+- **`event/input_wanted` is a hint, not a request**: nothing waits for an
+  answer to it. atelier sends it when the command has been quiet for a
+  second and is seen reading its terminal, or ends its output on what reads
+  like a prompt. The command then has at least five minutes from that
+  moment, whatever its timeout; so does one started with `interactive:
+  true`, which the client may attach to at once.
+- **`attached` is about time**: while it is `true` the command's timeout
+  does not run, since a person is at the keyboard. Send `false` when they
+  leave. `data` is accepted either way.
+- **What the user types never comes back** except as the terminal's echo in
+  `event/command_output`. The `output` of `event/tool_end`, the model's
+  context, `session/history` and the saved session hold the command's
+  output without the lines typed on and with any typed line of four
+  characters or more replaced by `[typed]`.
+- `turn/interrupt` kills the command. Ctrl-C *for the command* is
+  `"data": "\u0003"`.
+- Approval comes first, as for any `bash` call: the events start once the
+  call was allowed.
+
+Not covered: commands in the [sandbox](sandbox.md)'s guest, background
+jobs, and subagents' commands run with no terminal. A client that does not
+ask for the terminal sees none of this, and its commands run as they always
+did; one that stops at a prompt is reported to the model as having asked
+for input nobody could give.
 
 ### `turn/ended`
 
@@ -886,6 +972,7 @@ codes are stable:
 | `-32003` | no turn running | `turn/steer` or `turn/interrupt` with nothing to act on |
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |
 | `-32005` | already initialized | A second `initialize` |
+| `-32006` | no command | [`command/input`](#commandinput) with no command running on a terminal |
 | `-32020` | unauthorized | [`--listen`](#listening-on-a-socket) on TCP: the connection's first line was not the token. `"id": null`; the connection is closed |
 | `-32021` | too many sessions | [`--listen`](#listening-on-a-socket): `--max-sessions` connections are being served already. `"id": null`; the connection is closed |
 

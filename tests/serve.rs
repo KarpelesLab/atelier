@@ -1952,3 +1952,210 @@ fn jobs_list_shows_a_background_job() {
     client.ok("shutdown", json!({}));
     assert!(client.exited().success());
 }
+
+// ------------------------------------------------- typing to a command
+
+const NO_COMMAND: i64 = -32006;
+
+/// Every file under `dir`, read as text.
+fn files_under(dir: &Path, into: &mut Vec<(PathBuf, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files_under(&path, into);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            into.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+}
+
+/// A command that stops to ask for a code — on its terminal, as release
+/// tools do — is run on one for a client that said it has a terminal to
+/// show: the client is told the command wants input, sends what its user
+/// typed, and the command goes on. What was typed reaches the command and
+/// nothing else: not the model's context, not the events that report the
+/// call, not the saved session, not the trace.
+#[test]
+fn a_command_that_asks_is_answered_through_the_client_and_the_answer_stays_out() {
+    let command = "echo signing in; printf 'Enter the 6 digit code: ' > /dev/tty; \
+                   read code < /dev/tty; echo \"verifying $code\"; \
+                   [ ${#code} = 6 ] && echo signed in";
+    let mock = Mock::scripted(move |n, _| match n {
+        0 => tool_call("call_1", "bash", json!({"command": command})),
+        _ => answer("released"),
+    });
+    let dir = unique_dir("terminal");
+    let trace = dir.with_extension("trace");
+    let env = [("ATELIER_TRACE", Some(trace.to_str().unwrap()))];
+    let mut client = Client::spawn_env(&mock, &dir, &[], &env);
+    let hello = client.ok(
+        "initialize",
+        json!({"client": {"name": "test", "version": "0"}, "terminal": true}),
+    );
+    if hello["capabilities"]["command_input"] != true {
+        // A system this build has no pseudo-terminal for.
+        return;
+    }
+    // Nothing to type to yet; and a request that asks for nothing.
+    client.err("command/input", json!({"data": "x"}), NO_COMMAND);
+    client.err("command/input", json!({}), INVALID_PARAMS);
+    client.err("command/input", json!({"cols": 80}), INVALID_PARAMS);
+
+    let turn = client.start_turn("release it");
+    // Typing to it is no way around the approval.
+    let asked = client.asked("approval/request");
+    assert_eq!(asked["params"]["tool"], "bash");
+    client.reply(&asked, json!({"decision": "once"}));
+
+    let started = client.notification("event/command_started");
+    assert_eq!(started["turn"], 1);
+    assert_eq!(started["interactive"], false);
+    assert_eq!(started["command"], command);
+    // Noticed by atelier: the model did not say the command would ask.
+    let wanted = client.notification("event/input_wanted");
+    assert_eq!(wanted["prompt"], "Enter the 6 digit code:", "{wanted}");
+    assert_eq!(wanted["turn"], 1);
+    client.ok(
+        "command/input",
+        json!({"attached": true, "cols": 100, "rows": 30, "data": "424242\r"}),
+    );
+    client.notification("event/command_ended");
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    // Over: there is nothing to type to any more.
+    client.err("command/input", json!({"data": "x"}), NO_COMMAND);
+
+    // The client's user saw the terminal as it was, their own code included.
+    let screen: String = client
+        .log
+        .iter()
+        .filter(|m| m["method"] == "event/command_output")
+        .filter_map(|m| m["params"]["data"].as_str())
+        .collect();
+    assert!(
+        screen.contains("Enter the 6 digit code: 424242"),
+        "{screen}"
+    );
+    assert!(screen.contains("verifying 424242"), "{screen}");
+
+    // The model saw the command succeed, and not the code.
+    let body = mock.body(1);
+    assert!(body.contains("verifying [typed]"), "{body}");
+    assert!(body.contains("signed in"), "{body}");
+    assert!(body.contains("the user typed to this command"), "{body}");
+    assert!(!body.contains("424242"), "{body}");
+    // Nor does anything else that reports or records the call.
+    for message in &client.log {
+        let method = message["method"].as_str().unwrap_or("");
+        if method != "event/command_output" {
+            assert!(!message.to_string().contains("424242"), "{message}");
+        }
+    }
+    let history = client.ok("session/history", json!({}));
+    assert!(
+        history.to_string().contains("verifying [typed]"),
+        "{history}"
+    );
+    assert!(!history.to_string().contains("424242"), "{history}");
+    client.ok("shutdown", json!({}));
+    assert!(client.exited().success());
+
+    let mut files = Vec::new();
+    for place in ["", "state", "data", "home"] {
+        match place {
+            "" => files_under(&dir, &mut files),
+            ext => files_under(&dir.with_extension(ext), &mut files),
+        }
+    }
+    files.push((trace.clone(), std::fs::read_to_string(&trace).unwrap()));
+    // The session was saved and the trace written: they are what is checked.
+    assert!(
+        files
+            .iter()
+            .filter(|(_, text)| text.contains("verifying [typed]"))
+            .count()
+            >= 2,
+        "{:?}",
+        files.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    for (path, text) in &files {
+        assert!(!text.contains("424242"), "{}", path.display());
+    }
+}
+
+/// The model can say beforehand that the user will have to type, and a
+/// client can take the keyboard without being asked to.
+#[test]
+fn an_interactive_command_says_so_as_it_starts() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call(
+            "call_1",
+            "bash",
+            json!({"command": "read answer; echo \"got ${#answer} characters\"", "interactive": true}),
+        ),
+        _ => answer("done"),
+    });
+    let dir = unique_dir("interactive");
+    let mut client = Client::spawn(&mock, &dir, &[]);
+    let hello = client.ok("initialize", json!({"terminal": true}));
+    if hello["capabilities"]["command_input"] != true {
+        return;
+    }
+    let turn = client.start_turn("log in");
+    let asked = client.asked("approval/request");
+    client.reply(&asked, json!({"decision": "once"}));
+    let started = client.notification("event/command_started");
+    assert_eq!(started["interactive"], true, "{started}");
+    // No need to wait for atelier to notice anything.
+    client.ok("command/input", json!({"attached": true}));
+    client.ok("command/input", json!({"data": "s3cret-pass\r"}));
+    client.notification("event/command_ended");
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    let body = mock.body(1);
+    assert!(body.contains("got 11 characters"), "{body}");
+    assert!(!body.contains("s3cret-pass"), "{body}");
+}
+
+/// A client that did not say it has a terminal gets what a headless run
+/// gets: the command runs with no terminal and no input, as it always did,
+/// and a result that ends at a prompt tells the model so.
+#[test]
+fn without_a_terminal_a_command_that_asks_is_reported_to_the_model() {
+    let mock = Mock::scripted(|n, _| match n {
+        0 => tool_call(
+            "call_1",
+            "bash",
+            json!({"command": "printf 'Enter the 6 digit code: ' >&2; read code || exit 1"}),
+        ),
+        _ => answer("I could not sign in"),
+    });
+    let dir = unique_dir("no-terminal");
+    let mut client = Client::ready(&mock, &dir, &[]);
+    let turn = client.start_turn("release it");
+    let asked = client.asked("approval/request");
+    client.reply(&asked, json!({"decision": "once"}));
+    assert_eq!(client.turn_ended(&turn)["status"], "completed");
+    let body = mock.body(1);
+    assert!(
+        body.contains("the command seems to have stopped to ask for input"),
+        "{body}"
+    );
+    assert!(
+        body.contains("nobody is at a terminal in this mode"),
+        "{body}"
+    );
+    let methods = client.methods();
+    assert!(
+        !methods
+            .iter()
+            .any(|m| m.starts_with("event/command_") || m == "event/input_wanted"),
+        "{methods:?}"
+    );
+    client.err(
+        "initialize",
+        json!({"terminal": "yes"}),
+        ALREADY_INITIALIZED,
+    );
+}

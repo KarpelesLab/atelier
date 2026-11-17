@@ -71,7 +71,8 @@ What does not change:
 
 On screen, the calls of a batch are announced together (`⚙ read …`,
 `⚙ grep …`) and their results follow in the same order. Stopping the turn
-(Ctrl-C) lets the calls that are running finish and skips the ones that have
+(Ctrl-C) lets the calls that are running finish (a `bash` command [on a
+terminal](#a-command-you-can-type-to) is killed) and skips the ones that have
 not started.
 
 `[defaults] parallel_tools = false` in `atelier.toml`, or
@@ -215,6 +216,7 @@ stdout/stderr and the exit status.
 | `timeout_ms` | integer | no       | Max run time in ms (default **120000**) |
 | `background` | boolean | no       | Start as a background job (also `run_in_background`) |
 | `sandbox`    | boolean | no       | Only with the [sandbox](sandbox.md) on: `false` runs this command on the host instead, which needs approval |
+| `interactive` | boolean | no      | The user will have to type to the command (a password, a 2FA code): they are given its terminal as it starts. See [A command you can type to](#a-command-you-can-type-to) |
 | `tail`       | integer | no       | Show only the last N lines of the output |
 | `head`       | integer | no       | Show only the first N lines |
 | `grep`       | string  | no       | Show only the lines matching this regex (Rust `regex` syntax) |
@@ -223,8 +225,10 @@ stdout/stderr and the exit status.
 
 The last five are the [output filter](#part-of-the-output-without-a-pipe).
 
-The child is polled every 20ms and killed if it exceeds the timeout (output
-then reads `[command timed out after Nms and was killed]`). Output over
+A result opens with one line saying how the command ended — `[exit status:
+0]`, `[exit status: 3]`, `[killed by signal: 15 (SIGTERM)]`, `[command timed
+out after Nms and was killed]` — the same wherever it ran, then its output.
+The child is polled every 20ms and killed if it exceeds the timeout. Output over
 20,000 bytes comes back as its start and its end, with all of it saved to a
 file ([below](#long-output-goes-to-a-file)). **`bash` is the one built-in tool that is not confined**
 — it can run anything — so it requires approval (see
@@ -271,6 +275,99 @@ result whose failure looks like the sandbox's doing says so, and the model
 can ask for the host with `"sandbox": false`. Background jobs always run on
 the host.
 
+### A command you can type to
+
+A release tool that stops for a 2FA code, `ssh` asking about a host key,
+`sudo`, `npm login`, a "continue? [y/N]": on pipes with no stdin such a
+command fails or hangs until its timeout, and nobody — least of all the
+model — knows beforehand which command will ask. So where **somebody is at
+an interface that can pass keys on** (the terminal interface, or a
+[`serve`](protocol.md#typing-to-a-command) client that says it has a
+terminal), a foreground command on the host runs on a **pseudo-terminal of
+its own**, and can be handed the keyboard at any point of its run:
+
+- **You take it**: `Ctrl-T` while a command runs. Your keys go to the
+  command as the terminal sends them — `Ctrl-C` is then the command's
+  interrupt, not the turn's — and what it prints is written straight to the
+  scrollback, raw. `Ctrl-]` gives the keyboard back to atelier; so does the
+  command's end. No screen is switched and nothing is redrawn: the input
+  line and the strip step aside and come back under what was printed.
+- **atelier notices** a command that is probably waiting for input: it has
+  printed nothing for a second and is blocked reading its terminal (seen in
+  `/proc` on Linux x86-64 and arm64) or, where that cannot be seen, its
+  output ends in an unfinished line that reads like a prompt (`Password:`,
+  `[y/N]`, `Enter the 6 digit code:`). You get a line, a bell and the strip:
+
+  ```
+  ⌨ the command is waiting for input: Enter the 6 digit code:
+     Ctrl-T to type to it (Ctrl-] gives the keyboard back)
+  ```
+
+  The keyboard is never redirected by itself here: what you were typing on
+  the input line stays a message for the model.
+- **The model says so**: `interactive: true`, when it knows the command will
+  ask (the tool's description says when). The keyboard is handed over as
+  the command starts — unless you have something typed on the input line,
+  in which case you get the hint instead — and the command keeps your own
+  `TERM`.
+
+**Time.** While you have the keyboard the command's timeout does not run. A
+command seen waiting (or started `interactive`) has at least five minutes
+from that moment for you to come and answer, whatever was left of its
+timeout. Left unanswered it is killed, and the model is told that the
+command was waiting at that prompt and that nobody answered — not to
+answer it itself, but to tell you.
+
+**What you type is yours.** A code or a password goes to the command and
+nowhere else: it is not in the tool's result, so not in the model's
+context, the saved session, a trace (`ATELIER_TRACE`) or the kept output
+file. The terminal echoes what you type and a program may print it back, so
+of the command's output the model is given everything except the rest of
+each line you typed on (where the echo is), and any later occurrence of a
+line you typed that is at least four characters long, replaced with
+`[typed]`. The result ends with a line saying that you typed to the
+command. A shorter answer (`y`, `2`) is not searched for: it is no secret,
+and its echo is withheld all the same.
+
+**Why a terminal for every command, and what it changes.** A command
+cannot be moved onto a terminal once it runs, and the programs this is for
+prompt on the terminal (`/dev/tty`), often only when they see one. So it is
+a terminal from the start, with the cost to ordinary commands kept small:
+`TERM=dumb`, `NO_COLOR=1`, `PAGER=cat` and `GIT_PAGER=cat` are set, the
+window is 200 columns wide until you take the keyboard (then it is your
+window's size), and what the model receives is cleaned — escape sequences
+removed, `\r\n` back to `\n`, a line redrawn with `\r` or backspaces
+reduced to what it ended as. What does differ from a run on pipes:
+
+- stdout and stderr are **one stream**, in the order things were printed,
+  with no `[stderr]` section;
+- a command that reads stdin gets a terminal instead of an immediate end of
+  file: `cat` with no argument waits (and is reported as waiting) rather
+  than returning at once;
+- programs that format for a terminal still do where the variables above do
+  not stop them: `ls` prints in columns;
+- stopping the turn (Ctrl-C at the input line, `turn/interrupt`) **kills
+  the command** instead of waiting for it to finish.
+
+**Where nobody can type**, a command runs as it always did — pipes, no
+stdin, stdout and stderr apart: [`--print`](headless.md), a `serve` client
+that did not ask for the terminal, [ACP](acp.md) (whose `terminal/*`
+methods have the client run a command and offer no way to pass keys to
+one), subagents, background jobs, `node` scripts, the plain REPL, and
+systems with no pseudo-terminal support (anything but Linux and macOS). A
+command that then fails or times out with its output ending at what reads
+like a prompt gets a line in its result saying that it seems to have asked
+for input, that nobody could answer and why, and that the model should
+tell the user rather than try to answer. `interactive: true` in such a run
+is noted in the result as not honoured.
+
+The [sandbox](sandbox.md)'s guest is not wired to this yet: a command that
+runs there cannot be typed to, the same report applies, and the way to a
+terminal is `"sandbox": false` (which needs approval, as ever).
+
+`interactive` changes nothing about [permissions](permissions.md): rules
+read the command, and a call that needed approval still does.
+
 ### Part of the output, without a pipe
 
 Agents end commands in `| tail -n 20` or `| grep error` by habit, to keep a
@@ -291,7 +388,7 @@ output is saved under `.atelier/tool-output/`
 ([as long output is](#long-output-goes-to-a-file)).
 
 ```
-[exit status: exit status: 0]
+[exit status: 0]
 [filtered: 20 of 3,402 lines shown (last 20) — full output: .atelier/tool-output/ab12cd.txt (to see another part without rerunning: bash_output with id "out-ab12cd" and tail/head/grep, or read with offset/limit)]
 …
 ```

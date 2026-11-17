@@ -54,6 +54,7 @@ use crate::provider::{self, Completion, Message, StreamEvent};
 use crate::settings::{HttpServerConfig, McpOptions, McpServerConfig, Settings};
 use crate::tools::ask::{self, Answer, Question};
 use crate::tools::change::FileChange;
+use crate::tools::terminal::{CommandEvent, CommandInput, Console};
 use crate::tools::{FileState, ToolCtx, ToolOutput, ToolRegistry, base64_encode};
 use crate::trust::{self, Trust};
 
@@ -172,6 +173,44 @@ pub trait Ui {
     /// the loop while a turn runs; interfaces without a way to ask never do.
     fn interrupted(&mut self) -> bool {
         false
+    }
+    /// Whether the user can type to a running `bash` command through this
+    /// interface: it shows what the command prints
+    /// ([`command_event`](Ui::command_event)) and passes on what they type
+    /// ([`command_input`](Ui::command_input)). Then a foreground command
+    /// runs on a terminal of its own and can ask for a password or a code
+    /// (see [`crate::tools::terminal`]). The default declines, and commands
+    /// run with no terminal and no input, as they do with nobody there.
+    fn command_console(&mut self) -> bool {
+        false
+    }
+    /// What a command running on such a terminal has to tell: that it
+    /// started, what it printed (raw, for the user's eyes only — it may
+    /// echo what they typed), that it seems to wait for input, that it is
+    /// over. Only called where [`command_console`](Ui::command_console)
+    /// said yes.
+    fn command_event(&mut self, _event: CommandEvent) {}
+    /// What the user did to the running command since last asked: took or
+    /// gave back the keyboard, typed, resized. Polled every few
+    /// milliseconds while the command runs. What is returned here goes to
+    /// the command and nowhere else — not to the model, not to disk.
+    fn command_input(&mut self) -> Vec<CommandInput> {
+        Vec::new()
+    }
+}
+
+/// An interface as a running command sees it (see [`Ui::command_console`]).
+struct UiConsole<'a>(&'a mut dyn Ui);
+
+impl Console for UiConsole<'_> {
+    fn event(&mut self, event: CommandEvent) {
+        self.0.command_event(event);
+    }
+    fn input(&mut self) -> Vec<CommandInput> {
+        self.0.command_input()
+    }
+    fn interrupted(&mut self) -> bool {
+        self.0.interrupted()
     }
 }
 
@@ -2773,7 +2812,17 @@ impl ToolRunner<'_> {
             fstate: self.fstate,
             approved: true,
         };
-        let result = tool.call_output(&mut ctx, args);
+        // `bash` is the other tool that needs the interface, when it is one
+        // the user can type to a command through: the command then runs
+        // on a terminal they can be handed (see `tools::terminal`).
+        let result = if name == crate::tools::bash::NAME && ui.command_console() {
+            let mut console = UiConsole(&mut *ui);
+            crate::tools::bash::BashTool
+                .call_on(&mut ctx, args, Some(&mut console))
+                .map(ToolOutput::text)
+        } else {
+            tool.call_output(&mut ctx, args)
+        };
         // Whatever the call wrote, it wrote — also when it failed after
         // (a patch that could not write its second file).
         for change in self.fstate.take_changes() {
@@ -2944,6 +2993,15 @@ impl Ui for PeerUi<'_> {
     }
     fn interrupted(&mut self) -> bool {
         self.inner.interrupted()
+    }
+    fn command_console(&mut self) -> bool {
+        self.inner.command_console()
+    }
+    fn command_event(&mut self, event: CommandEvent) {
+        self.inner.command_event(event);
+    }
+    fn command_input(&mut self) -> Vec<CommandInput> {
+        self.inner.command_input()
     }
 }
 
