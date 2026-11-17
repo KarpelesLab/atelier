@@ -20,6 +20,10 @@
 //! - Where the project is a linked git worktree or a submodule, the git
 //!   directory its `.git` file leads to — once that directory has been
 //!   checked to name the project back ([`gitdirs`]).
+//! - Read-only, at their own paths: what atelier keeps for the project
+//!   outside it and names to the agent by path ([`kept_mounts`]) — the
+//!   output of tools that was too long for the conversation, and the
+//!   worktrees of the project's isolated subagents.
 //!
 //! and nothing else of the host. Inside the project, what decides which
 //! programs run on the *host* later stays read-only ([`protected_paths`]):
@@ -370,6 +374,8 @@ pub fn run(command: &str, project_root: &Path, setup: &Setup, timeout: Duration)
 
 /// In place of a status file's path: write none.
 const NO_STATUS: &str = "-";
+/// In place of the project's state directory: there is none.
+const NO_STATE: &str = "-";
 /// The helper's flag that carries the network allowlist, `+` between entries.
 const NET_FLAG: &str = "net=";
 
@@ -426,10 +432,14 @@ fn helper_command(
         flags.push(format!("{NET_FLAG}{}", setup.network.join("+")));
     }
     let mut cmd = Command::new(helper);
+    // The helper is given no environment, so it cannot find the project's
+    // state directory by itself.
+    let state = crate::state::dir(project_root);
     cmd.arg(HELPER)
         .arg(status_path)
         .arg(&setup.rootfs)
         .arg(project_root)
+        .arg(state.as_deref().unwrap_or(Path::new(NO_STATE)))
         .arg(timeout.as_millis().to_string())
         .arg(setup.memory_mb.to_string())
         .arg(flags.join(","))
@@ -659,6 +669,7 @@ pub fn helper_main(args: &[String]) -> u8 {
         status_path,
         rootfs,
         project,
+        state,
         timeout_ms,
         memory_mb,
         flags,
@@ -671,6 +682,7 @@ pub fn helper_main(args: &[String]) -> u8 {
     let spec = Spec {
         rootfs: Path::new(rootfs),
         project: Path::new(project),
+        state: (state != NO_STATE).then(|| Path::new(state)),
         command,
         timeout: timeout_ms.parse().ok().map(Duration::from_millis),
         memory_mb: memory_mb.parse().unwrap_or(DEFAULT_MEMORY_MB),
@@ -731,6 +743,8 @@ fn exit_status(outcome: &Outcome) -> u8 {
 struct Spec<'a> {
     rootfs: &'a Path,
     project: &'a Path,
+    /// The project's state directory ([`crate::state`]), if it has one.
+    state: Option<&'a Path>,
     command: &'a str,
     timeout: Option<Duration>,
     memory_mb: u64,
@@ -765,6 +779,7 @@ fn execute(spec: &Spec) -> (Outcome, Report) {
         let _ = (
             spec.rootfs,
             spec.project,
+            spec.state,
             spec.command,
             spec.timeout,
             spec.memory_mb,
@@ -833,9 +848,11 @@ pub fn run_command(args: &[String]) -> Result<u8> {
             for note in notes {
                 eprintln!("atelier: sandbox: {note}");
             }
+            let state = crate::state::dir(&root);
             let (outcome, report) = execute(&Spec {
                 rootfs: &rootfs,
                 project: &root,
+                state: state.as_deref(),
                 command: &command,
                 timeout: None,
                 memory_mb: user.memory_mb.unwrap_or(DEFAULT_MEMORY_MB),
@@ -906,6 +923,13 @@ fn status_lines_with(root: &Path, store: crate::trust::Store) -> Vec<String> {
                 protected_paths(root).join(", ")
             ));
             out.extend(gitdirs::status_lines(&gitdirs::plan(root)));
+            let kept = kept_mounts(root, crate::state::dir(root).as_deref());
+            if !kept.is_empty() {
+                out.push(format!(
+                    "read-only, kept for the project outside it: {}",
+                    kept.join(", ")
+                ));
+            }
             out.push(match setup.network.as_slice() {
                 [] => "network: none".to_string(),
                 hosts => format!(
@@ -918,6 +942,28 @@ fn status_lines_with(root: &Path, store: crate::trust::Store) -> Vec<String> {
         }
     }
     out
+}
+
+/// What atelier keeps outside the project at `project` — in `state`, its
+/// state directory — that the guest is shown, read-only, at the same
+/// paths: the directory of kept tool output, which results name by path
+/// for the agent to look at again, and the directory of its subagents'
+/// worktrees, which the hand-over commands of a report name (`git -C
+/// <worktree> diff … | git apply`). Only those that exist when the guest
+/// starts, are real directories, and are neither in the project nor around
+/// it. Nothing else of the state directory — the session, memory — is
+/// shown.
+pub fn kept_mounts(project: &Path, state: Option<&Path>) -> Vec<String> {
+    let Some(state) = state.filter(|s| s.is_absolute()) else {
+        return Vec::new();
+    };
+    [crate::tools::spill::DIR, crate::state::WORKTREES]
+        .iter()
+        .map(|name| state.join(name))
+        .filter(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()))
+        .filter(|dir| !dir.starts_with(project) && !project.starts_with(dir))
+        .filter_map(|dir| dir.to_str().map(str::to_string))
+        .collect()
 }
 
 /// What the `bash` tool's description says about the sandbox while it is
@@ -934,7 +980,9 @@ pub fn tool_note(network: &[String]) -> String {
     format!(
         " Commands run in a sandbox: a small Linux guest (its own \
          userland, typically Alpine with busybox) that sees the project directory at its usual \
-         path and nothing else of this machine. {reach}; each command starts in a \
+         path and nothing else of this machine — except, read-only and at the paths you are \
+         given, the files that tool results name as their full output and the worktrees of \
+         isolated subagents. {reach}; each command starts in a \
          fresh guest, so only files in the project persist between commands (not /tmp, not \
          installed packages); .git/hooks, .git/config and atelier.toml are read-only; programs \
          installed on the host are not available unless the sandbox's image has them too. If a \
@@ -1016,6 +1064,12 @@ mod guest {
             mkdir_all(&mut mounts, &git.guest);
             let guarded = Guarded::new(&git.host, &git.protected).only(git.writable.as_deref());
             mounts.mount(git.guest, Box::new(guarded));
+        }
+        // What atelier keeps for the project outside it, to look at.
+        for kept in super::kept_mounts(spec.project, spec.state) {
+            mkdir_all(&mut mounts, &kept);
+            let host = Passthrough::read_only(Path::new(&kept));
+            mounts.mount(kept, Box::new(host));
         }
         for dir in ["/root", "/etc"] {
             mkdir_all(&mut mounts, dir);
@@ -1845,7 +1899,12 @@ mod tests {
         )
         .unwrap();
         let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args[6], "interp,net=crates.io+*.crates.io");
+        // After the project: its state directory, here the tests' own.
+        assert_eq!(
+            Some(Path::new(args[4])),
+            crate::state::dir(Path::new("/")).as_deref()
+        );
+        assert_eq!(args[7], "interp,net=crates.io+*.crates.io");
         assert!(tool_note(&setup.network).contains("only these hosts"));
         assert!(tool_note(&[]).contains("There is no network;"));
     }
@@ -2071,6 +2130,80 @@ mod tests {
         // The bit was lent, not left.
         let mode = std::fs::metadata(&obj).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o444);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn what_is_kept_outside_the_project_is_shown_only_where_it_is_apart_from_it() {
+        let base =
+            std::env::temp_dir().join(format!("atelier-sandbox-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (project, state) = (base.join("project"), base.join("state"));
+        std::fs::create_dir_all(&project).unwrap();
+        // Nothing kept yet, no state directory at all, a relative one.
+        assert!(kept_mounts(&project, Some(&state)).is_empty());
+        assert!(kept_mounts(&project, None).is_empty());
+        assert!(kept_mounts(&project, Some(Path::new("state"))).is_empty());
+        // The two directories, and nothing else that is there.
+        for name in ["tool-output", "worktrees/agent-1", "memory"] {
+            std::fs::create_dir_all(state.join(name)).unwrap();
+        }
+        std::fs::write(state.join("session.json"), "{}").unwrap();
+        let shown = |name: &str| state.join(name).display().to_string();
+        assert_eq!(
+            kept_mounts(&project, Some(&state)),
+            [shown("tool-output"), shown("worktrees")]
+        );
+        // A link is not followed.
+        std::fs::remove_dir(state.join("tool-output")).unwrap();
+        std::os::unix::fs::symlink("/etc", state.join("tool-output")).unwrap();
+        assert_eq!(kept_mounts(&project, Some(&state)), [shown("worktrees")]);
+        // In the project (it is mounted already), or around it (a worktree
+        // is never given the directory of all the worktrees).
+        std::fs::create_dir_all(project.join("state/worktrees")).unwrap();
+        assert!(kept_mounts(&project, Some(&project.join("state"))).is_empty());
+        let child = state.join("worktrees/agent-1");
+        assert!(kept_mounts(&child, Some(&state)).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// In a guest: output kept for the project is read by the path a result
+    /// gave, cannot be changed, and the rest of the state directory is not
+    /// there. Skipped without a root filesystem, like the others.
+    #[test]
+    fn the_guest_reads_what_is_kept_for_the_project_and_nothing_else_of_its_state() {
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        let project =
+            std::env::temp_dir().join(format!("atelier-sandbox-test-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let project = std::fs::canonicalize(&project).unwrap();
+        let state = crate::state::dir(&project).unwrap();
+        let kept = crate::tools::spill::keep(&project, "kept output\n").unwrap();
+        std::fs::write(state.join("session.json"), "{}").unwrap();
+        let dir = state.join(crate::tools::spill::DIR);
+        let command = format!(
+            "cat {file}; (echo x > {dir}/new.txt) 2>/dev/null || echo read-only; \
+             (echo x >> {file}) 2>/dev/null || echo unchanged; \
+             cat {state}/session.json 2>/dev/null || echo no-session; ls {state}",
+            file = kept.path,
+            dir = dir.display(),
+            state = state.display(),
+        );
+        let out = run(&command, &project, &setup, Duration::from_secs(60)).unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout, "kept output\nread-only\nunchanged\nno-session\ntool-output\n",
+            "{out:?}"
+        );
+        assert!(!dir.join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(&kept.path).unwrap(),
+            "kept output\n"
+        );
+        crate::state::forget(&project);
         let _ = std::fs::remove_dir_all(&project);
     }
 

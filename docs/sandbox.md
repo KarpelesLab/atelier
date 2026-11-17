@@ -255,6 +255,7 @@ itself are claude's, on the host, under its own rules.
 | `/` | the root filesystem, read-only, under a writable layer in memory |
 | the project's own absolute path | the project, read-write; the working directory |
 | where the project's `.git` file points | in a linked worktree or a submodule: the git directory, and only that ([below](#linked-worktrees-and-submodules)) |
+| `tool-output/` and `worktrees/` of the project's [state directory](sessions.md#where-atelier-keeps-a-projects-state), at their own absolute paths | **read-only**, when they exist: the output of tools that was too long for the conversation, which results name by path, and the worktrees of the project's [isolated subagents](agents.md#worktree-isolation), which a subagent's report names in the command that brings its changes over. Nothing else of the state directory (the session, memory) |
 | `/tmp`, `/dev`, `/proc`, `/sys` | the guest's own |
 
 The project is mounted where it is on the host, so paths in a command's
@@ -465,6 +466,8 @@ x86-64 on KVM.
 | `git add`, `git commit` | works. Git creates each object read-only (`0444`) and then fills it; the guest is root and may, so atelier lends the file its write bit for the write |
 | a linked git worktree: `git status`, `diff`, `log`, `add`, `commit`, `branch` | works: the repository's git directory is mounted ([how, and what of it](#linked-worktrees-and-submodules)). `git config` and `git worktree add` are refused |
 | a submodule's checkout as the project: the same | works, likewise |
+| reading a kept tool output by the path a result gave (`cat`, `grep`) | works (nixvm 0.0.8, Alpine 3.22, KVM): it is mounted read-only, and nothing else of the state directory is there |
+| an [isolated subagent](agents.md#worktree-isolation): its guest has the worktree as the project, and commits there; in the parent's guest, the report's `git -C <worktree> diff --binary <base> \| git apply` | works (same setup). The parent's guest cannot change the worktree — the mount is read-only — so `git worktree remove` there is refused: `/agents clean` does it, or `"sandbox": false` |
 | a project with submodules: `git status`, `git submodule status`, `git add <submodule>`, `git -C <submodule> commit` | works (their git directories are in the project's `.git/modules`). `git -C <submodule> config` is refused |
 | `python3`, `node` (JIT included), subprocesses from both | works |
 | `gcc`, `make`, `make -j` | works |

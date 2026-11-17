@@ -610,6 +610,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&top);
     }
 
+    /// With the sandbox on, a worktree being outside the project changes
+    /// who sees what: the child's guest has the worktree as its project
+    /// (and the repository's git directory, which names it back); the
+    /// parent's guest has the project, and the worktrees to read — which is
+    /// what the command of the report needs. Runs real guests: skipped
+    /// without the feature, a root filesystem, or git in it.
+    #[test]
+    fn in_the_sandbox_the_child_commits_and_the_parent_takes_its_changes() {
+        use crate::sandbox::{Outcome, run, testing};
+        use std::time::Duration;
+        let Some(setup) = testing::live_setup() else {
+            return;
+        };
+        let guest = |command: &str, at: &Path| {
+            let out = run(command, at, &setup, Duration::from_secs(120)).unwrap();
+            let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
+            said.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.outcome, said)
+        };
+        let project = repo("guest");
+        if guest("command -v git", &project).0 != Outcome::Exited(0) {
+            eprintln!("skipped: no git in the sandbox's root filesystem");
+            let _ = std::fs::remove_dir_all(&project);
+            return;
+        }
+        let worktree = Worktree::create(&project, "agent-1").unwrap();
+        let dir = worktree.dir().to_path_buf();
+
+        // The child: a commit and a file left untracked, in its worktree.
+        let (outcome, said) = guest(
+            "echo two > a.txt && \
+             git -c user.name=G -c user.email=g@example.com commit -q -am change && \
+             echo new > new.txt && git status --porcelain",
+            &dir,
+        );
+        assert_eq!(
+            (outcome, said.as_str()),
+            (Outcome::Exited(0), "?? new.txt\n")
+        );
+        // It does not see the project it was made from.
+        let (_, said) = guest(&format!("ls {} 2>&1", project.display()), &dir);
+        assert!(!said.contains("a.txt"), "{said}");
+
+        let report = worktree.settle().report;
+        let command = report
+            .lines()
+            .find(|l| l.contains("diff --binary"))
+            .expect("the command")
+            .trim();
+
+        // The parent: the command of the report, as it is given.
+        let (outcome, said) = guest(
+            &format!("{command} && cat a.txt new.txt && git status --porcelain"),
+            &project,
+        );
+        assert_eq!(
+            (outcome, said.as_str()),
+            (Outcome::Exited(0), "two\nnew\n M a.txt\n?? new.txt\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("a.txt")).unwrap(),
+            "two\n"
+        );
+        // It reads the worktree and cannot change it.
+        let (_, said) = guest(
+            &format!(
+                "(echo x > {}/a.txt) 2>/dev/null || echo read-only",
+                dir.display()
+            ),
+            &project,
+        );
+        assert_eq!(said, "read-only\n");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n");
+
+        assert_eq!(
+            clean(&project, &[], Some("agent-1")),
+            ["agent-1: removed, with its changes"]
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
     #[test]
     fn without_a_repository_or_a_commit_there_is_no_worktree() {
         let plain = scratch("plain");
