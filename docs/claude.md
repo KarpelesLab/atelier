@@ -38,7 +38,8 @@ interface:
 **What Claude Code owns:** authentication, the model, the agent loop, its
 built-in tools, its permission rules (`~/.claude/settings.json`, project
 `.claude/`), compaction, and the conversation itself (stored by Claude Code;
-atelier only keeps the session id in `.atelier/claude-session`).
+atelier only keeps the session id, in `claude-session` in the project's
+[state directory](sessions.md#where-atelier-keeps-a-projects-state)).
 
 **What atelier adds:**
 

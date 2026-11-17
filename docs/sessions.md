@@ -6,8 +6,9 @@ can be resumed later.
 
 ## On-disk format
 
-Saved to `.atelier/session.json` under the project root
-(`session::SESSION_FILE`), written after **every completed turn**
+Saved to `session.json` in the project's [state
+directory](#where-atelier-keeps-a-projects-state) (`session::SESSION_FILE`)
+— not in the project — written after **every completed turn**
 (`Session::persist`, called once a model response arrives with no further
 tool calls):
 
@@ -28,7 +29,45 @@ pre-compaction file — a bare JSON array of messages with no wrapping object �
 also still loads (`summary` comes back `None`); atelier has always stored
 some form of this file, so old sessions aren't invalidated by newer versions.
 
-Add `.atelier/` to your project's `.gitignore`.
+## Where atelier keeps a project's state
+
+**atelier never creates a file in the project it works on.** What it writes
+for a project goes to a directory of yours, one per project, named after the
+project's path:
+
+```
+$XDG_STATE_HOME/atelier/projects/<project>/     (else ~/.local/state/atelier/projects/<project>/)
+├─ session.json      the conversation, for --continue
+├─ claude-session    the Claude backend's session id
+├─ todos.json        the todo tool's list
+├─ memory/           the project's memory notes
+├─ tool-output/      output a tool cut short, kept whole
+└─ worktrees/<id>/   isolated subagents' git worktrees
+```
+
+`<project>` is the project's absolute path (symlinks resolved) with every
+`/` replaced by `-`: for `/home/me/proj` it is `-home-me-proj`. A path too
+long for a file name (over 200 bytes) is cut and ends in a hash of the whole
+path. Two paths that differ only in `/` against `-` (`/a/b-c` and `/a-b/c`)
+share a directory.
+
+`ATELIER_STATE_DIR` names the directory that holds `projects/` instead
+(an absolute path). With none of `ATELIER_STATE_DIR`, `XDG_STATE_HOME` and
+`HOME` set there is nowhere to keep anything: the session is not saved, and
+the tools that keep something say so in their result.
+
+There is nothing to add to a project's `.gitignore`. What a project can
+still hold under `.atelier/` is what *you* put there for atelier to read —
+[commands](commands.md), [skills](skills.md), [agents](agents.md),
+`instructions.md` — and atelier does not create any of it.
+
+**Coming from an earlier version**, which kept all this in the project's
+`.atelier/`: the first time atelier runs in a project that has no state
+directory yet, it **copies** `.atelier/session.json`, `claude-session`,
+`todos.json` and `memory/` there. Nothing in the project is moved or
+deleted, and from then on only the copy is read — the old files can be
+removed. `.atelier/tool-output/` and `.atelier/worktrees/` are not carried
+over (`/agents clean` still finds the worktrees left there).
 
 ## Resuming: `--continue` / `-c`
 
@@ -39,7 +78,7 @@ atelier --continue --print "keep going"   # resume, then run one prompt headless
 
 `main` checks for `--continue`/`-c` anywhere in `argv` and, if present, calls
 `Session::resume()` before handing off to the TUI/REPL/`--print`. This loads
-`.atelier/session.json` into `summary`/`history` and prints `resumed session
+the saved `session.json` into `summary`/`history` and prints `resumed session
 (N message(s))` to stderr. Without the flag, every run starts with empty
 history (even if a session file exists — it is only loaded on request).
 
@@ -310,7 +349,7 @@ its peers, has no name and receives no message.
 The `/new` command (or a fresh run without `--continue`) discards the
 in-memory conversation: history, the rolling summary, any images staged with
 `/image` but not yet sent, and the per-turn context-dedup cache — and deletes
-`.atelier/session.json` (`Session::new_conversation`).
+the saved `session.json` (`Session::new_conversation`).
 
 ## The shape of a request
 

@@ -283,7 +283,9 @@ others.
 An agent that writes while someone else works in the same directory is a
 collision waiting to happen. With isolation, the agent gets a directory of
 its own: a fresh **git worktree** of the repository, checked out (detached)
-at the commit `HEAD` is at, under `.atelier/worktrees/<id>/`. Ask for it in
+at the commit `HEAD` is at, under `worktrees/<id>/` in the project's [state
+directory](sessions.md#where-atelier-keeps-a-projects-state) — outside the
+project, like everything atelier writes. Ask for it in
 the agent's file (`isolation: worktree`, for every run of that agent) or in
 the call (`"isolation": "worktree"`); it works in the foreground and in the
 background.
@@ -307,12 +309,13 @@ dropped.
 - **It changed nothing** (`git status` is clean and `HEAD` has not moved):
   the worktree is removed, and the report says so.
 - **It changed something**: the worktree stays, the line you see says where
-  (`⤶ general: done (9 steps) — changes left in .atelier/worktrees/agent-2`),
+  (`⤶ general: done (9 steps) — changes left in
+  /home/me/.local/state/atelier/projects/-home-me-proj/worktrees/agent-2`),
   and the agent's report ends with what the main agent needs to take the
   changes:
 
   ```
-  [worktree: .atelier/worktrees/agent-2 — the agent worked in a git worktree of its own, created at commit 8e7d16db4fdf. Its changes are there, NOT in your working tree, and nothing is merged automatically.]
+  [worktree: /home/me/.local/state/atelier/projects/-home-me-proj/worktrees/agent-2 — the agent worked in a git worktree of its own, created at commit 8e7d16db4fdf. Its changes are there, NOT in your working tree, and nothing is merged automatically.]
   commits it made:
     4451d55 parse: accept trailing commas
   changes against 8e7d16db4fdf (its commits and its uncommitted changes):
@@ -320,22 +323,24 @@ dropped.
    tests/parse_test.rs |  9 +++++++++
    2 files changed, 18 insertions(+), 5 deletions(-)
   To bring all of it into your working tree, run from the project directory:
-    git -C .atelier/worktrees/agent-2 diff --binary 8e7d16db4fdf | git apply
+    git -C /home/me/.local/state/atelier/projects/-home-me-proj/worktrees/agent-2 diff --binary 8e7d16db4fdf | git apply
   or take its commits as commits (without what it left uncommitted):
     git cherry-pick 8e7d16db4fdf..4451d55
   ```
 
 **atelier does not merge.** The main agent decides: apply the patch, pick the
 commits, take part of it, or leave it. New files the agent did not `git add`
-are part of the summary and of the patch. What atelier's own tools write
-under `.atelier/` while it works — spilled tool output, the `todo` list —
-is not counted as a change.
+are part of the summary and of the patch. What atelier keeps for the agent
+while it works — spilled tool output, the `todo` list — is not in the
+worktree, so it is never part of a change.
 
 ### What is different in a worktree
 
-- State kept in the project directory is the worktree's own: the `todo`
-  list and [memory notes](memory.md) it writes are files in the worktree
-  (memory notes show up as changes), not the project's.
+- The worktree has a state directory of its own, named after its path: the
+  agent's `todo` list and spilled tool output are kept there, apart from
+  the project's, and are removed with the worktree. [Memory
+  notes](memory.md) are the exception: the agent reads and writes the
+  project's own.
 - Project [hooks](hooks.md) are approved per project path, so they do not
   run in the worktree; your user-global hooks do.
 - Approvals are as for any subagent: in the foreground the parent decides
@@ -365,11 +370,15 @@ worktree in use is locked with `git worktree lock`, naming the process; a
 lock whose process is gone does not count). `git worktree remove --force
 <path>` does the same by hand.
 
-`.atelier/worktrees/` git-ignores itself, so the copies never show in your
-`git status`; and the project's own searches and listings (`grep`, `glob`,
-`tree`, the context providers) leave it out the way they leave out
-`.atelier/tool-output/`, unless pointed at it. Agent ids are not reused for
-a directory that exists: a new agent skips to the next free one.
+The worktrees are outside the project, so the copies show neither in your
+`git status` nor in the project's own searches and listings. Agent ids are
+not reused for a directory that exists: a new agent skips to the next free
+one.
+
+Earlier versions kept worktrees in the project, under `.atelier/worktrees/`.
+None is made there any more, but `/agents clean` still lists and removes the
+ones left there, and searches of the project still leave that directory
+out.
 
 ## As a process
 

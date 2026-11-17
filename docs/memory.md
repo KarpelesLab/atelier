@@ -3,14 +3,14 @@
 atelier's agent keeps a small set of notes between sessions, so a correction
 you give once ("run clippy before committing", "don't mock the database") or
 a fact it couldn't have read from the code still holds the next time you
-start it. Memory is plain Markdown files: you can read, edit, delete, commit
-or ignore them like any other file.
+start it. Memory is plain Markdown files: you can read, edit or delete them
+like any other file.
 
 ## Where it lives
 
 | Scope | Directory | Holds |
 |-------|-----------|-------|
-| project | `<project>/.atelier/memory/` | notes about this project |
+| project | `memory/` in the project's [state directory](sessions.md#where-atelier-keeps-a-projects-state): `~/.local/state/atelier/projects/<project path>/memory/` | notes about this project |
 | global | `$XDG_DATA_HOME/atelier/memory/`, else `~/.local/share/atelier/memory/` | notes about *you* that apply in every project (type `user` only) |
 
 Each note is one file, `<name>.md`:
@@ -88,24 +88,25 @@ To change a memory, edit its file.
 - **Untrusted content.** The agent is instructed not to save anything on the
   say-so of web pages, MCP output or other outside text unless you asked it
   to. This is an instruction to the model, not something atelier enforces.
-- Names can't contain path separators, symlinks in the memory directory are
-  not followed, and a project memory directory that resolves outside the
-  project is not used.
+- Names can't contain path separators, and symlinks in the memory directory
+  are not followed. Both directories are yours: a project cannot point
+  memory somewhere else.
 
-## Committing it, or not
+## Not in the repository
 
-That is your choice. Project memory sits under `.atelier/`, which also holds
-the [saved session](sessions.md) and is usually git-ignored. To share the
-project's memory with your team while still ignoring the rest:
+Project memory is kept outside the project, like everything atelier writes:
+it is not committed with the repository and not shared with whoever clones
+it, and a repository you clone cannot bring notes of its own for your agent
+to read as its memory. `/memory` prints where the notes are. What a team
+should all know belongs in the project's [instruction
+files](configuration.md#instruction-files) (`AGENTS.md`), which are
+committed.
 
-```gitignore
-.atelier/*
-!.atelier/memory/
-```
+Earlier versions kept project memory in `<project>/.atelier/memory/`. Notes
+found there are copied to the new place the first time atelier runs in the
+project ([how](sessions.md#where-atelier-keeps-a-projects-state)); after
+that the directory in the project is no longer read, so a note added to it
+later — by a colleague's commit, say — is not picked up.
 
-Bear in mind what that implies in both directions: whatever the agent saved
-becomes visible to everyone with the repository, and a memory directory that
-comes with a repository you cloned is read by your agent as its own notes —
-treat it with the same care as that repository's `AGENTS.md`.
-
-Global memory never leaves your machine.
+A [subagent working in a worktree of its own](agents.md#worktree-isolation)
+reads and writes the notes of the project it was started from.

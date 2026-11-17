@@ -40,8 +40,12 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   scripting tool are sandboxed to the project root and run without
   prompting; only genuinely unconfined execution (`bash`, MCP tools,
   networked scripts) asks for approval.
-- **Sessions persist and compact themselves.** Conversations are saved to
-  `.atelier/session.json` and resumable with `--continue`; once a
+- **Nothing is written in your project.** What atelier keeps for a project
+  — the session, memory, the todo list, long tool output, subagents'
+  worktrees — lives in a per-user directory named after the project's path
+  (`~/.local/state/atelier/projects/-home-me-proj/`).
+- **Sessions persist and compact themselves.** Conversations are saved
+  there and resumable with `--continue`; once a
   conversation grows past a token threshold, old tool output is pruned and,
   if needed, older turns become a structured hand-off summary (`/compact` on
   demand, `/context` to see where the window goes). One atelier at a time
@@ -116,7 +120,7 @@ first conversation, the REPL/TUI fallback).
 | [Sessions](docs/sessions.md) | Persistence, `--continue`/`/new`, one owner per project (remote control, take over, `--attach`/`--take-over`/`--cancel`), automatic compaction |
 | [Configuration](docs/configuration.md) | Env vars reference + `atelier.toml` (`[[mcp]]`, `[[mcp_http]]`, `[permissions]`, `[defaults]`, `[review]`, `[[diagnostics]]`, `[search]`, `[[hooks]]`, `[goals]`, `[sandbox]`, `[instructions]`), named providers, a model per role, effort/sampling variants, the usage log and `atelier stats`, instruction files (`AGENTS.md`), the `/config` settings screen |
 | [Tools](docs/tools.md) | Every built-in tool's parameters and behavior |
-| [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, `.atelier/memory/`, `/memory` |
+| [Memory](docs/memory.md) | What the agent remembers between sessions: the `memory` tool, where notes are kept, `/memory` |
 | [Custom commands](docs/commands.md) | Your own slash commands as Markdown files: `.atelier/commands/`, `$ARGUMENTS`/`$1`, `` !`command` `` output |
 | [Skills](docs/skills.md) | `SKILL.md` directories the agent loads on demand: `.atelier/skills/` (also `.claude/skills/`, `.agents/skills/`), the `skill` tool, `/skills` |
 | [Loops](docs/loops.md) | `/loop <interval> <prompt>`: re-send a prompt every 30s, 5m, 1h… while the session is idle; how loops stop; cron + `--print` for real schedules |
@@ -144,7 +148,8 @@ src/
 ├─ cli.rs         command-line flags (--continue, --print and its options)
 ├─ config.rs      env-based runtime config
 ├─ settings.rs    atelier.toml (MCP servers, permissions)
-├─ session.rs     on-disk session persistence (.atelier/session.json)
+├─ session.rs     on-disk session persistence (session.json in the state directory)
+├─ state.rs       where a project's state is kept: a per-user directory, never the project
 ├─ headless.rs    --print: non-interactive runs, JSON output, exit codes
 ├─ serve.rs       serve: the embedding protocol (JSON-RPC 2.0 over stdio)
 ├─ listen.rs      serve --listen: the protocol on a Unix socket or loopback TCP, a session per connection

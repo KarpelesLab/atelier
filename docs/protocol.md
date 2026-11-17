@@ -742,9 +742,9 @@ instruction files the session loads up front (see [Memory](memory.md)).
 
 ```json
 {"scopes":[
-   {"scope":"project","dir":"/home/me/project/.atelier/memory",
+   {"scope":"project","dir":"/home/me/.local/state/atelier/projects/-home-me-project/memory",
     "memories":[{"name":"build","type":"reference","description":"how to build and test",
-                 "path":"/home/me/project/.atelier/memory/build.md"}]},
+                 "path":"/home/me/.local/state/atelier/projects/-home-me-project/memory/build.md"}]},
    {"scope":"global","dir":"/home/me/.local/share/atelier/memory","memories":[]}],
  "instruction_files":[{"path":"/home/me/.config/atelier/AGENTS.md"},
                       {"path":"/home/me/project/AGENTS.md"}]}

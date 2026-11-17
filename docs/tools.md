@@ -10,7 +10,7 @@ the model verbatim as the tool result.
 
 | Tool    | Approval | Confined to project root |
 |---------|----------|----------------------------|
-| `read`      | auto; **required** outside the project | yes, unless approved |
+| `read`      | auto; **required** outside the project (but not for [output kept for it](#long-output-goes-to-a-file)) | yes, unless approved |
 | `write`     | auto     | yes |
 | `edit`      | auto     | yes |
 | `multiedit` | auto     | yes |
@@ -22,7 +22,7 @@ the model verbatim as the tool result.
 | `symbols`   | auto     | yes (a location outside it is named, not read) |
 | `todo`      | auto     | yes |
 | `ask`       | auto (it only talks to you) | n/a |
-| `memory`    | auto     | to the memory directories (the project's `.atelier/memory/` and the user-global one) |
+| `memory`    | auto     | to the memory directories (the project's, in its state directory, and the user-global one) |
 | `skill`     | auto     | to the skill directories (read-only; a skill's files only from inside that skill's directory) |
 | `task`      | auto to start; each call the subagent makes is approved like the agent's own | as the tools the subagent uses |
 | `notebook_edit` | auto | yes |
@@ -85,29 +85,35 @@ Tools whose output can be any size — `bash`, `bash_output`, `node`, MCP tools
 and `read_resource` — don't cut it off at a limit the agent can't see past.
 When a result is over the tool's budget (20,000 bytes for `bash` and
 `bash_output`, 10 KiB for `node`, 30,000 bytes for MCP), the whole text is
-saved under `.atelier/tool-output/` in the project and the result is its
+saved under `tool-output/` in the project's [state
+directory](sessions.md#where-atelier-keeps-a-projects-state) — not in the
+project — and the result is its
 start (about 60% of the budget) and its end (about 25%), cut on line
 boundaries, around one line saying what is missing and where it is:
 
 ```
-… 1,842 lines omitted (lines 121-1962) — full output: .atelier/tool-output/ab12cd.txt (use read with offset/limit, or grep) …
+… 1,842 lines omitted (lines 121-1962) — full output: /home/me/.local/state/atelier/projects/-home-me-proj/tool-output/ab12cd.txt (use read with offset/limit, or grep) …
 ```
 
-The file is in the project, so `read` (`offset`/`limit`) and `grep` reach it
-without approval. For `bash` and `bash_output` the marker also names a
+The file is named by its absolute path. It is outside the project, and
+`read` (`offset`/`limit`) and `grep` still reach it without approval: output
+atelier kept for this project is the one thing outside the project they
+open by themselves — a kept file by that exact path, nothing else in the
+state directory, and no other project's. For `bash` and `bash_output` the marker also names a
 handle (`out-ab12cd`) that `bash_output` takes with a `tail`, `head` or
 `grep` of its own — see [Part of the output, without a
 pipe](#part-of-the-output-without-a-pipe). Output with no line breaks is cut by bytes instead, and the
 marker counts bytes.
 
 The directory keeps the 50 most recent files and at most 20 MiB; older ones
-are deleted when a new one is written (the new one always stays). Searches
-and listings of the project — `grep`, `glob`, `tree`, `fs.glob` in `node`,
-the layout context — leave `.atelier/tool-output/` out, whether or not the
-project git-ignores `.atelier/`, unless the directory or a file in it is
-named as the `path`. The same goes for `.atelier/worktrees/`, where
-[isolated subagents](agents.md#worktree-isolation) work in copies of the
-repository.
+are deleted when a new one is written (the new one always stays).
+
+Earlier versions kept these files, and the worktrees of [isolated
+subagents](agents.md#worktree-isolation), in the project: under
+`.atelier/tool-output/` and `.atelier/worktrees/`. Where a project still has
+those directories, searches and listings of it — `grep`, `glob`, `tree`,
+`fs.glob` in `node`, the layout context — leave them out unless one is
+named as the `path`.
 
 `read`, `grep`, `glob` and `web_fetch` page or cap by themselves and are not
 affected.
@@ -393,12 +399,12 @@ result short. The pipe costs more than it saves:
 So the filter is a parameter. `tail`, `head` and `grep` (with `context` and
 `invert`) shape **what the model is shown** and nothing else: the command
 runs as written, unpiped, its own exit status is reported, and all of its
-output is saved under `.atelier/tool-output/`
+output is saved outside the project
 ([as long output is](#long-output-goes-to-a-file)).
 
 ```
 [exit status: 0]
-[filtered: 20 of 3,402 lines shown (last 20) — full output: .atelier/tool-output/ab12cd.txt (to see another part without rerunning: bash_output with id "out-ab12cd" and tail/head/grep, or read with offset/limit)]
+[filtered: 20 of 3,402 lines shown (last 20) — full output: /home/me/.local/state/atelier/projects/-home-me-proj/tool-output/ab12cd.txt (to see another part without rerunning: bash_output with id "out-ab12cd" and tail/head/grep, or read with offset/limit)]
 …
 ```
 
@@ -774,8 +780,10 @@ auto-approved.
 
 ## `todo`
 
-A durable checklist stored at `.atelier/todos.json`, for tracking multi-step
-work across turns (and across compaction).
+A durable checklist, for tracking multi-step work across turns (and across
+compaction). It is stored as `todos.json` in the project's [state
+directory](sessions.md#where-atelier-keeps-a-projects-state), not in the
+project.
 
 | Param    | Type   | Required | Meaning |
 |----------|--------|----------|---------|
@@ -839,8 +847,9 @@ itself and state its assumption. Auto-approved: it only talks to you.
 
 ## `memory`
 
-Notes that persist across sessions, one Markdown file each, in
-`.atelier/memory/` (project) or the user-global memory directory. The index
+Notes that persist across sessions, one Markdown file each, in the
+project's memory directory (in its state directory, outside the project) or
+the user-global one. The index
 of saved memories is injected as context every turn; this tool reads the
 notes and maintains them. See [memory](memory.md) for the file format and
 what the agent is told to save.
@@ -925,7 +934,7 @@ background](agents.md#in-the-background) for that, `/agents stop`, and the
 limit of 4 running at once.
 
 With `isolation: "worktree"` the agent's project root is its own [git
-worktree](agents.md#worktree-isolation) under `.atelier/worktrees/<id>/`. If
+worktree](agents.md#worktree-isolation), kept outside the project. If
 it changed anything, its report ends with the worktree's path, a `git diff
 --stat` against the base commit and the command that brings the changes over
 (`git -C <worktree> diff --binary <base> | git apply`); nothing is merged

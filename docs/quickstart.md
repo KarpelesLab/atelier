@@ -183,8 +183,9 @@ See [configuration](configuration.md) for the full picture including
 
 ## Sessions
 
-The conversation is saved to `.atelier/session.json` under the project root
-after each turn. Resume it in a later run with `--continue`/`-c` (you'll see
+The conversation is saved after each turn — to `session.json` in a
+directory of yours named after the project
+(`~/.local/state/atelier/projects/…`), not in the project. Resume it in a later run with `--continue`/`-c` (you'll see
 `resumed session (N message(s))`); start fresh at any time with `/new`, which
 clears the in-memory history and deletes the saved file. Long conversations
 are compacted automatically — once the context grows past a threshold, old
@@ -194,7 +195,9 @@ One atelier at a time works on a project's session: start a second one in
 the same directory and it tells you who has it and asks whether to join it
 as a remote control — a second terminal on the same live session — take it
 over, or leave ([One session, one owner](sessions.md#one-session-one-owner)).
-Add `.atelier/` to your project's `.gitignore`. See
+atelier writes nothing in the project directory, so there is nothing to
+git-ignore: see [where a project's state is
+kept](sessions.md#where-atelier-keeps-a-projects-state), and
 [Sessions](sessions.md) for the full picture.
 
 ## Next steps
