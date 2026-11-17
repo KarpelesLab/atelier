@@ -276,7 +276,12 @@ project-confined `fs` (readFile/writeFile/readdir/exists/mkdir) + captured
   grace rather than blocking the harness.)
 - ✅ Expanded mediated `fs`: stat/appendFile/rm/rmdir/rename + binary
   (`readFileBytes`/`writeFileBytes` via a real `Uint8Array`).
-- ⏳ async `fs`; out-of-project fs via approval.
+- ✅ Async `fs`: `fs.promises.*` (also via `require('fs/promises')`) and
+  top-level `await`; a minimal `require` for the built-ins.
+- ✅ Out-of-project fs via approval: `allow_read` / `allow_write` name
+  outside paths; naming any makes the call need approval (shown at the
+  prompt), the mediated fs allows exactly those, and "always" saves no
+  blanket rule for such calls.
 
 ### M9 — Safer command execution (script analysis) — v1 ✅
 
