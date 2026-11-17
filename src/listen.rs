@@ -345,7 +345,9 @@ fn same_token(presented: &str, token: &str) -> bool {
 /// enter (created so when missing). A socket file left by a listener that
 /// is gone is replaced; one that answers stops the start.
 #[cfg(unixlike)]
-fn bind_unix(path: &std::path::Path) -> Result<(std::os::unix::net::UnixListener, PathBuf)> {
+pub(crate) fn bind_unix(
+    path: &std::path::Path,
+) -> Result<(std::os::unix::net::UnixListener, PathBuf)> {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
 

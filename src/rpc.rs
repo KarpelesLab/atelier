@@ -316,6 +316,7 @@ pub fn watchdog(grace: Duration) {
         // What `main` does on the way out, which this exit skips.
         crate::tools::bash::kill_all();
         crate::lsp::kill_all();
+        crate::own::release();
         std::process::exit(0);
     });
 }

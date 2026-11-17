@@ -40,6 +40,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod oauth;
+pub mod own;
 pub mod permissions;
 pub mod provider;
 pub mod review;

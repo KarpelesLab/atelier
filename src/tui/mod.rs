@@ -162,7 +162,15 @@ pub fn run(mut session: Session) -> Result<()> {
 
     // Raw mode from here; the guard restores the terminal on every exit path,
     // including `?` early-returns and panics (its `Drop` runs while unwinding).
-    let _guard = RawGuard::enable()?;
+    let guard = RawGuard::enable()?;
+    // And on the one exit that unwinds nothing: the session taken over
+    // while a turn would not let go (see `own`).
+    crate::own::on_forced_exit(|| {
+        let mut out = io::stdout();
+        let _ = write!(out, "{}{}\r\n", term::RESET, term::SHOW_CURSOR);
+        let _ = out.flush();
+        term::restore();
+    });
 
     let mut r = Renderer::new();
     let mut turn: u32 = 0;
@@ -173,7 +181,13 @@ pub fn run(mut session: Session) -> Result<()> {
     }
     r.refresh()?;
 
+    // Who took the session over, when that is why the loop ended.
+    let mut taken = None;
     loop {
+        if let Some(by) = crate::own::yielding() {
+            taken = Some(by);
+            break;
+        }
         // Whatever was queued during the last turn is served first, in order,
         // exactly as if it had just been typed (echoed, then dispatched).
         // `own`: a prompt the session starts by itself (see `agent::idle`),
@@ -186,6 +200,8 @@ pub fn run(mut session: Session) -> Result<()> {
             None => match read_line(&mut r, &mut session, turn)? {
                 Idle::Line(line) => (line, false),
                 Idle::Start(prompt) => (prompt, true),
+                // Seen at the top of the loop.
+                Idle::Yield => continue,
                 // Ctrl-D: exits, unless that would stop claude's background
                 // work and this is the first attempt.
                 Idle::Exit => {
@@ -246,7 +262,62 @@ pub fn run(mut session: Session) -> Result<()> {
             }
         }
     }
+    // The terminal as it was found, then the last word.
+    r.refresh()?;
+    drop(guard);
+    if let Some(by) = taken {
+        eprintln!("{}", crate::own::taken_over_line(&by));
+    }
     Ok(())
+}
+
+/// Put a question to the user before any session runs: `intro` and the
+/// question's numbered lines in the scrollback, the answer on the input
+/// line — as the `ask` tool's are. `gone` is asked now and then whether
+/// there is still anything to ask about. For the question a start asks
+/// about a session it found live (see [`crate::own`]).
+pub fn choose(
+    intro: &[String],
+    question: &Question,
+    gone: &mut dyn FnMut() -> bool,
+) -> Result<crate::own::Picked> {
+    use crate::own::Picked;
+    let _guard = RawGuard::enable()?;
+    let mut r = Renderer::new();
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "?".into());
+    r.status = format!(" atelier · {cwd} · a session is already running here");
+    for line in intro {
+        r.push_line(line.clone(), false);
+    }
+    r.ask(question.clone());
+    let picked = loop {
+        r.refresh()?;
+        match term::poll(IDLE_POLL)? {
+            None if gone() => break Picked::Gone,
+            None | Some(Event::Resize) => {}
+            Some(Event::Key(Key::Ctrl('d'))) if r.editor.is_empty() => break Picked::Dismissed,
+            Some(Event::Key(k)) => match question_key(&mut r, k) {
+                Some(Answer::Labels(labels)) => {
+                    let label = labels.first();
+                    let at = question
+                        .options
+                        .iter()
+                        .position(|o| Some(&o.label) == label);
+                    break at.map_or(Picked::Dismissed, Picked::Option);
+                }
+                Some(_) => break Picked::Dismissed,
+                None => {}
+            },
+        }
+    };
+    // The live region goes: what follows — the interface proper, or the
+    // shell — starts under the answer.
+    let mut out = io::stdout().lock();
+    r.leave_live(&mut out)?;
+    Ok(picked)
 }
 
 /// How a wait at the idle prompt ended.
@@ -257,6 +328,8 @@ enum Idle {
     Exit,
     /// The session has a turn of its own to start, with this prompt.
     Start(String),
+    /// Another atelier asked for the session (see [`crate::own`]).
+    Yield,
 }
 
 /// Block at the idle prompt until the user submits a line or asks to exit
@@ -266,6 +339,9 @@ enum Idle {
 /// work) is rendered above the prompt.
 fn read_line(r: &mut Renderer, session: &mut Session, turn: u32) -> Result<Idle> {
     loop {
+        if crate::own::yielding().is_some() {
+            return Ok(Idle::Yield);
+        }
         let Some(event) = term::poll(IDLE_POLL)? else {
             if session.poll_background(&mut TuiUi { r: &mut *r }) {
                 r.status = build_status(session, turn);
@@ -472,6 +548,24 @@ fn pump(
                 r.refresh()?;
             }
             None => {}
+        }
+        // The session is being taken over (see `own`): the turn stops as
+        // on Ctrl-C, and the loop that started it leaves once it has.
+        if crate::own::yielding().is_some() {
+            if !r.stop.swap(true, Ordering::Relaxed) {
+                r.commit_pending_if_any();
+                r.push_line(
+                    "! stopping: another atelier is taking this session over".into(),
+                    true,
+                );
+            }
+            // Nobody is left to answer what the turn waits on.
+            if std::mem::take(&mut r.approval_pending) {
+                let _ = answers.send(agent::Approval::Deny);
+            }
+            if r.question.take().is_some() {
+                let _ = replies.send(Answer::Declined);
+            }
         }
 
         // Then everything the worker produced meanwhile, painted once.

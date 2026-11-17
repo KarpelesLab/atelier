@@ -202,18 +202,83 @@ pub fn run(args: &[String]) -> Result<u8> {
     // `atelier serve --listen …`: sessions for whoever connects, each an
     // `atelier serve` of its own (see `listen`). No session is opened here.
     if let Some(opts) = cli.listen {
-        return listen::run(opts, listen::child_args(args));
+        let mut session_args = listen::child_args(args);
+        session_args.push("--connection".to_string());
+        return listen::run(opts, session_args);
     }
     // `atelier acp`: the Agent Client Protocol on stdin/stdout, for an editor
     // to drive (see `acp`). The session is opened when the editor asks for
     // one, in the directory it names — so not here.
     if let Some(opts) = cli.acp {
-        let (claude, local) = (cli.claude, cli.local);
-        let open = move || with_local(open_session(claude, mode)?, local);
+        let (claude, local, live) = (cli.claude, cli.local, cli.live);
+        // Whether the directory's session is free is found out there too:
+        // an editor cannot be asked, so one that is not stops the session
+        // from opening unless the agent was started with `--take-over`.
+        let open = move || {
+            let root = std::env::current_dir()?;
+            let took_over = match own::start(&root, own::Kind::Acp, live, false)? {
+                own::Start::Go { took_over } => took_over,
+                own::Start::InUse(live) => anyhow::bail!(
+                    "{}\n(start the agent as `atelier acp --take-over` to take it over)",
+                    own::in_use_message(&live)
+                ),
+                own::Start::Exit(_) => {
+                    anyhow::bail!("a session is already running in this directory; left alone")
+                }
+            };
+            let mut session = with_local(open_session(claude, mode)?, local)?;
+            if took_over {
+                eprintln!("{}", session.resume());
+            }
+            Ok(session)
+        };
         return Ok(finish(acp::run(open, opts)));
     }
+    // Who owns this directory's saved session (see `own`): the runs that
+    // work on it — the interface, `--print --continue`, `serve` — and not
+    // those with a conversation of their own (`review`, `debug prompt`, a
+    // one-shot `--print`, a connection of `serve --listen` that does not
+    // `--continue`: a listener gives every connection a session, several
+    // at once).
+    let root = std::env::current_dir()?;
+    let at_terminal = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    };
+    let owning = match (&sub, &cli.print, &cli.serve) {
+        (Some(_), ..) => None,
+        (None, Some(_), _) => cli.resume.then_some(own::Kind::Print),
+        (None, None, Some(_)) if cli.connection && !cli.resume => None,
+        (None, None, Some(_)) => Some(own::Kind::Serve),
+        (None, None, None) if cfg!(tui) && at_terminal => Some(own::Kind::Terminal),
+        (None, None, None) => Some(own::Kind::Repl),
+    };
+    let mut resume = cli.resume;
+    if let Some(kind) = owning {
+        let interactive = at_terminal && matches!(kind, own::Kind::Terminal | own::Kind::Repl);
+        let start = match own::start(&root, kind, cli.live, interactive)? {
+            // A program drives `serve`, and can be told and asked.
+            own::Start::InUse(live) if kind == own::Kind::Serve => {
+                serve::in_use(&live, |choice| own::start(&root, kind, Some(choice), false))
+            }
+            start => start,
+        };
+        match start {
+            own::Start::Go { took_over } => resume |= took_over,
+            own::Start::InUse(live) => {
+                eprintln!("atelier: {}", own::in_use_message(&live));
+                return Ok(own::EXIT_IN_USE);
+            }
+            own::Start::Exit(code) => return Ok(code),
+        }
+    }
     let mut session = with_local(open_session(cli.claude, mode)?, cli.local)?;
-    if cli.resume {
+    // The saved session is its owner's: a run that is not, next to one
+    // that is, leaves the file as it finds it.
+    if owning.is_none() && own::live_elsewhere(&root) {
+        session.leave_saved_session();
+    }
+    if resume {
         eprintln!("{}", session.resume());
     }
     // Say which of the project's settings are waiting to be trusted (a
@@ -367,6 +432,9 @@ fn open(
         &trust,
     );
     let mut session = agent::Session::new(cfg, root, tools, context, settings, trust);
+    if child.is_none() {
+        own::watch_agents(session.agents_counter());
+    }
     if let Some(mode) = mode {
         session.set_mode(mode);
     }
@@ -386,5 +454,6 @@ fn open(
 pub fn finish<T>(result: T) -> T {
     tools::bash::kill_all();
     lsp::kill_all();
+    own::release();
     result
 }

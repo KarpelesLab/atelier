@@ -25,7 +25,7 @@ use crate::permissions::Mode;
 
 /// What a usage error prints after its message, and `--help` on its own.
 pub const USAGE: &str = "\
-usage: atelier [--claude | --local] [--continue] [--mode MODE]
+usage: atelier [--claude | --local] [--continue] [--mode MODE] [--take-over | --cancel]
        atelier --print [options] [--] [prompt...]
        atelier review [--uncommitted | --base BRANCH | --commit SHA] ...
        atelier debug prompt [prompt...]
@@ -47,6 +47,11 @@ usage: atelier [--claude | --local] [--continue] [--mode MODE]
       --claude               use the Claude Code backend
       --mode MODE            how much runs without asking: plan (read-only),
                              ask-edits, auto-edit (default), or yolo
+      --take-over            when a session is already running in this
+                             directory: stop it and what it runs, and continue
+                             it here (without a flag, a terminal is asked and
+                             anything else exits with status 7)
+      --cancel               ... or leave it alone and exit (status 8)
   -V, --version              print the version
   -h, --help                 print this help
 
@@ -74,7 +79,9 @@ acp: the Agent Client Protocol on stdin/stdout, for an editor to launch
       --max-turns N          stop a prompt after N model requests
 
 exit status: 0 success, 1 error, 2 usage, 3 --max-turns reached,
-             4 answer failed --output-schema, 6 --goal not met in its bounds
+             4 answer failed --output-schema, 6 --goal not met in its bounds,
+             7 a session is already running here and no flag says what to do,
+             8 a session is already running here and was left alone
 
 `atelier review --help`, `atelier debug --help`, `atelier doctor --help` and
 `atelier mcp --help` describe those commands.";
@@ -90,6 +97,9 @@ pub struct Cli {
     pub resume: bool,
     /// `--help`/`-h`.
     pub help: bool,
+    /// `--take-over`, `--cancel`: what to do when another atelier owns
+    /// this directory's session (see `own`). `None` asks, where it can.
+    pub live: Option<crate::own::Choice>,
     /// `--mode`: the permission mode to start in.
     pub mode: Option<Mode>,
     /// `--print`/`-p`: run headlessly with these options, instead of the
@@ -101,6 +111,9 @@ pub struct Cli {
     /// `serve --listen`: serve connections rather than stdin/stdout (see
     /// `listen`).
     pub listen: Option<crate::listen::Options>,
+    /// `serve --connection`: this `serve` is one connection's session of a
+    /// `serve --listen`, which starts it so (see [`crate::listen::run`]).
+    pub connection: bool,
     /// `acp` as the first argument: speak the Agent Client Protocol on
     /// stdin/stdout (see `acp`) instead of the interactive interface.
     pub acp: Option<crate::acp::Options>,
@@ -113,6 +126,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut local = false;
     let mut resume = false;
     let mut help = false;
+    let mut live = None;
     let mut mode = None;
     let mut print = false;
     let mut output = None;
@@ -122,6 +136,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut goal = None;
     let mut approval_timeout = None;
     let mut listen = None;
+    let mut connection = false;
     let mut allow_origins = Vec::new();
     let mut max_sessions = None;
     let mut words: Vec<&str> = Vec::new();
@@ -171,6 +186,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--continue" | "-c" => resume = true,
             "--print" | "-p" => print = true,
             "--help" | "-h" => help = true,
+            // Not in the usage: the listener's word to the sessions it
+            // starts.
+            "--connection" if serve => connection = true,
+            "--take-over" | "--cancel" => {
+                let choice = match flag {
+                    "--take-over" => crate::own::Choice::TakeOver,
+                    _ => crate::own::Choice::Cancel,
+                };
+                if live.is_some_and(|other| other != choice) {
+                    return Err("--take-over and --cancel are two answers; pick one".to_string());
+                }
+                live = Some(choice);
+            }
             _ => return Err(format!("unknown option {arg}")),
         }
     }
@@ -204,6 +232,26 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 .to_string(),
         );
     }
+    // What to do about a live session is a question for a run that would
+    // own this directory's: a one-shot `--print` never does.
+    if let Some(choice) = live
+        && print
+        && !resume
+    {
+        return Err(format!(
+            "{} only applies to a run on the saved session: --print needs --continue for it",
+            choice.flag()
+        ));
+    }
+    if let Some(choice) = live
+        && listen.is_some()
+        && !resume
+    {
+        return Err(format!(
+            "{} only applies to sessions on the saved one: serve --listen needs --continue for it",
+            choice.flag()
+        ));
+    }
     if serve && print {
         return Err("serve and --print are two ways to run; pick one".to_string());
     }
@@ -235,6 +283,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         local,
         resume,
         help,
+        live,
         mode,
         // Without --print, stray words are ignored, as they always were.
         print: print.then(|| Options {
@@ -248,6 +297,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         serve: serve.then(|| crate::serve::Options {
             approval_timeout: approval_timeout.map(|secs| Duration::from_secs(secs.into())),
         }),
+        connection,
         listen: listen.map(|at| crate::listen::Options {
             at,
             allow_origins,
@@ -408,6 +458,26 @@ mod tests {
         // A misspelt mode stops the run rather than falling back to another.
         assert!(parse_err(&["--mode", "pln"]).contains("unknown mode 'pln'"));
         assert_eq!(parse_err(&["--mode"]), "--mode needs a value");
+    }
+
+    #[test]
+    fn what_to_do_about_a_live_session_is_one_flag() {
+        use crate::own::Choice;
+        assert_eq!(parse_ok(&[]).live, None);
+        assert_eq!(parse_ok(&["--take-over"]).live, Some(Choice::TakeOver));
+        assert_eq!(parse_ok(&["serve", "--cancel"]).live, Some(Choice::Cancel));
+        assert_eq!(
+            parse_ok(&["-c", "-p", "--take-over", "go"]).live,
+            Some(Choice::TakeOver)
+        );
+        assert!(parse_err(&["--take-over", "--cancel"]).contains("pick one"));
+        // Only for a run that would own the saved session.
+        assert!(parse_err(&["-p", "--take-over", "go"]).contains("--print needs --continue"));
+        let listen = ["serve", "--listen", "unix:/run/x/a.sock", "--cancel"];
+        assert!(parse_err(&listen).contains("serve --listen needs --continue"));
+        // The listener's word to its sessions is `serve`'s alone.
+        assert!(parse_ok(&["serve", "--connection"]).connection);
+        assert!(parse_err(&["--connection"]).contains("unknown option"));
     }
 
     #[test]

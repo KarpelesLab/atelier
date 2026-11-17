@@ -44,7 +44,9 @@ See [ROADMAP.md](ROADMAP.md) for the milestone plan and design rationale.
   `.atelier/session.json` and resumable with `--continue`; once a
   conversation grows past a token threshold, old tool output is pruned and,
   if needed, older turns become a structured hand-off summary (`/compact` on
-  demand, `/context` to see where the window goes). Requests are laid out so
+  demand, `/context` to see where the window goes). One atelier at a time
+  owns a project's session; a second one started there says who has it and
+  offers to take it over. Requests are laid out so
   each is a prefix of the next, which keeps the inference server's prompt
   cache warm from turn to turn.
 - **A parallel reviewer, opt-in.** Turn on the "subconscious" (`/review on`)

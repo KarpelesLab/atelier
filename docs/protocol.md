@@ -6,7 +6,7 @@ another program driving an agent — lives *outside* atelier and talks to it
 through this protocol.
 
 ```sh
-atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS]
+atelier serve [--claude] [--continue] [--mode MODE] [--approval-timeout SECS] [--take-over | --cancel]
 atelier serve --listen WHERE [--allow-origin ORIGIN]... [--max-sessions N] [the flags above]
 ```
 
@@ -24,6 +24,7 @@ slash commands.
 | `-c`, `--continue` | Resume this directory's saved session first (see [Sessions](sessions.md)) |
 | `--mode MODE` | The [permission mode](permissions.md) to start in: `plan`, `ask-edits`, `auto-edit` (default), `yolo` |
 | `--approval-timeout SECS` | How long an [`approval/request`](#approvalrequest) or a [`question/request`](#questionrequest) waits for the client's answer. Without it they wait for as long as it takes |
+| `--take-over`, `--cancel` | What to do when another atelier is already running this directory's session: take it over, or exit with status 8. Without either, the client is asked: see [A session that is in use](#a-session-that-is-in-use) |
 
 Everything else — the model, the endpoint, `atelier.toml`, instruction
 files, hooks, MCP servers — is configured as for any other run (see
@@ -76,6 +77,57 @@ client                                   atelier
   │ shutdown ───────────────────────────────▶│
   │◀──────────────────────────────── result  │   then atelier exits
 ```
+
+## A session that is in use
+
+One atelier at a time owns a directory's session (see [One session, one
+owner](sessions.md#one-session-one-owner)). `atelier serve` started where
+another one is running does not open a session; what to do is the user's
+call, so it is put to the client, in the protocol:
+
+```
+client                                   atelier
+  │ initialize ─────────────────────────────▶│
+  │◀──────── error -32010 {owner, choices}   │   somebody has the session
+  │ session/take_over ──────────────────────▶│   …the user chose
+  │◀───────────────── result {took_over}     │   the other atelier is gone
+  │ initialize ─────────────────────────────▶│   and on as usual
+  │◀──────────────────────────────── result  │
+```
+
+- **`initialize` fails with `-32010`**, and so does every other method,
+  until a choice is made. `data` is what a client needs to ask its user:
+
+  ```json
+  {"owner":{"pid":4021,"kind":"terminal","tty":"/dev/pts/3","since":1767225600,"version":"0.1.2",
+            "answers":true,"busy":true,"jobs":1,"agents":0,"client":null},
+   "choices":["take_over","cancel"]}
+  ```
+
+  | Field | Meaning |
+  |-------|---------|
+  | `owner.pid`, `kind`, `tty`, `since` | The process that has the session, what kind of run it is (`terminal`, `repl`, `print`, `serve`, `acp`), the terminal it is on, and when it started (Unix seconds) |
+  | `owner.answers` | It answered when asked what it is doing. `false`: the four fields below are `null` |
+  | `owner.busy`, `jobs`, `agents` | A turn is in progress; background `bash` jobs running; background subagents running |
+  | `owner.client` | For a `serve` owner, the client driving it (`name version`), which a take-over cuts off |
+  | `choices` | The methods that go on from here: `take_over` is [`session/take_over`](#a-session-that-is-in-use), `cancel` is `shutdown` |
+
+- **`session/take_over`** (no params) stops the owner and what it runs, as
+  [take over](sessions.md#one-session-one-owner) does from a terminal — it
+  can take several seconds — and answers `{"took_over": true}`. The session
+  is then this process's, with the saved conversation resumed as
+  `--continue` resumes it: `initialize` now succeeds, and
+  [`session/history`](#sessionhistory) has what was said. It fails with
+  `-32010` again, about the owner there is now, when another atelier got to
+  the session first, and with `-32603` when the owner could not be stopped.
+- **`shutdown`**, or closing the input, leaves: nothing was touched. The
+  process exits with status 8 after `shutdown`, 7 at the end of input.
+
+Started with `--take-over` or `--cancel`, `serve` does not ask: it takes
+the session before `initialize` is answered, or exits with status 8.
+
+A served session can be taken over in its turn. Its client is then sent
+[`session/closed`](#sessionclosed), and the process exits.
 
 ## Methods (client → atelier)
 
@@ -814,6 +866,7 @@ One per thing the session reports. Events of a turn carry its id as
 | `event/idle` | `kind`, … | Output between turns; see below |
 | `turn/ended` | see below | The turn is over |
 | `request/cancelled` | `id`, `reason` | A request atelier made no longer needs an answer |
+| `session/closed` | `reason`, `by` | The session is no longer this process's; see below |
 
 The payloads are those of the [`stream-json` events](headless.md#events-stream-json)
 of the same name (`text`, `tool_start`, `tool_end`, `file_change`, …): the
@@ -955,6 +1008,15 @@ None of it starts a turn; the model hears of it with the next prompt.
 id (an `approval/request` or `question/request`) was given up on, and was
 taken as a refusal. Take the prompt down; an answer sent anyway is ignored.
 
+### `session/closed`
+
+`{"reason": "taken_over", "by": "pid 4188 on /dev/pts/5"}`: another atelier
+[took the session over](sessions.md#one-session-one-owner). The running
+turn was interrupted (its `turn/ended` may or may not precede this, with
+status `interrupted`), nothing more will be answered, and the process
+exits with status 0. What the session held is saved; whoever took it
+carries it on.
+
 ## Errors
 
 Failures are JSON-RPC error objects, `{"code", "message", "data"?}`. The
@@ -973,6 +1035,7 @@ codes are stable:
 | `-32004` | background running | Unforced `shutdown` with background tasks running. `data: {"background": n}` |
 | `-32005` | already initialized | A second `initialize` |
 | `-32006` | no command | [`command/input`](#commandinput) with no command running on a terminal |
+| `-32010` | session in use | Another atelier owns this directory's session: any method before a choice is made. `data: {"owner", "choices"}`; see [A session that is in use](#a-session-that-is-in-use) |
 | `-32020` | unauthorized | [`--listen`](#listening-on-a-socket) on TCP: the connection's first line was not the token. `"id": null`; the connection is closed |
 | `-32021` | too many sessions | [`--listen`](#listening-on-a-socket): `--max-sessions` connections are being served already. `"id": null`; the connection is closed |
 
@@ -1063,8 +1126,14 @@ flags (`--mode`, `--claude`, `--approval-timeout`, …) — and carries the
 messages between the two. So everything above holds unchanged on a
 connection: `initialize` first, the same methods, events and error codes.
 Sessions share nothing but the project directory and what any two atelier
-processes there share (with `--continue`, every connection resumes — and
-saves over — the directory's one saved session).
+processes there share. They are conversations of their own beside the
+directory's saved session: none of them [owns](sessions.md#one-session-one-owner)
+it, so they neither ask nor are asked, and next to an atelier that does own
+it they leave the saved file alone (with nobody owning it, each saves over
+it after its turns, the last one winning). A listener started with
+`--continue` is about the saved session itself: its first connection
+resumes and owns it, and a connection made while that one lasts is told
+so, as [above](#a-session-that-is-in-use).
 
 | Flag | Meaning |
 |------|---------|

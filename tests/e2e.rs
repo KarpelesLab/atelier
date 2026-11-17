@@ -231,6 +231,8 @@ fn atelier(base_url: &str, cwd: &Path) -> Command {
     // read from nor written to the real home, and nothing is trusted that a
     // test did not trust itself.
     cmd.env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // Its sockets too (see `own`): none in the real runtime directory.
+        .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env_remove("ATELIER_TRUST_HOOKS")
         .env_remove("ATELIER_TRUST_PROJECT")
         .env("ATELIER_BASE_URL", base_url)
@@ -1074,6 +1076,8 @@ fn run_repl(base_url: &str, cwd: &Path, input: &str) -> Output {
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
         .env("XDG_CONFIG_HOME", cwd.with_extension("config"))
         .env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // Its sockets too (see `own`): none in the real runtime directory.
+        .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env("HOME", cwd.with_extension("home"))
         .env_remove("ATELIER_TRUST_HOOKS")
         .env_remove("ATELIER_TRUST_PROJECT")
@@ -3339,6 +3343,8 @@ fn requests_are_logged_and_stats_totals_them() {
         atelier(&first.base_url(), cwd)
             // The log of the runs above, wherever the command is run from.
             .env("XDG_STATE_HOME", dir.with_extension("state"))
+            // Its sockets too (see `own`): none in the real runtime directory.
+            .env("XDG_RUNTIME_DIR", dir.with_extension("run"))
             .args(&full)
             .stdin(Stdio::null())
             .output()
@@ -4425,6 +4431,8 @@ fn a_projects_sandbox_switch_waits_for_trust() {
         .args(["trust", "status"])
         .current_dir(&dir)
         .env("XDG_STATE_HOME", dir.with_extension("state"))
+        // Its sockets too (see `own`): none in the real runtime directory.
+        .env("XDG_RUNTIME_DIR", dir.with_extension("run"))
         .env("HOME", dir.with_extension("home"))
         .env_remove("ATELIER_TRUST_PROJECT")
         .output()

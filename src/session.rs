@@ -77,7 +77,16 @@ pub fn save(root: &Path, summary: Option<&str>, messages: &[Message]) -> Result<
         messages: messages.to_vec(),
     };
     let text = serde_json::to_string_pretty(&stored).context("serializing session")?;
-    std::fs::write(&p, text).with_context(|| format!("writing {}", p.display()))
+    // Written beside and moved into place, so that a process stopped in the
+    // middle (a take-over that could not wait, see `own`) leaves the file
+    // of the turn before rather than half of this one.
+    let partial = p.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, &p))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&partial);
+        })
+        .with_context(|| format!("writing {}", p.display()))
 }
 
 /// Delete the saved session (both backends), if any.

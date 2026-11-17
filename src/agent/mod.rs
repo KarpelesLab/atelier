@@ -1071,6 +1071,9 @@ pub struct Session {
     /// atelier's. Such a session is not the project's conversation, and is
     /// never persisted as it.
     standalone: Option<String>,
+    /// The project's saved session is another atelier's to write (see
+    /// [`Session::leave_saved_session`]).
+    unsaved: bool,
     /// The condition the user wants met before the work stops (`/goal`,
     /// `--goal` — see [`goal`]).
     goal: Option<goal::Goal>,
@@ -1163,6 +1166,7 @@ impl Session {
             idle,
             child: None,
             standalone: None,
+            unsaved: false,
             goal: None,
             background: subagent::Background::default(),
             handed: subagent::Handed::default(),
@@ -1595,6 +1599,19 @@ impl Session {
         format!("resumed session ({} message(s))", self.history.len())
     }
 
+    /// Leave the project's saved session as it is: for a run next to the
+    /// atelier that owns it (see [`crate::own`]), whose file it is.
+    pub fn leave_saved_session(&mut self) {
+        self.unsaved = true;
+    }
+
+    /// How many background agents the session has running, to be asked
+    /// from another thread.
+    pub fn agents_counter(&self) -> impl Fn() -> usize + Send + Sync + 'static {
+        let roster = self.background.roster();
+        move || roster.running()
+    }
+
     /// Start a fresh conversation, discarding history and the saved session.
     pub fn new_conversation(&mut self) {
         self.history.clear();
@@ -1604,7 +1621,9 @@ impl Session {
         self.fstate.forget_dirs();
         self.claude = None;
         self.claude_session = None;
-        let _ = crate::session::clear(&self.root);
+        if !self.unsaved {
+            let _ = crate::session::clear(&self.root);
+        }
     }
 
     /// Stage an image file to attach to the next user message (for `/image`).
@@ -1638,7 +1657,7 @@ impl Session {
     fn persist(&self) {
         // A subagent's conversation is not the project's saved session, nor
         // is a standalone run's.
-        if self.child.is_some() || self.standalone.is_some() {
+        if self.child.is_some() || self.standalone.is_some() || self.unsaved {
             return;
         }
         let _ = crate::session::save(&self.root, self.summary.as_deref(), &self.history);
@@ -1895,8 +1914,17 @@ impl Session {
     /// since the last turn lead the prompt, and those that arrive during
     /// the turn are delivered the way messages typed mid-turn are.
     pub fn send(&mut self, user_input: &str, ui: &mut dyn Ui) -> Result<()> {
+        // What the session's owner says it is doing (see `own`); a
+        // subagent's turn is part of its parent's.
+        let own = self.child.is_none() && self.standalone.is_none();
+        if own {
+            crate::own::turn(true);
+        }
         let result = self.send_inner(user_input, ui);
         self.turn_ended(result.is_ok(), ui);
+        if own {
+            crate::own::turn(false);
+        }
         result
     }
 
@@ -3178,6 +3206,50 @@ impl Ui for StdoutUi {
         self.end_reasoning();
         println!("{DIM}💭 {text}{RESET}");
     }
+    /// Nothing here stops a turn but the session being taken over (see
+    /// [`crate::own`]).
+    fn interrupted(&mut self) -> bool {
+        crate::own::yielding().is_some()
+    }
+}
+
+/// Put `question` to the user of a terminal without the interface: its
+/// lines, then an answer read from standard input. `gone` is asked now and
+/// then whether there is still anything to ask about. For the question a
+/// start asks about a session it found live (see [`crate::own`]).
+#[cfg(not(tui))]
+pub fn choose(
+    intro: &[String],
+    question: &Question,
+    gone: &mut dyn FnMut() -> bool,
+) -> crate::own::Picked {
+    use crate::own::Picked;
+    for line in intro.iter().cloned().chain(question.lines()) {
+        println!("{line}");
+    }
+    loop {
+        print!("› ");
+        io::stdout().flush().ok();
+        let line = loop {
+            match idle::wait_line(REPL_POLL) {
+                idle::Line::Typed(line) => break line,
+                idle::Line::Closed => return Picked::Dismissed,
+                idle::Line::Pending if gone() => return Picked::Gone,
+                idle::Line::Pending => {}
+            }
+        };
+        match question.parse(&line) {
+            Ok(Answer::Labels(labels)) => {
+                let picked = question
+                    .options
+                    .iter()
+                    .position(|o| Some(&o.label) == labels.first());
+                return picked.map_or(Picked::Dismissed, Picked::Option);
+            }
+            Ok(_) => return Picked::Dismissed,
+            Err(why) => println!("  {why}\n{}", question.hint()),
+        }
+    }
 }
 
 /// Render the current settings as text (for `/config` outside the TUI).
@@ -3232,6 +3304,12 @@ pub fn repl(mut session: Session) -> Result<()> {
         // instances sent (see `coord`) and at whether the session has a
         // turn of its own to start (see `idle`).
         let next = loop {
+            // Another atelier took the session over (see `own`): leave
+            // the way a quit does.
+            if let Some(by) = crate::own::yielding() {
+                eprintln!("\n{}", crate::own::taken_over_line(&by));
+                return Ok(());
+            }
             let ui = &mut StdoutUi::new();
             session.poll_peers(ui);
             if let Some(prompt) = session.idle_tick(false, ui) {

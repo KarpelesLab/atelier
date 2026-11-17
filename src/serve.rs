@@ -111,6 +111,8 @@ mod code {
     pub const ALREADY_INITIALIZED: i64 = -32005;
     /// `command/input` with no command running that can be typed to.
     pub const NO_COMMAND: i64 = -32006;
+    /// Another atelier owns this directory's session (see [`super::in_use`]).
+    pub const SESSION_IN_USE: i64 = -32010;
 }
 
 /// `atelier serve`, as asked for on the command line (see `cli`).
@@ -146,6 +148,13 @@ pub fn run(session: Session, opts: Options) -> u8 {
     let (jobs_tx, jobs_rx) = mpsc::channel();
     let reader = Arc::clone(&shared);
     std::thread::spawn(move || reader.read_requests(&jobs_tx));
+    // Another atelier taking the session over (see `own`) stops the turn
+    // as a forced shutdown does; the session thread sees to the rest.
+    let yielding = Arc::clone(&shared);
+    crate::own::on_yield(move || {
+        yielding.stop.store(true, Ordering::Relaxed);
+        yielding.wire.cancel_turn();
+    });
     Server {
         shared,
         session,
@@ -153,6 +162,99 @@ pub fn run(session: Session, opts: Options) -> u8 {
     }
     .serve(&jobs_rx);
     0
+}
+
+/// `atelier serve` started in a directory whose session another atelier
+/// owns (`live`), with no flag saying what to do about it. The client is
+/// the one to ask, so it is told in the protocol: `initialize` — and
+/// anything else — fails with `-32010` and `data` describing the owner and
+/// the choices; `session/take_over` makes one (`act` carries it out), and
+/// `shutdown` or the end of input is the other. Returns how the start goes
+/// on: with the session, once it was taken over, or out.
+pub fn in_use(
+    live: &crate::own::Live,
+    mut act: impl FnMut(crate::own::Choice) -> anyhow::Result<crate::own::Start>,
+) -> crate::own::Start {
+    use crate::own::{Choice, Start};
+    use std::io::BufRead;
+
+    let wire = Wire::new("serve");
+    let mut live = live.clone();
+    let refusal = |live: &crate::own::Live| Failure {
+        code: code::SESSION_IN_USE,
+        message: format!(
+            "a session is already running in this directory (pid {}): take it over with \
+             session/take_over, or leave with shutdown",
+            live.record.pid
+        ),
+        data: Some(json!({
+            "owner": owner_data(live),
+            "choices": ["take_over", "cancel"],
+        })),
+    };
+    wire.log(&crate::own::in_use_message(&live));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Line by line, so that what follows the choice is left for the
+        // session's own reader.
+        match std::io::stdin().lock().read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return Start::Exit(crate::own::EXIT_IN_USE),
+            Ok(_) => {}
+        }
+        let Ok(message) = serde_json::from_slice::<Value>(&line) else {
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                let why = Failure::new(rpc::code::PARSE_ERROR, "parse error");
+                wire.fail(&Some(Value::Null), why);
+            }
+            continue;
+        };
+        let id = message.get("id").cloned();
+        match message["method"].as_str() {
+            Some("session/take_over") => match act(Choice::TakeOver) {
+                Ok(Start::Go { took_over }) => {
+                    wire.respond(&id, json!({ "took_over": took_over }));
+                    return Start::Go { took_over };
+                }
+                // Not the session that was there any more: the choice is
+                // put again, about the one that is.
+                Ok(Start::InUse(now)) => {
+                    live = now;
+                    wire.fail(&id, refusal(&live));
+                }
+                Ok(Start::Exit(_)) => wire.fail(&id, refusal(&live)),
+                Err(e) => wire.fail(
+                    &id,
+                    Failure::new(rpc::code::INTERNAL_ERROR, format!("{e:#}")),
+                ),
+            },
+            Some("shutdown") => {
+                wire.respond(&id, json!({}));
+                return Start::Exit(crate::own::EXIT_CANCELLED);
+            }
+            Some(_) => wire.fail(&id, refusal(&live)),
+            None => {}
+        }
+    }
+}
+
+/// The owner of a live session, as `-32010`'s `data.owner` describes it.
+fn owner_data(live: &crate::own::Live) -> Value {
+    let record = &live.record;
+    let status = live.status.as_ref();
+    let of = |key: &str| status.map_or(Value::Null, |s| s[key].clone());
+    json!({
+        "pid": record.pid,
+        "kind": record.kind.name(),
+        "since": record.since,
+        "tty": record.tty,
+        "version": record.version,
+        "answers": status.is_some(),
+        "busy": of("busy"),
+        "jobs": of("jobs"),
+        "agents": of("agents"),
+        "client": of("client"),
+    })
 }
 
 /// Work for the session thread, in the order the client asked for it.
@@ -595,6 +697,14 @@ impl Server {
     /// Carry out jobs until one of them ends the session.
     fn serve(mut self, jobs: &Receiver<Job>) {
         loop {
+            // The session was taken over: the client is told, and the
+            // process ends the way a shutdown ends it.
+            if let Some(by) = crate::own::yielding() {
+                let closed = json!({ "reason": "taken_over", "by": by });
+                self.shared.wire.notify("session/closed", closed);
+                self.shared.wire.log(&crate::own::taken_over_line(&by));
+                return;
+            }
             match jobs.recv_timeout(IDLE_POLL) {
                 Ok(Job::Initialize { id, client }) => self.initialize(&id, &client),
                 Ok(Job::Turn {
@@ -671,6 +781,7 @@ impl Server {
         if let Some(name) = client["name"].as_str() {
             let version = client["version"].as_str().unwrap_or("?");
             eprintln!("atelier serve: client {name} {version}");
+            crate::own::note_client(&format!("{name} {version}"));
         }
         let connected = self.session.connect_configured_mcp();
         let mut session = self.describe();

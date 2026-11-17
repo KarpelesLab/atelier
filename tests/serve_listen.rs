@@ -166,6 +166,8 @@ fn atelier(mock: &Mock, cwd: &Path, args: &[&str], token: Option<&str>) -> Comma
         .env("ATELIER_MODEL", "mock")
         .env("ATELIER_NO_COORDINATOR", "1")
         .env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // Its sockets too (see `own`): none in the real runtime directory.
+        .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
         .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))

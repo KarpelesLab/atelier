@@ -220,6 +220,7 @@ impl RawMode {
         raw.cc[os::VMIN] = 1;
         raw.cc[os::VTIME] = 0;
         ioctl(STDIN, os::SET_MODES, &mut raw)?;
+        *saved_modes() = Some(saved);
         Ok(Self { saved })
     }
 }
@@ -227,6 +228,22 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = ioctl(STDIN, os::SET_MODES, &mut self.saved);
+        *saved_modes() = None;
+    }
+}
+
+/// The modes the terminal had before raw mode, while it is in it.
+fn saved_modes() -> std::sync::MutexGuard<'static, Option<Termios>> {
+    static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
+    SAVED.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Give the terminal back the modes it had, from whichever thread: for a
+/// process that has to end without the interface unwinding (see
+/// `own::on_forced_exit`). Nothing to do when raw mode is not on.
+pub fn restore() {
+    if let Some(mut saved) = *saved_modes() {
+        let _ = ioctl(STDIN, os::SET_MODES, &mut saved);
     }
 }
 

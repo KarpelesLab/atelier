@@ -90,6 +90,14 @@ cargo run --example embed -- "what does this project do?"
   (`src/serve.rs`) are built; both are short and worth reading first.
 - **The current directory is the project.** A session works in the
   process's working directory, so one process holds one project's sessions.
+- **One owner per project.** The program takes the project's session for
+  itself before it opens it, and asks or refuses when another atelier has
+  it ([One session, one owner](sessions.md#one-session-one-owner)).
+  `open_session` does not: a host that wants the same calls
+  `atelier::own::start(&root, kind, choice, interactive)` first and goes on
+  when it answers `Start::Go`; one that does not is a run beside the owner,
+  and should call `Session::leave_saved_session` when
+  `atelier::own::live_elsewhere(&root)`.
 - **Helper processes.** atelier starts copies of the running program for
   the coordinator, the local model's server, the Claude relay, the
   sandbox and subagents that run as processes. Either call `atelier::app::helper(&args)` first thing in `main`,

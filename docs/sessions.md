@@ -47,6 +47,143 @@ A program driving the session (`atelier serve --continue`) has seen none of
 the resumed conversation's events; it asks for it with
 [`session/history`](protocol.md#sessionhistory).
 
+## One session, one owner
+
+A project has one saved session, so one atelier at a time works on it. The
+first to start **owns** it for as long as it runs; one started in the same
+directory while it does is told so, and chooses.
+
+```text
+A session is already running in this directory:
+  pid 4021 · the terminal interface on /dev/pts/3 · started 37 min ago
+  now: a turn in progress · 1 background job · 2 subagents
+? What do you want to do?
+  1. Take over — stop that atelier and everything it is running, and continue its session here
+  2. Cancel — leave it alone and exit
+  (answer with a number)
+```
+
+The question is answered on the input line, like one the
+[`ask` tool](tools.md#ask) puts: a number, or the option's name. Ctrl-C and
+Ctrl-D are "cancel". If the other atelier ends while the question is up,
+there is nothing left to ask, and this one starts as on any other day
+(`the other atelier (pid 4021) has ended: starting normally`).
+
+**Take over** stops the other process and everything it has going — the
+turn in progress, the command it is running, its background jobs, its
+subagents (those on threads and those that are processes of their own, with
+what they run), its language and MCP servers — and then continues its
+session here, from what was saved, as `--continue` does. In order:
+
+1. The owner is **asked** to stop, save and exit, over its own socket. It
+   interrupts its turn, saves the session and leaves as on a quit, with a
+   last line on its terminal:
+   `another atelier (pid 4188 on /dev/pts/5) took this session over; this
+   one has stopped.` An owner that cannot stop within two seconds — a model
+   that has not answered, a command that will not end — gives its terminal
+   back, says the same and ends where it is; the session file is then the
+   one of its last finished turn (it is always replaced whole, never
+   written in place).
+2. If the session is not free two seconds after that, the owner is
+   **signalled**: TERM, then KILL. Never before checking that the process
+   with that pid is still the one that wrote the record (by its start
+   time), and that the session is still that owner's: a recycled pid is not
+   signalled, and a session a third atelier took meanwhile is left to it.
+3. What the owner **left running** is stopped: every process it had started,
+   directly or not, noted before it was asked and stopped now if still
+   there (TERM, then KILL). The [coordinator](coordinator.md) and the
+   [local model](local.md)'s server serve other instances too and are not
+   touched; the model's server ends on its own once nobody uses it.
+
+The new owner then says what was done (`took over the session of pid 4021
+(it stopped when asked); stopped 3 process(es) it left running.`), and
+takes the old one's place among the instances of the
+[coordinator](coordinator.md): same name, no trace of the old one or of the
+locks it held. A subagent's worktree is left as a stop leaves it when the
+owner could stop by itself; after a signal it stays behind, locked by a
+process that no longer exists, for `/agents clean` to remove.
+
+If the owner is an `atelier serve` or `atelier acp` — a session an editor
+or another program drives — the question says so: taking it over ends that
+program's session with it (a `serve` client is sent
+[`session/closed`](protocol.md#sessionclosed) first).
+
+**Cancel** exits with status 8. Nothing was read, written or started: no
+session opened, no instance joined, no hook run.
+
+### Starts that cannot ask
+
+A start with nobody at a terminal — `--print --continue`, `serve`, `acp`,
+input from a pipe — does not guess: it prints who has the session and
+exits with **status 7**, having changed nothing. Say beforehand what to do:
+
+| Flag | When a session is already running here |
+|------|------------------------------------------|
+| `--take-over` | Take it over, as above, and continue it |
+| `--cancel` | Leave it alone and exit (status 8) |
+
+With no session running, the flags change nothing: the run starts as it
+would without them (`--take-over` does not by itself resume a saved
+session; `--continue` does). `atelier serve` puts the question to its
+client instead of exiting ([A session that is in
+use](protocol.md#a-session-that-is-in-use)); `atelier acp` refuses the
+editor's `session/new` with the same message unless it was started with
+`--take-over`.
+
+### Which runs own the session
+
+Those that work on the project's saved session:
+
+| Run | Owns the session |
+|-----|------------------|
+| `atelier` (the terminal interface, or the line REPL when input is not a terminal) | yes |
+| `atelier --print --continue` | yes, for as long as it runs |
+| `atelier serve`, and a connection of `serve --listen --continue` | yes |
+| `atelier acp` | yes, from the editor's `session/new`, in the directory it names |
+| `atelier --print` without `--continue` | no |
+| A connection of `serve --listen` without `--continue` | no: the listener gives every connection a conversation of its own, several at once |
+| `atelier review`, `debug prompt`, `doctor`, `mcp`, `stats`, `trust`, … and atelier's own helper processes (subagents, the coordinator) | no |
+
+A run that does not own the session is never asked and never refused. Next
+to an atelier that does, it leaves the saved session alone: a one-shot
+`--print` there is answered as always and its conversation is not saved
+(without an owner it is, as before).
+
+### How it is recorded
+
+Ownership is an exclusive lock (`flock`) on `.atelier/session.lock`, held
+from the start of the session to the end of the process. The kernel drops
+it however the process ends, so there is nothing to clean up after a crash:
+the next start finds the lock free and is the owner, without a word. Of two
+that start together, one gets the lock and the other is told about it.
+
+The file holds the owner's record — a line of JSON — for whoever finds the
+lock held:
+
+```json
+{"pid":4021,"started":"8812345","since":1767225600,"kind":"terminal",
+ "tty":"/dev/pts/3","socket":"/run/user/1000/atelier/session-4021.sock","version":"0.1.2"}
+```
+
+`started` is when that process started as the system counts it, which tells
+it from a later process with the same pid; `kind` is `terminal`, `repl`,
+`print`, `serve` or `acp`. The record is never believed on its own: without
+the lock held it is a leftover, and with it the pid is checked against
+`started` before anything is done to it.
+
+`socket` is where the owner answers: what it is doing (for the question),
+and the request to yield. It is a Unix socket in the directory the
+coordinator's is in (`$XDG_RUNTIME_DIR/atelier`, else
+`~/.local/state/atelier`), protected as
+[`serve --listen`'s](protocol.md#who-may-connect): a directory only you can
+enter, mode `0600`, no TCP. Whoever can open it is you, on this machine;
+that is the only gate, and it is the one your files have. Without such a
+directory the session is owned all the same, and can be taken over by
+signal only.
+
+Not on Windows, where atelier has neither the socket nor the process table:
+there every start proceeds as it always did.
+
 ## Starting over: `/new`
 
 The `/new` command (or a fresh run without `--continue`) discards the
