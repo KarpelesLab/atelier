@@ -44,9 +44,9 @@ default = ["tui"]
 # Gates the terminal interface so a headless build (scripted runs, tests,
 # CI) can drop the UI entirely. Nothing in provider/agent/core may depend on it.
 tui = []
-# Run `bash` commands inside nixvm (docs/sandbox.md). Off by default: it needs
-# a Unix target with a libc (nixvm's host-directory mounts), so it is not in
-# the fullrust release builds, and a guest root filesystem the user provides.
+# Run `bash` commands inside nixvm (docs/sandbox.md). Not a default feature;
+# the x86-64 release binary is built with it. Compiled in, it does nothing
+# until `[sandbox] enabled` or `ATELIER_SANDBOX` asks for it.
 sandbox = ["dep:nixvm"]
 
 [profile.release]

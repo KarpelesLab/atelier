@@ -9,8 +9,11 @@ name: Release binaries
 #
 # Assets are static binaries, gzip-compressed: `atelier-<target>.gz`.
 # - x86_64 is built with fullrust (https://github.com/KarpelesLab/fullrust):
-#   no libc at all, the binary only needs a Linux kernel.
-# - arm64 is built against musl, as fullrust is x86-64 only for now.
+#   no libc at all, the binary only needs a Linux kernel. It has the sandbox
+#   compiled in (`--features sandbox`, docs/sandbox.md), off unless enabled.
+# - arm64 is built against musl, as fullrust is x86-64 only for now, and
+#   without the sandbox: nixvm has no hardware virtualization on arm64 Linux
+#   yet, and the feature has not been run there.
 
 on:
   workflow_dispatch:
@@ -66,10 +69,14 @@ jobs:
           # Marks the build as official: it then updates itself from releases.
           ATELIER_RELEASE_TARGET: ${{ env.TARGET }}
         # Not `--locked`: the image substitutes its libc-free getrandom,
-        # which changes that one entry of the lock file.
-        run: cargo build --release
+        # which changes those entries of the lock file.
+        run: cargo build --release --features sandbox
       - name: Smoke test
-        run: ./target/$TARGET/release/atelier --version | grep -F "($TARGET)"
+        run: |
+          ./target/$TARGET/release/atelier --version | grep -F "($TARGET)"
+          # The sandbox is in the build (whether a guest runs is the
+          # machine's business: a root image, /dev/kvm).
+          ./target/$TARGET/release/atelier sandbox-exec --probe
       - name: Stage
         run: gzip -9 -c target/$TARGET/release/atelier > atelier-$TARGET.gz
       - uses: actions/upload-artifact@v4
