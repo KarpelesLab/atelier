@@ -50,6 +50,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::sandbox::project;
 use crate::settings::{FILE_NAME, HookConfig};
 use crate::trust::State;
 
@@ -278,6 +279,17 @@ impl Hooks {
         if self.hooks.iter().any(waiting) {
             out.push("project hooks do not run until you trust the project: /trust".into());
         }
+        if self.hooks.iter().any(|h| h.source == Source::Project) {
+            match crate::sandbox::state(&self.root) {
+                crate::sandbox::State::Off => {}
+                crate::sandbox::State::Ready(_) => {
+                    out.push("the sandbox is on: project hooks run in it, yours on the host".into())
+                }
+                crate::sandbox::State::Unavailable(why) => out.push(format!(
+                    "the sandbox is on but unavailable ({why}): project hooks do not run"
+                )),
+            }
+        }
         out
     }
 
@@ -503,6 +515,8 @@ impl Hooks {
         if hooks.peek().is_none() {
             return;
         }
+        // Asked once per event, and only if a project hook is to run.
+        let mut sandbox: Option<crate::sandbox::State> = None;
         let mut payload = Map::new();
         payload.insert("event".into(), event.as_str().into());
         payload.insert("cwd".into(), self.root.display().to_string().into());
@@ -522,8 +536,26 @@ impl Hooks {
                 env.push(("ATELIER_FILE", file));
             }
             let input = Value::Object(payload.clone()).to_string().into_bytes();
-            let outcome = run_command(&hook.command, &self.root, &env, input, hook.timeout)
-                .and_then(interpret);
+            // The user's hooks are the user's commands, on the user's
+            // machine. The project's run what is in the project, which a
+            // sandboxed `bash` may have rewritten unasked: with the sandbox
+            // on they run where `bash` does, or not at all.
+            let place = match hook.source {
+                Source::User => &crate::sandbox::State::Off,
+                Source::Project => sandbox.get_or_insert_with(|| crate::sandbox::state(&self.root)),
+            };
+            let ran = match place {
+                crate::sandbox::State::Off => {
+                    run_command(&hook.command, &self.root, &env, input, hook.timeout)
+                }
+                crate::sandbox::State::Ready(setup) => {
+                    run_in_guest(&hook.command, &self.root, setup, &env, &input, hook.timeout)
+                }
+                crate::sandbox::State::Unavailable(why) => {
+                    Err(project::unavailable("the project's hooks", why))
+                }
+            };
+            let outcome = ran.and_then(interpret);
             match outcome {
                 Ok(reply) => {
                     if each(&mut payload, reply).is_break() {
@@ -638,6 +670,9 @@ struct Finished {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+    /// For a hook that ran in the sandbox and failed: what of that looks
+    /// like the sandbox's doing ([`crate::sandbox::diagnose`]).
+    sandbox: Option<String>,
 }
 
 /// Read a finished hook as a reply (see the module docs for the contract);
@@ -679,10 +714,14 @@ fn interpret(done: Finished) -> Result<Reply, String> {
         }),
         code => {
             let status = code.map_or("killed by a signal".to_string(), |c| format!("exit {c}"));
-            Err(match done.stderr.trim().lines().next() {
+            let mut why = match done.stderr.trim().lines().next() {
                 Some(line) => format!("{status}: {}", shorten(line)),
                 None => status,
-            })
+            };
+            if let Some(blame) = done.sandbox {
+                why.push_str(&format!(" [sandbox: {blame}]"));
+            }
+            Err(why)
         }
     }
 }
@@ -751,7 +790,44 @@ fn run_command(
         code: status.code(),
         stdout: text(&stdout),
         stderr: text(&stderr),
+        sandbox: None,
     })
+}
+
+/// [`run_command`] in the sandbox's guest, for a project hook while the
+/// sandbox is on: the same command, environment and input, in the project
+/// as the guest sees it — its userland, not the host's; no network beyond
+/// `[sandbox] network`. A hook that fails there for want of the host says
+/// so; it is never run on the host instead.
+fn run_in_guest(
+    command: &str,
+    cwd: &Path,
+    setup: &crate::sandbox::Setup,
+    env: &[(&str, String)],
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Finished, String> {
+    use crate::sandbox::Outcome;
+    let out = project::run_with_input(command, env, input, cwd, setup, timeout)
+        .map_err(|e| format!("could not start in the sandbox: {e:#}"))?;
+    let blame = crate::sandbox::diagnose(&out);
+    let text = |bytes: &[u8]| {
+        String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_CAPTURE_BYTES)]).into_owned()
+    };
+    match &out.outcome {
+        Outcome::Exited(code) => Ok(Finished {
+            code: Some(*code),
+            stdout: text(&out.stdout),
+            stderr: text(&out.stderr),
+            sandbox: blame,
+        }),
+        Outcome::TimedOut => Err(format!(
+            "timed out after {}s in the sandbox and was killed{}",
+            timeout.as_secs(),
+            blame.map_or_else(String::new, |b| format!(" [sandbox: {b}]"))
+        )),
+        Outcome::Failed(why) => Err(format!("not run: the sandbox failed ({why})")),
+    }
 }
 
 /// Collect a pipe into a shared buffer on its own thread (so a chatty hook
@@ -1316,5 +1392,172 @@ mod tests {
         assert!(cut.ends_with("[truncated]"));
         assert_eq!(cap("short"), "short");
         assert_eq!(shorten(&"x".repeat(100)).chars().count(), 60);
+    }
+
+    /// The user's file with one `pre_tool` hook that leaves a mark.
+    fn user_file(config: &Path) -> PathBuf {
+        let file = config.join("atelier.toml");
+        std::fs::write(
+            &file,
+            "[[hooks]]\nevent = \"pre_tool\"\ncommand = \"echo user > user.txt\"\n",
+        )
+        .unwrap();
+        file
+    }
+
+    /// With the sandbox on and unable to run, the project's hooks are not
+    /// run on the host instead — and the user's, which never were the
+    /// sandbox's, still run.
+    #[test]
+    fn a_sandbox_that_cannot_run_keeps_project_hooks_off_the_host() {
+        use crate::sandbox;
+        let root = project("sbx-off-host");
+        let config = project("sbx-off-host-config");
+        let set = [hook("pre_tool", None, "echo project > project.txt; exit 2")];
+        let hooks = Hooks::load(&root, &set, Some(&user_file(&config)), State::Trusted);
+
+        // Unavailable: no root filesystem, a build without the feature.
+        {
+            let _reset = sandbox::testing::set(sandbox::State::Unavailable("no root".into()));
+            let mut notes = Notes::default();
+            let pre = hooks.pre_tool("bash", "{}", &mut notes.sink());
+            assert!(
+                pre.deny.is_none(),
+                "a hook that did not run decides nothing"
+            );
+            assert_eq!(notes.0.len(), 1, "{:?}", notes.0);
+            assert!(
+                notes.0[0].contains("the project's hooks run in it")
+                    && notes.0[0].contains("unavailable here (no root)")
+                    && notes.0[0].contains("Nothing was run on the host"),
+                "{:?}",
+                notes.0
+            );
+            assert!(hooks.list().iter().any(|l| l.contains("unavailable")));
+        }
+        assert!(root.join("user.txt").exists());
+        assert!(!root.join("project.txt").exists());
+        std::fs::remove_file(root.join("user.txt")).unwrap();
+
+        // Ready, but the guest cannot be started.
+        {
+            let _reset = sandbox::testing::set(sandbox::State::Ready(sandbox::Setup {
+                rootfs: PathBuf::from("/nonexistent/rootfs"),
+                memory_mb: 64,
+                interp: false,
+                network: Vec::new(),
+                helper: Some(PathBuf::from("/nonexistent/atelier")),
+                notes: Vec::new(),
+            }));
+            let mut notes = Notes::default();
+            let pre = hooks.pre_tool("bash", "{}", &mut notes.sink());
+            assert!(pre.deny.is_none());
+            assert_eq!(notes.0.len(), 1, "{:?}", notes.0);
+            assert!(notes.0[0].contains("sandbox"), "{:?}", notes.0);
+            assert!(hooks.list().iter().any(|l| l.contains("run in it")));
+        }
+        assert!(root.join("user.txt").exists());
+        assert!(!root.join("project.txt").exists());
+
+        // Off: on the host, as ever, and `/hooks` has nothing to add.
+        let pre = hooks.pre_tool("bash", "{}", &mut |_| {});
+        assert!(pre.deny.is_some());
+        assert!(root.join("project.txt").exists());
+        assert!(!hooks.list().iter().any(|l| l.contains("sandbox")));
+        for dir in [root, config] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Through a real guest (see `sandbox::testing::live_setup`): a project
+    /// hook is told about the event and answers as on the host — from the
+    /// guest; the user's hook beside it runs on the host.
+    #[test]
+    fn project_hooks_run_in_the_guest_and_the_users_on_the_host() {
+        use crate::sandbox;
+        let Some(setup) = sandbox::testing::live_setup() else {
+            return;
+        };
+        let root = std::fs::canonicalize(project("sbx-live")).unwrap();
+        let config = project("sbx-live-config");
+        let file = config.join("atelier.toml");
+        std::fs::write(
+            &file,
+            "[[hooks]]\nevent = \"post_tool\"\ncommand = \"uname -n > user-where.txt\"\n",
+        )
+        .unwrap();
+        let set = [
+            hook(
+                "post_tool",
+                Some("write"),
+                "uname -n > where.txt; cat > in.json; \
+                 echo \"$ATELIER_EVENT $ATELIER_TOOL $ATELIER_FILE $ATELIER_PROJECT\" > env.txt; \
+                 ls /home | wc -l > home.txt",
+            ),
+            hook(
+                "pre_tool",
+                Some("write"),
+                r#"echo '{"arguments": {"path": "b.rs", "content": "it'"'"'s"}}'"#,
+            ),
+            hook("pre_tool", Some("edit"), "echo frozen >&2; exit 2"),
+            hook("pre_tool", Some("bash"), "no-such-formatter --check"),
+            HookConfig {
+                timeout_secs: Some(1),
+                ..hook("pre_tool", Some("read"), "sleep 30")
+            },
+        ];
+        let _reset = sandbox::testing::set(sandbox::State::Ready(setup));
+        let hooks = Hooks::load(&root, &set, Some(&file), State::Trusted);
+        let mut notes = Notes::default();
+
+        // What the event was reaches the guest: stdin and environment.
+        let args = r#"{"path":"src/a.rs","content":"it's"}"#;
+        hooks.post_tool("write", args, true, "wrote", &mut notes.sink());
+        assert!(notes.0.is_empty(), "{:?}", notes.0);
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+        assert_eq!(read("where.txt"), "nixvm\n");
+        assert_ne!(read("user-where.txt"), "nixvm\n");
+        // The guest's /home is empty, whatever the host's holds.
+        assert_eq!(read("home.txt").trim(), "0");
+        let input: Value = serde_json::from_str(&read("in.json")).unwrap();
+        assert_eq!(input["event"], "post_tool");
+        assert_eq!(input["arguments"]["content"], "it's");
+        let root_s = root.display().to_string();
+        assert_eq!(
+            read("env.txt").trim(),
+            format!("post_tool write {root_s}/src/a.rs {root_s}")
+        );
+
+        // Its answers are read as a host hook's: a rewrite, a block.
+        let pre = hooks.pre_tool("write", args, &mut notes.sink());
+        assert!(pre.deny.is_none());
+        let rewritten: Value = serde_json::from_str(&pre.arguments).unwrap();
+        assert_eq!(rewritten, json!({"path": "b.rs", "content": "it's"}));
+        let pre = hooks.pre_tool("edit", "{}", &mut notes.sink());
+        assert!(pre.deny.unwrap().ends_with("frozen"));
+        assert!(notes.0.is_empty(), "{:?}", notes.0);
+
+        // A program the image has not: a failure that names the sandbox,
+        // and no decision.
+        let pre = hooks.pre_tool("bash", "{}", &mut notes.sink());
+        assert!(pre.deny.is_none());
+        assert_eq!(notes.0.len(), 1, "{:?}", notes.0);
+        assert!(
+            notes.0[0].contains("exit 127")
+                && notes.0[0]
+                    .contains("[sandbox: a program it needs is not in the sandbox's image"),
+            "{:?}",
+            notes.0
+        );
+
+        // Its timeout holds in the guest too.
+        let started = Instant::now();
+        let pre = hooks.pre_tool("read", "{}", &mut notes.sink());
+        assert!(pre.deny.is_none());
+        assert!(notes.0[1].contains("timed out after 1s"), "{:?}", notes.0);
+        assert!(started.elapsed() < Duration::from_secs(20));
+        for dir in [root, config] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
