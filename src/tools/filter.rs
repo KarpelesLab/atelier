@@ -312,7 +312,8 @@ pub fn kept_id(id: &str) -> Option<&str> {
     let name = name.strip_suffix(".txt").unwrap_or(name);
     let hex = name.strip_prefix("out-").or_else(|| {
         // The path of a kept file, and nothing that merely looks like hex.
-        id.contains(spill::DIR).then_some(name)
+        let mut above = id.rsplit('/').skip(1);
+        (above.next() == Some(spill::DIR)).then_some(name)
     })?;
     (hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
 }
@@ -537,7 +538,8 @@ mod tests {
         // The file holds all of it, and the handle is its name.
         let (_, rest) = header.split_once("full output: ").unwrap();
         let path = rest.split_once(' ').unwrap().0;
-        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), text);
+        assert!(Path::new(path).starts_with(spill::dir(&root).unwrap()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
         let id = path.rsplit('/').next().unwrap().trim_end_matches(".txt");
         assert!(header.contains(&format!("bash_output with id \"out-{id}\"")));
         assert_eq!(spill::kept(&root, id).unwrap(), text);
@@ -552,7 +554,8 @@ mod tests {
         assert!(out.contains("(grep \"line (5|200)$\" with 1 lines of context)"));
 
         // A filter that leaves nothing out is no filter: nothing to keep.
-        let files = std::fs::read_dir(root.join(spill::DIR)).unwrap().count();
+        let kept = spill::dir(&root).unwrap();
+        let files = std::fs::read_dir(&kept).unwrap().count();
         let out = render(
             &root,
             "a\nb\n".into(),
@@ -561,10 +564,7 @@ mod tests {
             20_000,
         );
         assert_eq!(out, "a\nb\n");
-        assert_eq!(
-            std::fs::read_dir(root.join(spill::DIR)).unwrap().count(),
-            files
-        );
+        assert_eq!(std::fs::read_dir(&kept).unwrap().count(), files);
         // Nor is there anything to say about no output at all.
         let out = render(
             &root,
@@ -590,7 +590,7 @@ mod tests {
         assert!(
             out.starts_with(
                 "[filtered: no line of the 40 lines of output matches \"error\", so nothing \
-                 is shown — full output: .atelier/tool-output/"
+                 is shown — full output: /"
             ),
             "{out}"
         );
@@ -641,7 +641,8 @@ mod tests {
         // Short output is returned as it is, and nothing is written.
         let short = tempdir("short");
         assert_eq!(render(&short, "hi\n".into(), None, true, 2000), "hi\n");
-        assert!(!short.join(".atelier").exists());
+        assert!(!spill::dir(&short).unwrap().exists());
+        assert_eq!(std::fs::read_dir(&short).unwrap().count(), 0);
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&short).unwrap();
     }
@@ -649,11 +650,13 @@ mod tests {
     #[test]
     fn a_kept_output_is_named_by_its_id_or_its_path() {
         assert_eq!(kept_id("out-ab12cd"), Some("ab12cd"));
-        assert_eq!(kept_id(".atelier/tool-output/ab12cd.txt"), Some("ab12cd"));
+        assert_eq!(kept_id("tool-output/ab12cd.txt"), Some("ab12cd"));
         assert_eq!(
-            kept_id("/p/.atelier/tool-output/AB12CD.txt"),
+            kept_id("/state/atelier/projects/-p/tool-output/AB12CD.txt"),
             Some("AB12CD")
         );
+        // As earlier versions named it, in a conversation that was resumed.
+        assert_eq!(kept_id(".atelier/tool-output/ab12cd.txt"), Some("ab12cd"));
         for not in [
             "job-1",
             "ab12cd",

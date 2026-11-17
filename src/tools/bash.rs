@@ -1088,11 +1088,14 @@ fn look_again(root: &Path, id: &str, filter: Option<&Filter>) -> Result<String> 
         Some(filter) => filter::again(id, text, filter, MAX_OUTPUT_BYTES),
         // Asked for whole: its start and its end, as when it was made.
         None if text.len() > MAX_OUTPUT_BYTES => {
-            let place = format!(
-                "pass tail, head or grep to see another part, or read {}/{id}.txt with \
-                 offset/limit",
-                super::spill::DIR
-            );
+            let place = match super::spill::dir(root) {
+                Some(dir) => format!(
+                    "pass tail, head or grep to see another part, or read {} with \
+                     offset/limit",
+                    dir.join(format!("{id}.txt")).display()
+                ),
+                None => "pass tail, head or grep to see another part".to_string(),
+            };
             super::spill::cut(&text, MAX_OUTPUT_BYTES, &place)
         }
         None => text,
@@ -1600,9 +1603,7 @@ mod tests {
         assert_eq!(lines.next(), Some("[exit status: 3]"));
         let header = lines.next().unwrap();
         assert!(
-            header.starts_with(
-                "[filtered: 25 of 300 lines shown (last 25) — full output: .atelier/tool-output/"
-            ),
+            header.starts_with("[filtered: 25 of 300 lines shown (last 25) — full output: /"),
             "{header}"
         );
         assert_eq!(lines.next(), Some("276"));
@@ -1728,7 +1729,10 @@ mod tests {
             )
         );
         // …the first lines, by the path the result gave…
-        let path = format!(".atelier/tool-output/{}.txt", &id[4..]);
+        let kept = crate::tools::spill::dir(&root).unwrap();
+        let path = kept.join(format!("{}.txt", &id[4..]));
+        let path = path.to_str().unwrap();
+        assert!(out.contains(path), "{out}");
         let again = BashOutputTool
             .call(&mut ctx, json!({"id": path, "head": 1}))
             .unwrap();
@@ -1743,8 +1747,8 @@ mod tests {
         );
         assert!(!range.contains("row 102"), "{range}");
         // Nothing of that made a new file, or ran the command again.
-        let kept = std::fs::read_dir(root.join(".atelier/tool-output")).unwrap();
-        assert_eq!(kept.count(), 1);
+        assert_eq!(std::fs::read_dir(&kept).unwrap().count(), 1);
+        assert!(!root.join(".atelier").exists());
         assert_eq!(std::fs::read_to_string(root.join("runs")).unwrap(), "run\n");
 
         // An id that names nothing kept says what to do.

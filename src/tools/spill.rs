@@ -4,38 +4,75 @@
 //! budget, and whatever was past the cut was gone: to see it the agent had
 //! to run the command again, differently. (MCP results weren't bounded at
 //! all, which is worse for the conversation.) [`fit`] instead saves
-//! the whole text under [`DIR`] in the project and returns its head and its
-//! tail — where a command says what it is doing, and where it says how it
-//! ended — around one line naming the file:
+//! the whole text under [`DIR`] in the project's state directory
+//! ([`crate::state`]) and returns its head and its tail — where a command
+//! says what it is doing, and where it says how it ended — around one line
+//! naming the file, by its absolute path:
 //!
 //! ```text
-//! … 1,842 lines omitted (lines 121-1962) — full output: .atelier/tool-output/ab12cd.txt (use read with offset/limit, or grep) …
+//! … 1,842 lines omitted (lines 121-1962) — full output: /home/me/.local/state/atelier/projects/-home-me-proj/tool-output/ab12cd.txt (use read with offset/limit, or grep) …
 //! ```
 //!
-//! The file is inside the project, so `read` and `grep` reach it without
-//! approval, and those page natively. Tools that page by themselves (`read`,
-//! `grep`, `web_fetch`) don't go through here.
+//! The file is outside the project — atelier writes nothing in a project —
+//! and `read` and `grep`, which page natively, still reach it without
+//! approval: they ask [`kept_file`], which answers for a file this module
+//! made for this project and for nothing else out there. Tools that page by
+//! themselves (`read`, `grep`, `web_fetch`) don't go through here.
 //!
-//! Two things keep this from becoming a nuisance:
+//! The directory is bounded: writing a file removes the oldest ones past
+//! [`MAX_FILES`] files or [`MAX_DIR_BYTES`] in total. The file just written
+//! always stays, whatever its size.
 //!
-//! - The directory is bounded: writing a file removes the oldest ones past
-//!   [`MAX_FILES`] files or [`MAX_DIR_BYTES`] in total. The file just written
-//!   always stays, whatever its size.
-//! - It is nobody's source: walks of the project (`grep`, `glob`, `tree`, the
-//!   `node` tool's `fs.glob`) leave it out through [`keep_in_walk`] unless
-//!   the walk was pointed at it. Not every project git-ignores `.atelier/`.
+//! # What earlier versions left in a project
 //!
-//! The same predicate keeps those walks out of the other thing under
-//! `.atelier/` that is nobody's source: the worktrees of isolated subagents
-//! ([`crate::agents::WORKTREES_DIR`]), each a copy of the whole repository.
+//! Spilled output used to be kept in `<project>/.atelier/tool-output/`, and
+//! subagents' worktrees in `<project>/.atelier/worktrees/`. Neither is
+//! written any more, but a project may still hold them, and they are
+//! nobody's source: walks of the project (`grep`, `glob`, `tree`, the
+//! `node` tool's `fs.glob`) leave them out through [`keep_in_walk`] unless
+//! the walk was pointed at one.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-/// Where spilled output is kept, relative to the project root.
-pub const DIR: &str = ".atelier/tool-output";
+/// Where spilled output is kept, in the project's state directory.
+pub const DIR: &str = "tool-output";
+
+/// The directory spilled output of the project at `root` is kept in,
+/// whether or not it exists yet; `None` with no state directory.
+pub fn dir(root: &Path) -> Option<PathBuf> {
+    Some(crate::state::dir(root)?.join(DIR))
+}
+
+/// `path`, as a tool was given it, if it names kept output of the project
+/// at `root`: a file [`keep`] made, or the directory they are in. This is
+/// what lets `read` and `grep` open them without approval although they
+/// are outside the project, so it answers for exactly those: the path must
+/// be absolute and, once `.` and `..` are resolved, be [`dir`] itself or a
+/// regular file in it with a name [`keep`] gives.
+pub fn kept_file(root: &Path, path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = super::normalize(path);
+    let dir = dir(root)?;
+    if path == dir {
+        return Some(path);
+    }
+    let stem = path.file_name()?.to_str()?.strip_suffix(".txt")?;
+    let ours = path.parent() == Some(dir.as_path())
+        && is_id(stem)
+        && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+    ours.then_some(path)
+}
+
+/// Whether `id` is a name [`keep`] gives: never a path.
+fn is_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())
+}
 
 /// The default budget, in bytes, for a tool result that has no better
 /// number of its own.
@@ -72,7 +109,7 @@ pub fn fit(root: &Path, text: String, budget: usize) -> String {
 
 /// A text saved under [`DIR`].
 pub struct Kept {
-    /// Where, relative to the project root.
+    /// Where: an absolute path, which `read` and `grep` take.
     pub path: String,
     /// The six hex digits of its name: what a tool that reads kept output
     /// back takes for a handle (see [`kept`]).
@@ -87,22 +124,17 @@ pub fn keep(root: &Path, text: &str) -> Result<Kept, String> {
     let id = path.file_stem().unwrap_or_default().to_string_lossy();
     Ok(Kept {
         id: id.into_owned(),
-        path: path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .display()
-            .to_string(),
+        path: path.display().to_string(),
     })
 }
 
 /// The text [`keep`] (or [`fit`]) saved under the id `id`, if it is still
 /// there: the directory keeps only the most recent files.
 pub fn kept(root: &Path, id: &str) -> Option<String> {
-    // Only a name this module made: never a path.
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_id(id) {
         return None;
     }
-    std::fs::read_to_string(root.join(DIR).join(format!("{id}.txt"))).ok()
+    std::fs::read_to_string(dir(root)?.join(format!("{id}.txt"))).ok()
 }
 
 /// The head and the tail of `text` — which is over `budget` — each ending
@@ -142,16 +174,15 @@ pub fn cut(text: &str, budget: usize, whereabouts: &str) -> String {
 }
 
 /// A `filter_entry` predicate for a walk of the project: everything but
-/// the spill directory and the subagents' worktrees. The walk's own
+/// the spilled output and the subagents' worktrees an earlier version left
+/// in its `.atelier/` (see the module documentation). The walk's own
 /// starting point is never filtered, so naming one of those directories (or
 /// a file in it) still searches it.
 pub fn keep_in_walk(
     project_root: &Path,
 ) -> impl Fn(&ignore::DirEntry) -> bool + Send + Sync + use<> {
-    let left_out = [
-        project_root.join(DIR),
-        project_root.join(crate::agents::WORKTREES_DIR),
-    ];
+    let legacy = project_root.join(crate::state::LEGACY);
+    let left_out = [legacy.join(DIR), legacy.join(crate::state::WORKTREES)];
     move |entry| entry.depth() == 0 || !left_out.iter().any(|dir| entry.path() == dir)
 }
 
@@ -190,7 +221,11 @@ fn tail_start(text: &str, max: usize) -> usize {
 /// Write `text` to a new file in the spill directory, then trim the
 /// directory around it.
 fn save(root: &Path, text: &str) -> std::io::Result<PathBuf> {
-    let dir = root.join(DIR);
+    let dir = dir(root).ok_or_else(|| {
+        std::io::Error::other(
+            "no state directory (none of ATELIER_STATE_DIR, XDG_STATE_HOME and HOME is set)",
+        )
+    })?;
     std::fs::create_dir_all(&dir)?;
     let path = loop {
         let candidate = dir.join(format!("{}.txt", short_id()));
@@ -291,7 +326,7 @@ mod tests {
     }
 
     fn spilled(root: &Path) -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(root.join(DIR))
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir(root).unwrap())
             .map(|d| d.flatten().map(|e| e.path()).collect())
             .unwrap_or_default();
         files.sort();
@@ -304,7 +339,8 @@ mod tests {
         let text = numbered(10);
         assert_eq!(fit(&root, text.clone(), text.len()), text);
         assert_eq!(fit(&root, String::new(), 0), "");
-        assert!(!root.join(".atelier").exists());
+        assert!(!dir(&root).unwrap().exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -343,9 +379,13 @@ mod tests {
             )
         );
         assert!(marker.starts_with("1,"), "{marker}");
-        assert!(file.starts_with(".atelier/tool-output/") && file.ends_with(".txt"));
-        assert_eq!(file.len(), ".atelier/tool-output/".len() + 6 + ".txt".len());
-        assert_eq!(std::fs::read_to_string(root.join(&file)).unwrap(), text);
+        // In the project's state directory, by its whole path; the project
+        // itself is not written to.
+        let kept = format!("{}/", dir(&root).unwrap().display());
+        assert!(file.starts_with(&kept) && file.ends_with(".txt"), "{file}");
+        assert_eq!(file.len(), kept.len() + 6 + ".txt".len());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -363,10 +403,7 @@ mod tests {
             marker.starts_with("9,150 bytes omitted — full output: "),
             "{marker}"
         );
-        assert_eq!(
-            std::fs::read_to_string(root.join(named_file(&out))).unwrap(),
-            text
-        );
+        assert_eq!(std::fs::read_to_string(named_file(&out)).unwrap(), text);
 
         // A long last line after short ones: the head is lines, the cut
         // into the last line is not.
@@ -382,7 +419,9 @@ mod tests {
     fn an_unwritable_directory_still_cuts_and_says_so() {
         let root = tempdir("unwritable");
         // A file where the directory should be.
-        std::fs::write(root.join(".atelier"), "in the way").unwrap();
+        let kept = dir(&root).unwrap();
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "in the way").unwrap();
         let out = fit(&root, numbered(2000), 2000);
         assert!(out.starts_with("line 1\n"));
         assert!(out.ends_with("line 2000\n"));
@@ -398,7 +437,7 @@ mod tests {
     #[test]
     fn the_directory_keeps_only_the_most_recent_files() {
         let root = tempdir("prune-count");
-        let dir = root.join(DIR);
+        let dir = dir(&root).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let now = SystemTime::now();
         // 60 older files, `old-00` the oldest, and one that isn't ours.
@@ -412,7 +451,7 @@ mod tests {
         std::fs::write(dir.join("notes.md"), "kept").unwrap();
 
         let out = fit(&root, numbered(2000), 2000);
-        let new = root.join(named_file(&out));
+        let new = PathBuf::from(named_file(&out));
         let left = spilled(&root);
         let txt: Vec<&PathBuf> = left
             .iter()
@@ -431,7 +470,7 @@ mod tests {
     #[test]
     fn the_directory_is_bounded_in_bytes_but_keeps_the_new_file() {
         let root = tempdir("prune-bytes");
-        let dir = root.join(DIR);
+        let dir = dir(&root).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let now = SystemTime::now();
         // Three 8 MiB files (sparse): with the new one, only two fit.
@@ -443,7 +482,7 @@ mod tests {
                 .unwrap();
         }
         let out = fit(&root, numbered(2000), 2000);
-        assert!(root.join(named_file(&out)).is_file());
+        assert!(Path::new(&named_file(&out)).is_file());
         assert!(!dir.join("big-0.txt").exists());
         assert!(dir.join("big-1.txt").exists());
         assert!(dir.join("big-2.txt").exists());
@@ -461,26 +500,16 @@ mod tests {
     }
 
     #[test]
-    fn read_and_grep_reach_the_file_without_approval_but_walks_leave_it_out() {
-        reach(false);
-    }
-
-    /// The same where the project git-ignores `.atelier/`: the walkers then
-    /// skip it by themselves, and naming the file must still get through.
-    #[test]
-    fn a_git_ignored_spill_directory_is_still_reachable_by_name() {
-        reach(true);
-    }
-
-    fn reach(ignored: bool) {
-        let root = tempdir(if ignored { "reach-ignored" } else { "reach" });
-        if ignored {
-            std::fs::create_dir(root.join(".git")).unwrap();
-            std::fs::write(root.join(".gitignore"), ".atelier/\n").unwrap();
-        }
+    fn read_and_grep_reach_the_file_without_approval_and_nothing_else_out_there() {
+        let root = tempdir("reach");
         std::fs::write(root.join("src.txt"), "line 1500 lives here too\n").unwrap();
         let out = fit(&root, numbered(2000), 2000);
         let file = named_file(&out);
+        let kept = dir(&root).unwrap();
+        // Outside the project, which holds what it held.
+        assert!(Path::new(&file).is_absolute() && !Path::new(&file).starts_with(&root));
+        assert_eq!(Path::new(&file).parent(), Some(kept.as_path()));
+        assert!(!root.join(".atelier").exists());
 
         let mut fstate = FileState::new();
         let mut ctx = ToolCtx {
@@ -488,7 +517,7 @@ mod tests {
             fstate: &mut fstate,
             approved: false,
         };
-        // In the project: no prompt, and the omitted part is one call away.
+        // No prompt, and the omitted part is one call away.
         let args = json!({"path": file, "offset": 1500, "limit": 2});
         assert!(!read::ReadTool.requires_approval_in(&args, &root));
         let page = read::ReadTool.call(&mut ctx, args).unwrap();
@@ -499,48 +528,72 @@ mod tests {
         assert!(!page.contains("line 1502"));
 
         // Named, the file (or its directory) is searched…
-        for path in [file.as_str(), DIR] {
+        for path in [file.as_str(), kept.to_str().unwrap()] {
             let hits = grep::GrepTool
                 .call(&mut ctx, json!({"pattern": "^line 1500$", "path": path}))
                 .unwrap();
             assert_eq!(hits, format!("{file}:1500:line 1500"));
         }
-        // …but a walk of the project, or of `.atelier`, doesn't wander in.
+        // …and a walk of the project has nothing of it to find.
         let hits = grep::GrepTool
             .call(&mut ctx, json!({"pattern": "line 1500"}))
             .unwrap();
         assert_eq!(hits, "src.txt:1:line 1500 lives here too");
-        let hits = grep::GrepTool
-            .call(
-                &mut ctx,
-                json!({"pattern": "line 1500", "path": ".atelier"}),
-            )
-            .unwrap();
-        assert_eq!(hits, "no matches found");
-        let files = glob::GlobTool
-            .call(&mut ctx, json!({"pattern": "**/*.txt"}))
-            .unwrap();
-        assert_eq!(files, "src.txt");
-        let listing = tree::TreeTool.call(&mut ctx, json!({"depth": 4})).unwrap();
-        assert_eq!(listing.contains(".atelier/"), !ignored, "{listing}");
-        assert!(!listing.contains("tool-output"), "{listing}");
-        // Pointed at it, they list it.
-        let files = glob::GlobTool
-            .call(&mut ctx, json!({"pattern": "*.txt", "path": DIR}))
-            .unwrap();
-        assert_eq!(files, file);
+
+        // Nothing else outside the project is opened by that: not the rest
+        // of the state directory, not a path that only passes through the
+        // kept files, not a link someone left among them, not another
+        // project's.
+        let state = crate::state::dir(&root).unwrap();
+        std::fs::write(state.join("session.json"), "{}").unwrap();
+        std::fs::write(kept.join("notes.md"), "not ours").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(state.join("session.json"), kept.join("abcdef.txt")).unwrap();
+        let other = tempdir("reach-other");
+        let theirs = named_file(&fit(&other, numbered(2000), 2000));
+        let outside = [
+            state.join("session.json").display().to_string(),
+            state.display().to_string(),
+            format!("{}/../session.json", kept.display()),
+            format!("{file}/../../session.json"),
+            kept.join("notes.md").display().to_string(),
+            kept.join("abcdef.txt").display().to_string(),
+            theirs,
+            "tool-output/ab12cd.txt".to_string(),
+        ];
+        for path in &outside {
+            assert_eq!(kept_file(&root, path), None, "{path}");
+        }
+        for path in &outside[..7] {
+            let args = json!({"path": path});
+            assert!(read::ReadTool.requires_approval_in(&args, &root), "{path}");
+            assert!(read::ReadTool.call(&mut ctx, args).is_err(), "{path}");
+            let args = json!({"pattern": ".", "path": path});
+            assert!(grep::GrepTool.call(&mut ctx, args).is_err(), "{path}");
+        }
+        // A spelling with `..` that lands on the file is the file.
+        let roundabout = format!("{}/../{DIR}/{}", kept.display(), &file[file.len() - 10..]);
+        assert_eq!(kept_file(&root, &roundabout), Some(PathBuf::from(&file)));
         std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
     }
 
-    /// Subagents' worktrees are copies of the repository: a walk of the
-    /// project stays out of them, and one pointed at them goes in.
+    /// What an earlier version left in a project's `.atelier/` — subagents'
+    /// worktrees, each a copy of the repository, and spilled output: a walk
+    /// of the project stays out of them, and one pointed at them goes in.
     #[test]
-    fn walks_of_the_project_stay_out_of_agents_worktrees() {
-        let root = tempdir("walk-worktrees");
-        let copy = root.join(crate::agents::WORKTREES_DIR).join("agent-1");
+    fn walks_of_the_project_stay_out_of_what_earlier_versions_left() {
+        let root = tempdir("walk-legacy");
+        let copy = root.join(".atelier/worktrees/agent-1");
         std::fs::create_dir_all(copy.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".atelier/tool-output")).unwrap();
         std::fs::write(root.join("lib.txt"), "needle in the project\n").unwrap();
         std::fs::write(copy.join("src/lib.txt"), "needle in the copy\n").unwrap();
+        std::fs::write(
+            root.join(".atelier/tool-output/ab12cd.txt"),
+            "needle in old output\n",
+        )
+        .unwrap();
         let mut fstate = FileState::new();
         let mut ctx = ToolCtx {
             project_root: &root,
@@ -558,6 +611,7 @@ mod tests {
         assert_eq!(files, "lib.txt");
         let listing = tree::TreeTool.call(&mut ctx, json!({"depth": 6})).unwrap();
         assert!(!listing.contains("agent-1"), "{listing}");
+        assert!(!listing.contains("tool-output"), "{listing}");
 
         let inside = ".atelier/worktrees/agent-1";
         let hits = grep::GrepTool

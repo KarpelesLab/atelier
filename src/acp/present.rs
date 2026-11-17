@@ -200,7 +200,7 @@ pub fn diffs(tool: &str, args: &Value, root: &Path) -> Vec<Value> {
 /// (the client replaces what it had). atelier's items are done or not, and
 /// carry no priority.
 pub fn plan(root: &Path) -> Option<Value> {
-    let raw = std::fs::read_to_string(root.join(".atelier").join("todos.json")).ok()?;
+    let raw = std::fs::read_to_string(crate::state::dir(root)?.join("todos.json")).ok()?;
     let items: Vec<Value> = serde_json::from_str(&raw).ok()?;
     let entry = |item: &Value| {
         let done = item["done"].as_bool().unwrap_or(false);
@@ -463,10 +463,12 @@ mod tests {
     #[test]
     fn the_todo_list_is_a_plan() {
         let root = std::env::temp_dir().join(format!("atelier-acp-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
         assert_eq!(plan(&root), None);
-        std::fs::create_dir_all(root.join(".atelier")).unwrap();
+        let state = crate::state::dir(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
         let todos = json!([{"text": "write it", "done": true}, {"text": "test it", "done": false}]);
-        std::fs::write(root.join(".atelier/todos.json"), todos.to_string()).unwrap();
+        std::fs::write(state.join("todos.json"), todos.to_string()).unwrap();
         assert_eq!(
             plan(&root).unwrap(),
             json!({"sessionUpdate": "plan", "entries": [

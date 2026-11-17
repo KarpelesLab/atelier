@@ -5,7 +5,10 @@
 //! (pure Rust, via `oxideav-pdf`; page ranges supported), and Jupyter notebooks
 //! as rendered cells with their outputs. Reading outside the project is
 //! possible but needs approval ([`Tool::requires_approval_in`]) — e.g. a
-//! screenshot path the user pasted, or a temp file another tool wrote.
+//! screenshot path the user pasted, or a temp file another tool wrote. The
+//! one exception is output atelier itself kept for this project
+//! ([`spill::kept_file`]): it lives outside the project, and is the agent's
+//! own to read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +16,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolImage, ToolOutput, ToolSpec, base64_encode, normalize, path_arg};
+use super::{
+    Tool, ToolCtx, ToolImage, ToolOutput, ToolSpec, base64_encode, normalize, path_arg, spill,
+};
 
 /// Largest image returned inline (the model API's per-image limit, with
 /// headroom for base64's growth).
@@ -35,9 +40,11 @@ impl Tool for ReadTool {
         false
     }
 
-    /// Inside the project: never. Outside it: yes.
+    /// Inside the project: never. Outside it: yes, except for output a tool
+    /// kept for this project.
     fn requires_approval_in(&self, args: &Value, root: &Path) -> bool {
-        path_arg(args).is_ok_and(|p| super::confine(root, p).is_err())
+        path_arg(args)
+            .is_ok_and(|p| super::confine(root, p).is_err() && spill::kept_file(root, p).is_none())
     }
 
     fn spec(&self) -> ToolSpec {
@@ -48,7 +55,8 @@ impl Tool for ReadTool {
                 are returned as images you can see; PDFs as extracted text (use `pages` \
                 for large ones); Jupyter notebooks (.ipynb) as cells with their outputs. \
                 Paths are relative to the project root; files outside the project can be \
-                read with the user's approval."
+                read with the user's approval. The file a tool result names as its \
+                \"full output\" is read by the absolute path given, without approval."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -123,20 +131,24 @@ impl Tool for ReadTool {
     }
 }
 
-/// Resolve `path`: confined to the project, unless this call was approved
-/// (which [`ReadTool::requires_approval_in`] demands for outside paths).
+/// Resolve `path`: confined to the project, unless it is output kept for
+/// the project or this call was approved (which
+/// [`ReadTool::requires_approval_in`] demands for other outside paths).
 fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
     match ctx.resolve(path) {
         Ok(p) => Ok(p),
-        Err(_) if ctx.approved => {
-            let p = Path::new(path);
-            Ok(normalize(&if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                ctx.project_root.join(p)
-            }))
-        }
-        Err(e) => Err(e),
+        Err(e) => match spill::kept_file(ctx.project_root, path) {
+            Some(kept) => Ok(kept),
+            None if ctx.approved => {
+                let p = Path::new(path);
+                Ok(normalize(&if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    ctx.project_root.join(p)
+                }))
+            }
+            None => Err(e),
+        },
     }
 }
 

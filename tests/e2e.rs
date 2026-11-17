@@ -223,6 +223,17 @@ fn unique_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Where atelier keeps what it writes for the project at `dir` — outside
+/// it: under the state base these tests give it (`ATELIER_STATE_DIR`, next
+/// to the project), in a directory named after the project's path.
+fn state_dir(dir: &Path) -> PathBuf {
+    let real = dir.canonicalize().expect("the project exists");
+    let base = dir.with_extension("state").join("atelier");
+    let base = base.canonicalize().unwrap_or(base);
+    base.join("projects")
+        .join(real.to_string_lossy().replace('/', "-"))
+}
+
 /// The `atelier` binary, set up to talk to the mock at `base_url` from `cwd`
 /// with nothing of the outer environment or the real home leaking in.
 fn atelier(base_url: &str, cwd: &Path) -> Command {
@@ -231,6 +242,12 @@ fn atelier(base_url: &str, cwd: &Path) -> Command {
     // read from nor written to the real home, and nothing is trusted that a
     // test did not trust itself.
     cmd.env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // What it keeps for the project (the session, memory, kept tool
+        // output, worktrees): next to the temp project, see `state_dir`.
+        .env(
+            "ATELIER_STATE_DIR",
+            cwd.with_extension("state").join("atelier"),
+        )
         // Its sockets too (see `own`): none in the real runtime directory.
         .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env_remove("ATELIER_TRUST_HOOKS")
@@ -462,7 +479,8 @@ fn system_message(body: &str) -> String {
 }
 
 /// Case 4 — memory across sessions. In a first run the mock model calls
-/// `memory save` and the note lands in `.atelier/memory/`, with its index.
+/// `memory save` and the note lands in the project's state directory — not
+/// in the project — with its index.
 /// A second, separate run in the same directory — a new process with no
 /// saved conversation — must send the memory index in its system message,
 /// which is how a correction given once carries over to the next session.
@@ -487,7 +505,8 @@ fn memory_saved_in_one_run_is_recalled_in_the_next() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let note = dir.join(".atelier/memory/lint-first.md");
+    let memory = state_dir(&dir).join("memory");
+    let note = memory.join("lint-first.md");
     let saved = std::fs::read_to_string(&note).unwrap_or_else(|e| {
         panic!("expected {note:?} to exist: {e}\n stdout: {stdout:?}\n stderr: {stderr:?}")
     });
@@ -496,7 +515,8 @@ fn memory_saved_in_one_run_is_recalled_in_the_next() {
         saved.contains("clippy clean before every commit"),
         "{saved}"
     );
-    let index = std::fs::read_to_string(dir.join(".atelier/memory/MEMORY.md")).unwrap();
+    let index = std::fs::read_to_string(memory.join("MEMORY.md")).unwrap();
+    assert!(!dir.join(".atelier").exists());
     assert!(
         index.contains("- [lint-first](lint-first.md) — run clippy before committing"),
         "{index}"
@@ -534,6 +554,109 @@ fn memory_saved_in_one_run_is_recalled_in_the_next() {
         !system.contains("clippy clean before every commit"),
         "only the index is ambient, not the note: {system}"
     );
+}
+
+/// atelier writes nothing in the project it works on. One run that does
+/// everything that keeps something — a command whose output is too long
+/// for the conversation, a `todo` list, a memory note, and the session
+/// saved at the end — leaves the project directory exactly as it was, with
+/// no `.atelier` in it: all of it is in the project's state directory. The
+/// kept output is named to the model by its path there, which `read` opens;
+/// and `--continue` finds the session.
+#[cfg(unix)]
+#[test]
+fn a_full_run_leaves_nothing_of_ateliers_in_the_project() {
+    let mock = Mock::by_body(Arc::new(|body| {
+        let results = messages_of(&request(body), "tool");
+        let call = |name: &str, args: serde_json::Value| json_tool_call("call", name, args);
+        match results.len() {
+            0 => call("bash", serde_json::json!({"command": "seq 1 20000"})),
+            1 => call(
+                "todo",
+                serde_json::json!({"action": "add", "items": ["look at the output"]}),
+            ),
+            2 => call(
+                "memory",
+                serde_json::json!({
+                    "action": "save",
+                    "name": "counts-far",
+                    "type": "project",
+                    "description": "the project counts to twenty thousand",
+                    "content": "It does.",
+                }),
+            ),
+            // The part of the output that was left out, by the path the
+            // first result gave.
+            3 => {
+                let (_, rest) = results[0].split_once("full output: ").expect("a kept file");
+                let path = rest.split_once(' ').unwrap().0;
+                call(
+                    "read",
+                    serde_json::json!({"path": path, "offset": 10000, "limit": 1}),
+                )
+            }
+            _ => text_response("all done"),
+        }
+    }));
+    let dir = unique_dir("nothing-in-the-project");
+    std::fs::write(dir.join("keep.txt"), "the user's own\n").unwrap();
+    let listing = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let out = run_print(&mock.base_url(), &dir, "go");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(mock.requests(), 5, "stderr: {stderr}");
+
+    // The project holds what it held.
+    assert_eq!(listing(&dir), ["keep.txt"], "stderr: {stderr}");
+
+    // Everything is in its state directory instead.
+    let state = state_dir(&dir);
+    assert!(!state.starts_with(&dir));
+    assert_eq!(
+        listing(&state),
+        ["memory", "session.json", "todos.json", "tool-output"]
+    );
+    let todos = std::fs::read_to_string(state.join("todos.json")).unwrap();
+    assert!(todos.contains("look at the output"), "{todos}");
+    assert_eq!(
+        listing(&state.join("memory")),
+        ["MEMORY.md", "counts-far.md"]
+    );
+    let kept = listing(&state.join("tool-output"));
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let whole = std::fs::read_to_string(state.join("tool-output").join(&kept[0])).unwrap();
+    assert_eq!(whole.lines().count(), 20000);
+
+    // The model was given the file by its path there, and read from it.
+    let results = messages_of(&request(&mock.body(4)), "tool");
+    let named = format!(
+        "full output: {} ",
+        state.join("tool-output").join(&kept[0]).display()
+    );
+    assert!(results[0].contains(&named), "{}", results[0]);
+    assert!(results[3].contains("10000\t10000"), "{}", results[3]);
+    assert!(!results[3].contains("10001"), "{}", results[3]);
+
+    // The session is found again, and still nothing is in the project.
+    let out = run_atelier(
+        &mock.base_url(),
+        &dir,
+        &["--continue", "--print", "and then?"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let users = messages_of(&request(&mock.body(mock.requests() - 1)), "user");
+    assert!(users.iter().any(|u| u.ends_with("go")), "{users:?}");
+    assert!(users.last().unwrap().ends_with("and then?"), "{users:?}");
+    assert_eq!(listing(&dir), ["keep.txt"]);
 }
 
 /// Case 5 — instruction files reach the model. The project root's `AGENTS.md`
@@ -1076,6 +1199,11 @@ fn run_repl(base_url: &str, cwd: &Path, input: &str) -> Output {
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
         .env("XDG_CONFIG_HOME", cwd.with_extension("config"))
         .env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // What it keeps for the project: next to it, not in the real home.
+        .env(
+            "ATELIER_STATE_DIR",
+            cwd.with_extension("state").join("atelier"),
+        )
         // Its sockets too (see `own`): none in the real runtime directory.
         .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env("HOME", cwd.with_extension("home"))
@@ -2009,7 +2137,7 @@ fn compact_command_replaces_older_turns_with_a_hand_off_summary() {
     );
 
     // Saved with the session, and back with `--continue`.
-    let saved = std::fs::read_to_string(dir.join(".atelier/session.json")).unwrap();
+    let saved = std::fs::read_to_string(state_dir(&dir).join("session.json")).unwrap();
     assert!(saved.contains("HANDOFF-NOTES-77"), "{saved}");
     let out = atelier(&mock.base_url(), &dir)
         .args(["--continue", "--print", "and again"])
@@ -3343,6 +3471,11 @@ fn requests_are_logged_and_stats_totals_them() {
         atelier(&first.base_url(), cwd)
             // The log of the runs above, wherever the command is run from.
             .env("XDG_STATE_HOME", dir.with_extension("state"))
+            // What it keeps for the project: next to it, not in the real home.
+            .env(
+                "ATELIER_STATE_DIR",
+                dir.with_extension("state").join("atelier"),
+            )
             // Its sockets too (see `own`): none in the real runtime directory.
             .env("XDG_RUNTIME_DIR", dir.with_extension("run"))
             .args(&full)
@@ -3884,6 +4017,7 @@ fn review_sends_the_diff_to_a_read_only_reviewer() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 
     // Read-only: no saved session, nothing new in the working tree.
+    assert!(!state_dir(&dir).exists());
     assert!(!dir.join(".atelier").exists());
 }
 
@@ -3973,6 +4107,7 @@ fn debug_prompt_prints_the_request_print_then_sends() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("sk-very-secret"));
     let printed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert!(!state_dir(&dir).exists());
     assert!(!dir.join(".atelier").exists());
 
     let args = ["--print", "what is here?"];
@@ -4431,6 +4566,11 @@ fn a_projects_sandbox_switch_waits_for_trust() {
         .args(["trust", "status"])
         .current_dir(&dir)
         .env("XDG_STATE_HOME", dir.with_extension("state"))
+        // What it keeps for the project: next to it, not in the real home.
+        .env(
+            "ATELIER_STATE_DIR",
+            dir.with_extension("state").join("atelier"),
+        )
         // Its sockets too (see `own`): none in the real runtime directory.
         .env("XDG_RUNTIME_DIR", dir.with_extension("run"))
         .env("HOME", dir.with_extension("home"))
@@ -5478,8 +5618,10 @@ fn an_isolated_subagent_works_in_a_worktree_and_reports_its_changes() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
 
-    // The write is in the worktree, not in the parent's tree.
-    let worktree = dir.join(".atelier/worktrees/agent-1");
+    // The write is in the worktree, which is not in the parent's tree nor
+    // anywhere in the project.
+    let worktree = state_dir(&dir).join("worktrees/agent-1");
+    assert!(!dir.join(".atelier").exists());
     assert_eq!(
         std::fs::read_to_string(worktree.join("made.txt")).unwrap(),
         "WRITTEN-BY-THE-AGENT\n"
@@ -5497,7 +5639,7 @@ fn an_isolated_subagent_works_in_a_worktree_and_reports_its_changes() {
     assert!(did[1].starts_with("error:"), "{did:?}");
     assert_eq!(did[2], "a.txt:1:committed", "{did:?}");
     assert!(
-        did[3].contains("/.atelier/worktrees/agent-1\n"),
+        did[3].contains(&format!("{}\n", worktree.display())),
         "bash ran in {did:?}"
     );
 
@@ -5510,7 +5652,7 @@ fn an_isolated_subagent_works_in_a_worktree_and_reports_its_changes() {
         "{report}"
     );
     assert!(
-        report.contains("\n\n[worktree: .atelier/worktrees/agent-1 — "),
+        report.contains(&format!("\n\n[worktree: {} — ", worktree.display())),
         "{report}"
     );
     assert!(report.contains(" made.txt | 1 +"), "{report}");
@@ -5524,7 +5666,7 @@ fn an_isolated_subagent_works_in_a_worktree_and_reports_its_changes() {
         .expect("the command to bring the changes over")
         .trim();
     assert!(
-        command.starts_with("git -C .atelier/worktrees/agent-1 diff --binary ")
+        command.starts_with(&format!("git -C {} diff --binary ", worktree.display()))
             && command.ends_with(" | git apply"),
         "{command}"
     );
@@ -5544,8 +5686,11 @@ fn an_isolated_subagent_works_in_a_worktree_and_reports_its_changes() {
         .filter_map(|e| e["text"].as_str())
         .collect();
     assert_eq!(
-        info.last().unwrap(),
-        &"⤶ general: done (5 steps) — changes left in .atelier/worktrees/agent-1"
+        *info.last().unwrap(),
+        format!(
+            "⤶ general: done (5 steps) — changes left in {}",
+            worktree.display()
+        )
     );
 
     // And the command does what the report says.
@@ -5605,7 +5750,15 @@ fn an_unchanged_worktree_is_removed_when_the_subagent_ends() {
     let child = requests_with_system(&mock, "SCOUT-PROMPT");
     assert_eq!(child.len(), 2, "stderr: {stderr}");
     assert!(messages_of(&child[1], "tool")[0].contains("committed"));
-    assert!(!dir.join(".atelier/worktrees/agent-1").exists());
+    assert!(!state_dir(&dir).join("worktrees/agent-1").exists());
+    // The project holds the agent file the test wrote, and nothing of atelier.
+    assert!(!dir.join(".atelier/worktrees").exists());
+    // Nor is anything left of what was kept for the agent while it worked.
+    let projects = state_dir(&dir).parent().unwrap().to_path_buf();
+    for entry in std::fs::read_dir(&projects).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(!name.to_string_lossy().contains("agent-1"), "{name:?}");
+    }
     let listed = git_out(&dir, &["worktree", "list"]);
     assert_eq!(listed.lines().count(), 1, "{listed}");
 
@@ -5663,7 +5816,8 @@ fn isolation_without_a_repository_or_a_commit_is_an_error_result() {
         // The parent's two requests, and none of a child.
         assert_eq!(mock.requests(), 2, "stderr: {stderr}");
         assert!(requests_with_system(&mock, GENERAL_MARKER).is_empty());
-        assert!(!dir.join(".atelier/worktrees").exists());
+        assert!(!state_dir(&dir).join("worktrees").exists());
+        assert!(!dir.join(".atelier").exists());
         let events = json_lines(&out);
         assert_eq!(of_type(&events, "tool_end")[0]["ok"], false);
         messages_of(&request(&mock.body(1)), "tool")[0].clone()
@@ -5724,14 +5878,17 @@ fn a_background_agent_in_a_worktree_reports_its_changes_and_clean_removes_it() {
         }
     }));
     let dir = committed_project("worktree-bg");
-    let worktree = dir.join(".atelier/worktrees/agent-1");
+    let worktree = state_dir(&dir).join("worktrees/agent-1");
     let mut repl = LiveRepl::start(&mock.base_url(), &dir);
 
     repl.line("first prompt");
     repl.wait_for("turn over");
     repl.type_until(
         "/agents",
-        "⤶ general agent-1: done (2 steps) — changes left in .atelier/worktrees/agent-1",
+        &format!(
+            "⤶ general agent-1: done (2 steps) — changes left in {}",
+            worktree.display()
+        ),
     );
     assert_eq!(
         std::fs::read_to_string(worktree.join("made.txt")).unwrap(),
@@ -5764,12 +5921,12 @@ fn a_background_agent_in_a_worktree_reports_its_changes_and_clean_removes_it() {
         "{prompt}"
     );
     assert!(
-        prompt.contains("\n\n[worktree: .atelier/worktrees/agent-1 — "),
+        prompt.contains(&format!("\n\n[worktree: {} — ", worktree.display())),
         "{prompt}"
     );
     assert!(prompt.contains(" made.txt | 1 +"), "{prompt}");
     assert!(
-        prompt.contains("git -C .atelier/worktrees/agent-1 diff --binary "),
+        prompt.contains(&format!("git -C {} diff --binary ", worktree.display())),
         "{prompt}"
     );
     assert!(prompt.ends_with("second prompt"), "{prompt}");
@@ -6438,7 +6595,7 @@ fn a_process_subagent_in_a_worktree_works_there_and_its_changes_are_reported() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
 
-    let worktree = joined.dir.join(".atelier/worktrees/agent-1");
+    let worktree = state_dir(&joined.dir).join("worktrees/agent-1");
     assert_eq!(
         std::fs::read_to_string(worktree.join("made.txt")).unwrap(),
         "WRITTEN-BY-THE-AGENT\n"
@@ -6464,7 +6621,7 @@ fn a_process_subagent_in_a_worktree_works_there_and_its_changes_are_reported() {
         "{report}"
     );
     assert!(
-        report.contains("\n\n[worktree: .atelier/worktrees/agent-1 — "),
+        report.contains(&format!("\n\n[worktree: {} — ", worktree.display())),
         "{report}"
     );
     assert!(report.contains(" made.txt | 1 +"), "{report}");
@@ -6474,8 +6631,11 @@ fn a_process_subagent_in_a_worktree_works_there_and_its_changes_are_reported() {
         .map(|e| e["text"].as_str().unwrap())
         .collect();
     assert_eq!(
-        info.last().unwrap(),
-        &"⤶ general: done (3 steps) — changes left in .atelier/worktrees/agent-1",
+        *info.last().unwrap(),
+        format!(
+            "⤶ general: done (3 steps) — changes left in {}",
+            worktree.display()
+        ),
         "{info:?}"
     );
 }

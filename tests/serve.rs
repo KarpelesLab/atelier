@@ -244,6 +244,11 @@ impl Client {
             .env("ATELIER_MODEL", "mock")
             .env("ATELIER_NO_COORDINATOR", "1")
             .env("XDG_STATE_HOME", cwd.with_extension("state"))
+            // What it keeps for the project: next to it, not in the real home.
+            .env(
+                "ATELIER_STATE_DIR",
+                cwd.with_extension("state").join("atelier"),
+            )
             // Its sockets too (see `own`): none in the real runtime directory.
             .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
             .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
@@ -1827,9 +1832,24 @@ fn mcp_list_reports_each_server_and_its_tools() {
     );
 }
 
+/// Where atelier keeps what it writes for the project at `dir` — outside
+/// it: under the state base these tests give it (`ATELIER_STATE_DIR`, next
+/// to the project), in a directory named after the project's path.
+fn state_dir(dir: &Path) -> PathBuf {
+    let real = dir.canonicalize().expect("the project exists");
+    let base = dir.with_extension("state").join("atelier");
+    let base = base.canonicalize().unwrap_or(base);
+    base.join("projects")
+        .join(real.to_string_lossy().replace('/', "-"))
+}
+
 /// `memory/list`, `commands/list` and `peers/list`: the notes and the
 /// instruction files, the commands and the skills — each with the file it
 /// comes from — and, with the coordinator off, no peers.
+///
+/// The note is one an earlier version of atelier left in the project's
+/// `.atelier/memory/`: it is found where notes are kept now, in the
+/// project's state directory, copied there and not moved.
 #[test]
 fn memory_commands_and_peers_are_listed_as_data() {
     let mock = Mock::scripted(|_, _| answer("unused"));
@@ -1859,8 +1879,10 @@ fn memory_commands_and_peers_are_listed_as_data() {
 
     let memory = client.ok("memory/list", json!({}));
     let project = entry(&memory["scopes"], "scope", "project");
-    assert!(
-        Path::new(project["dir"].as_str().unwrap()).ends_with(".atelier/memory"),
+    let kept = state_dir(&dir).join("memory");
+    assert_eq!(
+        Path::new(project["dir"].as_str().unwrap()),
+        kept,
         "{project}"
     );
     let notes = project["memories"].as_array().unwrap();
@@ -1868,13 +1890,18 @@ fn memory_commands_and_peers_are_listed_as_data() {
     assert_eq!(notes[0]["name"], "build");
     assert_eq!(notes[0]["type"], "reference");
     assert_eq!(notes[0]["description"], "how to build it");
-    assert!(Path::new(notes[0]["path"].as_str().unwrap()).ends_with(".atelier/memory/build.md"));
+    assert_eq!(
+        Path::new(notes[0]["path"].as_str().unwrap()),
+        kept.join("build.md")
+    );
+    assert!(dir.join(".atelier/memory/build.md").is_file());
     let global = entry(&memory["scopes"], "scope", "global");
     assert_eq!(global["memories"], json!([]));
     let files = memory["instruction_files"].as_array().unwrap();
     assert_eq!(files.len(), 1, "{memory}");
     assert!(Path::new(files[0]["path"].as_str().unwrap()).ends_with("AGENTS.md"));
     // Asking writes nothing (`/memory` brings the index file up to date).
+    assert!(!kept.join("MEMORY.md").exists());
     assert!(!dir.join(".atelier/memory/MEMORY.md").exists());
 
     let commands = client.ok("commands/list", json!({}));

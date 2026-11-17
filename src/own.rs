@@ -1,6 +1,7 @@
 //! Who owns a project's session: one atelier at a time.
 //!
-//! A project has one saved session (`.atelier/session.json`), and every run
+//! A project has one saved session (`session.json` in its state directory,
+//! [`crate::state`]), and every run
 //! that works on it — the terminal interface, the line REPL, `--print
 //! --continue`, `serve`, `acp` — writes it after each turn. Two of them at
 //! once would write over each other, so the first one *owns* the session

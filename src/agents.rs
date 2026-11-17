@@ -64,10 +64,6 @@ pub const TASK_TOOL: &str = "task";
 /// Model requests an agent may make when its definition does not say.
 pub const DEFAULT_MAX_STEPS: u32 = 40;
 
-/// Where the worktrees of isolated agents are kept, relative to the project
-/// root: one directory per run, named by the run's id.
-pub const WORKTREES_DIR: &str = ".atelier/worktrees";
-
 /// Where an agent works.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Isolation {

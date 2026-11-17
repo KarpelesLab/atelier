@@ -55,6 +55,7 @@ pub mod settings;
 pub mod settings_api;
 pub mod shlex;
 pub mod skills;
+pub mod state;
 pub mod tools;
 pub mod trust;
 #[cfg(tui)]

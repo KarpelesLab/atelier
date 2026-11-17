@@ -316,6 +316,11 @@ fn atelier(base_url: &str, cwd: &Path, args: &[&str]) -> Command {
         .env("ATELIER_NO_UPDATE", "1")
         .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // What it keeps for the project: next to it, not in the real home.
+        .env(
+            "ATELIER_STATE_DIR",
+            cwd.with_extension("state").join("atelier"),
+        )
         .env("XDG_CONFIG_HOME", cwd.join(".no-user-config"))
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
         .env("HOME", cwd.with_extension("home"))
@@ -775,6 +780,17 @@ impl Client {
     }
 }
 
+/// Where atelier keeps what it writes for the project at `dir` — outside
+/// it: under the state base these tests give it (`ATELIER_STATE_DIR`, next
+/// to the project), in a directory named after the project's path.
+fn state_dir(dir: &Path) -> PathBuf {
+    let real = dir.canonicalize().expect("the project exists");
+    let base = dir.with_extension("state").join("atelier");
+    let base = base.canonicalize().unwrap_or(base);
+    base.join("projects")
+        .join(real.to_string_lossy().replace('/', "-"))
+}
+
 // ============================================================== the cases
 
 /// A start that cannot ask finds the session owned and leaves: its own exit
@@ -788,9 +804,9 @@ fn a_start_that_cannot_ask_is_refused_and_touches_nothing() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
-    let saved = std::fs::read(dir.join(".atelier/session.json")).unwrap();
+    let saved = std::fs::read(state_dir(&dir).join("session.json")).unwrap();
     let before = record(&dir).unwrap();
     assert_eq!(before["kind"], "repl");
     assert_eq!(before["pid"], owner.pid());
@@ -831,7 +847,7 @@ fn a_start_that_cannot_ask_is_refused_and_touches_nothing() {
     // Nothing was asked of the model, written or stopped.
     assert_eq!(mock.requests(), 1);
     assert_eq!(
-        std::fs::read(dir.join(".atelier/session.json")).unwrap(),
+        std::fs::read(state_dir(&dir).join("session.json")).unwrap(),
         saved
     );
     assert_eq!(record(&dir).unwrap(), before);
@@ -852,9 +868,9 @@ fn runs_that_do_not_own_the_session_are_never_blocked() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
-    let saved = std::fs::read(dir.join(".atelier/session.json")).unwrap();
+    let saved = std::fs::read(state_dir(&dir).join("session.json")).unwrap();
 
     let (code, out, err) = run(&mock, &dir, &["--print", "say aside"], "");
     assert_eq!(code, 0, "{err}");
@@ -871,7 +887,7 @@ fn runs_that_do_not_own_the_session_are_never_blocked() {
 
     // The saved session is still the owner's own.
     assert_eq!(
-        std::fs::read(dir.join(".atelier/session.json")).unwrap(),
+        std::fs::read(state_dir(&dir).join("session.json")).unwrap(),
         saved
     );
     assert_eq!(record(&dir).unwrap()["pid"], owner.pid());
@@ -880,7 +896,7 @@ fn runs_that_do_not_own_the_session_are_never_blocked() {
     let (code, ..) = run(&mock, &dir, &["--print", "say after"], "");
     assert_eq!(code, 0);
     assert_ne!(
-        std::fs::read(dir.join(".atelier/session.json")).unwrap(),
+        std::fs::read(state_dir(&dir).join("session.json")).unwrap(),
         saved
     );
 }
@@ -1113,7 +1129,7 @@ fn take_over_stops_an_idle_owner_and_continues_its_session() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
 
     let mut next = Piped::spawn(atelier(&mock.base_url(), &dir, &["--take-over"]));
@@ -1368,7 +1384,7 @@ fn serve_puts_the_choice_to_its_client() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
 
     // Leaving is the other choice.
@@ -1445,7 +1461,7 @@ fn print_continue_takes_over_with_the_flag() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
     let (code, out, err) = run(
         &mock,
@@ -1545,9 +1561,9 @@ fn listen_connections_own_the_session_only_with_continue() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
-    let saved = std::fs::read(dir.join(".atelier/session.json")).unwrap();
+    let saved = std::fs::read(state_dir(&dir).join("session.json")).unwrap();
 
     let listen = |args: &[&str], name: &str| {
         let socket = dir.with_extension("run").join(name);
@@ -1570,7 +1586,7 @@ fn listen_connections_own_the_session_only_with_continue() {
     a.call("shutdown", json!({"force": true}));
     b.call("shutdown", json!({}));
     assert_eq!(
-        std::fs::read(dir.join(".atelier/session.json")).unwrap(),
+        std::fs::read(state_dir(&dir).join("session.json")).unwrap(),
         saved
     );
     assert_eq!(record(&dir).unwrap()["pid"], owner.pid());
@@ -1659,7 +1675,7 @@ fn take_over_from_the_question_leaves_the_old_terminal_a_line() {
     owner.line("say one");
     owner.wait_for("re: one");
     wait_until("the session to be saved", || {
-        dir.join(".atelier/session.json").exists()
+        state_dir(&dir).join("session.json").exists()
     });
 
     let mut next = Term::start(&mock, &dir, &[]);
@@ -2282,7 +2298,7 @@ fn a_remote_leaving_mid_turn_does_not_stop_the_turn() {
     std::fs::write(dir.join("go"), "").unwrap();
     owner.wait_for("finished without you");
     wait_until("the turn to be saved", || {
-        std::fs::read_to_string(dir.join(".atelier/session.json"))
+        std::fs::read_to_string(state_dir(&dir).join("session.json"))
             .is_ok_and(|s| s.contains("finished without you"))
     });
     // And the next one is brought up to date from what was saved.
@@ -2426,7 +2442,7 @@ fn a_command_is_typed_to_from_a_remote() {
     // A remote that did not ask for the terminal is shown none of it.
     wait_until("the turn to end for all", || plain.ever("turn/ended"));
     assert!(!plain.ever("event/command_started") && !plain.ever("event/command_output"));
-    let saved = std::fs::read_to_string(dir.join(".atelier/session.json")).unwrap();
+    let saved = std::fs::read_to_string(state_dir(&dir).join("session.json")).unwrap();
     assert!(!saved.contains("sesame-4242"), "{saved}");
     owner.keys(b"\x7f");
     owner.line("/quit");

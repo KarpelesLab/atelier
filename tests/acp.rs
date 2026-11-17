@@ -375,6 +375,11 @@ impl Client {
             .env("ATELIER_MODEL", "mock")
             .env("ATELIER_NO_COORDINATOR", "1")
             .env("XDG_STATE_HOME", project.with_extension("state"))
+            // What it keeps for the project: next to it, not in the real home.
+            .env(
+                "ATELIER_STATE_DIR",
+                project.with_extension("state").join("atelier"),
+            )
             // Its sockets too (see `own`): none in the real runtime directory.
             .env("XDG_RUNTIME_DIR", project.with_extension("run"))
             .env("XDG_CONFIG_HOME", project.join(".no-user-config"))

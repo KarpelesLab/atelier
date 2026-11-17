@@ -253,6 +253,11 @@ fn run_repl_env(model: &Server, cwd: &Path, input: &str, env: &[(&str, &str)]) -
         .env("XDG_DATA_HOME", cwd.with_extension("data"))
         .env("XDG_CONFIG_HOME", cwd.with_extension("config"))
         .env("XDG_STATE_HOME", cwd.with_extension("state"))
+        // What it keeps for the project: next to it, not in the real home.
+        .env(
+            "ATELIER_STATE_DIR",
+            cwd.with_extension("state").join("atelier"),
+        )
         // Its sockets too (see `own`): none in the real runtime directory.
         .env("XDG_RUNTIME_DIR", cwd.with_extension("run"))
         .env("HOME", cwd.with_extension("home"))

@@ -1,8 +1,8 @@
 //! On-disk session persistence (roadmap M6).
 //!
 //! The conversation (a rolling summary of compacted older turns, plus the recent
-//! message history) is saved to `.atelier/session.json` under the project root
-//! after each turn, so a session can be resumed later with `--continue`. This is
+//! message history) is saved to `session.json` in the project's state directory
+//! ([`crate::state`] — outside the project) after each turn, so a session can be resumed later with `--continue`. This is
 //! a thin store; the [`Session`](crate::agent::Session) owns when to save/load.
 
 use std::path::{Path, PathBuf};
@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::Message;
 
-/// Session file, relative to the project root.
-pub const SESSION_FILE: &str = ".atelier/session.json";
+/// Session file, in the project's state directory.
+pub const SESSION_FILE: &str = "session.json";
 
 /// Claude backend: the id of the Claude Code session to `--resume`. The
 /// conversation itself lives in Claude Code's own store.
-pub const CLAUDE_SESSION_FILE: &str = ".atelier/claude-session";
+pub const CLAUDE_SESSION_FILE: &str = "claude-session";
 
 /// A restored session: the compaction summary (if any) and the recent history.
 #[derive(Default)]
@@ -36,18 +36,27 @@ struct Stored {
     messages: Vec<Message>,
 }
 
-/// Path to the session file for a project root.
-pub fn path(root: &Path) -> PathBuf {
-    root.join(SESSION_FILE)
+/// Path to the session file for a project root; `None` when there is no
+/// state directory to keep it in.
+pub fn path(root: &Path) -> Option<PathBuf> {
+    Some(crate::state::dir(root)?.join(SESSION_FILE))
 }
+
+/// Where the Claude session id of a project root is kept.
+fn claude_path(root: &Path) -> Option<PathBuf> {
+    Some(crate::state::dir(root)?.join(CLAUDE_SESSION_FILE))
+}
+
+/// Why nothing can be saved, when [`path`] is `None`.
+const NOWHERE: &str =
+    "nowhere to keep the session (none of ATELIER_STATE_DIR, XDG_STATE_HOME and HOME is set)";
 
 /// Load a saved session, or an empty one if none exists / is unreadable.
 ///
 /// Accepts both the current object form and the original bare-array form (a
 /// plain `[Message, ...]`) for backward compatibility.
 pub fn load(root: &Path) -> SessionData {
-    let p = path(root);
-    let Ok(text) = std::fs::read_to_string(&p) else {
+    let Some(Ok(text)) = path(root).map(std::fs::read_to_string) else {
         return SessionData::default();
     };
     if let Ok(stored) = serde_json::from_str::<Stored>(&text) {
@@ -66,9 +75,10 @@ pub fn load(root: &Path) -> SessionData {
     SessionData::default()
 }
 
-/// Persist the session to `.atelier/session.json` (creating `.atelier/`).
+/// Persist the session to `session.json` in the project's state directory
+/// (creating it).
 pub fn save(root: &Path, summary: Option<&str>, messages: &[Message]) -> Result<()> {
-    let p = path(root);
+    let p = path(root).context(NOWHERE)?;
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -91,7 +101,7 @@ pub fn save(root: &Path, summary: Option<&str>, messages: &[Message]) -> Result<
 
 /// Delete the saved session (both backends), if any.
 pub fn clear(root: &Path) -> Result<()> {
-    for p in [path(root), root.join(CLAUDE_SESSION_FILE)] {
+    for p in [path(root), claude_path(root)].into_iter().flatten() {
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -103,14 +113,14 @@ pub fn clear(root: &Path) -> Result<()> {
 
 /// The saved Claude session id, if any.
 pub fn load_claude(root: &Path) -> Option<String> {
-    let id = std::fs::read_to_string(root.join(CLAUDE_SESSION_FILE)).ok()?;
+    let id = std::fs::read_to_string(claude_path(root)?).ok()?;
     let id = id.trim();
     (!id.is_empty()).then(|| id.to_string())
 }
 
 /// Remember the Claude session id for `--continue`.
 pub fn save_claude(root: &Path, id: &str) -> Result<()> {
-    let p = root.join(CLAUDE_SESSION_FILE);
+    let p = claude_path(root).context(NOWHERE)?;
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -144,6 +154,13 @@ mod tests {
         let history = vec![Message::user("hello"), Message::assistant("hi there")];
         save(&root, Some("earlier: we said hi"), &history).unwrap();
 
+        // Kept for the project, not in it.
+        assert!(path(&root).unwrap().is_file());
+        assert!(!path(&root).unwrap().starts_with(&root));
+        save_claude(&root, "abc").unwrap();
+        assert_eq!(load_claude(&root).as_deref(), Some("abc"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
         let data = load(&root);
         assert_eq!(data.summary.as_deref(), Some("earlier: we said hi"));
         assert_eq!(data.messages.len(), 2);
@@ -151,6 +168,7 @@ mod tests {
 
         clear(&root).unwrap();
         assert!(load(&root).messages.is_empty());
+        assert_eq!(load_claude(&root), None);
         clear(&root).unwrap(); // no-op, not an error
 
         let _ = std::fs::remove_dir_all(&root);
@@ -160,8 +178,9 @@ mod tests {
     fn reads_legacy_bare_array() {
         let root = tmpdir();
         let legacy = serde_json::to_string(&vec![Message::user("legacy")]).unwrap();
-        std::fs::create_dir_all(path(&root).parent().unwrap()).unwrap();
-        std::fs::write(path(&root), legacy).unwrap();
+        let file = path(&root).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, legacy).unwrap();
 
         let data = load(&root);
         assert!(data.summary.is_none());
@@ -179,8 +198,9 @@ mod tests {
         let old = r#"{"summary":"s","messages":[
             {"role":"user","content":"hi","tool_calls":[],"tool_call_id":null,"images":[]},
             {"role":"assistant","content":"yo","tool_calls":[],"tool_call_id":null}]}"#;
-        std::fs::create_dir_all(path(&root).parent().unwrap()).unwrap();
-        std::fs::write(path(&root), old).unwrap();
+        let file = path(&root).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, old).unwrap();
 
         let mut data = load(&root);
         assert_eq!(data.summary.as_deref(), Some("s"));

@@ -30,7 +30,9 @@ impl Tool for GrepTool {
         ToolSpec {
             name: self.name().to_string(),
             description: "Search file contents for a regular expression, respecting \
-                .gitignore. Returns matches as path:line:text, capped at 100 results."
+                .gitignore. Returns matches as path:line:text, capped at 100 results. \
+                `path` may also be the absolute path of a file a tool result names as its \
+                \"full output\"."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -71,7 +73,11 @@ impl Tool for GrepTool {
             None => None,
         };
 
-        let search_root = ctx.resolve(path)?;
+        // In the project, or output a tool kept for it (which is outside).
+        let search_root = match ctx.resolve(path) {
+            Ok(inside) => inside,
+            Err(e) => spill::kept_file(ctx.project_root, path).ok_or(e)?,
+        };
         if !search_root.exists() {
             anyhow::bail!("path {path:?} does not exist");
         }

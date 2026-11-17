@@ -141,11 +141,11 @@ mod tests {
             .unwrap();
         let provider = MemoryProvider::new(Some(global));
         std::fs::write(
-            root.join(".atelier/memory/by-hand.md"),
+            crate::state::dir(&root).unwrap().join("memory/by-hand.md"),
             "Written by the user.",
         )
         .unwrap();
-        std::fs::remove_file(root.join(".atelier/memory/a.md")).unwrap();
+        std::fs::remove_file(crate::state::dir(&root).unwrap().join("memory/a.md")).unwrap();
 
         let body = provider.gather(&root).unwrap().body;
         assert!(body.contains("- by-hand [project, project] — Written by the user."));

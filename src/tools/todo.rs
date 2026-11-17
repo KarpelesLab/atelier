@@ -1,10 +1,10 @@
-//! The `todo` tool: a durable task checklist stored in the project.
+//! The `todo` tool: a durable task checklist kept for the project.
 //!
-//! Persists to `<project_root>/.atelier/todos.json` so the agent can track
+//! Persists to `todos.json` in the project's state directory
+//! ([`crate::state`], outside the project) so the agent can track
 //! multi-step work across turns (and across context compaction). The file
-//! path is a fixed internal location under the project root — not a
-//! user-supplied path — so it is joined directly rather than passed through
-//! [`super::confine`].
+//! path is a fixed internal location — not a user-supplied path — so
+//! nothing goes through [`super::confine`].
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,16 @@ struct TodoItem {
 pub struct TodoTool;
 
 impl TodoTool {
-    fn todos_path(project_root: &Path) -> PathBuf {
-        project_root.join(".atelier").join("todos.json")
+    /// Where the list of the project at `project_root` is kept.
+    pub fn todos_path(project_root: &Path) -> Result<PathBuf> {
+        crate::state::dir(project_root)
+            .map(|dir| dir.join("todos.json"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "nowhere to keep the todo list (none of ATELIER_STATE_DIR, XDG_STATE_HOME \
+                     and HOME is set)"
+                )
+            })
     }
 
     /// Load the list, treating a missing or corrupt file as empty.
@@ -81,7 +89,7 @@ impl Tool for TodoTool {
     }
 
     fn requires_approval(&self, _args: &Value) -> bool {
-        // Only reads/writes .atelier/todos.json inside the project root.
+        // Only reads/writes the project's own todos.json (see `todos_path`).
         false
     }
 
@@ -89,7 +97,7 @@ impl Tool for TodoTool {
         ToolSpec {
             name: self.name().to_string(),
             description: "Maintain a durable, numbered task checklist for the current project, \
-                persisted to .atelier/todos.json so it survives across turns and context \
+                persisted outside the conversation so it survives across turns and context \
                 compaction. Use it to plan and track progress on multi-step work. Actions:\n\
                 - {\"action\": \"list\"}: show the current checklist with status and a count summary.\n\
                 - {\"action\": \"add\", \"items\": [\"...\"]}: append one or more new pending items.\n\
@@ -124,7 +132,7 @@ impl Tool for TodoTool {
     }
 
     fn call(&self, ctx: &mut ToolCtx, args: Value) -> Result<String> {
-        let path = Self::todos_path(ctx.project_root);
+        let path = Self::todos_path(ctx.project_root)?;
         let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
             anyhow::anyhow!(
                 "missing required argument 'action' (expected one of: \
@@ -305,14 +313,17 @@ mod tests {
         let out = TodoTool.call(&mut ctx, json!({"action": "list"})).unwrap();
         assert!(out.contains("persisted"));
 
-        assert!(root.join(".atelier").join("todos.json").exists());
+        // Kept for the project, not in it.
+        assert!(TodoTool::todos_path(&root).unwrap().is_file());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 
     #[test]
     fn corrupt_file_treated_as_empty() {
         let root = tempdir("todo-corrupt");
-        std::fs::create_dir_all(root.join(".atelier")).unwrap();
-        std::fs::write(root.join(".atelier").join("todos.json"), "not json{{{").unwrap();
+        let file = TodoTool::todos_path(&root).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "not json{{{").unwrap();
 
         let out = call(&root, json!({"action": "list"}));
         assert_eq!(out, "(todo list is empty)");

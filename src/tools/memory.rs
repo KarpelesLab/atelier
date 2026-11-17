@@ -110,7 +110,7 @@ impl Tool for MemoryTool {
                 - {{\"action\": \"save\", \"name\": \"kebab-case-slug\", \"description\": \"one \
                 line, shown in the index\", \"type\": \"feedback\", \"content\": \"the \
                 note, Markdown, at most {MAX_BYTES} bytes\"}}: create or overwrite. Optional \
-                \"scope\": \"project\" (default; kept in .atelier/memory/) or \"global\" (type \
+                \"scope\": \"project\" (default; kept for this project, outside its files) or \"global\" (type \
                 \"user\" only; applies to every project).\n\
                 - {{\"action\": \"read\", \"name\": \"...\"}}: the full note.\n\
                 - {{\"action\": \"list\"}}: every memory with its type, scope and description.\n\
@@ -270,8 +270,18 @@ mod tests {
             call(&tool, &root, save("lint-first")).unwrap(),
             "saved memory 'lint-first' (project)"
         );
-        assert!(root.join(".atelier/memory/lint-first.md").is_file());
-        assert!(root.join(".atelier/memory/MEMORY.md").is_file());
+        assert!(
+            crate::state::dir(&root)
+                .unwrap()
+                .join("memory/lint-first.md")
+                .is_file()
+        );
+        assert!(
+            crate::state::dir(&root)
+                .unwrap()
+                .join("memory/MEMORY.md")
+                .is_file()
+        );
         assert_eq!(
             call(&tool, &root, save("lint-first")).unwrap(),
             "updated memory 'lint-first' (project)"
@@ -301,7 +311,12 @@ mod tests {
             .unwrap(),
             "deleted memory 'lint-first' (project)"
         );
-        assert!(!root.join(".atelier/memory/lint-first.md").exists());
+        assert!(
+            !crate::state::dir(&root)
+                .unwrap()
+                .join("memory/lint-first.md")
+                .exists()
+        );
         assert!(
             call(
                 &tool,

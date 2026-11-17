@@ -3,10 +3,12 @@
 //!
 //! # Design
 //!
-//! Memory is **plain files**, so the user can read, edit, delete, commit or
-//! ignore it with the tools they already have:
+//! Memory is **plain files**, so the user can read, edit or delete it with
+//! the tools they already have:
 //!
-//! - `<project>/.atelier/memory/` — notes about this project;
+//! - `memory/` in the project's state directory ([`crate::state`]:
+//!   `~/.local/state/atelier/projects/<project path>/memory/`) — notes about
+//!   this project. Not in the project itself: atelier writes nothing there;
 //! - `$XDG_DATA_HOME/atelier/memory/` (else `~/.local/share/atelier/memory/`)
 //!   — notes about the *user* that hold in every project.
 //!
@@ -27,14 +29,14 @@
 //! # Guard rails
 //!
 //! - A name is a strict kebab-case slug, so it can never name a path outside
-//!   the directory; symlinks inside the directory are not followed, and a
-//!   project directory that resolves outside the project is refused. That
-//!   confinement is what lets the tool run without asking.
+//!   the directory, and symlinks inside the directory are not followed.
+//!   Both directories are the user's own, which no project can redirect.
+//!   That confinement is what lets the tool run without asking.
 //! - Notes are capped in size ([`MAX_BYTES`]) and number ([`MAX_MEMORIES`]):
 //!   the index is sent every turn, and memory is meant to be a few durable
 //!   facts, not a journal.
 //! - Text that looks like a credential is refused ([`secret_kind`]): memory
-//!   outlives the session, is re-sent to the model, and may be committed.
+//!   outlives the session and is re-sent to the model.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -105,7 +107,7 @@ impl Kind {
 /// Which directory a note lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// `<project>/.atelier/memory/`.
+    /// `memory/` in the project's state directory.
     Project,
     /// The user's data directory; applies in every project.
     Global,
@@ -168,33 +170,29 @@ impl Store {
         }
     }
 
-    /// The directory for `scope`, whether or not it exists yet. `None` for
-    /// the global scope when the environment names no home.
+    /// The directory for `scope`, whether or not it exists yet. `None` when
+    /// the environment names no home to put it under. A subagent's worktree
+    /// has the notes of the project it was made for
+    /// ([`crate::state::shared`]).
     pub fn dir(&self, scope: Scope) -> Option<PathBuf> {
         match scope {
-            Scope::Project => Some(self.root.join(".atelier").join("memory")),
+            Scope::Project => Some(crate::state::shared(&self.root)?.join("memory")),
             Scope::Global => self.global.clone(),
         }
     }
 
-    /// [`dir`](Store::dir), checked: an error when the scope has no directory,
-    /// or when the project's resolves (through a symlink) outside the project
-    /// — a repository must not be able to point memory at, say, `~/.ssh`.
+    /// [`dir`](Store::dir), or an error saying what is missing.
     fn checked_dir(&self, scope: Scope) -> Result<PathBuf> {
-        let dir = self.dir(scope).with_context(|| {
-            "no user-global memory directory (neither XDG_DATA_HOME nor HOME is set); \
-             use scope \"project\""
-        })?;
-        if scope == Scope::Project
-            && let (Ok(real), Ok(root)) = (dir.canonicalize(), self.root.canonicalize())
-            && !real.starts_with(&root)
-        {
-            bail!(
-                "{} resolves outside the project; refusing to use it for memory",
-                dir.display()
-            );
-        }
-        Ok(dir)
+        self.dir(scope).with_context(|| match scope {
+            Scope::Project => {
+                "no directory for this project's memory (none of ATELIER_STATE_DIR, \
+                 XDG_STATE_HOME and HOME is set)"
+            }
+            Scope::Global => {
+                "no user-global memory directory (neither XDG_DATA_HOME nor HOME is set); \
+                 use scope \"project\""
+            }
+        })
     }
 
     /// Every note in `scope`, sorted by name. A missing or unusable directory
@@ -369,8 +367,7 @@ impl Store {
                 m.name, m.name, m.description
             ));
         }
-        // Skip the write when nothing changed, so listing doesn't touch a
-        // file the user may have committed.
+        // Skip the write when nothing changed: listing is not a change.
         if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
             return;
         }
@@ -591,7 +588,12 @@ mod tests {
         let m = memory("small-commits", Kind::Feedback, "One change per commit.");
         assert!(!store.save(Scope::Project, &m).unwrap());
 
-        let raw = std::fs::read_to_string(root.join(".atelier/memory/small-commits.md")).unwrap();
+        let raw = std::fs::read_to_string(
+            crate::state::dir(&root)
+                .unwrap()
+                .join("memory/small-commits.md"),
+        )
+        .unwrap();
         assert_eq!(
             raw,
             "---\nname: small-commits\ndescription: about small-commits\ntype: feedback\n---\n\n\
@@ -620,7 +622,7 @@ mod tests {
     #[test]
     fn index_is_regenerated_from_the_files() {
         let (store, root, _) = store("index");
-        let dir = root.join(".atelier/memory");
+        let dir = crate::state::dir(&root).unwrap().join("memory");
         store
             .save(Scope::Project, &memory("beta", Kind::Project, "b"))
             .unwrap();
@@ -725,7 +727,7 @@ mod tests {
     #[test]
     fn count_is_capped_but_overwriting_still_works() {
         let (store, root, _) = store("count");
-        let dir = root.join(".atelier/memory");
+        let dir = crate::state::dir(&root).unwrap().join("memory");
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..MAX_MEMORIES {
             std::fs::write(dir.join(format!("n{i}.md")), "note").unwrap();
@@ -828,7 +830,7 @@ mod tests {
         let (store, root, _) = store("symlink");
         let outside = root.parent().unwrap().join("outside.txt");
         std::fs::write(&outside, "private").unwrap();
-        let dir = root.join(".atelier/memory");
+        let dir = crate::state::dir(&root).unwrap().join("memory");
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("leak.md")).unwrap();
 
@@ -840,19 +842,6 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "private");
-
-        // Nor a memory directory that itself points out of the project.
-        std::fs::remove_dir_all(&dir).unwrap();
-        let elsewhere = root.parent().unwrap().join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::fs::write(elsewhere.join("note.md"), "private").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
-        assert!(store.list().is_empty());
-        let err = store
-            .save(Scope::Project, &memory("x", Kind::Project, "b"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("outside the project"), "{err}");
     }
 
     #[test]
@@ -866,7 +855,15 @@ mod tests {
             .unwrap();
 
         let out = command(&store, &[]).join("\n");
-        assert!(out.contains(&root.join(".atelier/memory").display().to_string()));
+        assert!(
+            out.contains(
+                &crate::state::dir(&root)
+                    .unwrap()
+                    .join("memory")
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(out.contains(&global.display().to_string()));
         assert!(out.contains("  ci [project] — about ci"));
         assert!(out.contains("  role [user] — about role"));

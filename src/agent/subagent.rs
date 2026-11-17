@@ -714,7 +714,7 @@ impl Session {
     /// worktree is left under, from this session or an earlier one.
     fn ids_taken(&self) -> impl Fn(&str) -> bool + use<> {
         let project = self.root.clone();
-        move |id| worktree::dir_of(&project, id).exists()
+        move |id| worktree::dir_of(&project, id).is_some_and(|dir| dir.exists())
     }
 
     /// `/agents`: the agents that can be run and the ones running in the

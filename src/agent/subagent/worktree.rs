@@ -4,8 +4,9 @@
 //! stale-edit check only catches it afterwards. An agent whose definition
 //! says `isolation: worktree` — or whose `task` call does — is given a
 //! fresh **git worktree** of the repository instead: `git worktree add
-//! --detach` of the commit `HEAD` is at, under
-//! `<project>/.atelier/worktrees/<id>/`. That directory is the child's
+//! --detach` of the commit `HEAD` is at, under `worktrees/<id>/` in the
+//! project's state directory ([`crate::state`]) — outside the project,
+//! where atelier writes nothing. That directory is the child's
 //! project root: its file tools are confined to it, its `bash` runs in it,
 //! and its instruction files are read from it. What is not committed in the
 //! parent's tree is not there.
@@ -29,10 +30,15 @@
 //!   naming this process), so neither `git worktree prune` nor another
 //!   atelier's `/agents clean` takes it from under a running agent. A lock
 //!   whose process is gone counts for nothing.
-//! - `.atelier/worktrees/` holds a `.gitignore` of `*`, so the copies never
-//!   show in the parent's `git status`; the parent's own walks leave the
-//!   directory out as they do spilled tool output (see
-//!   [`crate::tools::spill::keep_in_walk`]).
+//! - A worktree is outside the project, so the copies show neither in the
+//!   parent's `git status` nor in its walks, and the report names it by
+//!   its absolute path.
+//! - What atelier keeps for the child (spilled tool output, its `todo`
+//!   list) is in a state directory named after the worktree's path, not in
+//!   the worktree: it is nobody's change, and it is removed with the
+//!   worktree ([`remove`]).
+//! - Earlier versions kept worktrees in `<project>/.atelier/worktrees/`.
+//!   None is made there any more, but [`clean`] still finds those.
 //! - The project root may be a subdirectory of the repository. The
 //!   worktree is of the whole repository; the child's root is the same
 //!   subdirectory inside it.
@@ -40,38 +46,21 @@
 //!   the worktree's index before the summary is made, which is what makes
 //!   `git diff <base>` — the summary and the hand-over command — include
 //!   them.
-//! - Except atelier's own scratch files ([`SCRATCH`]): output a tool
-//!   spilled to a file and the `todo` list land under the child's
-//!   `.atelier/` like anyone's, and are nobody's change. They are left out
-//!   of every question asked here, and never marked.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::agents::WORKTREES_DIR;
+use crate::state::{LEGACY, WORKTREES};
 
 /// The most lines of `git diff --stat` and of the commit list a report
 /// carries.
 const MAX_SUMMARY_LINES: usize = 40;
 
-/// Pathspecs for "the whole worktree, but not what atelier itself writes
-/// while an agent works": spilled tool output (`tools::spill::DIR`) and the
-/// `todo` tool's list — wherever in the repository the project root is.
-const SCRATCH: [&str; 4] = [
-    "--",
-    ":(top)",
-    ":(exclude,glob)**/.atelier/tool-output/**",
-    ":(exclude,glob)**/.atelier/todos.json",
-];
-
 /// The changes in the worktree at `dir`, one per line as `git status
 /// --porcelain` gives them; empty when there are none.
 fn changes(dir: &Path) -> Result<String, String> {
-    // Every file by name: a directory shown as one entry would hide
-    // whether all of it is scratch.
-    let mut args = vec!["status", "--porcelain", "--untracked-files=all"];
-    args.extend(SCRATCH);
-    git(dir, &args)
+    // Every file by name, so that the lines count files.
+    git(dir, &["status", "--porcelain", "--untracked-files=all"])
 }
 
 /// A child's worktree, from its creation to the child's end.
@@ -122,9 +111,15 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     })
 }
 
-/// Where the worktree of the agent `id` goes in the project at `project`.
-pub(super) fn dir_of(project: &Path, id: &str) -> PathBuf {
-    project.join(WORKTREES_DIR).join(id)
+/// Where the worktrees of the project at `project` are kept; `None` with
+/// no state directory.
+fn home_of(project: &Path) -> Option<PathBuf> {
+    Some(crate::state::dir(project)?.join(WORKTREES))
+}
+
+/// Where the worktree of the agent `id` goes for the project at `project`.
+pub(super) fn dir_of(project: &Path, id: &str) -> Option<PathBuf> {
+    Some(home_of(project)?.join(id))
 }
 
 /// A commit id as shown: its first twelve characters.
@@ -132,8 +127,9 @@ fn short(commit: &str) -> &str {
     &commit[..commit.len().min(12)]
 }
 
-/// `path` relative to `project` where it is inside it (as it always is
-/// for a worktree), for display and for commands run from the project.
+/// `path` relative to `project` where it is inside it (as a worktree an
+/// earlier version made is) and whole otherwise, for display and for
+/// commands run from the project.
 fn shown(project: &Path, path: &Path) -> String {
     path.strip_prefix(project)
         .unwrap_or(path)
@@ -174,17 +170,16 @@ impl Worktree {
             }
         };
 
-        let dir = dir_of(project, id);
-        let home = project.join(WORKTREES_DIR);
-        let prepared = std::fs::create_dir_all(&home).and_then(|()| {
-            // Copies of the repository are nobody's changes.
-            let ignore = home.join(".gitignore");
-            match ignore.exists() {
-                true => Ok(()),
-                false => std::fs::write(ignore, "*\n"),
-            }
-        });
-        prepared.map_err(|e| refused(format!("could not prepare {}: {e}", home.display())))?;
+        let home = home_of(project).ok_or_else(|| {
+            refused(
+                "needs a directory to put the worktree in, and there is none (none of \
+                 ATELIER_STATE_DIR, XDG_STATE_HOME and HOME is set)"
+                    .to_string(),
+            )
+        })?;
+        let dir = home.join(id);
+        std::fs::create_dir_all(&home)
+            .map_err(|e| refused(format!("could not prepare {}: {e}", home.display())))?;
         let at = dir.display().to_string();
         git(project, &["worktree", "add", "--detach", &at, &base])
             .map_err(|e| refused(format!("could not create the worktree: {e}")))?;
@@ -240,9 +235,7 @@ impl Worktree {
         }
 
         // From here on, untracked files are part of `git diff <base>`.
-        let mut mark = vec!["add", "--all", "--intent-to-add"];
-        mark.extend(SCRATCH);
-        let _ = git(&self.dir, &mark);
+        let _ = git(&self.dir, &["add", "--all", "--intent-to-add"]);
         let range = format!("{}..HEAD", self.base);
         let commits = git(&self.dir, &["log", "--reverse", "--format=%h %s", &range]);
         let commits = commits.unwrap_or_default();
@@ -295,11 +288,20 @@ impl Worktree {
 /// and a `)` follow.
 const LOCK_REASON: &str = "atelier agent at work (pid ";
 
-/// Remove the worktree at `dir`, whatever is in it.
+/// Remove the worktree at `dir`, whatever is in it, and with it what
+/// atelier kept for the agent that worked there.
 fn remove(project: &Path, dir: &Path) -> Result<(), String> {
     let at = dir.display().to_string();
     // Twice `--force`: once for what is not committed, once for a lock.
-    git(project, &["worktree", "remove", "--force", "--force", &at]).map(|_| ())
+    git(project, &["worktree", "remove", "--force", "--force", &at])?;
+    // The agent's root was the worktree, or the project's place in it.
+    crate::state::forget(dir);
+    if let Ok(prefix) = git(project, &["rev-parse", "--show-prefix"])
+        && !prefix.is_empty()
+    {
+        crate::state::forget(&dir.join(prefix));
+    }
+    Ok(())
 }
 
 /// Each line of `text` indented by two spaces.
@@ -359,25 +361,25 @@ fn alive(pid: u32) -> bool {
 /// Never one an agent is working in — `running` are this session's, and a
 /// lock names another process's. Returns the lines to show.
 pub(super) fn clean(project: &Path, running: &[PathBuf], only: Option<&str>) -> Vec<String> {
-    let home = project.join(WORKTREES_DIR);
-    let mut ids: Vec<String> = std::fs::read_dir(&home)
-        .into_iter()
+    // Where they are kept, and where earlier versions kept them.
+    let homes = [home_of(project), Some(project.join(LEGACY).join(WORKTREES))];
+    let mut found: Vec<(String, PathBuf)> = homes
+        .iter()
         .flatten()
-        .flatten()
+        .flat_map(|home| std::fs::read_dir(home).into_iter().flatten().flatten())
         .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|id| only.is_none_or(|only| only == id))
+        .filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())))
+        .filter(|(id, _)| only.is_none_or(|only| only == id))
         .collect();
-    ids.sort();
-    if ids.is_empty() {
+    found.sort();
+    if found.is_empty() {
         return vec![match only {
-            Some(id) => format!("no worktree {id} under {WORKTREES_DIR}/"),
-            None => format!("no agent worktrees under {WORKTREES_DIR}/"),
+            Some(id) => format!("no worktree {id} of an agent of this project"),
+            None => "no agent worktrees for this project".to_string(),
         }];
     }
     let mut lines = Vec::new();
-    for id in ids {
-        let dir = home.join(&id);
+    for (id, dir) in found {
         if running.contains(&dir) {
             lines.push(format!(
                 "{id}: an agent is working in it — /agents stop {id} first"
@@ -477,7 +479,11 @@ mod tests {
         std::fs::write(project.join("draft.txt"), "uncommitted").unwrap();
         let worktree = Worktree::create(&project, "agent-1").unwrap();
         let dir = worktree.dir().to_path_buf();
-        assert_eq!(dir, project.join(".atelier/worktrees/agent-1"));
+        // Kept for the project, outside it.
+        let state = crate::state::dir(&project).unwrap();
+        assert_eq!(dir, state.join("worktrees/agent-1"));
+        assert_eq!(dir_of(&project, "agent-1"), Some(dir.clone()));
+        assert!(!dir.starts_with(&project));
         assert_eq!(worktree.root(), dir);
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
         assert!(!dir.join("draft.txt").exists());
@@ -485,10 +491,15 @@ mod tests {
         assert_eq!(locked_by(&dir), Some(std::process::id()));
         assert_eq!(run(&project, &["status", "--porcelain"]), "?? draft.txt");
 
-        // What atelier's own tools leave under `.atelier/` is no change.
-        std::fs::create_dir_all(dir.join(".atelier/tool-output")).unwrap();
-        std::fs::write(dir.join(".atelier/tool-output/ab12cd.txt"), "spilled").unwrap();
-        std::fs::write(dir.join(".atelier/todos.json"), "[]").unwrap();
+        assert!(!project.join(".atelier").exists());
+
+        // What atelier keeps for the agent is not in the worktree — it is
+        // no change — and goes when the worktree does.
+        let kept = crate::state::dir(&dir).unwrap();
+        assert_ne!(kept, state);
+        std::fs::create_dir_all(kept.join("tool-output")).unwrap();
+        std::fs::write(kept.join("tool-output/ab12cd.txt"), "spilled").unwrap();
+        std::fs::write(kept.join("todos.json"), "[]").unwrap();
 
         let settled = worktree.settle();
         assert!(
@@ -498,6 +509,8 @@ mod tests {
         );
         assert_eq!(settled.note, "");
         assert!(!dir.exists());
+        assert!(!kept.exists());
+        assert!(!project.join(".atelier").exists());
         assert!(!run(&project, &["worktree", "list"]).contains("agent-1"));
         let _ = std::fs::remove_dir_all(&project);
     }
@@ -512,20 +525,17 @@ mod tests {
         run(&dir, &["commit", "--quiet", "-am", "the agent's commit"]);
         std::fs::write(dir.join("sub/b.txt"), "bee\nmore\n").unwrap();
         std::fs::write(dir.join("new.txt"), "new\n").unwrap();
-        // Scratch next to real changes is not part of them; a file the
-        // agent made under `.atelier/` on purpose is.
+        // A file the agent made under `.atelier/` is a change like another.
         std::fs::create_dir_all(dir.join(".atelier/agents")).unwrap();
-        std::fs::write(dir.join(".atelier/todos.json"), "[]").unwrap();
         std::fs::write(dir.join(".atelier/agents/helper.md"), "an agent\n").unwrap();
 
         let settled = worktree.settle();
         let report = &settled.report;
-        assert_eq!(
-            settled.note,
-            " — changes left in .atelier/worktrees/agent-2"
-        );
+        // Outside the project: named by its whole path.
+        let at = dir.display().to_string();
+        assert_eq!(settled.note, format!(" — changes left in {at}"));
         assert!(
-            report.starts_with("\n\n[worktree: .atelier/worktrees/agent-2 — "),
+            report.starts_with(&format!("\n\n[worktree: {at} — ")),
             "{report}"
         );
         assert!(report.contains("NOT in your working tree"), "{report}");
@@ -533,7 +543,6 @@ mod tests {
         for file in ["a.txt", "sub/b.txt", "new.txt", ".atelier/agents/helper.md"] {
             assert!(report.contains(&format!(" {file} ")), "{file}: {report}");
         }
-        assert!(!report.contains("todos.json"), "{report}");
         assert!(report.contains("4 files changed"), "{report}");
         assert!(report.contains("git cherry-pick "), "{report}");
         assert!(dir.exists());
@@ -547,7 +556,7 @@ mod tests {
             .expect("the command")
             .trim();
         assert!(
-            command.starts_with("git -C .atelier/worktrees/agent-2 diff --binary ")
+            command.starts_with(&format!("git -C {at} diff --binary "))
                 && command.ends_with(" | git apply"),
             "{command}"
         );
@@ -562,7 +571,10 @@ mod tests {
         assert_eq!(read("sub/b.txt"), "bee\nmore\n");
         assert_eq!(read("new.txt"), "new\n");
         assert_eq!(read(".atelier/agents/helper.md"), "an agent\n");
-        assert!(!project.join(".atelier/todos.json").exists());
+        assert_eq!(
+            clean(&project, &[], Some("agent-2")),
+            ["agent-2: removed, with its changes"]
+        );
         let _ = std::fs::remove_dir_all(&project);
     }
 
@@ -571,13 +583,14 @@ mod tests {
         let top = repo("subdir");
         let project = top.join("sub");
         let worktree = Worktree::create(&project, "agent-1").unwrap();
-        // The child's scratch is under its root, deeper in the worktree.
-        let state = worktree.root().join(".atelier");
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(state.join("todos.json"), "[]").unwrap();
-        assert_eq!(changes(worktree.dir()).as_deref(), Ok(""));
-        let dir = project.join(".atelier/worktrees/agent-1");
+        let dir = dir_of(&project, "agent-1").unwrap();
         assert_eq!(worktree.dir(), dir);
+        // What is kept for the child is named after its root, deeper in
+        // the worktree.
+        let kept = crate::state::dir(worktree.root()).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("todos.json"), "[]").unwrap();
+        assert_eq!(changes(worktree.dir()).as_deref(), Ok(""));
         // The whole repository is checked out; the child's root is the
         // project's directory in it.
         assert_eq!(worktree.root(), dir.join("sub"));
@@ -587,6 +600,13 @@ mod tests {
         // The patch is of the whole repository: applied at its top.
         let apply = format!(" | git -C {} apply", top.display());
         assert!(report.contains(&apply), "{report}");
+        // Removed, the worktree takes what was kept for the child along.
+        assert_eq!(
+            clean(&project, &[], Some("agent-1")),
+            ["agent-1: removed, with its changes"]
+        );
+        assert!(!dir.exists() && !kept.exists());
+        assert!(!top.join(".atelier").exists() && !project.join(".atelier").exists());
         let _ = std::fs::remove_dir_all(&top);
     }
 
@@ -617,7 +637,7 @@ mod tests {
         let project = repo("clean");
         assert_eq!(
             clean(&project, &[], None),
-            ["no agent worktrees under .atelier/worktrees/"]
+            ["no agent worktrees for this project"]
         );
         // Left behind by agents: one untouched, one with an uncommitted
         // change, one with a commit of its own, one still at work.
@@ -656,7 +676,7 @@ mod tests {
         );
         assert_eq!(
             clean(&project, &[], Some("agent-9")),
-            ["no worktree agent-9 under .atelier/worktrees/"]
+            ["no worktree agent-9 of an agent of this project"]
         );
         // A commit a branch has since taken is nothing to lose. (The agent
         // in agent-4 is gone: this process's lock alone does not hold it.)
@@ -669,6 +689,12 @@ mod tests {
                 "agent-4: unchanged — removed"
             ]
         );
+        // One an earlier version left in the project is found too.
+        let old = project.join(".atelier/worktrees/agent-0");
+        let at = old.display().to_string();
+        run(&project, &["worktree", "add", "--quiet", "--detach", &at]);
+        assert_eq!(clean(&project, &[], None), ["agent-0: unchanged — removed"]);
+        assert!(!old.exists());
         let _ = std::fs::remove_dir_all(&project);
     }
 
