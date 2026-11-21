@@ -81,6 +81,35 @@ fs.promises = (function (host) {
   });
   return p;
 })(fs);
+// Node's names and callbacks, for scripts written the Node way: each method
+// is also `<name>Sync`, and a call whose last argument is a function runs as
+// Node's callback form — the callback gets `(err, result)` (`exists`: just
+// the boolean) once the script's synchronous code has run.
+(function (host) {
+  Object.keys(host).forEach(function (name) {
+    if (name === "promises") return;
+    var f = host[name];
+    host[name + "Sync"] = f;
+    host[name] = function () {
+      var n = arguments.length;
+      var cb = n > 0 ? arguments[n - 1] : undefined;
+      if (typeof cb !== "function") return f.apply(host, arguments);
+      var args = Array.prototype.slice.call(arguments, 0, n - 1);
+      Promise.resolve().then(function () {
+        var result, error = null;
+        try { result = f.apply(host, args); } catch (e) { error = e; }
+        // A callback's own throw would vanish in the promise; say it.
+        try {
+          if (name === "exists") cb(error === null && result);
+          else if (error !== null) cb(error);
+          else cb(null, result);
+        } catch (e) {
+          console.error("Uncaught " + (e && e.name ? e.name + ": " + e.message : String(e)));
+        }
+      });
+    };
+  });
+})(fs);
 console = {
   log: __atelier_console_log,
   error: __atelier_console_error,

@@ -58,9 +58,13 @@ fail.
 
 ## `fs` — project-confined
 
-The methods are synchronous and return their result directly (there are no
-callbacks); [`fs.promises`](#fspromises) has the same ones returning
-promises. Every path argument is resolved against the project root the same
+The methods are synchronous and return their result directly;
+[`fs.promises`](#fspromises) has the same ones returning promises. For
+scripts written the Node way, each is also there as `<name>Sync`
+(`fs.readFileSync`, `fs.existsSync`, …), and a call whose last argument is a
+function is Node's callback form: it calls back with `(err, result)` —
+`exists` with just the boolean — once the script's synchronous code has run.
+A callback that throws prints `Uncaught …` on stderr rather than vanishing. Every path argument is resolved against the project root the same
 way built-in file tools are (`tools::confine`): relative paths are joined to
 the root, `.`/`..` are normalized, and anything that still doesn't stay
 under the root throws a catchable JS error instead of touching the
@@ -327,5 +331,5 @@ console.log(httpGet("https://example.com/robots.txt"));
 ## What's not there yet
 
 Per the project roadmap: typed-array/binary support for request/response
-bodies (everything is currently string-based), Node's callback-style `fs`
-API, and an unhandled-rejection report.
+bodies (everything is currently string-based), and an unhandled-rejection
+report.

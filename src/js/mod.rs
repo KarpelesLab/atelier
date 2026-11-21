@@ -263,7 +263,9 @@ impl Tool for NodeTool {
                 directory, a pure `path` (POSIX-style path utilities, no I/O), a pure `os` \
                 (host facts, no I/O), a pure `encoding` (base64/hex string conversions, no \
                 I/O), and a pure `hash` (SHA-256, no I/O). The fs methods are SYNCHRONOUS and \
-                return values directly (no callbacks); fs.promises has the same methods \
+                return values directly (each is also `<name>Sync`; given a callback as the \
+                last argument they call it Node-style with (err, result)); fs.promises has \
+                the same methods \
                 returning promises, for `await fs.promises.readFile(...)` (top-level await \
                 works): \
                 fs.readFile(path[, 'utf8']) -> string; fs.writeFile(path, content); \
@@ -1088,6 +1090,43 @@ false
             "#,
         );
         assert_eq!(output.trim(), "via promises p.txt true", "{output}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Node's `*Sync` names and callback form: the callback runs after the
+    /// script's synchronous code, with `(err, result)`.
+    #[test]
+    fn fs_sync_names_and_callbacks() {
+        let root = tmpdir();
+        let output = run(
+            &root,
+            r#"
+                fs.writeFileSync("c.txt", "cb");
+                fs.readFile("c.txt", "utf8", function (err, text) {
+                    console.log("read", err, text);
+                });
+                fs.readFile("../../etc/passwd", function (err, text) {
+                    console.log("escape", err instanceof Error, text);
+                });
+                fs.exists("c.txt", function (yes) { console.log("exists", yes); });
+                fs.exists("nope", function (yes) { console.log("missing", yes); });
+                fs.readFile("c.txt", function () { throw new TypeError("in callback"); });
+                console.log("first", fs.readFileSync("c.txt"), fs.existsSync("c.txt"));
+            "#,
+        );
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "first cb true",
+                "read null cb",
+                "escape true undefined",
+                "exists true",
+                "missing false",
+                "error: Uncaught TypeError: in callback",
+            ],
+            "{output}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
