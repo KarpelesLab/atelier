@@ -997,6 +997,131 @@ fn an_owner_keeps_its_session_across_coordinators() {
     assert_eq!(mock.requests(), 1);
 }
 
+/// Kill the coordinator of the project in `dir` outright, and see it gone.
+fn kill_coordinator(dir: &Path) -> u32 {
+    let daemon = coordinator_pid(dir).expect("a coordinator");
+    Command::new("kill")
+        .args(["-9", &daemon.to_string()])
+        .status()
+        .unwrap();
+    wait_until("the coordinator to be gone", || !alive(daemon));
+    daemon
+}
+
+/// A take-over that starts while there is no coordinator: the newcomer
+/// starts the next one, and is kept from the session until the owner has
+/// claimed it again there — then takes it over as on any other day, and
+/// continues it.
+#[test]
+fn take_over_right_after_the_coordinator_died() {
+    let mock = echo();
+    let dir = project("takeover-restart");
+    let mut owner = Piped::repl(&mock, &dir, &[]);
+    owner.line("say one");
+    owner.wait_for("re: one");
+    wait_until("the session to be saved", || {
+        state_dir(&dir).join("session.json").exists()
+    });
+    let daemon = kill_coordinator(&dir);
+
+    let mut next = Piped::spawn(atelier(&mock.base_url(), &dir, &["--take-over"]));
+    assert_eq!(owner.exit(), 0, "it left by itself: {}", owner.stderr());
+    assert!(
+        owner.stderr().contains(&format!(
+            "another atelier (pid {}) took this session over",
+            next.pid()
+        )),
+        "{}",
+        owner.stderr()
+    );
+    assert_eq!(wait_owner(&dir, next.pid())["kind"], "repl");
+    assert_ne!(coordinator_pid(&dir), Some(daemon));
+    next.wait_for("resumed session (2 message(s))");
+    let err = next.stderr();
+    assert!(
+        err.contains(&format!(
+            "took over the session of pid {} (it stopped when asked)",
+            owner.pid()
+        )),
+        "{err}"
+    );
+    next.line("say two");
+    next.wait_for("re: two");
+    let body = mock.body(1);
+    assert!(body.contains("re: one"), "{body}");
+    assert_eq!(ateliers_in(&dir), vec![next.pid()]);
+    assert_eq!(next.finish(), 0);
+    assert!(
+        !next.stderr().contains("another atelier"),
+        "{}",
+        next.stderr()
+    );
+}
+
+/// The coordinator dies in the middle of a take-over: the newcomer is
+/// already in line behind the owner — which is stopped here, so that it
+/// can neither yield nor claim again — when the coordinator that has that
+/// line is killed. The newcomer finds the next coordinator and takes the
+/// session up there. The owner, let go on (`resume`), finds the request to
+/// yield waiting and does; left stopped, it is signalled. Either way the
+/// newcomer ends up the one owner, of the one coordinator, and the old one
+/// is gone.
+fn take_over_across_a_dying_coordinator(name: &str, resume: bool) {
+    let mock = echo();
+    let dir = project(name);
+    let mut owner = Piped::repl(&mock, &dir, &[]);
+    owner.line("say one");
+    owner.wait_for("re: one");
+    let pid = owner.pid().to_string();
+    Command::new("kill").args(["-STOP", &pid]).status().unwrap();
+
+    let mut next = Piped::spawn(atelier(&mock.base_url(), &dir, &["--take-over"]));
+    let real = dir.canonicalize().unwrap();
+    wait_until("the newcomer to be in line", || {
+        ask_coordinator(&dir, "claims", json!({ "dir": real }))
+            .is_some_and(|c| c["claims"][0]["heir"]["pid"] == next.pid())
+    });
+    let daemon = kill_coordinator(&dir);
+    if resume {
+        Command::new("kill").args(["-CONT", &pid]).status().unwrap();
+    }
+
+    wait_owner(&dir, next.pid());
+    let code = owner.exit();
+    next.wait_for("took over the session of pid");
+    let err = next.stderr();
+    if resume {
+        assert_eq!(code, 0, "{}", owner.stderr());
+        assert!(err.contains("(it stopped when asked)"), "{err}");
+    } else {
+        assert_eq!(code, -1, "ended by a signal");
+        assert!(err.contains("had to be killed"), "{err}");
+    }
+    next.wait_for("resumed session (2 message(s))");
+    next.line("say two");
+    next.wait_for("re: two");
+    assert_ne!(coordinator_pid(&dir), Some(daemon));
+    let claims = ask_coordinator(&dir, "claims", json!({})).unwrap();
+    assert_eq!(claims["claims"].as_array().unwrap().len(), 1, "{claims}");
+    assert_eq!(ateliers_in(&dir), vec![next.pid()]);
+    assert_eq!(next.finish(), 0);
+    assert!(
+        !next.stderr().contains("another atelier"),
+        "{}",
+        next.stderr()
+    );
+}
+
+#[test]
+fn take_over_survives_the_coordinator_dying_under_it() {
+    take_over_across_a_dying_coordinator("takeover-midway", true);
+}
+
+#[test]
+fn take_over_of_a_stuck_owner_survives_the_coordinator_dying_under_it() {
+    take_over_across_a_dying_coordinator("takeover-stuck", false);
+}
+
 /// With the coordinator switched off nobody says whose the session is: a
 /// second atelier starts as it did before there were owners — no question,
 /// no refusal — and no coordinator is started to ask.
@@ -2856,4 +2981,89 @@ fn serve_attaches_its_client_to_the_running_session() {
     assert_eq!(client.notification("session/closed")["reason"], "ended");
     assert_eq!(client.piped.exit(), 0);
     assert_eq!(owner.exit(), 0);
+}
+
+/// What claiming the session adds to a start, measured: `--print` runs
+/// against the mock, each to its end, with and without the claim. Ignored,
+/// since it only prints numbers (`docs/coordinator.md` has them):
+///
+/// ```sh
+/// cargo test --release --test own the_claim_adds -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement: prints how long starts take, asserts nothing tight"]
+fn the_claim_adds_little_to_a_start() {
+    const RUNS: usize = 25;
+    let mock = echo();
+    let dir = project("timing");
+    let time = |args: &[&str], off: bool| -> Duration {
+        let mut cmd = atelier(&mock.base_url(), &dir, args);
+        if off {
+            cmd.env("ATELIER_NO_COORDINATOR", "1");
+        }
+        let started = Instant::now();
+        let out = cmd.stdin(Stdio::null()).output().expect("run atelier");
+        let took = started.elapsed();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        took
+    };
+    let report = |what: &str, mut runs: Vec<Duration>| -> Duration {
+        runs.sort();
+        let median = runs[runs.len() / 2];
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "{what:<52} median {:6.1} ms   min {:6.1} ms   max {:6.1} ms",
+            ms(median),
+            ms(runs[0]),
+            ms(runs[runs.len() - 1])
+        );
+        median
+    };
+    // Warm everything up once: the binary in the page cache, a coordinator.
+    time(&["--print", "--continue", "say warm"], false);
+
+    let off = report(
+        "no coordinator at all (ATELIER_NO_COORDINATOR)",
+        (0..RUNS)
+            .map(|_| time(&["--print", "--continue", "say x"], true))
+            .collect(),
+    );
+    let unclaimed = report(
+        "coordinator running, one-shot --print (no claim)",
+        (0..RUNS)
+            .map(|_| time(&["--print", "say x"], false))
+            .collect(),
+    );
+    let warm = report(
+        "coordinator running, --print --continue (claim)",
+        (0..RUNS)
+            .map(|_| time(&["--print", "--continue", "say x"], false))
+            .collect(),
+    );
+    let cold = report(
+        "no coordinator yet, --print --continue (starts one)",
+        (0..RUNS)
+            .map(|_| {
+                stop_coordinator(&dir);
+                time(&["--print", "--continue", "say x"], false)
+            })
+            .collect(),
+    );
+    let ms = |a: Duration, b: Duration| (a.as_secs_f64() - b.as_secs_f64()) * 1000.0;
+    eprintln!(
+        "the claim, coordinator running:  {:+.1} ms",
+        ms(warm, unclaimed)
+    );
+    eprintln!(
+        "the claim, starting coordinator: {:+.1} ms",
+        ms(cold, unclaimed)
+    );
+    eprintln!("coordinator on vs off:           {:+.1} ms", ms(warm, off));
+    // Loose bounds only: this is a measurement, not a race.
+    assert!(warm < unclaimed + Duration::from_millis(500));
+    assert!(cold < unclaimed + Duration::from_secs(2));
 }

@@ -19,7 +19,9 @@ and be replaced:
   to retry starts a new coordinator, and they all rejoin it under the same
   names, with the same topic subscriptions and locks, each owner claiming
   its session again. This takes a fraction of a second and needs nothing
-  from you.
+  from you. An atelier that was taking a session over when it happened —
+  or that starts with `--take-over` just then — takes its place behind the
+  owner again at the new coordinator, and finishes.
 - **atelier was updated**: the coordinator ends by itself when its
   executable is replaced on disk (a self-update, a rebuild), and when a
   newer atelier connects to it. The next one runs the new version.
@@ -309,6 +311,29 @@ in before the owner is back. If two owners claim the same directory again
 (they could not see each other when they started), the first has it and the
 second is answered `claimed: false` like anybody else; it is for that
 atelier to say so to its user, and it keeps running.
+
+**What a claim costs a start.** It is made before the session is opened,
+so a start waits for it. Measured on 2026-11-22 (x86_64 Linux, release
+build, median of 25 `--print` runs each against a local mock model; the
+ignored test `the_claim_adds_little_to_a_start` in `tests/own.rs` runs it
+again):
+
+| Start | Median |
+|---|---|
+| no coordinator at all (`ATELIER_NO_COORDINATOR=1`) | 10.1 ms |
+| coordinator running, a run that claims nothing (`--print`) | 10.1 ms |
+| coordinator running, a run that claims (`--print --continue`) | 10.1 ms |
+| no coordinator running yet, a run that claims — and so starts one | 41.6 ms |
+
+With a coordinator up — every start but the first on the machine, or the
+first after it went idle — the claim is one request on a local socket and
+its cost is below what these runs can tell apart (well under a
+millisecond). The first start pays about 30 ms for launching the
+coordinator and waiting for its socket; an instance that does not claim
+launches it too, but without waiting. Neither is worth making faster.
+The exception is a start in the second after a coordinator was killed: a
+directory nobody has claimed again yet is kept from it for that long (see
+`again` above).
 
 The answer to a `call` need not be ready when its handler returns. Handlers
 run on the thread that reads the connection and must not hold it up, so one
