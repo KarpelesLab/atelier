@@ -484,7 +484,7 @@ pub const SPECS: &[Spec] = &[
     spec(
         "local.model",
         Kind::Text,
-        "The model `atelier --local` runs on this machine, as `SOURCE[,KEY=VALUE...]`",
+        "The model `atelier --local` runs on this machine, as `SOURCE[,KEY=VALUE...]` (unset: chosen by what the machine can run)",
     )
     .user_only()
     .env(crate::local::ENV_MODEL),

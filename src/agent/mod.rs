@@ -1259,18 +1259,26 @@ impl Session {
             anyhow::bail!("the Claude backend runs claude's own models; start without --claude");
         }
         let user = Settings::load_user().unwrap_or_default();
-        let model = local::Model::configured(&user);
-        // One already running is joined at once; the rest is what it takes
-        // to get the first one going.
-        let running = local::join(&model)?;
-        let bin = match &running {
-            Some(_) => None,
-            None => Some(local::binary(&mut |line| ui.info(line))?),
+        let wanted = local::Model::configured(&user);
+        // One already running is joined at once (with no model named, any
+        // atelier chose); the rest is what it takes to get the first one
+        // going: the program, the model chosen for the machine, its weights.
+        let running = local::join(wanted.as_ref())?;
+        let (bin, model, plan) = match &running {
+            Some(server) => (None, server.model.clone(), local::Plan::default()),
+            None => {
+                let bin = local::binary(&mut |line| ui.info(line))?;
+                let report = local::report(&bin);
+                let (model, why) = local::resolve(&user, report.as_ref());
+                if let Some(why) = why {
+                    ui.info(&why);
+                }
+                let plan = local::plan(&bin, report.as_ref(), &model);
+                (Some(bin), model, plan)
+            }
         };
-        let plan = match &bin {
-            Some(bin) => local::plan(bin, &model),
-            None => local::Plan::default(),
-        };
+        // A newer oxinfer, if there is one, is for the next server started.
+        local::spawn_update_check();
         for line in plan.lines(&model) {
             ui.info(&line);
         }

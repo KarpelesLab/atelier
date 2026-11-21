@@ -56,6 +56,24 @@ pub fn take_notice() -> Option<String> {
     NOTICE.lock().ok()?.take()
 }
 
+/// Leave a message for the interface to pick up with [`take_notice`],
+/// after any already waiting: the local model's program
+/// ([`crate::local`]) updates itself in the background too.
+pub(crate) fn set_notice(text: String) {
+    if let Ok(mut slot) = NOTICE.lock() {
+        *slot = Some(match slot.take() {
+            Some(before) => format!("{before}\n{text}"),
+            None => text,
+        });
+    }
+}
+
+/// Whether the user has turned updates off: `ATELIER_NO_UPDATE` set to
+/// anything but empty or `0`.
+pub(crate) fn turned_off() -> bool {
+    std::env::var_os("ATELIER_NO_UPDATE").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Start the daily background check, if this build updates itself and the
 /// user hasn't turned it off. Never blocks; failures stay quiet (a network
 /// hiccup isn't worth interrupting anyone for).
@@ -63,7 +81,7 @@ pub fn spawn_background_check() {
     let Some(target) = TARGET else {
         return;
     };
-    if std::env::var_os("ATELIER_NO_UPDATE").is_some_and(|v| !v.is_empty() && v != "0") {
+    if turned_off() {
         return;
     }
     std::thread::spawn(move || {
@@ -88,8 +106,8 @@ pub fn spawn_background_check() {
             )),
             Ok(Outcome::UpToDate { .. }) | Err(_) => None,
         };
-        if let (Some(n), Ok(mut slot)) = (notice, NOTICE.lock()) {
-            *slot = Some(n);
+        if let Some(n) = notice {
+            set_notice(n);
         }
     });
 }
@@ -283,23 +301,28 @@ fn checksum_for(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Where the time of the last check is kept: `$XDG_STATE_HOME/atelier/`
-/// (default `~/.local/state/atelier/`). `None` when there's no home.
+/// Where the time of the last check is kept.
 fn stamp_path() -> Option<PathBuf> {
+    state_file("last-update-check")
+}
+
+/// `name` in atelier's state directory: `$XDG_STATE_HOME/atelier/`
+/// (default `~/.local/state/atelier/`). `None` when there's no home.
+pub(crate) fn state_file(name: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("atelier").join("last-update-check"))
+    Some(base.join("atelier").join(name))
 }
 
 /// Whether a check is due: the stamp is missing, unreadable, older than
 /// [`CHECK_INTERVAL`], or in the future (a clock that jumped back).
-fn due(stamp: &Path, now: SystemTime) -> bool {
+pub(crate) fn due(stamp: &Path, now: SystemTime) -> bool {
     let Some(last) = std::fs::read_to_string(stamp)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -310,7 +333,7 @@ fn due(stamp: &Path, now: SystemTime) -> bool {
     last > now || now - last >= CHECK_INTERVAL.as_secs()
 }
 
-fn record_check(stamp: &Path, now: SystemTime) -> Result<()> {
+pub(crate) fn record_check(stamp: &Path, now: SystemTime) -> Result<()> {
     if let Some(dir) = stamp.parent() {
         std::fs::create_dir_all(dir)?;
     }

@@ -114,7 +114,7 @@ pub fn run(args: &[String]) -> Result<u8> {
     if args.first().map(String::as_str) == Some("sandbox") {
         return sandbox::run_command(&args[1..]);
     }
-    // `atelier local [status|download|stop]`: the model on this machine;
+    // `atelier local [status|download|update|stop]`: the model on this machine;
     // `local-serve` is its server's supervisor, started by atelier itself
     // (see `local`).
     if args.first().map(String::as_str) == Some("local") {

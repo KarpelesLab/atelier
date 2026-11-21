@@ -35,7 +35,7 @@ usage: atelier [--claude | --local] [--continue] [--mode MODE]
                      [--listen WHERE [--allow-origin ORIGIN]... [--max-sessions N]]
        atelier acp [--claude] [--mode MODE] [--max-turns N]
        atelier update | coordinator [status|stop]
-       atelier local [status|download|stop]
+       atelier local [status|download|update|stop]
        atelier permissions check [--mode MODE] -- <command...>
        atelier permissions reviewer-policy
        atelier stats [--days N] [--project] [--json]
