@@ -15,17 +15,80 @@ atelier has two configuration layers:
   and rewritten whenever it changes (`/mcp add`/`/mcp remove`, granting
   "always" on a tool approval, `/review [on|off]`, or the `/config` editor).
 
-`atelier.toml` is read from the current project root. Some tables are also
-read from your own `$XDG_CONFIG_HOME/atelier/atelier.toml`
-(`~/.config/atelier/atelier.toml` when that variable is unset), with the
-project's entries winning: [`[permissions]`](#permissions),
-[`[[hooks]]`](#hooks), and the model tables — `[[provider]]`, `[models]`,
-`[variant.*]`, `[[price]]`, and `[defaults]`' `model` and `provider`.
-[`[instructions]`](#instruction-files) is read from both, and both lists
-apply; so is [`[sandbox]`](#sandbox), whose `root` counts only there and
-whose `network` lists add up. The
-other tables (`[[mcp]]`, `[[mcp_http]]`, `[review]`, `[[diagnostics]]`,
-`[search]`, `[goals]`, the rest of `[defaults]`) are the project's alone.
+`atelier.toml` is read from the current project root, and from your own
+`$XDG_CONFIG_HOME/atelier/atelier.toml` (`~/.config/atelier/atelier.toml`
+when that variable is unset), the project's laid over yours — see
+[Precedence](#precedence) for how, table by table.
+
+## Precedence
+
+Strongest first:
+
+1. **Flags and the session** — `--mode`, `--claude`, and what a command
+   changes for the running session (`/model`, `/mode`, `/review`, `/config`);
+2. **Environment variables** — each overrides the one setting it names (the
+   [table below](#environment-variables));
+3. **the project's `atelier.toml`** — as far as the project is
+   [trusted](trust.md): what an untrusted project's file may not say is left
+   out, and leaves *your* value standing, not the built-in default;
+4. **your user-global `atelier.toml`** — never gated: it is yours;
+5. **the built-in defaults.**
+
+Between the two files (`Settings::layered` in `src/settings.rs`):
+
+- **Keys override one by one, not tables.** A project's `[review]` with only
+  `preflight = true` leaves your `enabled` as you set it. A key written as
+  `false` is a value like any other: it overrides yours.
+- **Lists of rules and additions add up**: your entries, then the
+  project's. Nothing in a project's file takes one of yours away, so your
+  deny and ask rules hold in every project.
+- **Named entries** — servers, providers, variants, language servers — are
+  both files' together; a project's entry replaces yours of the same name.
+  `[[mcp]]` and `[[mcp_http]]` are one namespace (a server's tools are
+  `mcp__<name>__*` whichever kind it is).
+- **A few tables are taken whole**, because their keys mean something only
+  together; a project's table replaces yours.
+- **The permission mode can only get more careful.** A project's
+  `[defaults] mode` (or `approve`) counts only where it is at least as
+  careful as the one your file names — `plan`, `ask-edits`, `auto-edit`,
+  `yolo`, from the most careful — trusted or not: like a deny rule, a
+  project may tighten what you chose, never loosen it. Without a mode in
+  your file, the project's applies (its `yolo` once trusted).
+- **Some tables are one file's only**, where the other's would be unsafe
+  or make no sense.
+
+| Table / key | Read from | Combined how | Why |
+|-------------|-----------|--------------|-----|
+| `[defaults] model`, `provider`, `context_limit`, `mcp_tool_budget`, `parallel_tools` | both | per key | |
+| `[defaults] mode`, `approve` | both | one setting per file; the project's only if at least as careful as yours | a repository must not loosen the mode you chose; its `yolo` is [gated](trust.md) |
+| `[review]` | both | per key | |
+| `[models]` | both | per key | |
+| `[goals]`, `[agents]` | both | per key | |
+| `[coordinator]`, `[loops]` | both | per key; the project's only once trusted | how far the instance goes unattended is yours to say |
+| `[permissions] allow`, `ask`, `deny` | both | yours, then the project's; the project's `allow` once trusted | rules only add; a project cannot remove one of yours |
+| `[permissions.reviewer]` | both | whole table; an untrusted project's only to switch it off | `policy` is a path relative to its own file |
+| `[[hooks]]` | both | yours, then the project's (once trusted) | |
+| `[instructions] files` | both | yours, then the project's | each relative to its own file |
+| `[[mcp]]`, `[[mcp_http]]` | both | by name, across both kinds; the project's once trusted | |
+| `[[provider]]`, `[variant.*]` | both | by name; a project's providers once trusted | |
+| `[[price]]` | both | the project's, then yours: the first for a model counts | |
+| `[[lsp]]` | both | by name, the project's first (the first entry listing an extension serves it); started only in a trusted project | a language server runs the project's code, whoever configured it |
+| `[search]` | both | whole table: the project's, when it has one | your key must not follow a project's provider or endpoint; its `url` and `key_env` count once trusted |
+| `[sandbox] enabled`, `memory_mb` | both | per key; the project's `enabled` once trusted | |
+| `[sandbox] network` | both | yours, then the project's (once trusted) | |
+| `[sandbox] root` | yours only | | it decides what of the host the guest can read |
+| `[local]` | yours only | | what to download and run is not a repository's to choose |
+| `[[diagnostics]]` | the project's only | | checkers run the project's build (`cargo check` runs build scripts), and a list replaces detection: one list for every project would be wrong for most |
+
+**Where writes go.** `/config`, `/review`, `/mcp add`/`/mcp remove` and
+"always" at an approval prompt write the **project's** file. `/mcp remove`
+does not touch your file: a server configured there is removed by editing
+it. [`settings/set`](protocol.md#settingsset) writes **your** file by
+default and the project's with `"scope": "project"`;
+[`settings/get`](protocol.md#settingsget) reports, for every setting, the
+value in force and each layer that says something about it — and why a
+layer that is there does not count. `atelier trust accept` and `/trust`
+record a decision outside both files.
 
 ## Environment variables
 
@@ -142,8 +205,10 @@ tokens go to `mcp-auth.json` in the user config directory
 (`$XDG_CONFIG_HOME/atelier/`, else `~/.config/atelier/`), mode 0600 — not
 into this file. See [MCP → Signing in](mcp.md#signing-in-to-a-remote-server-oauth).
 
-Servers of either kind are started or contacted only in a
-[trusted project](trust.md).
+A project's servers, of either kind, are started or contacted only in a
+[trusted project](trust.md). Servers in your user-global `atelier.toml`
+are yours and always are; a project's server of the same name replaces
+yours (once the project is trusted).
 
 ### `[permissions]`
 
@@ -222,8 +287,12 @@ parallel_tools = true       # overridden by ATELIER_PARALLEL_TOOLS
 `approve = true` is the older spelling of `mode = "yolo"`; `mode` wins when
 both are set. On the command line, `--mode <name>` (or `--mode=<name>`)
 selects the mode for one run, interactive or `--print`; `/mode <name>`
-switches it during a session. `mode = "yolo"` and `approve = true` are
-honored only in a [trusted project](trust.md).
+switches it during a session. In a project's file, `mode = "yolo"` and
+`approve = true` are honored only once the project is
+[trusted](trust.md); and a project's mode never counts where it is looser
+than the one in your user-global file (see [Precedence](#precedence)).
+Every key here can go in your user-global file, as your default for every
+project.
 
 `mcp_tool_budget` is how many bytes of MCP tool specs (names, descriptions,
 schemas) are advertised to the model before the tools are
@@ -541,8 +610,10 @@ wake_max = 5     # turns it may start by itself before you type again
 | `wake`     | string  | `never` (default): what peers send waits for your next prompt. `questions`: a `peer_ask` starts a turn. `always`: any peer message does |
 | `wake_max` | integer | The most turns the instance starts by itself between two inputs of yours (default 5) |
 
-The table is read from the project's `atelier.toml` only; to make it your
-choice for every project, export `ATELIER_COORDINATOR_WAKE` instead.
+Put the table in your user-global `atelier.toml` to make it your choice
+for every project. A project's counts only once the project is
+[trusted](trust.md): whether peers may set an instance to work is not a
+repository's to decide.
 
 ## `[[hooks]]`
 
@@ -659,6 +730,11 @@ model what they found — and, after an edit, what *changed*: the diagnostics
 that are new, a count of those still there, and how many were fixed. A clean
 project adds nothing to the context.
 
+The table is read from the project's file only, never from your
+user-global one: a list of checkers replaces detection, and the commands
+run the project's own build — one list for every project would be wrong for
+most of them.
+
 ```toml
 [[diagnostics]]
 name = "tsc"
@@ -740,8 +816,13 @@ timeout_secs = 30
 | `extensions`   | string[] | The file extensions it serves, with or without the dot |
 | `timeout_secs` | integer  | How long one `symbols` call waits for it, loading included, before answering from the text instead (default 20) |
 
+Entries in your user-global file apply to every project, after the
+project's own: a project's entry of the same name replaces yours, and the
+first entry listing an extension serves it.
+
 The server is started the first time `symbols` needs it, not at startup, and
-only in a [trusted project](trust.md) — it runs the project's code. The list
+only in a [trusted project](trust.md) — it runs the project's code, whether
+the project or you configured it. The list
 is read on each call, so an edit applies to servers not yet started. A
 command that cannot be started, or that does not answer `initialize`, is
 given up on for the session and `symbols` says why in its results;
@@ -776,6 +857,12 @@ key_env = "BRAVE_API_KEY"            # the variable holding the key; ATELIER_SEA
 The key is sent only as that request header. It is not written to
 `atelier.toml`, tool results, errors or logs.
 
+The table can go in your user-global file. A project's `[search]` table
+replaces yours **whole** rather than key by key, so that the key your
+`key_env` names is never sent to a provider the project chose; a project's
+table that says nothing once its untrusted `url` and `key_env` are left
+out leaves yours in force.
+
 ## `[sandbox]`
 
 Runs the `bash` tool's commands inside nixvm instead of on the host —
@@ -801,8 +888,9 @@ network = ["crates.io", "*.crates.io"]
 
 `/config` opens a settings view covering the model, auto-approve, the context
 limit, review mode, and the [pre-flight summary](permissions.md#pre-flight-summary-bash-only). In the inline TUI it's a full-screen editor
-(alternate screen) — edit the values and save & exit to write them back to
-`atelier.toml`; in the plain REPL, which has no alternate screen, it instead
+(alternate screen) — edit the values and save & exit to write the ones you
+changed to the project's `atelier.toml` (one left as it was is not copied
+there, so a value from your user-global file stays yours); in the plain REPL, which has no alternate screen, it instead
 prints a read-only text summary of the same settings. Either way it shows
 the active **backend** — the configured chat/completions endpoint, or
 `chatgpt:<model>` while [signed in with ChatGPT](chatgpt.md) via `/login`.

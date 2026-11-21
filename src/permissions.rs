@@ -155,6 +155,11 @@ impl Mode {
     /// Every mode, from the most careful to the least.
     pub const ALL: [Mode; 4] = [Mode::Plan, Mode::AskEdits, Mode::AutoEdit, Mode::Yolo];
 
+    /// Where it stands in [`ALL`](Self::ALL): the lower, the more careful.
+    pub fn strictness(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
     /// The name the user selects it by.
     pub fn name(self) -> &'static str {
         match self {

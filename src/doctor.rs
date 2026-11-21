@@ -216,7 +216,15 @@ fn examine(root: &Path, opts: &Options) -> Report {
     }
     check_instructions(&mut report, root);
     check_extensions(&mut report, root, &settings);
-    check_mcp(&mut report, &settings, &cfg, opts.mcp);
+    // The servers of both files (a project's server replacing the user's
+    // of the same name), as a session would have them once trusted.
+    let user = Settings::load_user().unwrap_or_default();
+    check_mcp(
+        &mut report,
+        &Settings::layered(&user, &settings),
+        &cfg,
+        opts.mcp,
+    );
     report.ok("coordinator", coord::describe());
     check_git(&mut report, root);
     check_terminal(&mut report);
@@ -244,8 +252,7 @@ fn check_settings(report: &mut Report, root: &Path) -> Settings {
             ),
         ),
     }
-    // Only its `[permissions]` and `[[hooks]]` are read, but it is one
-    // file: a mistake anywhere in it loses both.
+    // A mistake anywhere in it loses all of it.
     match Settings::user_dir().map(|dir| dir.join(settings::FILE_NAME)) {
         None => report.ok(
             "user config",
@@ -601,9 +608,15 @@ fn check_extensions(report: &mut Report, root: &Path, settings: &Settings) {
         user_config.as_deref(),
         trust.hooks_state(),
     );
+    let user = Settings::load_user().unwrap_or_default();
     report.ok(
         "language servers",
-        language_servers(root, settings, trust.active(), &context::on_path),
+        language_servers(
+            root,
+            &Settings::layered(&user, settings),
+            trust.active(),
+            &context::on_path,
+        ),
     );
     let (user, project) = hooks.counts();
     let (status, trust) = match hooks.trust_state() {

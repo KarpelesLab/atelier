@@ -455,15 +455,17 @@ An entry of `settings`:
 | `env` | The environment variable that overrides it, if there is one |
 | `value` | The value in force; `null` when nothing sets it and there is no default worth stating |
 | `source` | Where `value` comes from: `default`, `user` (the user-global file), `project`, `env`, `flag` (the command line) or `session` (changed since the session started: `/model`, `/mode`, `/review`, …) |
-| `combined` | `true` when the files' entries apply together (`permissions.allow`, `hooks`, `provider`, …): `value` is the project's entries followed by the user's, and `source` the first file that has any |
+| `combined` | `true` when the files' entries apply together (`permissions.allow`, `hooks`, `mcp`, `provider`, …): `value` is what the two files make together, by the [precedence rules](configuration.md#precedence) — lists one after the other, named entries with the project's replacing the user's of the same name — and `source` the first file that has any |
 | `layers` | Everything that says something about the setting, the strongest first: `source`, `value`, `name` (the variable or the flag), `key` (when the value sits under another key: `models.main` decides `defaults.model`), and `ignored` — the reason a value that is there does not count |
 
 A value is `ignored` when the project is not trusted and the setting is
 [gated](trust.md#what-is-gated-and-why) — an untrusted project's `yolo`
 default, its MCP servers, its allow rules — when it sits in a file the
 setting is not read from (`[local] model` or `[sandbox] root` in a project's
-file; `context_limit` in the user's), or when the variable holds something
-it does not understand.
+file; `[[diagnostics]]` in the user's), when the other file overrules it
+(a project's mode looser than the user's; the user's `[search]` keys, when
+the project has a `[search]` table of its own), or when the variable holds
+something it does not understand.
 
 **No secret is returned.** `atelier.toml` names keys rather than holding
 them (`api_key_env`, `key_env`: reported as written). Where one can sit
@@ -487,8 +489,9 @@ Where the sources are approximate:
 - In an untrusted project, the allow rules saved with "always" during the
   session count for it, though `permissions.allow` shows the project's rules
   as ignored.
-- A `combined` value is the plain concatenation: an entry of the user's file
-  that the project replaces by name (`provider`) is still listed.
+- A `combined` value's layers are each file's entries as written: an entry
+  of the user's file that the project replaces by name is in the `user`
+  layer, not in `value`.
 - Checkers and language servers detected from the project's files are not
   settings, and are not listed.
 
@@ -528,17 +531,18 @@ written the way it writes:
 | Key | Scopes | |
 |-----|--------|-|
 | `defaults.model` | `user`, `project` | The main model. Written to the project's file it is in effect at once, as on the screen. Written to the user's, at once when that value is the one that counts: `ATELIER_MODEL`, `[models] main` and the project's `[defaults] model` win over it (`overridden`) |
-| `defaults.context_limit` | `project` | In effect at once |
-| `review.enabled` | `project` | In effect at once |
-| `review.preflight` | `project` | In effect at once |
+| `defaults.context_limit` | `user`, `project` | Written to the project's file, in effect at once. Written to the user's, at once when that value is the one that counts (`ATELIER_CONTEXT_LIMIT` and the project's file win over it) |
+| `review.enabled` | `user`, `project` | As `defaults.context_limit` (`ATELIER_REVIEW` wins over both files) |
+| `review.preflight` | `user`, `project` | As `defaults.context_limit` (`ATELIER_PREFLIGHT` wins over both files) |
 
 - The user-global file is the default, and the place for the user's own
-  choices; but `context_limit`, `review.enabled` and `review.preflight` are read from the
-  project's file only, so that is the one scope they take. A scope the
+  choices, for every project; `scope: "project"` writes the project's, for
+  this one. The `/config` screen writes the project's file. A scope the
   setting is not read from is refused rather than written to no effect.
 - `defaults.approve` (the screen's auto-approve) cannot be set: in a
   project's file it is a [gated setting](trust.md) — it switches every
-  approval prompt off — and the user-global file is not read for it. Switch
+  approval prompt off — and in the user-global file it would do that in
+  every project at once, which is for the user to write themselves. Switch
   the session with `command/run` and `/mode yolo`. Nothing gated by trust,
   and nothing honoured in the user-global file only (`[local] model`,
   `[sandbox] root`), can be written to a project's file through this method.

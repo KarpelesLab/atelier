@@ -177,8 +177,17 @@ impl SymbolsTool {
         // Asked on every call: `/trust` switches the servers on
         // mid-session, as it does the checkers.
         let trusted = Trust::load(root, &settings, store).active();
+        // The project's entries first, then the user-global file's: the
+        // first that lists an extension serves it. Whoever configured it,
+        // a server is started only where detected ones would be, since it
+        // runs the project's code all the same.
+        let user = match cfg!(test) {
+            true => Settings::default(),
+            false => Settings::load_user().unwrap_or_default(),
+        };
+        let configured = Settings::layered(&user, &settings).lsp;
         let setup = Setup {
-            configured: &settings.lsp,
+            configured: &configured,
             trusted,
             has: &crate::context::on_path,
         };

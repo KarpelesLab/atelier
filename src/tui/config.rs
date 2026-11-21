@@ -270,18 +270,29 @@ fn handle_key(state: &mut State, k: Key) -> bool {
     false
 }
 
-/// Apply the edited values back onto the session (the setters are cheap and
-/// idempotent; the context limit alone is only set when it was changed).
+/// Apply the edited values back onto the session — only those that were
+/// changed: what the screen showed may come from the user-global file or
+/// the environment, and writing it unchanged into the project's file would
+/// pin it there, over the user's later choices.
 fn apply(session: &mut Session, state: &State) {
-    session.set_default_model(&state.model);
-    session.set_auto_approve(state.auto_approve);
+    let before = State::from_session(session);
+    if state.model != before.model {
+        session.set_default_model(&state.model);
+    }
+    if state.auto_approve != before.auto_approve {
+        session.set_auto_approve(state.auto_approve);
+    }
     // Unchanged, the threshold stays what follows from the model's context
     // window rather than becoming a setting.
-    if state.context_limit != session.context_limit() {
+    if state.context_limit != before.context_limit {
         session.set_context_limit(state.context_limit);
     }
-    session.set_review_enabled(state.review);
-    session.set_preflight_enabled(state.preflight);
+    if state.review != before.review {
+        session.set_review_enabled(state.review);
+    }
+    if state.preflight != before.preflight {
+        session.set_preflight_enabled(state.preflight);
+    }
 }
 
 /// The screen title.

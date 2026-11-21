@@ -1369,7 +1369,7 @@ headers = { "X-Token" = "sk-secret-table" }
     let why = ignored["ignored"].as_str().unwrap();
     assert!(why.contains("not trusted"), "{mode}");
     let servers = setting(&settings, "mcp_http");
-    assert!(servers["value"].is_null(), "{servers}");
+    assert_eq!(servers["value"], json!([]), "{servers}");
     assert!(servers["layers"][0]["ignored"].is_string(), "{servers}");
     assert_eq!(
         servers["layers"][0]["value"][0]["headers"],
@@ -1391,7 +1391,7 @@ headers = { "X-Token" = "sk-secret-table" }
     assert_eq!(limit["type"], "integer");
     assert_eq!(limit["label"], "context limit");
     assert_eq!(limit["settable"], true);
-    assert_eq!(limit["scopes"], json!(["project"]));
+    assert_eq!(limit["scopes"], json!(["user", "project"]));
     assert_eq!(model["scopes"], json!(["user", "project"]));
     for entry in settings["settings"].as_array().unwrap() {
         let described = entry["description"].as_str().is_some_and(|d| !d.is_empty());
@@ -1531,6 +1531,132 @@ fn a_setting_is_written_applied_and_read_back() {
     assert!(written.contains("later-model"), "{written}");
 }
 
+/// The user-global file lies under the project's key by key: a key the
+/// project does not set is the user's, a project's mode looser than the
+/// user's does not count, named entries are both files' with the project's
+/// replacing the user's of the same name, and `[search]` is taken whole —
+/// and `settings/get` says so, layer by layer. `settings/set` writes the
+/// user's file for what is read from both.
+#[test]
+fn the_users_file_is_laid_under_the_projects_key_by_key() {
+    let mock = Mock::scripted(|_, _| answer("unused"));
+    let dir = unique_dir("settings-layered");
+    std::fs::write(
+        dir.join("atelier.toml"),
+        r#"
+[defaults]
+mode = "auto-edit"
+context_limit = 4000
+
+[search]
+provider = "duckduckgo"
+
+[[mcp]]
+name = "notes"
+command = "project-notes"
+enabled = false
+"#,
+    )
+    .unwrap();
+    let user = user_settings(&dir);
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::write(
+        &user,
+        r#"
+[defaults]
+mode = "plan"
+context_limit = 9000
+mcp_tool_budget = 100
+
+[review]
+preflight = true
+
+[search]
+provider = "tavily"
+key_env = "TAVILY_KEY"
+
+[[mcp]]
+name = "notes"
+command = "user-notes"
+enabled = false
+
+[[mcp]]
+name = "tools"
+command = "user-tools"
+enabled = false
+"#,
+    )
+    .unwrap();
+    let env = [
+        ("ATELIER_TRUST_PROJECT", Some("1")),
+        ("ATELIER_MODE", None),
+        ("ATELIER_PREFLIGHT", None),
+        ("ATELIER_REVIEW", None),
+    ];
+    let mut client = Client::ready_env(&mock, &dir, &[], &env);
+    let settings = client.ok("settings/get", json!({}));
+    assert_eq!(settings["trust"]["active"], true);
+
+    // Key by key: the project's where it says, the user's elsewhere.
+    let limit = setting(&settings, "defaults.context_limit");
+    assert_eq!(held(limit), (json!(4000), "project"));
+    assert_eq!(limit["layers"][1]["source"], "user");
+    assert!(limit["layers"][1]["ignored"].is_null(), "{limit}");
+    let budget = setting(&settings, "defaults.mcp_tool_budget");
+    assert_eq!(held(budget), (json!(100), "user"));
+    let preflight = setting(&settings, "review.preflight");
+    assert_eq!(held(preflight), (json!(true), "user"));
+
+    // The project's mode is looser than the user's: the user's stands.
+    let mode = setting(&settings, "defaults.mode");
+    assert_eq!(held(mode), (json!("plan"), "user"));
+    let why = mode["layers"][0]["ignored"].as_str().unwrap();
+    assert!(why.contains("looser"), "{mode}");
+    assert_eq!(client.ok("session/status", json!({}))["mode"], "plan");
+
+    // `[search]` whole: the project's provider, and not the user's key.
+    let provider = setting(&settings, "search.provider");
+    assert_eq!(held(provider), (json!("duckduckgo"), "project"));
+    let key = setting(&settings, "search.key_env");
+    assert!(key["value"].is_null(), "{key}");
+    let why = key["layers"][0]["ignored"].as_str().unwrap();
+    assert!(why.contains("replaces the user-global one"), "{key}");
+
+    // Servers from both files, the project's `notes` in place of the
+    // user's.
+    let servers = setting(&settings, "mcp");
+    assert_eq!(servers["combined"], true);
+    assert_eq!(servers["source"], "project");
+    let listed: Vec<(&str, &str)> = (servers["value"].as_array().unwrap().iter())
+        .map(|s| (s["name"].as_str().unwrap(), s["command"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("tools", "user-tools"), ("notes", "project-notes")]
+    );
+
+    // What is read from both files can be written to the user's, which is
+    // the default; here the project's file does not say, so it counts.
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "review.enabled", "value": true}),
+    );
+    assert_eq!(set["scope"], "user");
+    assert_eq!(set["applies"], "now");
+    assert_eq!(set["setting"]["source"], "user");
+    let written = std::fs::read_to_string(&user).unwrap();
+    assert!(written.contains("enabled = true"), "{written}");
+    let project = std::fs::read_to_string(dir.join("atelier.toml")).unwrap();
+    assert!(!project.contains("[review]"), "{project}");
+    // The project's says, so the user's would not count.
+    let set = client.ok(
+        "settings/set",
+        json!({"key": "defaults.context_limit", "value": 7000}),
+    );
+    assert_eq!(set["applies"], "overridden");
+    assert_eq!(set["by"]["source"], "project");
+}
+
 /// What `settings/set` refuses, each as invalid params and without a file
 /// written: a key that is none, a value of the wrong type, a setting that
 /// is not the client's to change — above all one gated by trust or reserved
@@ -1555,9 +1681,6 @@ fn settings_that_cannot_be_set_are_refused() {
         json!({"key": "defaults.context_limit", "value": "many", "scope": "project"}),
         json!({"key": "defaults.context_limit", "value": 0, "scope": "project"}),
         json!({"key": "review.enabled", "value": "yes", "scope": "project"}),
-        // Read from the project's file only: the user's would not count.
-        json!({"key": "defaults.context_limit", "value": 9000}),
-        json!({"key": "defaults.context_limit", "value": 9000, "scope": "user"}),
         // Gated by trust, or the user's own file's alone: at no scope.
         json!({"key": "defaults.approve", "value": true, "scope": "project"}),
         json!({"key": "defaults.approve", "value": true}),

@@ -184,7 +184,7 @@ impl Session {
         ui: &mut dyn Ui,
     ) -> VecDeque<String> {
         let env = std::env::var(ENV).ok();
-        if !enabled(env.as_deref(), &self.settings.defaults) {
+        if !enabled(env.as_deref(), &self.layered().defaults) {
             return VecDeque::new();
         }
         let batch = calls

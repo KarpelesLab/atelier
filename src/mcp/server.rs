@@ -250,7 +250,7 @@ pub fn run_command(args: &[String]) -> Result<u8> {
     for warning in cfg.apply_settings(&trust.effective(&settings), &user) {
         eprintln!("warning: {warning}");
     }
-    let mut session = Session::new(cfg, root, tools, Vec::new(), settings, trust);
+    let mut session = Session::with_user(cfg, root, tools, Vec::new(), settings, user, trust);
     session.set_mode(mode);
 
     let served = serve(&mut session, io::stdin().lock(), io::stdout().lock());

@@ -452,9 +452,10 @@ pub struct HookConfig {
 /// dialog after tool calls. It can do nothing but observe and comment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewSettings {
-    /// Whether the reviewer runs.
-    #[serde(default)]
-    pub enabled: bool,
+    /// Whether the reviewer runs (unset: off). An `Option`, so that a
+    /// project's file that does not say leaves the user-global one's say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Model for the reviewer (defaults to the main model when unset).
     #[serde(default)]
     pub model: Option<String>,
@@ -462,11 +463,11 @@ pub struct ReviewSettings {
     /// glance gets a model's plain-language summary at its approval prompt
     /// (see [`crate::preflight`]). Off by default: it is one more request,
     /// and a wait of up to a few seconds before such a prompt.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub preflight: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<bool>,
 }
 
-/// Per-project defaults from `[defaults]`. Each is overridden by its env var
+/// `[defaults]`, of either file. Each is overridden by its env var
 /// (`ATELIER_MODEL`, `ATELIER_APPROVE`, `ATELIER_MODE`, `ATELIER_CONTEXT_LIMIT`,
 /// `ATELIER_PARALLEL_TOOLS`) when that's set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -653,11 +654,9 @@ impl Settings {
     }
 
     /// The directory of the user-global settings file:
-    /// `$XDG_CONFIG_HOME/atelier`, else `~/.config/atelier`. Its
-    /// `[permissions]`, `[[hooks]]` and model tables (`[[provider]]`,
-    /// `[models]`, `[variant.*]`, `[[price]]`, `[defaults] model`/`provider`)
-    /// are used, under the project's; its `[instructions] files` are loaded
-    /// as well as the project's.
+    /// `$XDG_CONFIG_HOME/atelier`, else `~/.config/atelier`. Every table of
+    /// it is read, under the project's, except `[[diagnostics]]` (see
+    /// [`layered`](Self::layered) for how the two combine).
     pub fn user_dir() -> Option<PathBuf> {
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
         var("XDG_CONFIG_HOME")
@@ -686,11 +685,203 @@ impl Settings {
         tomlproc::serde::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// The settings in force: `project`'s laid over `user`'s (the
+    /// user-global file's). Environment variables and flags are laid over
+    /// the result by whoever reads each setting.
+    ///
+    /// `project` must already be what may be acted on — for a session,
+    /// [`Trust::effective`](crate::trust::Trust::effective) of the project's
+    /// file — so that whatever an untrusted project is not allowed to say
+    /// leaves the user's value standing rather than taking it away. The
+    /// rules, table by table (`docs/configuration.md` has them too):
+    ///
+    /// - **Scalar keys** (`[defaults]`, `[review]`, `[models]`, `[goals]`,
+    ///   `[agents]`, `[loops]`, `[coordinator]`, `[sandbox] enabled` and
+    ///   `memory_mb`) override key by key: the project's where it says,
+    ///   else the user's.
+    /// - **The permission mode** (`[defaults] mode`, and `approve`, its
+    ///   older spelling) is one setting per file, and a project's counts
+    ///   only where it is at least as careful as the user's: as with deny
+    ///   rules, a project can tighten what the user chose, never loosen it.
+    /// - **Lists that only add up** — `[permissions] allow`/`ask`/`deny`,
+    ///   `[[hooks]]`, `[instructions] files`, `[sandbox] network` — are the
+    ///   user's entries followed by the project's.
+    /// - **Named entries** — `[[mcp]]` and `[[mcp_http]]` (one namespace:
+    ///   a server's tools are `mcp__<name>__*` whichever kind it is),
+    ///   `[[provider]]`, `[variant.*]`, `[[lsp]]` — are both files'
+    ///   together, a project's entry replacing the user's of the same
+    ///   name. `[[price]]` is the project's entries, then the user's (the
+    ///   first entry for a model counts).
+    /// - **Tables taken whole**, because their keys only mean something
+    ///   together: `[search]` (a provider, its endpoint and the name of its
+    ///   key — the user's key must not follow a project's choice of
+    ///   provider) and `[permissions.reviewer]` (its `policy` path is
+    ///   relative to the file it is in). The project's, when it has one.
+    /// - **The user's file only**: `[local]` and `[sandbox] root` — what to
+    ///   download and run, and what of the host the sandbox guest can read,
+    ///   are not a repository's to choose.
+    /// - **The project's file only**: `[[diagnostics]]`. Checkers run the
+    ///   project's own build (`cargo check` runs build scripts), and a list
+    ///   of them replaces detection: one list for every project would be
+    ///   wrong for most of them.
+    ///
+    /// Some readers keep the two files apart because they need to know
+    /// which file a value came from — the permission rules
+    /// ([`Policy::load`](crate::permissions::Policy::load), for where
+    /// "always" writes), the hooks, the instruction files (paths relative
+    /// to their own file), the model tables
+    /// ([`Config::apply_settings`](crate::config::Config::apply_settings))
+    /// — and follow these same rules themselves; the merged tables here are
+    /// for everything else, and for reporting.
+    pub fn layered(user: &Settings, project: &Settings) -> Settings {
+        let (u, p) = (user, project);
+        let pick = |p: &Option<String>, u: &Option<String>| p.clone().or_else(|| u.clone());
+        let both = |u: &[String], p: &[String]| u.iter().chain(p).cloned().collect::<Vec<_>>();
+
+        // Servers, by name across both kinds.
+        let project_servers: Vec<&str> = (p.mcp.iter().map(|m| m.name.as_str()))
+            .chain(p.mcp_http.iter().map(|m| m.name.as_str()))
+            .collect();
+        let users = |name: &str| !project_servers.contains(&name);
+        let mcp = (u.mcp.iter().filter(|m| users(&m.name)))
+            .chain(&p.mcp)
+            .cloned()
+            .collect();
+        let mcp_http = (u.mcp_http.iter().filter(|m| users(&m.name)))
+            .chain(&p.mcp_http)
+            .cloned()
+            .collect();
+
+        let mut provider: Vec<ProviderConfig> = Vec::new();
+        for table in u.provider.iter().chain(&p.provider) {
+            match provider.iter_mut().find(|t| t.name == table.name) {
+                Some(slot) => *slot = table.clone(),
+                None => provider.push(table.clone()),
+            }
+        }
+        let mut variant = u.variant.clone();
+        variant.extend(p.variant.clone());
+        // The first entry listing an extension serves it.
+        let lsp = (p.lsp.iter())
+            .chain(
+                u.lsp
+                    .iter()
+                    .filter(|l| p.lsp.iter().all(|q| q.name != l.name)),
+            )
+            .cloned()
+            .collect();
+
+        let (pm, um) = (&p.models, &u.models);
+        Settings {
+            mcp,
+            mcp_http,
+            permissions: Permissions {
+                allow: both(&u.permissions.allow, &p.permissions.allow),
+                ask: both(&u.permissions.ask, &p.permissions.ask),
+                deny: both(&u.permissions.deny, &p.permissions.deny),
+                reviewer: (p.permissions.reviewer.clone())
+                    .or_else(|| u.permissions.reviewer.clone()),
+            },
+            defaults: Defaults {
+                model: pick(&p.defaults.model, &u.defaults.model),
+                provider: pick(&p.defaults.provider, &u.defaults.provider),
+                // Folded into `mode`.
+                approve: None,
+                mode: layered_mode(&u.defaults, &p.defaults),
+                context_limit: p.defaults.context_limit.or(u.defaults.context_limit),
+                mcp_tool_budget: p.defaults.mcp_tool_budget.or(u.defaults.mcp_tool_budget),
+                parallel_tools: p.defaults.parallel_tools.or(u.defaults.parallel_tools),
+            },
+            review: ReviewSettings {
+                enabled: p.review.enabled.or(u.review.enabled),
+                model: pick(&p.review.model, &u.review.model),
+                preflight: p.review.preflight.or(u.review.preflight),
+            },
+            diagnostics: p.diagnostics.clone(),
+            lsp,
+            search: match p.search.is_unset() {
+                true => u.search.clone(),
+                false => p.search.clone(),
+            },
+            hooks: u.hooks.iter().chain(&p.hooks).cloned().collect(),
+            provider,
+            models: ModelRoles {
+                main: pick(&pm.main, &um.main),
+                small: pick(&pm.small, &um.small),
+                subagent: pick(&pm.subagent, &um.subagent),
+                review: pick(&pm.review, &um.review),
+                summary: pick(&pm.summary, &um.summary),
+            },
+            variant,
+            price: p.price.iter().chain(&u.price).cloned().collect(),
+            goals: GoalSettings {
+                max_rounds: p.goals.max_rounds.or(u.goals.max_rounds),
+                max_tokens: p.goals.max_tokens.or(u.goals.max_tokens),
+            },
+            sandbox: SandboxSettings {
+                enabled: p.sandbox.enabled.or(u.sandbox.enabled),
+                root: u.sandbox.root.clone(),
+                network: both(&u.sandbox.network, &p.sandbox.network),
+                memory_mb: p.sandbox.memory_mb.or(u.sandbox.memory_mb),
+            },
+            instructions: InstructionSettings {
+                files: both(&u.instructions.files, &p.instructions.files),
+            },
+            agents: AgentSettings {
+                max_background: p.agents.max_background.or(u.agents.max_background),
+            },
+            local: u.local.clone(),
+            coordinator: CoordinatorSettings {
+                wake: p.coordinator.wake.or(u.coordinator.wake),
+                wake_max: p.coordinator.wake_max.or(u.coordinator.wake_max),
+            },
+            loops: LoopSettings {
+                max_runs: p.loops.max_runs.or(u.loops.max_runs),
+            },
+        }
+    }
+
     /// Write settings back to `<root>/atelier.toml`.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
         let text = tomlproc::serde::to_string_pretty(self).context("serializing settings")?;
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// The permission mode one file's `[defaults]` asks for: `mode`, else what
+/// `approve` meant before there were modes (as
+/// [`Mode::configured`](crate::permissions::Mode::configured) reads it).
+pub fn file_mode(defaults: &Defaults) -> Option<crate::permissions::Mode> {
+    use crate::permissions::Mode;
+    (defaults.mode).or(defaults.approve.map(|yes| match yes {
+        true => Mode::Yolo,
+        false => Mode::AutoEdit,
+    }))
+}
+
+/// Whether the mode `project`'s `[defaults]` asks for is laid over
+/// `user`'s: it is there, and where the user's file names a mode too, it
+/// is at least as careful.
+pub fn project_mode_counts(user: &Defaults, project: &Defaults) -> bool {
+    match (file_mode(user), file_mode(project)) {
+        (Some(user), Some(project)) => project.strictness() <= user.strictness(),
+        (_, project) => project.is_some(),
+    }
+}
+
+/// The mode of [`Settings::layered`].
+fn layered_mode(user: &Defaults, project: &Defaults) -> Option<crate::permissions::Mode> {
+    match project_mode_counts(user, project) {
+        true => file_mode(project),
+        false => file_mode(user),
+    }
+}
+
+impl SearchSettings {
+    /// Nothing set: as a file without the table.
+    pub fn is_unset(&self) -> bool {
+        self.provider.is_none() && self.url.is_none() && self.key_env.is_none()
     }
 }
 
@@ -911,5 +1102,438 @@ disabled_tools = ["*"]
         let fs_table = text.split("[[mcp]]").nth(1).unwrap();
         assert!(!fs_table.contains("enabled"), "{text}");
         assert!(!fs_table.contains("timeout"), "{text}");
+    }
+
+    fn parse(text: &str) -> Settings {
+        tomlproc::serde::from_str(text).unwrap()
+    }
+
+    fn names<'a>(items: impl IntoIterator<Item = &'a String>) -> Vec<&'a str> {
+        items.into_iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn layered_scalars_override_key_by_key_not_table_by_table() {
+        let user = parse(
+            r#"
+[defaults]
+model = "user-model"
+provider = "home"
+context_limit = 9000
+mcp_tool_budget = 100
+parallel_tools = false
+
+[review]
+enabled = true
+model = "user-judge"
+
+[goals]
+max_rounds = 3
+max_tokens = 1000
+
+[agents]
+max_background = 2
+
+[coordinator]
+wake = "questions"
+wake_max = 7
+
+[loops]
+max_runs = 9
+
+[models]
+small = "user-small"
+summary = "user-summary"
+
+[sandbox]
+enabled = true
+memory_mb = 512
+"#,
+        );
+        let project = parse(
+            r#"
+[defaults]
+context_limit = 4000
+
+[review]
+preflight = true
+
+[goals]
+max_tokens = 50
+
+[coordinator]
+wake_max = 1
+
+[models]
+small = "project-small"
+
+[sandbox]
+memory_mb = 2048
+"#,
+        );
+        let s = Settings::layered(&user, &project);
+        // The project's where it says…
+        assert_eq!(s.defaults.context_limit, Some(4000));
+        assert_eq!(s.review.preflight, Some(true));
+        assert_eq!(s.goals.max_tokens, Some(50));
+        assert_eq!(s.coordinator.wake_max, Some(1));
+        assert_eq!(s.models.small.as_deref(), Some("project-small"));
+        assert_eq!(s.sandbox.memory_mb, Some(2048));
+        // …the user's for the other keys of the same tables.
+        assert_eq!(s.defaults.model.as_deref(), Some("user-model"));
+        assert_eq!(s.defaults.provider.as_deref(), Some("home"));
+        assert_eq!(s.defaults.mcp_tool_budget, Some(100));
+        assert_eq!(s.defaults.parallel_tools, Some(false));
+        assert_eq!(s.review.enabled, Some(true));
+        assert_eq!(s.review.model.as_deref(), Some("user-judge"));
+        assert_eq!(s.goals.max_rounds, Some(3));
+        assert_eq!(s.agents.max_background, Some(2));
+        assert_eq!(s.coordinator.wake, Some(crate::coord::Wake::Questions));
+        assert_eq!(s.loops.max_runs, Some(9));
+        assert_eq!(s.models.summary.as_deref(), Some("user-summary"));
+        assert_eq!(s.sandbox.enabled, Some(true));
+
+        // A project's `false` is a say of its own, not "unset".
+        let off = parse("[review]\nenabled = false\n[sandbox]\nenabled = false\n");
+        let s = Settings::layered(&user, &off);
+        assert_eq!(s.review.enabled, Some(false));
+        assert_eq!(s.sandbox.enabled, Some(false));
+
+        // Neither file: nothing, for the built-in default to fill.
+        let none = Settings::layered(&Settings::default(), &Settings::default());
+        assert_eq!(none.review.enabled, None);
+        assert_eq!(none.defaults.mode, None);
+        assert_eq!(none.defaults.context_limit, None);
+    }
+
+    #[test]
+    fn a_review_table_without_enabled_says_nothing_about_it() {
+        // Written back by `/config` before `enabled` could be unset, the
+        // key is there; written now, a table that never set it stays so.
+        let mut settings = parse("[review]\nmodel = \"m\"\n");
+        assert_eq!(settings.review.enabled, None);
+        let text = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        assert!(!text.contains("enabled"), "{text}");
+        assert!(!text.contains("preflight"), "{text}");
+        settings.review.enabled = Some(false);
+        let text = tomlproc::serde::to_string_pretty(&settings).unwrap();
+        assert_eq!(parse(&text).review.enabled, Some(false));
+    }
+
+    #[test]
+    fn layered_lists_that_only_add_are_the_users_then_the_projects() {
+        let user = parse(
+            r#"
+[permissions]
+allow = ["read"]
+ask = ["bash(git push *)"]
+deny = ["bash(rm -rf *)"]
+
+[instructions]
+files = ["~/notes.md"]
+
+[sandbox]
+network = ["crates.io"]
+
+[[hooks]]
+event = "turn_end"
+command = "user-hook"
+"#,
+        );
+        let project = parse(
+            r#"
+[permissions]
+allow = ["bash(cargo *)"]
+deny = ["web_fetch"]
+
+[instructions]
+files = ["docs/style.md"]
+
+[sandbox]
+network = ["pypi.org"]
+
+[[hooks]]
+event = "turn_end"
+command = "project-hook"
+"#,
+        );
+        let s = Settings::layered(&user, &project);
+        assert_eq!(names(&s.permissions.allow), ["read", "bash(cargo *)"]);
+        assert_eq!(names(&s.permissions.ask), ["bash(git push *)"]);
+        assert_eq!(names(&s.permissions.deny), ["bash(rm -rf *)", "web_fetch"]);
+        assert_eq!(
+            names(&s.instructions.files),
+            ["~/notes.md", "docs/style.md"]
+        );
+        assert_eq!(names(&s.sandbox.network), ["crates.io", "pypi.org"]);
+        let hooks: Vec<&str> = s.hooks.iter().map(|h| h.command.as_str()).collect();
+        assert_eq!(hooks, ["user-hook", "project-hook"]);
+
+        // A project with no rules of its own takes none of the user's away.
+        let s = Settings::layered(&user, &Settings::default());
+        assert_eq!(names(&s.permissions.deny), ["bash(rm -rf *)"]);
+        assert_eq!(names(&s.permissions.allow), ["read"]);
+    }
+
+    #[test]
+    fn layered_named_entries_are_both_files_with_the_project_replacing_by_name() {
+        let user = parse(
+            r#"
+[[mcp]]
+name = "github"
+command = "user-github"
+
+[[mcp]]
+name = "notes"
+command = "user-notes"
+
+[[mcp_http]]
+name = "search"
+url = "https://user.invalid/mcp"
+
+[[provider]]
+name = "home"
+base_url = "http://user.invalid/v1"
+
+[[provider]]
+name = "shared"
+base_url = "http://user-shared.invalid/v1"
+
+[variant.low]
+reasoning_effort = "low"
+
+[variant.high]
+reasoning_effort = "high"
+
+[[lsp]]
+name = "pyright"
+command = "pyright-langserver --stdio"
+extensions = ["py"]
+
+[[lsp]]
+name = "clangd"
+command = "clangd"
+extensions = ["c", "h"]
+
+[[price]]
+model = "m"
+input = 1.0
+output = 2.0
+"#,
+        );
+        let project = parse(
+            r#"
+[[mcp]]
+name = "search"
+command = "project-search"
+
+[[mcp_http]]
+name = "github"
+url = "https://project.invalid/mcp"
+
+[[provider]]
+name = "shared"
+base_url = "http://project-shared.invalid/v1"
+
+[variant.high]
+reasoning_effort = "max"
+
+[[lsp]]
+name = "pylsp"
+command = "pylsp"
+extensions = ["py"]
+
+[[lsp]]
+name = "clangd"
+command = "clangd --project"
+extensions = ["c"]
+
+[[price]]
+model = "m"
+input = 5.0
+output = 6.0
+"#,
+        );
+        let s = Settings::layered(&user, &project);
+        // One namespace across both kinds: the project's HTTP `github`
+        // replaces the user's stdio one, its stdio `search` the user's
+        // HTTP one. The user's first, then the project's.
+        let stdio: Vec<(&str, &str)> = (s.mcp.iter())
+            .map(|m| (m.name.as_str(), m.command.as_str()))
+            .collect();
+        assert_eq!(
+            stdio,
+            [("notes", "user-notes"), ("search", "project-search")]
+        );
+        let http: Vec<(&str, &str)> = (s.mcp_http.iter())
+            .map(|m| (m.name.as_str(), m.url.as_str()))
+            .collect();
+        assert_eq!(http, [("github", "https://project.invalid/mcp")]);
+
+        let providers: Vec<(&str, &str)> = (s.provider.iter())
+            .map(|p| (p.name.as_str(), p.base_url.as_str()))
+            .collect();
+        assert_eq!(
+            providers,
+            [
+                ("home", "http://user.invalid/v1"),
+                ("shared", "http://project-shared.invalid/v1")
+            ]
+        );
+        assert_eq!(s.variant["low"].reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(s.variant["high"].reasoning_effort.as_deref(), Some("max"));
+
+        // The project's servers first — the first listing an extension
+        // serves it — and the user's `clangd` gives way to the project's.
+        let lsp: Vec<(&str, &str)> = (s.lsp.iter())
+            .map(|l| (l.name.as_str(), l.command.as_str()))
+            .collect();
+        assert_eq!(
+            lsp,
+            [
+                ("pylsp", "pylsp"),
+                ("clangd", "clangd --project"),
+                ("pyright", "pyright-langserver --stdio")
+            ]
+        );
+        let py = s.lsp.iter().find(|l| l.serves("py")).unwrap();
+        assert_eq!(py.name, "pylsp");
+        assert!(s.lsp.iter().all(|l| !l.serves("h") || l.name != "clangd"));
+
+        // The project's price first: the first for a model counts.
+        let prices: Vec<f64> = s.price.iter().map(|p| p.input).collect();
+        assert_eq!(prices, [5.0, 1.0]);
+    }
+
+    #[test]
+    fn layered_search_and_reviewer_tables_are_taken_whole() {
+        let user = parse(
+            r#"
+[search]
+provider = "tavily"
+key_env = "TAVILY_KEY"
+
+[permissions.reviewer]
+enabled = true
+model = "judge"
+policy = "policy.md"
+"#,
+        );
+        // A provider of the project's own: the user's key does not follow.
+        let project = parse("[search]\nprovider = \"brave\"\n");
+        let s = Settings::layered(&user, &project);
+        assert_eq!(s.search.provider.as_deref(), Some("brave"));
+        assert_eq!(s.search.key_env, None);
+        // No table of the project's: the user's, whole.
+        let s = Settings::layered(&user, &Settings::default());
+        assert_eq!(s.search.provider.as_deref(), Some("tavily"));
+        assert_eq!(s.search.key_env.as_deref(), Some("TAVILY_KEY"));
+        let reviewer = s.permissions.reviewer.unwrap();
+        assert_eq!(reviewer.policy.as_deref(), Some("policy.md"));
+
+        // The project's reviewer table, without a policy of its own, does
+        // not borrow the user's (a path relative to the user's file).
+        let project = parse("[permissions.reviewer]\nenabled = true\nmodel = \"other\"\n");
+        let s = Settings::layered(&user, &project);
+        let reviewer = s.permissions.reviewer.unwrap();
+        assert_eq!(reviewer.model.as_deref(), Some("other"));
+        assert_eq!(reviewer.policy, None);
+    }
+
+    #[test]
+    fn layered_keeps_user_only_and_project_only_tables_where_they_belong() {
+        let user = parse(
+            r#"
+[local]
+model = "user/weights"
+
+[sandbox]
+root = "/srv/rootfs"
+
+[[diagnostics]]
+name = "everywhere"
+command = "make lint"
+"#,
+        );
+        let project = parse(
+            r#"
+[local]
+model = "evil/weights"
+
+[sandbox]
+root = "/"
+
+[[diagnostics]]
+name = "clippy"
+command = "cargo clippy"
+"#,
+        );
+        let s = Settings::layered(&user, &project);
+        assert_eq!(s.local.model.as_deref(), Some("user/weights"));
+        assert_eq!(s.sandbox.root.as_deref(), Some("/srv/rootfs"));
+        let checks: Vec<&str> = s.diagnostics.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(checks, ["clippy"]);
+        // The user's checkers never apply: none of the project's means
+        // "detect them", not "use the user's".
+        let s = Settings::layered(&user, &Settings::default());
+        assert!(s.diagnostics.is_empty());
+        assert_eq!(s.local.model.as_deref(), Some("user/weights"));
+    }
+
+    #[test]
+    fn layered_mode_lets_a_project_tighten_the_users_never_loosen_it() {
+        use crate::permissions::Mode;
+        let defaults = |text: &str| parse(&format!("[defaults]\n{text}\n"));
+        let mode = |user: &str, project: &str| {
+            Settings::layered(&defaults(user), &defaults(project))
+                .defaults
+                .mode
+        };
+        // Only one file says: that one.
+        assert_eq!(mode("", ""), None);
+        assert_eq!(mode("mode = \"plan\"", ""), Some(Mode::Plan));
+        assert_eq!(mode("", "mode = \"ask-edits\""), Some(Mode::AskEdits));
+        assert_eq!(mode("", "mode = \"yolo\""), Some(Mode::Yolo));
+        // Both: the project's when at least as careful…
+        assert_eq!(
+            mode("mode = \"auto-edit\"", "mode = \"plan\""),
+            Some(Mode::Plan)
+        );
+        assert_eq!(
+            mode("mode = \"yolo\"", "mode = \"auto-edit\""),
+            Some(Mode::AutoEdit)
+        );
+        assert_eq!(mode("mode = \"plan\"", "mode = \"plan\""), Some(Mode::Plan));
+        // …else the user's.
+        assert_eq!(
+            mode("mode = \"plan\"", "mode = \"auto-edit\""),
+            Some(Mode::Plan)
+        );
+        assert_eq!(
+            mode("mode = \"ask-edits\"", "mode = \"yolo\""),
+            Some(Mode::AskEdits)
+        );
+        // `approve` is the older spelling, on either side.
+        assert_eq!(mode("approve = true", ""), Some(Mode::Yolo));
+        assert_eq!(mode("approve = true", "mode = \"plan\""), Some(Mode::Plan));
+        assert_eq!(mode("mode = \"plan\"", "approve = true"), Some(Mode::Plan));
+        assert_eq!(
+            mode("approve = false", "approve = true"),
+            Some(Mode::AutoEdit)
+        );
+        assert_eq!(
+            mode("mode = \"yolo\"", "approve = false"),
+            Some(Mode::AutoEdit)
+        );
+        // Within a file, `mode` wins over `approve`, as it always has.
+        assert_eq!(
+            mode("", "mode = \"plan\"\napprove = true"),
+            Some(Mode::Plan)
+        );
+        // The merged table says it with `mode` alone, so that
+        // `Mode::configured` reads it as it is meant.
+        let s = Settings::layered(&defaults("approve = true"), &Settings::default());
+        assert_eq!(s.defaults.approve, None);
+        assert_eq!(s.defaults.mode, Some(Mode::Yolo));
     }
 }

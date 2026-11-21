@@ -300,7 +300,9 @@ impl Config {
             main: None,
             small: pick(|m| &m.small),
             subagent: pick(|m| &m.subagent),
-            review: pick(|m| &m.review).or_else(|| project.review.model.clone()),
+            review: pick(|m| &m.review)
+                .or_else(|| project.review.model.clone())
+                .or_else(|| user.review.model.clone()),
             summary: pick(|m| &m.summary),
         };
         // ATELIER_MODEL wins; then the role, then the older spelling of it.

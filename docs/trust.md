@@ -52,7 +52,13 @@ atelier runs — but listed in the summary so you see the whole picture:
 definitions](agents.md) and [instruction files](configuration.md#instruction-files).
 
 Your user-global `atelier.toml` (`$XDG_CONFIG_HOME/atelier/atelier.toml`) is
-yours and is never gated.
+yours and is never gated. The project's file is laid over it (see
+[precedence](configuration.md#precedence)), and what an untrusted project's
+file is not allowed to say leaves your value standing: its `[sandbox]
+enabled = false` does not switch off a sandbox you turned on, its MCP
+servers do not replace yours of the same name, its `[coordinator]` and
+`[loops]` do not override yours. A project's mode never counts where it is
+looser than the one your file names, trusted or not.
 
 ### A provider without a key is gated too
 
@@ -66,8 +72,9 @@ endpoint and model.
 
 ## In an untrusted project
 
-- MCP servers are neither started nor contacted. (With the
-  [Claude backend](claude.md) they are not passed to claude.)
+- The project's MCP servers are neither started nor contacted. (With the
+  [Claude backend](claude.md) they are not passed to claude.) Yours, from
+  the user-global file, are.
 - No checker runs, configured or detected: there are no diagnostics.
 - No language server is started, configured or detected: the
   [`symbols`](tools.md#symbols) tool answers from the text, and says so.
@@ -77,8 +84,10 @@ endpoint and model.
   usual, and count in later sessions once the project is trusted).
 - The project's approval reviewer is not consulted; yours (from the
   user-global file) is, under your policy.
-- Sessions start in `auto-edit` unless you choose otherwise (`--mode`,
-  `ATELIER_MODE`, `ATELIER_APPROVE`).
+- Sessions start in the mode your own file names, else `auto-edit`, unless
+  you choose otherwise (`--mode`, `ATELIER_MODE`, `ATELIER_APPROVE`); the
+  project can only make it more careful.
+- `[coordinator]` and `[loops]` are yours: the project's are not read.
 - Project hooks do not run. Your own do.
 - `web_search` ignores `[search] key_env` and `url`: `ATELIER_SEARCH_KEY`
   still works, and goes to the provider's own endpoint (or

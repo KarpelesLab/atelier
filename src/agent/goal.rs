@@ -131,7 +131,7 @@ impl Session {
 
     /// The most a prompt is sent back to work, and its output-token budget.
     fn goal_bounds(&self) -> (u32, Option<u64>) {
-        let goals = &self.settings.goals;
+        let goals = &self.layered().goals;
         (
             goals.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS),
             goals.max_tokens,

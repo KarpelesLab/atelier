@@ -436,7 +436,8 @@ fn open(
         context::InstructionFiles::new(&settings, &user_settings),
         &trust,
     );
-    let mut session = agent::Session::new(cfg, root, tools, context, settings, trust);
+    let mut session =
+        agent::Session::with_user(cfg, root, tools, context, settings, user_settings, trust);
     if child.is_none() {
         own::watch_agents(session.agents_counter());
     }

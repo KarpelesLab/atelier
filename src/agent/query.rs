@@ -21,7 +21,7 @@ use super::{HELP, Session, is_builtin, needs_login};
 use crate::config::Role;
 use crate::coord::{self, locks::Lock};
 use crate::mcp::Annotations;
-use crate::settings::McpOptions;
+use crate::settings::{McpOptions, Settings};
 
 /// Why a configured MCP server is not connected.
 pub(super) enum McpProblem {
@@ -191,16 +191,21 @@ impl Session {
         self.mcp_problems.insert(name.to_string(), problem);
     }
 
-    /// The MCP servers: the configured ones (stdio, then HTTP, as `/mcp`
-    /// lists them), then those the client attached.
+    /// The MCP servers: the configured ones of both files (stdio, then
+    /// HTTP, as `/mcp` lists them), then those the client attached.
     pub(super) fn mcp_servers(&self) -> Vec<McpServer> {
         let connected = self.mcp_catalog.servers();
+        // The project's, which wait for trust; the user's never do.
+        let project = |name: &str| {
+            let s = &self.settings;
+            s.mcp.iter().any(|m| m.name == name) || s.mcp_http.iter().any(|m| m.name == name)
+        };
         let status = |name: &str, options: &McpOptions| {
             if connected.iter().any(|c| c == name) {
                 McpStatus::Connected
             } else if !options.enabled {
                 McpStatus::Disabled
-            } else if !self.trust.active() {
+            } else if !self.trust.active() && project(name) {
                 McpStatus::Untrusted
             } else if self.is_claude() {
                 McpStatus::Delegated
@@ -220,14 +225,15 @@ impl Session {
             status: options.map_or(McpStatus::Connected, |o| status(name, o)),
             tools: self.mcp_tools(name),
         };
-        let stdio = self.settings.mcp.iter().map(|m| {
+        let configured = Settings::layered(&self.user, &self.settings);
+        let stdio = configured.mcp.iter().map(|m| {
             let transport = Transport::Stdio {
                 command: m.command.clone(),
                 args: m.args.clone(),
             };
             server(&m.name, transport, Some(&m.options))
         });
-        let http = self.settings.mcp_http.iter().map(|m| {
+        let http = configured.mcp_http.iter().map(|m| {
             let transport = Transport::Http { url: m.url.clone() };
             server(&m.name, transport, Some(&m.options))
         });
@@ -533,5 +539,69 @@ impl Session {
             "agents": agents.iter().map(agent).collect::<Vec<Value>>(),
             "claude_background": self.background_tasks(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::permissions::Mode;
+    use crate::trust;
+
+    fn parse(text: &str) -> Settings {
+        tomlproc::serde::from_str(text).unwrap()
+    }
+
+    /// The user-global file under an untrusted project's: the user's
+    /// servers are the user's and wait for nobody, the project's wait for
+    /// trust; the user's mode stands against a looser one of the project's;
+    /// and `/mcp remove` edits the project's file only.
+    #[test]
+    fn a_session_lays_the_project_over_the_users_file() {
+        let root = std::env::temp_dir().join(format!("atl-query-layered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let project = parse(
+            "[defaults]\nmode = \"auto-edit\"\n\n[[mcp]]\nname = \"theirs\"\ncommand = \"x\"\n",
+        );
+        let user = parse(
+            "[defaults]\nmode = \"plan\"\n\n[review]\npreflight = true\n\n\
+             [[mcp]]\nname = \"mine\"\ncommand = \"y\"\n",
+        );
+        let mut session = Session::with_user(
+            Config::from_env(false),
+            root.clone(),
+            crate::tools::builtin_registry(),
+            Vec::new(),
+            project,
+            user,
+            trust::testing::closed(&root),
+        );
+        let env = |name: &str| std::env::var_os(name).is_some();
+        if !env("ATELIER_APPROVE") {
+            assert_eq!(session.mode(), Mode::Plan);
+        }
+        if !env("ATELIER_PREFLIGHT") {
+            assert!(session.preflight_enabled());
+        }
+        let status: Vec<(String, &str)> = (session.mcp_servers().into_iter())
+            .map(|s| (s.name.clone(), s.status.name()))
+            .collect();
+        assert_eq!(
+            status,
+            [
+                ("mine".to_string(), "disconnected"),
+                ("theirs".to_string(), "untrusted")
+            ]
+        );
+        let error = session.mcp_remove("mine").unwrap_err();
+        assert!(format!("{error}").contains("user-global"), "{error}");
+        assert!(!session.mcp_remove("nobody").unwrap());
+        assert!(session.mcp_remove("theirs").unwrap());
+        let written = std::fs::read_to_string(Settings::path(&root)).unwrap();
+        assert!(!written.contains("theirs"), "{written}");
+        assert!(!written.contains("mine"), "{written}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -126,10 +126,13 @@ impl Tool for WebSearchTool {
         // just means "no [search] table".
         let settings = Settings::load(ctx.project_root).unwrap_or_default();
         // `key_env` names a variable to send to an endpoint the same file
-        // chooses: honored only in a project the user has trusted.
+        // chooses: honored only in a project the user has trusted. The
+        // project's table, when it has one, replaces the user-global one
+        // whole (see `Settings::layered`).
         let store = crate::trust::Store::from_env();
         let trust = crate::trust::Trust::load(ctx.project_root, &settings, store);
-        let search = trust.effective(&settings).search;
+        let user = Settings::load_user().unwrap_or_default();
+        let search = trust.layered(&settings, &user).search;
         let backend = resolve(&|name| std::env::var(name).ok(), &search)?;
         let hits = backend.search(query, max, &domains)?;
         Ok(render(query, &hits))

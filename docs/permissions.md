@@ -107,14 +107,18 @@ In order of precedence:
 2. `--mode <name>` on the command line.
 3. `ATELIER_MODE=<name>`.
 4. `ATELIER_APPROVE=all` (or `yes`, `1`) — `yolo`.
-5. `[defaults] mode = "<name>"` in the project's `atelier.toml`.
+5. `[defaults] mode = "<name>"` in the project's `atelier.toml`, then in
+   your user-global one.
 6. `[defaults] approve = true` — `yolo` (what the `/config` screen's
-   auto-approve switch sets).
+   auto-approve switch sets); in one file, `mode` wins over it.
 7. Otherwise `auto-edit`.
 
 A project's file gets to choose `yolo` (5 or 6) only in a project you have
 [trusted](trust.md); in an untrusted one that default is ignored. The more
-careful modes need no trust.
+careful modes need no trust. And where your user-global file names a mode,
+a project's counts only if it is at least as careful — trusted or not, a
+project can tighten the mode you chose but not loosen it (see
+[precedence](configuration.md#precedence)).
 
 A name that is no mode is an error, not a fallback: `--mode pln` and
 `ATELIER_MODE=pln` stop atelier before it runs anything.

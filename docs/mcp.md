@@ -12,6 +12,13 @@ of the file's choosing. In an untrusted project the startup notice lists the
 servers and `/trust` starts them. Servers you add yourself with `/mcp add`
 are connected at once either way.
 
+Servers can also go in your user-global `~/.config/atelier/atelier.toml`,
+for every project: they are yours, and are started in untrusted projects
+too. A project's server with the same name (of either kind) replaces yours
+once the project is trusted. `/mcp add` and `/mcp remove` edit the
+project's file; one of yours is removed by editing your file. See
+[precedence](configuration.md#precedence).
+
 The other direction — atelier's own tools, offered to another program's
 agent over MCP — is [`atelier mcp`](#atelier-as-an-mcp-server), at the end
 of this page.

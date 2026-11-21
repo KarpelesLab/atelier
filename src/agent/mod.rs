@@ -994,7 +994,13 @@ pub struct Session {
     /// sign-in, or connecting it failed (see [`query`]). Gone once it
     /// connects, or is removed.
     mcp_problems: HashMap<String, query::McpProblem>,
+    /// The project's `atelier.toml` as written: what `/config`, `/mcp add`
+    /// and "always" change and write back.
     settings: Settings,
+    /// The user-global `atelier.toml`, as the session started with it;
+    /// what is in force is the project's laid over it
+    /// ([`layered`](Self::layered)).
+    user: Settings,
     /// How much runs without asking (see [`crate::permissions`]); `yolo` is
     /// `ATELIER_APPROVE=all`.
     mode: Mode,
@@ -1091,35 +1097,61 @@ pub struct Session {
 }
 
 impl Session {
+    /// A session on the project's `settings` alone, as if there were no
+    /// user-global file.
     pub fn new(
+        cfg: Config,
+        root: PathBuf,
+        tools: ToolRegistry,
+        context: Vec<Box<dyn ContextProvider>>,
+        settings: Settings,
+        trust: Trust,
+    ) -> Self {
+        Self::with_user(
+            cfg,
+            root,
+            tools,
+            context,
+            settings,
+            Settings::default(),
+            trust,
+        )
+    }
+
+    /// A session on the project's `settings` laid over the user-global
+    /// `user` (see [`Settings::layered`]).
+    pub fn with_user(
         cfg: Config,
         root: PathBuf,
         tools: ToolRegistry,
         mut context: Vec<Box<dyn ContextProvider>>,
         settings: Settings,
+        user: Settings,
         trust: Trust,
     ) -> Self {
+        let layered = trust.layered(&settings, &user);
         // Servers connect later (startup, `/mcp add`); what they have to
         // tell the model reaches this provider through the catalog.
         let mcp_catalog = mcp::Catalog::default();
         context.push(Box::new(crate::context::McpProvider::new(
             mcp_catalog.clone(),
         )));
-        // env wins; else the project's [defaults] — which get to choose
-        // `yolo` only in a trusted project; else the built-in default.
-        let mode = Mode::configured(&trust.effective(&settings).defaults);
+        // env wins; else the files' [defaults] — where the project's gets
+        // to choose `yolo` only once trusted, and nothing looser than the
+        // user's; else the built-in default.
+        let mode = Mode::configured(&layered.defaults);
         let context_limit = std::env::var("ATELIER_CONTEXT_LIMIT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&n| n > 0)
-            .or(settings.defaults.context_limit.filter(|&n| n > 0));
+            .or(layered.defaults.context_limit.filter(|&n| n > 0));
         let review_enabled = match std::env::var("ATELIER_REVIEW") {
             Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
-            Err(_) => settings.review.enabled,
+            Err(_) => layered.review.enabled.unwrap_or(false),
         };
         let preflight_enabled = match std::env::var("ATELIER_PREFLIGHT") {
             Ok(v) => matches!(v.as_str(), "on" | "yes" | "1" | "true"),
-            Err(_) => settings.review.preflight,
+            Err(_) => layered.review.preflight.unwrap_or(false),
         };
         let hooks = Hooks::load(
             &root,
@@ -1128,12 +1160,9 @@ impl Session {
             trust.hooks_state(),
         );
         // Whether peers may wake this instance is the user's to say: a
-        // project's `[coordinator]` counts only once the project is trusted.
-        let idle = if trust.active() {
-            idle::Idle::configured(&settings)
-        } else {
-            idle::Idle::configured(&Settings::default())
-        };
+        // project's `[coordinator]` counts only once the project is trusted
+        // (`effective` leaves it out until then).
+        let idle = idle::Idle::configured(&layered);
         Self {
             trust,
             hooks,
@@ -1149,6 +1178,7 @@ impl Session {
             mcp_tokens: mcp::oauth::TokenStore::user(),
             mcp_problems: HashMap::new(),
             settings,
+            user,
             mode,
             usage_ctx: 0,
             usage_out: 0,
@@ -1345,6 +1375,12 @@ impl Session {
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
+    /// The settings in force: what may be acted on of the project's laid
+    /// over the user-global ones (see [`Trust::layered`]). Asked anew each
+    /// time, so `/trust` and the session's own edits count at once.
+    pub fn layered(&self) -> Settings {
+        self.trust.layered(&self.settings, &self.user)
+    }
     /// The project's settings, to change in memory (`settings/set`):
     /// [`save_settings`](Self::save_settings) writes them.
     pub fn settings_mut(&mut self) -> &mut Settings {
@@ -1394,11 +1430,11 @@ impl Session {
     }
     pub fn set_review_enabled(&mut self, on: bool) {
         self.review_enabled = on;
-        self.settings.review.enabled = on;
+        self.settings.review.enabled = Some(on);
     }
     pub fn set_preflight_enabled(&mut self, on: bool) {
         self.preflight_enabled = on;
-        self.settings.review.preflight = on;
+        self.settings.review.preflight = Some(on);
     }
     /// Set the default model (updates the live model and the persisted default).
     #[allow(dead_code)] // used by the /config screen
@@ -1692,12 +1728,11 @@ impl Session {
     /// Returns human-readable status lines (one per server) for the caller to
     /// display; a failed server is reported but does not abort the others.
     pub fn connect_configured_mcp(&mut self) -> Vec<String> {
-        // A server is a command, or an address, of the project's choosing:
-        // none is started or contacted in a project the user has not
-        // trusted (the startup notice lists them; `/trust` comes back here).
-        if !self.trust.active() {
-            return Vec::new();
-        }
+        // A project's server is a command, or an address, of the project's
+        // choosing: none is started or contacted in a project the user has
+        // not trusted (the startup notice lists them; `/trust` comes back
+        // here). The user-global file's are the user's, and always are.
+        let layered = self.layered();
         let mut status = Vec::new();
         // With the Claude backend the servers are handed to claude itself
         // (`--mcp-config`); connecting them here too would run them twice.
@@ -1706,10 +1741,10 @@ impl Session {
                 true => "will be passed to claude",
                 false => "is disabled",
             };
-            for m in &self.settings.mcp {
+            for m in &layered.mcp {
                 status.push(format!("mcp: '{}' {}", m.name, fate(&m.options)));
             }
-            for m in &self.settings.mcp_http {
+            for m in &layered.mcp_http {
                 status.push(format!("mcp: '{}' (http) {}", m.name, fate(&m.options)));
             }
             return status;
@@ -1718,13 +1753,13 @@ impl Session {
         // order tools are registered and so advertised in; it must not
         // depend on which server answered first (see `mcp::connect_all`).
         let mut servers = Vec::new();
-        for s in &self.settings.mcp {
+        for s in &layered.mcp {
             match s.options.enabled {
                 true => servers.push(mcp::Server::Stdio(to_stdio(s))),
                 false => status.push(format!("mcp: '{}' is disabled", s.name)),
             }
         }
-        for s in &self.settings.mcp_http {
+        for s in &layered.mcp_http {
             match s.options.enabled {
                 true => servers.push(mcp::Server::Http(to_http(s, &self.mcp_tokens))),
                 false => status.push(format!("mcp: '{}' (http) is disabled", s.name)),
@@ -1765,7 +1800,7 @@ impl Session {
     /// Re-decide whether the MCP tools are advertised one by one or
     /// deferred, now that the set of them changed (see `mcp::deferred`).
     fn mcp_defer(&mut self) -> Option<mcp::deferred::Deferral> {
-        let budget = self.settings.defaults.mcp_tool_budget;
+        let budget = self.layered().defaults.mcp_tool_budget;
         let budget = budget.unwrap_or(mcp::deferred::DEFAULT_TOOL_BUDGET);
         mcp::deferred::apply(&mut self.tools, &self.mcp_catalog, budget)
     }
@@ -1791,10 +1826,17 @@ impl Session {
         (lines(configured), lines(attached))
     }
 
-    /// Whether any configured MCP server (stdio or HTTP) already uses `name`.
+    /// Whether any configured MCP server (stdio or HTTP, in either file)
+    /// already uses `name`.
     fn mcp_name_taken(&self, name: &str) -> bool {
-        self.settings.mcp.iter().any(|m| m.name == name)
-            || self.settings.mcp_http.iter().any(|m| m.name == name)
+        let all = Settings::layered(&self.user, &self.settings);
+        all.mcp.iter().any(|m| m.name == name) || all.mcp_http.iter().any(|m| m.name == name)
+    }
+
+    /// The configured HTTP MCP server `name`, as in force.
+    fn mcp_http_config(&self, name: &str) -> Option<HttpServerConfig> {
+        let layered = Settings::layered(&self.user, &self.settings);
+        layered.mcp_http.into_iter().find(|m| m.name == name)
     }
 
     /// Connect a new stdio MCP server, register its tools, and persist it.
@@ -1863,6 +1905,13 @@ impl Session {
         self.settings.mcp.retain(|m| m.name != name);
         self.settings.mcp_http.retain(|m| m.name != name);
         if self.settings.mcp.len() + self.settings.mcp_http.len() == before {
+            // `/mcp remove` edits the project's file; the user's own is
+            // theirs to edit.
+            if self.mcp_name_taken(name) {
+                anyhow::bail!(
+                    "'{name}' is configured in the user-global atelier.toml; remove it there"
+                );
+            }
             return Ok(false);
         }
         self.mcp_problems.remove(name);
@@ -1879,12 +1928,12 @@ impl Session {
     /// connect it. `open` is given the URL to send the user to. Returns how
     /// many tools the server brought.
     pub fn mcp_login(&mut self, name: &str, open: &mut dyn FnMut(&str)) -> Result<usize> {
-        let Some(cfg) = self.settings.mcp_http.iter().find(|m| m.name == name) else {
+        let Some(cfg) = self.mcp_http_config(name) else {
             anyhow::bail!(
                 "no HTTP MCP server named '{name}' (sign-in is for [[mcp_http]] servers)"
             );
         };
-        let server = to_http(cfg, &self.mcp_tokens);
+        let server = to_http(&cfg, &self.mcp_tokens);
         let request = mcp::oauth::LoginRequest {
             url: &server.url,
             headers: &server.headers,
@@ -1904,7 +1953,7 @@ impl Session {
     /// Forget the sign-in to the HTTP MCP server `name` and drop its tools.
     /// Returns whether there was a sign-in to forget.
     pub fn mcp_logout(&mut self, name: &str) -> Result<bool> {
-        let Some(cfg) = self.settings.mcp_http.iter().find(|m| m.name == name) else {
+        let Some(cfg) = self.mcp_http_config(name) else {
             anyhow::bail!("no HTTP MCP server named '{name}'");
         };
         if !self.mcp_tokens.remove(&cfg.url)? {
@@ -2456,9 +2505,9 @@ impl Session {
             self.claude = Some(Bridge::spawn(
                 &launch,
                 &self.root,
-                // claude launches the MCP servers it is handed: only a
-                // trusted project's.
-                &self.trust.effective(&self.settings),
+                // claude launches the MCP servers it is handed: the user's,
+                // and a trusted project's.
+                &self.layered(),
                 self.tools.specs(),
             )?);
             self.claude_restart = false;
@@ -2648,30 +2697,31 @@ impl Session {
             }
             Ok(_) => {
                 self.hooks.set_trust(self.trust.hooks_state());
+                // The project's servers: the user's were running already.
                 let servers = !self.settings.mcp.is_empty() || !self.settings.mcp_http.is_empty();
                 if self.is_claude() {
                     // claude is handed the servers when it is launched.
                     self.claude_restart |= servers;
                 } else {
                     // The providers, and the models addressed on them.
-                    let user = Settings::load_user().unwrap_or_default();
                     let before = self.cfg.model.clone();
-                    for warning in self.cfg.apply_settings(&self.settings, &user) {
+                    for warning in self.cfg.apply_settings(&self.settings, &self.user) {
                         ui.info(&format!("warning: {warning}"));
                     }
                     if self.cfg.model != before {
                         ui.info(&format!("model: {} (this project's)", self.cfg.model));
                     }
-                    // A server added by hand this session is connected
-                    // already; start over rather than run it twice.
-                    self.drop_mcp_tools();
+                    // A server added by hand this session, and the
+                    // user's own, are connected already; start over rather
+                    // than run them twice.
+                    self.drop_mcp_tools(true);
                     for line in self.connect_configured_mcp() {
                         ui.info(&line);
                     }
                 }
                 ui.info("trusted: in effect from now on, and on record until one of these changes");
                 // What only a new session picks up.
-                if Mode::configured(&self.settings.defaults) == Mode::Yolo
+                if Mode::configured(&self.layered().defaults) == Mode::Yolo
                     && self.mode != Mode::Yolo
                 {
                     ui.info("  the yolo default applies from the next session (/mode yolo: now)");
@@ -2700,7 +2750,7 @@ impl Session {
                 trust::ENV_TRUST
             )),
             _ => {
-                self.drop_mcp_tools();
+                self.drop_mcp_tools(false);
                 // With them goes the deferral they may have been under
                 // (`mcp_search` / `mcp_call`).
                 self.mcp_defer();
@@ -2714,13 +2764,19 @@ impl Session {
         }
     }
 
-    /// Unregister the tools of every configured MCP server, and forget
-    /// what else the servers brought (their instructions, standing in the
-    /// system message; their prompts, typed as `/mcp:<server>:<prompt>`).
-    fn drop_mcp_tools(&mut self) {
-        let stdio = self.settings.mcp.iter().map(|m| &m.name);
+    /// Unregister the tools of every MCP server the project's file
+    /// configures — with `user_too`, the user-global file's as well — and
+    /// forget what else the servers brought (their instructions, standing
+    /// in the system message; their prompts, typed as
+    /// `/mcp:<server>:<prompt>`).
+    fn drop_mcp_tools(&mut self, user_too: bool) {
+        let servers = match user_too {
+            true => Settings::layered(&self.user, &self.settings),
+            false => self.settings.clone(),
+        };
+        let stdio = servers.mcp.iter().map(|m| &m.name);
         let names: Vec<String> = stdio
-            .chain(self.settings.mcp_http.iter().map(|m| &m.name))
+            .chain(servers.mcp_http.iter().map(|m| &m.name))
             .cloned()
             .collect();
         for name in names {

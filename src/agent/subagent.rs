@@ -616,7 +616,7 @@ impl Session {
     /// this turn does not wait for. `Ok` is the call's result — the agent's
     /// id and what to expect — and `Err` the reason it was not started.
     fn start_background(&mut self, task: TaskCall, ui: &mut dyn Ui) -> Result<String, String> {
-        let max = self.settings.agents.max_background;
+        let max = self.layered().agents.max_background;
         let roster = self.background.roster();
         let seat = roster.start(
             max.unwrap_or(background::DEFAULT_MAX),
@@ -772,12 +772,13 @@ impl Session {
     /// directory. See the module docs for what it shares with this one.
     fn child(&self, agent: &Agent, link: Link, root: Option<&Path>) -> Session {
         let tools = self.tools.filtered(|name| agent.allows(name));
-        let mut child = Session::new(
+        let mut child = Session::with_user(
             self.cfg.clone(),
             root.unwrap_or(&self.root).to_path_buf(),
             tools,
             context::standing_providers(context::InstructionFiles::with_user(&self.settings)),
             self.settings.clone(),
+            self.user.clone(),
             // The same decision as its parent's, not another reading of it.
             self.trust.clone(),
         );

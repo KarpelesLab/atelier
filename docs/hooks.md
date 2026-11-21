@@ -33,7 +33,7 @@ Two files are read:
 | File | Hooks in it |
 |------|-------------|
 | `<project>/atelier.toml` | the project's: run only once [you have trusted the project](#trust) |
-| `$XDG_CONFIG_HOME/atelier/atelier.toml`, else `~/.config/atelier/atelier.toml` | yours, for every project: always run. Only `[[hooks]]` is read from this file |
+| `$XDG_CONFIG_HOME/atelier/atelier.toml`, else `~/.config/atelier/atelier.toml` | yours, for every project: always run |
 
 Several hooks on one event run in order, yours first, then the project's in
 the order written. Hooks are read when atelier starts; edits take effect at

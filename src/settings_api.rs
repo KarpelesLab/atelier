@@ -41,9 +41,13 @@
 //!
 //! Only the screen's rows can be set, and of those not `defaults.approve`:
 //! at project scope it is a gated setting (it would have the file switch
-//! every approval prompt off), and the user-global file is not read for it.
-//! Nothing that is gated by trust, or honoured in the user-global file only,
-//! can be written to the project's file from here.
+//! every approval prompt off), and at user scope it would switch them off in
+//! every project at once — a choice for the user's own editor, not for a
+//! client. Nothing that is gated by trust, or honoured in the user-global
+//! file only, can be written to the project's file from here.
+//!
+//! How the two files combine is [`Settings::layered`]'s; the layers reported
+//! here follow it, and a combined setting's value is what it yields.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -224,9 +228,10 @@ pub const SPECS: &[Spec] = &[
     spec(
         "defaults.approve",
         Kind::Bool,
-        "The older spelling of `mode = \"yolo\"`: no approval prompts. Honoured in a trusted \
-         project only, so not settable here: switch the session with `/mode`",
+        "The older spelling of `mode = \"yolo\"`: no approval prompts. In a project's file \
+         honoured once it is trusted, so not settable here: switch the session with `/mode`",
     )
+    .both()
     .env("ATELIER_APPROVE")
     .default(Builtin::Bool(false))
     .screen("auto-approve", &[]),
@@ -235,29 +240,34 @@ pub const SPECS: &[Spec] = &[
         Kind::Integer,
         "Tokens in a request past which older history is compacted into a summary",
     )
+    .both()
     .env("ATELIER_CONTEXT_LIMIT")
-    .screen("context limit", &[Scope::Project]),
+    .screen("context limit", &[Scope::User, Scope::Project]),
     spec(
         "review.enabled",
         Kind::Bool,
         "Whether the parallel reviewer watches the exchange and comments on it",
     )
+    .both()
     .env("ATELIER_REVIEW")
     .default(Builtin::Bool(false))
-    .screen("review mode", &[Scope::Project]),
+    .screen("review mode", &[Scope::User, Scope::Project]),
     spec(
         "review.preflight",
         Kind::Bool,
         "Whether a complex `bash` command gets the model's plain-language summary at its approval prompt",
     )
+    .both()
     .env("ATELIER_PREFLIGHT")
     .default(Builtin::Bool(false))
-    .screen("pre-flight", &[Scope::Project]),
+    .screen("pre-flight", &[Scope::User, Scope::Project]),
     spec(
         "defaults.mode",
         Kind::Choice(MODES),
-        "The permission mode sessions start in; `yolo` is honoured in a trusted project only",
+        "The permission mode sessions start in; a project's `yolo` is honoured once it is trusted, \
+         and a project's mode never when it is looser than the user-global file's",
     )
+    .both()
     .env("ATELIER_MODE")
     .default(Builtin::Text("auto-edit")),
     spec(
@@ -272,12 +282,14 @@ pub const SPECS: &[Spec] = &[
         Kind::Integer,
         "Bytes of MCP tool specs advertised before the tools are deferred behind `mcp_search`; 0 never defers",
     )
+    .both()
     .default(Builtin::Int(8192)),
     spec(
         "defaults.parallel_tools",
         Kind::Bool,
         "Whether the read-only tool calls of one model step run at the same time",
     )
+    .both()
     .env("ATELIER_PARALLEL_TOOLS")
     .default(Builtin::Bool(true)),
     spec("models.main", Kind::Text, "The model of the conversation")
@@ -311,7 +323,8 @@ pub const SPECS: &[Spec] = &[
         "review.model",
         Kind::Text,
         "The older spelling of `[models] review`",
-    ),
+    )
+    .both(),
     spec(
         "provider",
         Kind::Tables,
@@ -364,13 +377,18 @@ pub const SPECS: &[Spec] = &[
     spec(
         "mcp",
         Kind::Tables,
-        "MCP servers started with the session (stdio)",
-    ),
+        "MCP servers started with the session (stdio); a project's entry replaces a user-global \
+         server of the same name, of either kind",
+    )
+    .both()
+    .combined(),
     spec(
         "mcp_http",
         Kind::Tables,
         "MCP servers contacted with the session (Streamable HTTP); header values are not reported",
-    ),
+    )
+    .both()
+    .combined(),
     spec(
         "hooks",
         Kind::Tables,
@@ -388,18 +406,24 @@ pub const SPECS: &[Spec] = &[
     spec(
         "diagnostics",
         Kind::Tables,
-        "Lint and typecheck commands whose output the model is shown each turn; none means auto-detect",
+        "Lint and typecheck commands whose output the model is shown each turn; none means \
+         auto-detect. The project's file only: they run the project's build",
     ),
     spec(
         "lsp",
         Kind::Tables,
-        "Language servers for the `symbols` tool, by file extension",
-    ),
+        "Language servers for the `symbols` tool, by file extension; a project's entry replaces \
+         a user-global one of the same name",
+    )
+    .both()
+    .combined(),
     spec(
         "search.provider",
         Kind::Choice(SEARCH),
-        "The provider the `web_search` tool queries",
+        "The provider the `web_search` tool queries; a project's `[search]` table replaces the \
+         user-global one whole",
     )
+    .both()
     .env("ATELIER_SEARCH_PROVIDER")
     .default(Builtin::Text("duckduckgo")),
     spec(
@@ -407,34 +431,40 @@ pub const SPECS: &[Spec] = &[
         Kind::Text,
         "The SearXNG instance, or another endpoint for the provider",
     )
+    .both()
     .env("ATELIER_SEARCH_URL"),
     spec(
         "search.key_env",
         Kind::Text,
         "The name of the environment variable holding the search API key (never the key)",
-    ),
+    )
+    .both(),
     spec(
         "agents.max_background",
         Kind::Integer,
         "Background subagents that may run at once",
     )
+    .both()
     .default(Builtin::Int(4)),
     spec(
         "goals.max_rounds",
         Kind::Integer,
         "Times the agent is sent back to work on one prompt in pursuit of a `/goal`",
     )
+    .both()
     .default(Builtin::Int(10)),
     spec(
         "goals.max_tokens",
         Kind::Integer,
         "Output tokens one prompt may generate while the goal is unmet; unset, no limit",
-    ),
+    )
+    .both(),
     spec(
         "loops.max_runs",
         Kind::Integer,
         "Times one `/loop` fires before it stops by itself",
     )
+    .both()
     .needs_trust()
     .default(Builtin::Int(50)),
     spec(
@@ -442,6 +472,7 @@ pub const SPECS: &[Spec] = &[
         Kind::Choice(WAKE),
         "What from another instance starts a turn in this one while it is idle",
     )
+    .both()
     .needs_trust()
     .env("ATELIER_COORDINATOR_WAKE")
     .default(Builtin::Text("never")),
@@ -450,6 +481,7 @@ pub const SPECS: &[Spec] = &[
         Kind::Integer,
         "Turns the instance may start by itself before its user types again",
     )
+    .both()
     .needs_trust()
     .default(Builtin::Int(5)),
     spec(
@@ -698,6 +730,11 @@ struct View<'a> {
     written: Value,
     effective: Value,
     effective_settings: Settings,
+    /// What is in force: the effective project settings laid over the
+    /// user-global ones (see [`Settings::layered`]), as JSON — the value
+    /// of a [`Spec::combined`] setting.
+    layered: Value,
+    layered_settings: Settings,
 }
 
 impl<'a> View<'a> {
@@ -705,14 +742,48 @@ impl<'a> View<'a> {
         let project = File::read(Some(Settings::path(root)));
         let user = File::read(Settings::user_dir().map(|dir| Settings::path(&dir)));
         let effective_settings = session.trust().effective(&project.typed);
+        let layered_settings = Settings::layered(&user.typed, &effective_settings);
         View {
             session,
             written: serde_json::to_value(&project.typed).unwrap_or_default(),
             effective: serde_json::to_value(&effective_settings).unwrap_or_default(),
             effective_settings,
+            layered: serde_json::to_value(&layered_settings).unwrap_or_default(),
+            layered_settings,
             project,
             user,
         }
+    }
+
+    /// Why the project's value for `spec` gives way to the user's, though
+    /// the project may say it: what only the two files together decide.
+    fn yields_to_user(&self, spec: &Spec) -> Option<String> {
+        match spec.key {
+            "defaults.mode" | "defaults.approve"
+                if !crate::settings::project_mode_counts(
+                    &self.user.typed.defaults,
+                    &self.effective_settings.defaults,
+                ) =>
+            {
+                Some(
+                    "looser than the user-global file's mode: a project can make it more \
+                     careful, not less"
+                        .to_string(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Why the user's value for `spec` is not read, though the project's
+    /// file does not set this key.
+    fn replaced_for_user(&self, spec: &Spec) -> Option<String> {
+        if spec.key.starts_with("search.") && !self.effective_settings.search.is_unset() {
+            return Some(
+                "the project's `[search]` table replaces the user-global one whole".to_string(),
+            );
+        }
+        None
     }
 
     /// What the two files say about `spec`, the project's first.
@@ -735,13 +806,15 @@ impl<'a> View<'a> {
                     trust.state().name()
                 ))
             } else {
-                None
+                self.yields_to_user(spec)
             };
             out.push(layer("project", value, ignored));
         }
         if let Some(value) = lookup(&self.user.raw, spec.key) {
-            let ignored = (spec.files == Files::Project)
-                .then(|| "read from the project's file only".to_string());
+            let ignored = match spec.files {
+                Files::Project => Some("read from the project's file only".to_string()),
+                _ => self.replaced_for_user(spec),
+            };
             out.push(layer("user", value, ignored));
         }
     }
@@ -817,8 +890,8 @@ impl<'a> View<'a> {
                 ..Layer::new("flag", value)
             };
         }
-        // `ATELIER_APPROVE`, or the older `approve = true`.
-        if mode == Mode::configured(&self.effective_settings.defaults) {
+        // `ATELIER_APPROVE`, or the older `approve = true` of a file.
+        if mode == Mode::configured(&self.layered_settings.defaults) {
             let approve = std::env::var("ATELIER_APPROVE");
             if matches!(approve.as_deref(), Ok("all" | "yes" | "1")) {
                 return Layer {
@@ -826,9 +899,14 @@ impl<'a> View<'a> {
                     ..Layer::new("env", value)
                 };
             }
+            let from = find("defaults.approve").and_then(|spec| {
+                let mut layers = Vec::new();
+                self.file_layers(spec, false, &mut layers);
+                layers.into_iter().find(|l| l.ignored.is_none())
+            });
             return Layer {
                 key: Some("defaults.approve"),
-                ..Layer::new("project", value)
+                ..Layer::new(from.map_or("project", |l| l.source), value)
             };
         }
         Layer::new("session", value)
@@ -870,17 +948,14 @@ impl<'a> View<'a> {
         let mut counting = layers.iter().filter(|l| l.ignored.is_none());
         let (value, source) = if spec.combined {
             let source = counting.clone().next().map_or("default", |l| l.source);
-            let value = if spec.kind == Kind::Table {
-                // By name, the stronger file's entry replacing the other's.
-                let mut all = Map::new();
-                for layer in counting.rev() {
-                    all.extend(layer.value.as_object().cloned().unwrap_or_default());
-                }
-                Value::Object(all)
-            } else {
-                let lists = counting.filter_map(|l| l.value.as_array());
-                Value::Array(lists.flatten().cloned().collect())
+            // What the merge of the two files makes of them, exactly: by
+            // name for named entries, one list after the other for the
+            // rest (see `Settings::layered`).
+            let empty = match spec.kind {
+                Kind::Table => Value::Object(Map::new()),
+                _ => Value::Array(Vec::new()),
             };
+            let value = lookup(&self.layered, spec.key).map_or(empty, |v| redact(spec.key, v));
             (value, source)
         } else {
             match counting.next() {
