@@ -422,9 +422,12 @@ A daemon that connects every atelier running on the machine
   finds the directory held offers three things: remote control of the
   running session (`--attach`), take over (`--take-over`, which stops the
   owner and its tasks), or cancel. With the coordinator off there is no
-  detection. Open: `acp` does not claim a second `session/new` in another
-  directory; a take-over across a daemon restart has no process-level
-  test; the delay the claim adds to a start is not measured.
+  detection. ✅ `acp`: a `session/new` in another directory runs in a
+  second `atelier acp` it relays to, which claims that directory (a held
+  one fails, naming the owner and `--take-over`). ✅ Take-over across a
+  coordinator restart has process-level tests (`tests/own.rs`). ✅ The
+  claim costs a start under 1 ms with the coordinator up; launching the
+  coordinator costs the first start ~30 ms (docs/coordinator.md).
 - ⏳ Continued in M18 (subagents ride the coordinator): waking an idle
   instance on a message, `call` handlers that reach the agent, advisory
   locks. Also open: a non-Unix transport.
