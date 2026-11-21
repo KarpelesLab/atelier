@@ -883,8 +883,13 @@ truth. Each item maps to a milestone.
    run together (`src/agent/batch.rs`, M20); anything that mutates runs
    alone, in order. `[defaults] parallel_tools = false` or
    `ATELIER_PARALLEL_TOOLS=0` turns it off.
-5. **Config precedence:** today env vars/flags overlay the project
-   `atelier.toml`; a user-global config file is not implemented yet (M0).
+5. ✅ **Config precedence:** flags/session > env vars > the project's
+   `atelier.toml` (as far as its trust allows) > the user-global one
+   (`~/.config/atelier/atelier.toml`) > defaults, key by key
+   (`Settings::layered`). Lists that restrict only add, named entries
+   (MCP servers, providers, …) replace by name, the permission mode can
+   only get stricter from the project, and a few tables stay in one file
+   (docs/configuration.md, "Precedence").
 
 ---
 
