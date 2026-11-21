@@ -869,8 +869,10 @@ truth. Each item maps to a milestone.
 2. ✅ **Tool schemas:** hand-written JSON Schema per tool; no derive crate.
 3. ✅ **Edit semantics:** exact-string replace (`edit`, `multiedit`), plus
    `apply_patch` for models trained on patches.
-4. **Multiple concurrent tool calls:** still sequential for legibility;
-   parallelize later if models emit independent batches (M1/M4).
+4. ✅ **Multiple concurrent tool calls:** the read-only calls of one step
+   run together (`src/agent/batch.rs`, M20); anything that mutates runs
+   alone, in order. `[defaults] parallel_tools = false` or
+   `ATELIER_PARALLEL_TOOLS=0` turns it off.
 5. **Config precedence:** today env vars/flags overlay the project
    `atelier.toml`; a user-global config file is not implemented yet (M0).
 
