@@ -483,9 +483,16 @@ tools) by default. The weights (56 GB) are only downloaded after a yes; one
 supervised server is shared by all sessions and stops a minute after the
 last one leaves.
 
-- ⏳ Not yet run with the default 27B model (the plumbing was exercised
-  end to end with a 0.8B one); choosing a model by what the machine can
-  run; updating the installed oxinfer; Windows.
+- ✅ The model is chosen by what the machine can run: Qwen3.8 27B at 8
+  bits, 4 bits or a 3-bit GGUF, by GPU and RAM as oxinfer reports them
+  (`/proc/meminfo` / `sysctl` before it is installed); said with the reason
+  and the override (docs/local.md).
+- ✅ The installed oxinfer updates itself like atelier: once a day,
+  checked against GitHub's sha256 digest, never under a running server;
+  `atelier local update`.
+- ⏳ Not yet run with the 27B models (the plumbing was exercised end to
+  end with a 0.8B one); the 3-bit model's memory figure is an estimate;
+  macOS untried; Windows.
 
 ### Progress on M15–M22
 
