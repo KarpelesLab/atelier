@@ -1202,9 +1202,12 @@ pub(crate) fn approve_with(
     // summary, where that is on — advisory, and silent when it fails.
     if !unattended
         && let Some(host) = host.as_deref_mut()
-        && let Some(line) = crate::preflight::summarize(req.tool, req.arguments, root, host)
+        && crate::preflight::applies(req.tool, req.arguments, host)
     {
-        ui.info(&line);
+        ui.activity("🔎 pre-flight: asking the model what this command does…");
+        if let Some(line) = crate::preflight::summarize(req.tool, req.arguments, root, host) {
+            ui.info(&line);
+        }
     }
     match ui.ask_approval(req.tool, req.arguments) {
         Approval::Once => Ok(()),
@@ -2712,6 +2715,12 @@ mod tests {
         );
         // The rule-based signals are still there, ahead of it.
         assert!(ui.infos[0].starts_with("⚠"), "{:?}", ui.infos);
+        // Saying it is waiting, before the request.
+        assert!(
+            ui.infos[ui.infos.len() - 2].starts_with("🔎 pre-flight: asking"),
+            "{:?}",
+            ui.infos
+        );
 
         let mut ui = Scripted::new(|| Approval::Once);
         let (_, asked) = run("cargo test", Ok("Runs the tests."), &mut ui);
@@ -2723,8 +2732,11 @@ mod tests {
         let (result, asked) = run(script, failed, &mut ui);
         assert!(result.is_ok());
         assert_eq!((asked, ui.asked), (1, 1));
+        // Only the signals and the note that it asked: no summary.
         assert!(
-            ui.infos.iter().all(|i| i.starts_with("⚠")),
+            ui.infos
+                .iter()
+                .all(|i| i.starts_with("⚠") || i.starts_with("🔎 pre-flight: asking")),
             "{:?}",
             ui.infos
         );

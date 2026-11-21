@@ -208,6 +208,13 @@ pub fn query(command: &str, root: &Path) -> (Query, bool) {
     (query, clipped)
 }
 
+/// Whether [`summarize`] would ask the model about this call: the pre-flight
+/// is on and it is a complex `bash` command. Lets the caller say it is
+/// waiting before the request, which may take up to [`TIMEOUT`].
+pub fn applies(tool: &str, arguments: &str, host: &Host) -> bool {
+    host.preflight && command_of(tool, arguments).is_some_and(|c| is_complex(&c))
+}
+
 /// The line to show above the approval prompt of `tool` called with
 /// `arguments`, or `None`: the pre-flight is off, the call is not a complex
 /// `bash` command, or the model gave no usable answer in time (see the
@@ -367,10 +374,14 @@ mod tests {
         let mut off = host(&mut call);
         off.preflight = false;
         assert_eq!(summarize("bash", &script, root, &mut off), None);
+        assert!(!applies("bash", &script, &off));
         let mut on = host(&mut call);
         assert_eq!(summarize("bash", &args("ls -la"), root, &mut on), None);
         assert_eq!(summarize("write", &script, root, &mut on), None);
         assert_eq!(summarize("bash", "{not json", root, &mut on), None);
+        assert!(applies("bash", &script, &on));
+        assert!(!applies("bash", &args("ls -la"), &on));
+        assert!(!applies("write", &script, &on));
         assert_eq!(asked, 0);
     }
 

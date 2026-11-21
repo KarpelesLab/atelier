@@ -579,6 +579,7 @@ deleted, network, privilege — as one line under the risk signals:
 
 ```
 ⚠ recursive force delete (rm -rf)
+🔎 pre-flight: asking the model what this command does…
 🔎 pre-flight, the model's reading — advisory: For each directory under build/, deletes it and re-runs cmake there; nothing outside the project, no network.
 ```
 
@@ -587,7 +588,8 @@ It is off by default. Turn it on with `[review] preflight = true` in
 the file), or the `/config` screen's **pre-flight** row (see
 [Configuration](configuration.md#review)). Off by default because it is one
 more model request per such prompt, and a wait of up to five seconds before
-the prompt appears.
+the prompt appears. The dim "asking" line says that wait is under way; it shows
+only when a request is actually made.
 
 **Which commands.** `src/preflight.rs` (`is_complex`) counts a command as
 complex when it spans several lines, is longer than 200 characters, has a
