@@ -1642,6 +1642,126 @@ fn acp_refuses_a_directory_in_use_unless_told_to_take_over() {
     assert_eq!(client.piped.finish(), 0);
 }
 
+/// An editor's second `session/new`, in another directory, is a session of
+/// that directory's: the atelier that runs it (one the agent starts for
+/// it) claims it, is refused it while another atelier has it, takes it
+/// over with `--take-over`, and gives it up when the editor goes.
+#[test]
+fn acp_claims_the_directory_of_each_session_it_opens() {
+    let mock = echo();
+    let dir = project("acp-two");
+    // Another project, under the same coordinator.
+    let other = dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let real = other.canonicalize().unwrap();
+    let owner_of = |path: &Path| -> Option<Value> {
+        let real = path.canonicalize().unwrap();
+        let claims = ask_coordinator(&dir, "claims", json!({ "dir": real }))?;
+        let owner = claims["claims"][0]["owner"].clone();
+        owner.is_object().then_some(owner)
+    };
+    let repl_in_other = || {
+        let mut cmd = atelier(&mock.base_url(), &dir, &[]);
+        cmd.current_dir(&other);
+        let piped = Piped::spawn(cmd);
+        wait_until("the REPL to own the other directory", || {
+            owner_of(&other).is_some_and(|o| o["pid"] == piped.pid())
+        });
+        piped
+    };
+    let editor = |args: &[&str]| {
+        let mut all = vec!["acp"];
+        all.extend_from_slice(args);
+        let mut client = Client {
+            piped: Piped::spawn(atelier(&mock.base_url(), &dir, &all)),
+            seen: 0,
+            next_id: 0,
+        };
+        client.result("initialize", json!({"protocolVersion": 1}));
+        client.result("session/new", json!({"cwd": &*dir, "mcpServers": []}));
+        assert_eq!(owner_of(&dir).unwrap()["pid"], client.piped.pid());
+        client
+    };
+
+    let mut owner = repl_in_other();
+    let mut client = editor(&[]);
+    let refused = client.call("session/new", json!({"cwd": real, "mcpServers": []}));
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("a session is already running"),
+        "{refused}"
+    );
+    assert!(
+        message.contains(&format!("pid {}", owner.pid())),
+        "{refused}"
+    );
+    assert!(message.contains("atelier acp --take-over"), "{refused}");
+    assert_eq!(owner_of(&other).unwrap()["pid"], owner.pid());
+
+    // Free, it is the editor's — the atelier's that runs that session.
+    assert_eq!(owner.finish(), 0);
+    wait_until("the other directory to be free", || {
+        owner_of(&other).is_none()
+    });
+    let opened = client.result("session/new", json!({"cwd": real, "mcpServers": []}));
+    let session = opened["sessionId"].as_str().unwrap().to_string();
+    let claim = owner_of(&other).expect("claimed");
+    assert_eq!(claim["kind"], "acp");
+    let runner = claim["pid"].as_u64().unwrap() as u32;
+    assert_ne!(runner, client.piped.pid());
+    assert_eq!(ateliers_in(&real), vec![runner]);
+    let answer = client.result(
+        "session/prompt",
+        json!({"sessionId": session, "prompt": [{"type": "text", "text": "say two"}]}),
+    );
+    assert_eq!(answer["stopReason"], "end_turn");
+    assert!(client.piped.stdout().contains("re: two"));
+
+    // The editor goes: both sessions are given up, and nothing is left.
+    assert_eq!(client.piped.finish(), 0);
+    wait_until("both directories to be free", || {
+        owner_of(&dir).is_none() && owner_of(&other).is_none()
+    });
+    wait_until("the other session's atelier to be gone", || !alive(runner));
+
+    // Told to take over, it does, for the second directory as for a first.
+    let mut owner = repl_in_other();
+    let mut client = editor(&["--take-over"]);
+    let opened = client.result("session/new", json!({"cwd": real, "mcpServers": []}));
+    let session = opened["sessionId"].as_str().unwrap().to_string();
+    assert_eq!(owner.exit(), 0, "{}", owner.stderr());
+    assert!(
+        owner.stderr().contains("took this session over"),
+        "{}",
+        owner.stderr()
+    );
+    let claim = owner_of(&other).expect("claimed");
+    assert_eq!(claim["kind"], "acp");
+    let runner = claim["pid"].as_u64().unwrap() as u32;
+    assert_ne!(runner, client.piped.pid());
+
+    // Taken over in its turn, that session ends, and the editor's first
+    // goes on.
+    let mut cmd = atelier(&mock.base_url(), &dir, &["--take-over"]);
+    cmd.current_dir(&other);
+    let mut taker = Piped::spawn(cmd);
+    wait_until("the taker to own the other directory", || {
+        owner_of(&other).is_some_and(|o| o["pid"] == taker.pid())
+    });
+    wait_until("the other session's atelier to be gone", || !alive(runner));
+    let gone = client.call(
+        "session/prompt",
+        json!({"sessionId": session, "prompt": [{"type": "text", "text": "say three"}]}),
+    );
+    assert_eq!(gone["error"]["code"], -32002, "{gone}");
+    assert_eq!(owner_of(&dir).unwrap()["pid"], client.piped.pid());
+    assert_eq!(taker.finish(), 0);
+    assert_eq!(client.piped.finish(), 0);
+    wait_until("both directories to be free", || {
+        owner_of(&dir).is_none() && owner_of(&other).is_none()
+    });
+}
+
 /// One connection to a `serve --listen` socket: lines out, lines in.
 struct Connection {
     stream: std::os::unix::net::UnixStream,

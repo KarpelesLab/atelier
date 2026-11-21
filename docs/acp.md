@@ -70,7 +70,7 @@ protocol messages to stdout.
 | ACP | atelier |
 |-----|---------|
 | `initialize` | Version negotiation (always answers version 1) and capabilities — below. No authentication is asked for (`authMethods` is empty): the model backends authenticate out of band (`ATELIER_API_KEY`, `/login`, claude's own sign-in) |
-| `session/new` | Opens the session in `cwd` and connects the MCP servers: the project's configured ones (if the project is [trusted](trust.md)) and the ones the client sends. Answers with the session id and the modes |
+| `session/new` | Opens the session in `cwd` and connects the MCP servers: the project's configured ones (if the project is [trusted](trust.md)) and the ones the client sends. Answers with the session id and the modes. Several on one connection, one per directory ([below](#sessions-and-directories)) |
 | `session/prompt` | A turn of the conversation, or a slash command. The response is the stop reason: `end_turn`, `cancelled`, `max_turn_requests` |
 | `session/cancel` | Interrupts the running turn (and prompts still queued behind it); they end as `cancelled` |
 | `$/cancel_request` | For a `session/prompt` request: cancels that prompt alone |
@@ -84,24 +84,55 @@ Advertised agent capabilities: `promptCapabilities.image` and
 `.embeddedContext` (not `audio`), `mcpCapabilities.http` (not `sse`),
 `loadSession: false`.
 
-### One session per process
+### Sessions and directories
 
 ACP lets one agent process hold several sessions, each with its own working
-directory. atelier's session is the process's — its tools and the sandbox go
+directory. atelier's session is a process's — its tools and the sandbox go
 by the process's current directory — so `atelier acp` changes to the `cwd`
-of `session/new`, opens the session there, and refuses a second
-`session/new` with error `1001` and a message that says why. A client that
-wants another session starts another `atelier acp`.
+of the first `session/new` and opens the session there, and runs each
+`session/new` in **another directory** in an `atelier acp` of its own: one
+it starts with its own arguments (`--take-over`, `--max-turns`, the model
+flags), hands the client's `initialize` and the `session/new`, and speaks
+to on the client's behalf from then on. The client sees one agent with
+several sessions:
+
+- what it sends for a session goes to the process that has it, and what
+  that process sends — updates, permission requests, `fs/*`, forms —
+  comes back as if this one had sent it. A request made by a session's own
+  process carries an id of the form `atelier-relay-<n>:<id>`; it is answered
+  as any other;
+- each session is its directory's session in the sense of the next
+  paragraph, with its own saved conversation, coordinator instance and
+  background work;
+- when the client goes, every session ends.
+
+A `session/new` in a directory that already has a session **on this
+connection** fails with error `1001`, the open session's id as
+`data.sessionId`: a directory has one session, and the client is to prompt
+that one.
 
 The session is also the directory's: one atelier at a time
-[owns a project's session](sessions.md#one-session-one-owner). When another
-one is running in `cwd` — a terminal, another editor's agent — `session/new`
-fails with `-32603` and a message naming it (pid, kind, what it is doing),
-and nothing there is touched; an editor cannot be asked the question a
-terminal is. Start the agent as `atelier acp --take-over` to have it stop
-the other one and continue its session instead (`--cancel` is the default
-spelled out). An ACP session takes no remote, and is not attached to one:
-`--attach` is refused. Taken over in its turn, the agent process exits.
+[owns a project's session](sessions.md#one-session-one-owner), and every
+`session/new` claims its directory, in whichever process runs it, exactly
+as a start at a terminal does. When another atelier is running in `cwd` —
+a terminal, another editor's agent — that `session/new` fails with
+`-32603` and a message naming it (pid, kind, what it is doing) and the way
+out, `atelier acp --take-over`; nothing there is touched, and the
+connection's other sessions go on. An editor cannot be asked the question
+a terminal is, so the answer is given beforehand: start the agent as
+`atelier acp --take-over` to have it stop the other one and continue its
+session instead, for every `session/new` (`--cancel` is the default spelled
+out). An ACP session takes no remote, and is not attached to one:
+`--attach` is refused.
+
+A claim lasts as long as the process that made it: a session's directory is
+given up when the client goes (or the agent process ends some other way).
+ACP's `session/close` is not offered, so a session is not given up before.
+A session that is taken over by another atelier ends there: its process
+exits, what was asked of it and not answered fails with `-32603`, and its
+id is unknown from then on (`-32002`); the connection's other sessions go
+on — unless it was the agent process's own, the first, whose end is the
+agent's.
 
 ### Prompts
 
@@ -251,7 +282,6 @@ the capability, a paragraph in the answer.
 | | |
 |---|---|
 | `session/load`, `session/resume`, `session/list`, `session/close`, `session/delete` | Not advertised. atelier keeps one saved conversation per directory (`--continue`), with no id a client could ask for, and cannot replay it as updates |
-| Several sessions in one process | See above |
 | `terminal/*` | Never used |
 | Typing to a running command | No mechanism in ACP: commands are not interactive (`atelier serve` has [one](protocol.md#typing-to-a-command)) |
 | `authenticate`, `logout` | No authentication methods |
@@ -271,7 +301,7 @@ the capability, a paragraph in the answer.
 | `-32602` | Malformed or unsupported parameters: a relative `cwd`, an unknown mode, an `audio` block, an `sse` server |
 | `-32603` | The turn failed (the model's endpoint, a hook that blocked the prompt): the message says how |
 | `-32002` | A `sessionId` this connection did not create (`data.sessionId` repeats it) |
-| `1001` | A second `session/new` |
+| `1001` | A `session/new` in a directory that has a session on this connection (`data.sessionId` is that session's) |
 
 ## Tried against
 

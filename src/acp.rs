@@ -26,15 +26,18 @@
 //!   why the session never reads stdin: a turn blocked on a permission
 //!   request is cancelled from here.
 //!
-//! # One session
+//! # One session per process, one per directory
 //!
 //! ACP lets a connection hold several sessions, each with its own working
 //! directory. atelier's session is the process's: its tools, the status
-//! helpers and the sandbox go by the process's current directory. So
-//! `session/new` changes to the directory the client names and opens the
-//! session there, and a second `session/new` is refused
-//! ([`code::SESSION_LIMIT`]). Editors start an agent process per thread, or
-//! can be made to; nothing is lost but the sharing of one process.
+//! helpers and the sandbox go by the process's current directory, and the
+//! process owns that directory's session for as long as it lives (see
+//! [`crate::own`]). So the first `session/new` changes to the directory the
+//! client names and opens the session there, and one in another directory
+//! is run by an `atelier acp` of its own that this process starts and
+//! relays for ([`relay`]) — which claims its directory, as any start does.
+//! A `session/new` in a directory that has a session on this connection is
+//! refused ([`code::SESSION_LIMIT`]): a directory has one session.
 //!
 //! That is also why the session is opened here rather than by `main`:
 //! which directory it belongs to is not known until the client says.
@@ -48,6 +51,7 @@
 //! A prompt sent after the cancel is not affected by it.
 
 mod present;
+mod relay;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -87,8 +91,9 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(60);
 mod code {
     /// ACP's "resource not found": a session id this connection never gave.
     pub const NOT_FOUND: i64 = -32002;
-    /// atelier's own, outside the ranges JSON-RPC and ACP reserve: this
-    /// process already has its one session.
+    /// atelier's own, outside the ranges JSON-RPC and ACP reserve: the
+    /// directory of a `session/new` has a session on this connection
+    /// already (`data.sessionId` names it once it is open).
     pub const SESSION_LIMIT: i64 = 1001;
 }
 
@@ -104,22 +109,33 @@ pub struct Options {
 /// goes away, and return the exit status: 0, since how each prompt went was
 /// reported to the client as it happened. `open` sets up a session in the
 /// current directory (see the module docs for why that is not done yet).
-pub fn run(open: impl FnMut() -> anyhow::Result<Session>, opts: Options) -> u8 {
+///
+/// `program` and `args` start this agent again, for a session in another
+/// directory (see [`relay`]).
+pub fn run(
+    open: impl FnMut() -> anyhow::Result<Session>,
+    opts: Options,
+    program: PathBuf,
+    args: Vec<String>,
+) -> u8 {
     let shared = Arc::new(Shared {
-        wire: Wire::new("acp"),
+        wire: Arc::new(Wire::new("acp")),
         state: Mutex::new(State::default()),
         next_call: AtomicU64::new(1),
+        relay: Arc::new(relay::Relay::new(program, args)),
     });
     let (jobs_tx, jobs_rx) = mpsc::channel();
     let reader = Arc::clone(&shared);
     std::thread::spawn(move || reader.read_requests(&jobs_tx));
     Agent {
-        shared,
+        shared: Arc::clone(&shared),
         open,
         max_turns: opts.max_turns,
         current: None,
     }
     .serve(&jobs_rx);
+    // The other sessions' ateliers were told when stdin ended.
+    shared.relay.wait(GRACE);
     0
 }
 
@@ -181,7 +197,12 @@ struct Turn {
 struct State {
     /// `initialize` was answered; nothing else is accepted before.
     client: Option<Client>,
+    /// Its parameters, as sent: for the atelier of another session.
+    initialize: Value,
     session: Opened,
+    /// The directory of the process's session (its real path), from when
+    /// `session/new` is accepted for it.
+    root: Option<PathBuf>,
     /// The prompts accepted and not yet answered, oldest first: the first
     /// is the one running, if any is.
     turns: Vec<Turn>,
@@ -195,16 +216,21 @@ struct State {
 struct Accepted {
     reply: Option<Value>,
     job: Option<Job>,
+    /// A `session/new` for an atelier of its own, in this directory (see
+    /// [`relay`]).
+    relay: Option<PathBuf>,
 }
 
 /// State shared by the two threads (and by the tools, through
 /// [`ClientFiles`]).
 struct Shared {
     /// stdout, and the requests made of the client that it has not answered.
-    wire: Wire,
+    wire: Arc<Wire>,
     state: Mutex<State>,
     /// Numbers the tool calls of the session, for their ids.
     next_call: AtomicU64,
+    /// The sessions in other directories, each an atelier of its own.
+    relay: Arc<relay::Relay>,
 }
 
 impl Shared {
@@ -243,8 +269,12 @@ impl Shared {
 
     /// The reader thread: every line of stdin, until it ends.
     fn read_requests(&self, jobs: &Sender<Job>) {
-        self.wire
-            .read(|method, id, params| match self.accept(method, id, params) {
+        let on_request = |method: &str, id: &Id, params: &Value| {
+            // Another session's, in an atelier of its own: passed on.
+            if self.relay.route(&self.wire, method, id, params) {
+                return;
+            }
+            match self.accept(method, id, params) {
                 Ok(accepted) => {
                     if let Some(reply) = accepted.reply {
                         self.wire.respond(id, reply);
@@ -252,9 +282,17 @@ impl Shared {
                     if let Some(job) = accepted.job {
                         let _ = jobs.send(job);
                     }
+                    if let Some(dir) = accepted.relay {
+                        let initialize = lock(&self.state).initialize.clone();
+                        self.relay.open(&self.wire, &initialize, id, params, dir);
+                    }
                 }
                 Err(failure) => self.wire.fail(id, failure),
-            });
+            }
+        };
+        self.wire
+            .read_with(on_request, |answer| self.relay.answer(answer));
+        self.relay.close();
         // The client is gone: whatever is running is stopped, as far as it
         // can be, and the session thread is told to leave.
         for turn in &mut lock(&self.state).turns {
@@ -282,6 +320,7 @@ impl Shared {
                 return Err(Failure::params("\"protocolVersion\" must be a number"));
             }
             let caps = &params["clientCapabilities"];
+            state.initialize = params.clone();
             state.client = Some(Client {
                 read_file: caps["fs"]["readTextFile"] == true,
                 write_file: caps["fs"]["writeTextFile"] == true,
@@ -310,12 +349,35 @@ impl Shared {
                     return Err(Failure::params("\"cwd\" must be an absolute path"));
                 };
                 let servers = mcp_servers(&params["mcpServers"])?;
-                if state.session != Opened::No {
-                    let why = "this atelier process already has its session: atelier serves \
-                               one session per process (start another `atelier acp` for another)";
-                    return Err(Failure::new(code::SESSION_LIMIT, why));
+                // The directory by its real path, as the session and its
+                // claim know it.
+                let dir = std::fs::canonicalize(&cwd)
+                    .map_err(|e| Failure::params(format!("\"cwd\": {}: {e}", cwd.display())))?;
+                // A directory has one session: one that this connection
+                // has is not opened again.
+                if state.root.as_ref() == Some(&dir) {
+                    let open = match &state.session {
+                        Opened::Yes(id) => Some(id.as_str()),
+                        _ => None,
+                    };
+                    return Err(relay::already_open(&dir, open));
+                }
+                if let Some(open) = self.relay.session_in(&dir) {
+                    return Err(relay::already_open(&dir, open.as_deref()));
+                }
+                // The process's own session, while it has none — and in
+                // the directory it owns, if it already claimed one (a
+                // `session/new` that failed after the claim).
+                let owned = crate::own::claimed_dir();
+                let ours = owned.is_none_or(|owned| Path::new(&owned) == dir);
+                if state.session != Opened::No || !ours {
+                    return Ok(Accepted {
+                        relay: Some(dir),
+                        ..Accepted::default()
+                    });
                 }
                 state.session = Opened::Opening;
+                state.root = Some(dir);
                 let id = id.clone();
                 Ok(Accepted {
                     job: Some(Job::NewSession { id, cwd, servers }),
@@ -631,7 +693,10 @@ impl<F: FnMut() -> anyhow::Result<Session>> Agent<F> {
             Ok(opened) => opened,
             Err(failure) => {
                 // Nothing was opened: the client may try again.
-                lock(&self.shared.state).session = Opened::No;
+                let mut state = lock(&self.shared.state);
+                state.session = Opened::No;
+                state.root = None;
+                drop(state);
                 return self.shared.wire.fail(id, failure);
             }
         };

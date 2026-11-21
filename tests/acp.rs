@@ -828,8 +828,10 @@ fn a_session_opens_in_the_directory_the_client_names() {
         second["message"]
             .as_str()
             .unwrap()
-            .contains("one session per process")
+            .contains("is already open on this connection"),
+        "{second}"
     );
+    assert_eq!(second["data"]["sessionId"], client.session);
     let unknown = client.err(
         "session/prompt",
         json!({"sessionId": "sess_other", "prompt": [{"type": "text", "text": "hi"}]}),
@@ -1520,6 +1522,112 @@ IFS= read -r _end
         said.contains("for this session:\n  my_tools → (from the client)"),
         "{said}"
     );
+}
+
+/// A `session/new` in another directory is a session of its own, beside
+/// the first: an `atelier acp` this one starts (with its arguments) runs
+/// it, and the client cannot tell. Its requests of the client come under
+/// ids of their own and its answers go back to it; each session works in
+/// its directory. A directory that has a session on the connection is
+/// refused another. When the client goes, both end.
+#[test]
+fn a_session_in_another_directory_runs_beside_the_first() {
+    let mock = Mock::scripted(|_, body| {
+        let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let messages = request["messages"].as_array().cloned().unwrap_or_default();
+        let said = messages.iter().rev().find(|m| m["role"] == "user");
+        if said.is_some_and(|m| m["content"].to_string().contains("forever")) {
+            return tool_call("call_ls", "ls", json!({}));
+        }
+        if messages.last().is_some_and(|m| m["role"] == "tool") {
+            return answer("done");
+        }
+        tool_call(
+            "call_w",
+            "write",
+            json!({"path": "made.txt", "content": "here"}),
+        )
+    });
+    let first = unique_dir("first");
+    let second = unique_dir("second");
+    std::fs::write(
+        second.join("atelier.toml"),
+        "[permissions]\nask = [\"write\"]\n",
+    )
+    .unwrap();
+    let mut client = Client::open(&mock, &first, &["--max-turns", "3"], json!({}));
+    let one = client.session.clone();
+    let created = client.new_session(&second, json!([]));
+    let two = client.session.clone();
+    assert_ne!(one, two);
+    assert_eq!(created["modes"]["currentModeId"], "auto-edit");
+    client.take("the second session's commands", |m| {
+        m["params"]["sessionId"] == two
+            && m["params"]["update"]["sessionUpdate"] == "available_commands_update"
+    });
+
+    // The second session asks, through this process, under an id of its own.
+    let prompt = client.prompt("write it");
+    let asked = client.asked("session/request_permission");
+    assert_eq!(asked["params"]["sessionId"], two);
+    assert!(
+        asked["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("atelier-relay-")),
+        "{asked}"
+    );
+    client.reply(
+        &asked,
+        json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}}),
+    );
+    assert_eq!(client.stopped(&prompt), "end_turn");
+    assert_eq!(
+        std::fs::read_to_string(second.join("made.txt")).unwrap(),
+        "here"
+    );
+    assert!(!first.join("made.txt").exists());
+    // Its process was started as this one was.
+    let prompt = client.prompt("look around forever");
+    assert_eq!(client.stopped(&prompt), "max_turn_requests");
+    client.ok(
+        "session/set_mode",
+        json!({"sessionId": two, "modeId": "plan"}),
+    );
+    std::fs::remove_file(second.join("made.txt")).unwrap();
+    let prompt = client.prompt("write it again");
+    assert_eq!(client.stopped(&prompt), "end_turn");
+    assert!(!second.join("made.txt").exists(), "plan mode refused it");
+
+    // The first session is as it was.
+    client.session = one.clone();
+    let prompt = client.prompt("write it");
+    assert_eq!(client.stopped(&prompt), "end_turn");
+    assert_eq!(
+        std::fs::read_to_string(first.join("made.txt")).unwrap(),
+        "here"
+    );
+
+    // One session per directory, whichever process has it.
+    for (dir, id) in [(&first, &one), (&second, &two)] {
+        let again = client.err(
+            "session/new",
+            json!({"cwd": dir, "mcpServers": []}),
+            SESSION_LIMIT,
+        );
+        assert_eq!(again["data"]["sessionId"], *id, "{again}");
+    }
+    // A third directory is a third session.
+    let third = unique_dir("third");
+    client.new_session(&third, json!([]));
+    assert_ne!(client.session, two);
+    client.err(
+        "session/prompt",
+        json!({"sessionId": "sess_other", "prompt": [{"type": "text", "text": "hi"}]}),
+        NOT_FOUND,
+    );
+
+    drop(client.stdin.take());
+    assert!(client.exited().success());
 }
 
 /// `--max-turns` bounds a prompt, which then ends as `max_turn_requests`.

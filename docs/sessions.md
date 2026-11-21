@@ -266,7 +266,7 @@ Those that work on the project's saved session:
 | `atelier` (the terminal interface, or the line REPL when input is not a terminal) | yes |
 | `atelier --print --continue` | yes, for as long as it runs |
 | `atelier serve`, and a connection of `serve --listen --continue` | yes |
-| `atelier acp` | yes, from the editor's `session/new`, in the directory it names |
+| `atelier acp` | yes, from each of the editor's `session/new`, in the directory it names — one in another directory than the first is run, and owned, by an `atelier acp` of its own ([acp](acp.md#sessions-and-directories)) |
 | `atelier --print` without `--continue` | no |
 | A connection of `serve --listen` without `--continue` | no: the listener gives every connection a conversation of its own, several at once |
 | `atelier review`, `debug prompt`, `doctor`, `mcp`, `stats`, `trust`, … and atelier's own helper processes (subagents, the coordinator) | no |

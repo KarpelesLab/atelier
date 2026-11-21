@@ -232,7 +232,19 @@ impl Wire {
     /// request or a notification is handed to `on_request` (method, id,
     /// params — `Null` when there are none); the client's answers go to
     /// whoever waits for them; what is neither is refused here.
-    pub fn read(&self, mut on_request: impl FnMut(&str, &Id, &Value)) {
+    pub fn read(&self, on_request: impl FnMut(&str, &Id, &Value)) {
+        self.read_with(on_request, |_| false);
+    }
+
+    /// [`read`](Self::read), with a look at each answer first: one that
+    /// `on_answer` takes (returns `true` for) is not looked for among this
+    /// process's requests — it answers a request this process passed on
+    /// for another (see `acp`'s relay).
+    pub fn read_with(
+        &self,
+        mut on_request: impl FnMut(&str, &Id, &Value),
+        mut on_answer: impl FnMut(&Map<String, Value>) -> bool,
+    ) {
         let mut stdin = io::stdin().lock();
         let mut line = Vec::new();
         loop {
@@ -246,14 +258,19 @@ impl Wire {
             let text = String::from_utf8_lossy(&line);
             let text = text.trim();
             if !text.is_empty() {
-                self.incoming(text, &mut on_request);
+                self.incoming(text, &mut on_request, &mut on_answer);
             }
         }
     }
 
     /// One line from the client: a request, a notification, or the answer
     /// to a request of ours.
-    fn incoming(&self, line: &str, on_request: &mut impl FnMut(&str, &Id, &Value)) {
+    fn incoming(
+        &self,
+        line: &str,
+        on_request: &mut impl FnMut(&str, &Id, &Value),
+        on_answer: &mut impl FnMut(&Map<String, Value>) -> bool,
+    ) {
         let null = Some(Value::Null);
         let message: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -278,7 +295,9 @@ impl Wire {
             }
             Some(_) => invalid(&id.or(null), "\"method\" must be a string"),
             None if object.contains_key("result") || object.contains_key("error") => {
-                self.answered(object);
+                if !on_answer(object) {
+                    self.answered(object);
+                }
             }
             None => invalid(
                 &id.or(null),

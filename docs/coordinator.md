@@ -281,7 +281,9 @@ one owner.
 A run that works on a project's saved session opens a connection for it —
 separate from its instance's, without `hello`: it has no name, is not
 listed and receives no message — and sends `claim` with the project's real
-path as `dir`, what it says of itself as `record` (kept as given), and its
+path as `dir` (`atelier acp` does so for every session an editor opens, each
+from the process that runs it: see [acp](acp.md#sessions-and-directories)),
+what it says of itself as `record` (kept as given), and its
 `version` and `proto`, checked as `hello`'s are. The answer is one of:
 
 | Answer | |

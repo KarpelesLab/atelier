@@ -232,7 +232,9 @@ pub fn run(args: &[String]) -> Result<u8> {
             }
             Ok(session)
         };
-        return Ok(finish(acp::run(open, opts)));
+        // The agent again, for a session in another directory.
+        let program = helper_exe()?;
+        return Ok(finish(acp::run(open, opts, program, args.to_vec())));
     }
     // Who owns this directory's saved session (see `own`): the runs that
     // work on it — the interface, `--print --continue`, `serve` — and not

@@ -598,10 +598,42 @@ mod imp {
         choice: Option<Choice>,
         interactive: bool,
     ) -> Result<Start> {
-        // Already this process's (an editor's second `session/new`).
+        // Already this process's: an editor's `session/new` again after
+        // one that failed past the claim. A process owns one directory's
+        // session, and keeps it for as long as it lives: another directory
+        // is another process's (`acp` starts one for it).
         if owner().is_some() {
+            let asked = claims::project_key(root);
+            if let Some(owned) = CLAIMED.get().filter(|owned| **owned != asked) {
+                anyhow::bail!(
+                    "this atelier owns the session of {owned}, and a process owns one \
+                     directory's session: {asked} is another's"
+                );
+            }
             return Ok(Start::Go { took_over: false });
         }
+        let start = start_owning(root, kind, choice, interactive)?;
+        if owner().is_some() {
+            let _ = CLAIMED.set(claims::project_key(root));
+        }
+        Ok(start)
+    }
+
+    /// The directory whose session this process owns, by its real path
+    /// (see [`start`]); set once, for the life of the process.
+    static CLAIMED: OnceLock<String> = OnceLock::new();
+
+    /// The directory whose session this process owns, if it owns one.
+    pub fn claimed_dir() -> Option<String> {
+        CLAIMED.get().cloned()
+    }
+
+    fn start_owning(
+        root: &Path,
+        kind: Kind,
+        choice: Option<Choice>,
+        interactive: bool,
+    ) -> Result<Start> {
         // Without a coordinator nobody says whose the session is: the run
         // starts as if it were alone.
         let Some(link) = claims::Link::open(root) else {
@@ -784,6 +816,9 @@ mod imp {
     }
     pub fn start(_: &Path, _: Kind, _: Option<Choice>, _: bool) -> Result<Start> {
         Ok(Start::Go { took_over: false })
+    }
+    pub fn claimed_dir() -> Option<String> {
+        None
     }
     pub fn take_notice() -> Option<String> {
         None
