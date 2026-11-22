@@ -6,8 +6,8 @@ and continuously feeds itself context (git status, diagnostics, …) — driven
 from a deliberately minimal terminal interface.
 
 Status: **M0–M14 done** (§3); **M15–M24** (§3b) done but for the sandbox,
-which builds, tests, commits and reaches the hosts it is allowed, but is
-still opt-in and not in the release binaries — see "Progress on M15–M22" and "What is next" there. This document
+which is in the x86-64 release binary but off unless turned on, and still
+leaves some commands on the host — see "Progress on M15–M22" and "What is next" there. This document
 is the plan of record; it changes as we build.
 
 ---
@@ -453,7 +453,7 @@ overlay or a mouse.
 | Undo of file changes | checkpoints + rewind | snapshot per step in a private git object store, undo/redo | removed; "use git" | no — git does it (M16 dropped) |
 | Compaction | auto + manual with instructions; old tool output cleared first | cache-aware, structured hand-off, prune tool output, background | auto + manual, custom prompt, hooks | ✅ prune tool output, then a hand-off summary; `/compact`, `/context`; retry on overflow |
 | Permission rules | allow/ask/deny patterns per tool and command; modes | one grammar for tools, MCP, skills, subagents; per-agent | Starlark prefix rules with inline tests, `check` CLI | ✅ allow/ask/deny patterns, command splitting, user-global rules, `permissions check` |
-| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | ⏳ nixvm, opt-in `sandbox` feature: `bash`, background jobs and command files run in the guest, which builds, commits (linked worktrees and submodules too) and reaches the hosts on `[sandbox] network`; not in the release binaries (docs/sandbox.md) |
+| OS sandbox for commands | opt-in (bubblewrap/Seatbelt), network allowlist | — | default: bwrap+seccomp/Seatbelt, proxy with domain allowlist | ⏳ nixvm, opt-in `sandbox` feature: `bash`, background jobs and command files run in the guest, which builds, commits (linked worktrees and submodules too) and reaches the hosts on `[sandbox] network`; in the x86-64 release binary, off unless turned on (docs/sandbox.md) |
 | Approvals without the user | — | — | reviewer agent with a policy, fails closed | ✅ a reviewer model with a policy, failing closed; `permission_request` hooks |
 | Plan / read-only mode | plan mode | `plan` agent | read-only sandbox | ✅ `plan`, `ask-edits`, `auto-edit`, `yolo` |
 | Subagents | task tool, custom agents (Markdown), parallel, background, worktrees | task tool, Markdown agents, step cap, background | spawn/wait/message, roles, TOML agents | ✅ `task`, agents as files, step cap, parallel, background, worktrees |
@@ -503,7 +503,7 @@ last one leaves.
 |---|---|---|
 | M15 Instructions & memory | ✅ | — |
 | M16 | dropped | — |
-| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins, the approval reviewer | ⏳ the nixvm sandbox (nixvm 0.0.8) runs `bash`, background jobs and command-file shell lines, and `git commit` (in a linked worktree or a submodule too), `cargo` and `make -j` work in the guest; `[sandbox] network` lets it reach hosts by name; it stays opt-in (`--features sandbox`) — see "What is next" |
+| M17 Permissions & sandbox | ✅ rules, modes, project trust, rules over claude's built-ins, the approval reviewer | ⏳ the nixvm sandbox (nixvm 0.0.9) runs `bash`, background jobs, command-file shell lines, project hooks and checkers; it is in the x86-64 release binary, off unless turned on, and fetches its root image — see "What is next" |
 | M18 Subagents | ✅ `task`, agent files, step cap, parallel, background, worktree isolation; on the coordinator: ask/answer, opt-in wake, advisory locks, and a subagent as an instance of its own (`process: true`) | — |
 | M19 Commands, skills, hooks | ✅ | — |
 | M20 Tools | ✅ `ask`, `web_search`, diagnostics, parallel reads, output to a file, job notices, `symbols`, MCP (OAuth, filters, deferred tools, code mode, `atelier mcp`) | — |
@@ -520,22 +520,25 @@ against a real authorization server, the Brave and Tavily search providers.
 
 ### What is next
 
-In order; the first waits on nixvm, the rest are atelier's own.
+In order.
 
-1. **The sandbox in the release binaries.** Waits on nixvm: a host-directory
-   filesystem and KVM that need no libc, so the fullrust build can mount the
-   project (docs/sandbox.md, "What nixvm needs next"; nixvm #13).
+1. **The sandbox in the release binaries.** Done for x86-64 on nixvm 0.0.9:
+   the fullrust build has it, off unless turned on, and runs guests on KVM.
+   Open: the release workflow's own build has not run yet; the arm64 binary
+   is without it (nixvm has no KVM on arm64 Linux).
 2. **The rest of the sandbox**: project hooks, diagnostics checkers and
-   the `node` tool's commands now run in the guest; still on the host, and
-   the ways out that remain, are language servers, MCP servers (one shipped
-   in the project runs project code), the Claude backend and `node`'s own
-   `fs` (docs/sandbox.md, "What runs where") — the first two need a guest
-   with a stdin that lasts the session; a hook's large input still passes
-   through a file in the project for want of a guest stdin; a command the
-   user can type to, which the host has and the guest has not; a network allowlist that is exact by name rather than by
-   address (nixvm #18); a root image atelier fetches, and packages that
-   stay installed (nixvm #16); nixvm's "run this command" API, to drop the
-   exact version pin (nixvm #14).
+   the `node` tool's commands run in the guest, which now has a stdin and
+   an environment; atelier fetches a pinned Alpine root when none is named,
+   and `apk add` under `atelier sandbox run --rw-root` stays installed.
+   Still on the host, and the ways out that remain: language servers, MCP
+   servers (one shipped in the project runs project code), the Claude
+   backend and `node`'s own `fs` (docs/sandbox.md, "What runs where") —
+   the first two need a guest that lasts the session. Also open: a command
+   the user can type to, which the host has and the guest has not; a
+   network allowlist that is exact by name rather than by address
+   (nixvm #18); packages an agent installs itself (the layer is shared by
+   all projects, so only the user writes it); a nixvm builder that takes an
+   embedder's root filesystem.
 3. **Trying what was built against the real thing**: the list above, the
    GitHub Action on a runner, ACP in an editor, `--local` with the 27B, and
    the interactive `bash` on macOS, where its terminal has not been run.
