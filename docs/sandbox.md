@@ -486,7 +486,7 @@ unfiltered, for preparing the root filesystem by hand.
 
 ## What works in the guest, and what doesn't
 
-Measured with nixvm 0.0.7 (this is now built on nixvm's master of 2026-11-18, to become 0.0.9, where the tests pass; the figures here and under [Speed](#speed) were not taken again) and Alpine 3.22
+Measured with nixvm 0.0.7 (this is now built on nixvm 0.0.9, where the tests pass; the figures here and under [Speed](#speed) were not taken again) and Alpine 3.22
 x86-64 on KVM.
 
 | | |
@@ -548,7 +548,7 @@ for an image of the other architecture. atelier gives the guest one vCPU.
 ## Builds
 
 The feature adds 5.0 MB to the x86-64 release binary (25.2 → 30.2 MB,
-measured on the fullrust build with nixvm at 7761ff8). A build without it
+measured on the fullrust build with nixvm at 7761ff8, the revision that became 0.0.9). A build without it
 is unchanged: the code that touches nixvm is compiled only with the
 feature, on Unix and on fullrust.
 
@@ -610,7 +610,7 @@ was not run.
 
 In the order that unblocks atelier, with what atelier does once each lands.
 
-1. *(Done in nixvm's master, nixvm #13: the release binary has the sandbox.)* **A host-directory filesystem without libc, and KVM on fullrust.**
+1. *(Done in nixvm 0.0.9, nixvm #13: the release binary has the sandbox.)* **A host-directory filesystem without libc, and KVM on fullrust.**
    `fs::Passthrough` on raw system calls (or on `std::os::fd` where std
    suffices) and gated on something fullrust satisfies; the same for
    `vcpu::kvm`'s `target_os = "linux"` and `kernel::egress`'s `setsockopt`.
@@ -629,7 +629,7 @@ In the order that unblocks atelier, with what atelier does once each lands.
    open them non-blocking; and enforce `Limits::wall_time` from outside the
    thread that may be stuck. *Then:* atelier could drop the kill-the-helper
    fallback (it will keep the helper process for the reasons below).
-5. *(Done in nixvm's master, nixvm #14: atelier's guest is `Sandbox::execute`. Left over: the builder takes a root that is a directory, a squashfs or an image name, not a filesystem of the embedder's — atelier mounts its own at `/` over the empty one, which works because the later of two mounts at one path wins.)* **An embedding API for "run this command"**, so atelier stops assembling
+5. *(Done in nixvm 0.0.9, nixvm #14: atelier's guest is `Sandbox::execute`. Left over: the builder takes a root that is a directory, a squashfs or an image name, not a filesystem of the embedder's — atelier mounts its own at `/` over the empty one, which works because the later of two mounts at one path wins.)* **An embedding API for "run this command"**, so atelier stops assembling
    the guest from `Kernel`, `MountTable`, `loader` and `vcpu` by hand (about
    80 lines that track nixvm's internals, hence the exact version pin):
    `SandboxBuilder` with the working directory, binds at arbitrary guest
@@ -649,7 +649,7 @@ In the order that unblocks atelier, with what atelier does once each lands.
    environment variables change a library's behaviour from outside
    (atelier clears the helper's environment). *Then:* the pin becomes a
    normal version requirement.
-6. *(Done in nixvm's master, nixvm #15: atelier's path filter is gone; `Passthrough::protect` keeps them.)* **Read-only paths inside a writable host directory**, including single
+6. *(Done in nixvm 0.0.9, nixvm #15: atelier's path filter is gone; `Passthrough::protect` keeps them.)* **Read-only paths inside a writable host directory**, including single
    files, that survive a rename of a parent. Mounts are matched by path, so
    a read-only mount at `.git/hooks` is defeated by `mv .git g` (tested);
    atelier wraps `Passthrough` in a filter of its own instead. A
@@ -674,7 +674,7 @@ In the order that unblocks atelier, with what atelier does once each lands.
      answers "Network unreachable" and reports the refusal out of band.
 
    *Then:* an allowlist exact by name rather than by address.
-8. *(Done in nixvm's master, nixvm #16: `image::pull` and `Overlay::persistent`. Left over: a persistent layer in a directory of a user who is not root cannot record ownership — atelier papers over it, see [turning it on](#turning-it-on) — and the layer has one writer and no way to be read safely while written.)* **A released root image and a fetch that needs no C**: today the image is
+8. *(Done in nixvm 0.0.9, nixvm #16: `image::pull` and `Overlay::persistent`. Left over: a persistent layer in a directory of a user who is not root cannot record ownership — atelier papers over it, see [turning it on](#turning-it-on) — and the layer has one writer and no way to be read safely while written.)* **A released root image and a fetch that needs no C**: today the image is
    the user's to download and unpack. A pinned, digest-verified Alpine (plus
    a "dev" variant with git, make, a C compiler) that nixvm or atelier can
    fetch with a pure-Rust client and read without unpacking (squashfs is

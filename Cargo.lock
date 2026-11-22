@@ -737,8 +737,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nixvm"
-version = "0.0.8"
-source = "git+https://github.com/KarpelesLab/nixvm?rev=7761ff88002762428700f37a42cfdacb0b827920#7761ff88002762428700f37a42cfdacb0b827920"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2da55ba0b85f81b9075a9d4147c92b2572c63bc80d630f448f217162532c748"
 dependencies = [
  "compcol 0.7.9",
  "fstool",
