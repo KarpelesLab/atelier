@@ -483,16 +483,21 @@ for the user with no endpoint, key or subscription. oxinfer is fetched from
 its releases and run as a separate process — an OpenAI-compatible server on
 loopback, so it is one more provider — with Qwen3.8 27B (text, images,
 tools) by default. The weights (56 GB) are only downloaded after a yes; one
-supervised server is shared by all sessions and stops a minute after the
-last one leaves.
+server, run by the coordinator (M14) and started with no model, is shared
+by all sessions — each loads its own model through oxinfer's API, so
+different models run side by side — survives a coordinator restart, and
+stops a minute after the last session leaves. With the coordinator off
+there is no local model.
 
 - ✅ The model is chosen by what the machine can run: Qwen3.8 27B at 8
   bits, 4 bits or a 3-bit GGUF, by GPU and RAM as oxinfer reports them
   (`/proc/meminfo` / `sysctl` before it is installed); said with the reason
   and the override (docs/local.md).
-- ✅ The installed oxinfer updates itself like atelier: once a day,
-  checked against GitHub's sha256 digest, never under a running server;
-  `atelier local update`.
+- ✅ atelier only installs oxinfer the first time; after that oxinfer
+  updates itself (`oxinfer --update`, run by the coordinator before it
+  starts a server, at most daily, and at once for a copy older than
+  0.0.16); `atelier local update`. Open: a session is not told when
+  oxinfer crashes; nothing unloads a model when its session leaves.
 - ⏳ Not yet run with the 27B models (the plumbing was exercised end to
   end with a 0.8B one); the 3-bit model's memory figure is an estimate;
   macOS untried; Windows.
