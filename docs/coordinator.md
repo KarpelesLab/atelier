@@ -10,10 +10,14 @@ directory**, so that a second one started there is told instead of writing
 over the first (see [One session, one
 owner](sessions.md#one-session-one-owner)).
 
+It also runs the **server of the [model on this machine](local.md)**, for
+the ateliers that use one (`atelier --local`): one server for all of them,
+started when the first asks and stopped when the last is gone.
+
 There is nothing to install or start. The first atelier you launch starts
-the coordinator; the others find it. It keeps nothing on disk, and what it
-holds in memory each atelier can tell it again, so it can end at any time
-and be replaced:
+the coordinator; the others find it. What it holds in memory each atelier
+can tell it again, and the one thing it keeps on disk is where the model
+server is, so it can end at any time and be replaced:
 
 - **It ended** (crashed, was killed): every instance notices, the first one
   to retry starts a new coordinator, and they all rejoin it under the same
@@ -26,7 +30,12 @@ and be replaced:
   executable is replaced on disk (a self-update, a rebuild), and when a
   newer atelier connects to it. The next one runs the new version.
 - **Nobody is left**: it ends a minute after the last instance exits and
-  the last session is given up.
+  the last session is given up — once it has stopped the model server,
+  which it does a minute after the last atelier using it is gone.
+
+The model server is not ended with the coordinator: it stays, with the
+models it has loaded, and the next coordinator finds it again
+([below](#the-local-models-server)).
 
 While the coordinator is away, `/peers`, `/send` and the agent's tools fail
 with a message saying so, and an atelier started in a directory where
@@ -251,6 +260,8 @@ coordinator answers with the name it gets. After that:
 | `claim {dir, record, version, proto, wait?, again?}` | Claim the session of the project directory `dir` for this connection (see [below](#session-claims)); allowed without `hello` |
 | `unclaim {dir?}` | Give up the caller's claim on `dir`, or its place behind one — all of them without `dir`. `{released: n}` |
 | `claims {dir?}` | The sessions that are owned: `{claims: [{dir, owner, heir}]}`; allowed without `hello` |
+| `local {bin, update, version, proto, pid, start?, lease?}` | The local model's server, for this connection to use from now on (see [below](#the-local-models-server)); allowed without `hello` |
+| `local-status`, `local-stop` | Where the server is (with its key), and end it now; allowed without `hello` |
 
 Deliveries arrive as a `message` notification (`from`, `body`, `topic` or
 `broadcast`, and the sender's `wake_depth`, which the coordinator passes on
@@ -369,3 +380,59 @@ The code is in `src/coord/`: `daemon.rs` (the coordinator), `client.rs`
 `ask.rs` (questions awaiting this instance's agent), `locks.rs` (the
 advisory locks), `claims.rs` (the session claims), `tools.rs` (the agent's
 tools).
+
+### The local model's server
+
+The coordinator runs [oxinfer](local.md) for every atelier of the user
+(`src/coord/infer.rs`). An atelier that uses the local model opens a
+connection for it — separate from its instance's, without `hello`, as for a
+session claim — and sends `local` with the oxinfer to start (`bin`, an
+absolute path), whether that program may be updated first (`update`), and
+its `version` and `proto`, checked as `hello`'s are. The answer is one of:
+
+| Answer | |
+|---|---|
+| `{state: "up", port, key, pid, version, bin, leases}` | The server: `http://127.0.0.1:<port>`, and the key it wants |
+| `{state: "starting"}` | It is being started (or looked for, see below). Ask again in a moment |
+| `{state: "down"}` | There is none, and none was to be started (`start: false`) |
+| an error | The start failed — the message says why — or the caller's protocol is not this coordinator's |
+
+- **Starting.** With no server running, the coordinator has oxinfer update
+  itself if it is due or too old ([how](local.md#keeping-oxinfer-up-to-date)),
+  then starts `oxinfer serve --listen 127.0.0.1:<port> --max-body-mb 64
+  --no-update-check` on a free port, with a key it makes in the server's
+  environment (`OXINFER_API_KEY`), detached, its output in `oxinfer.log`.
+  No model is named: each atelier has the server load its own through
+  oxinfer's management API. The request does not wait for this — it is
+  answered `starting` — so the coordinator goes on serving meanwhile. A
+  start that failed is told to those that ask for the next three seconds;
+  after that the next request tries again.
+- **A lease is its connection's.** The request makes the connection a user
+  of the server (unless `lease: false`), and it stops being one when it
+  ends, however the process went. Nothing is written for it. `status`
+  counts the leases, and `atelier coordinator status` prints them: *local
+  model server: oxinfer 0.0.16 (pid …) on 127.0.0.1:…, used by 2 ateliers*.
+- **Stopping.** The server is stopped (`SIGTERM`, then `SIGKILL` after five
+  seconds) once no lease has been held for a minute (`ATELIER_LOCAL_IDLE`
+  seconds), by `local-stop`, and by a coordinator that ends while no lease
+  is held. The coordinator does not leave for idleness while the server
+  runs or a lease is held.
+- **Adoption.** The server outlives the coordinator. What it takes to find
+  it again — port, key, pid, and when that process started — is in
+  `oxinfer-server.json` beside the socket (mode 0600), written when the
+  server is spawned. A coordinator that starts and finds the file looks for
+  the server on a thread of its own: the process must be there, started
+  when the file says (a pid alone could be another process by now), and
+  answer to its key, for which it gets ten seconds — the coordinator before
+  may have only just started it. Then it is this coordinator's, models and
+  all; otherwise the file is removed, and a process that is the server but
+  never answered is ended. Meanwhile `local` answers `starting`. The
+  holders make their leases again as they reconnect (`start: false`: a
+  lease only), and the idle minute counts from the adoption, which is the
+  time they have to. A server whose users all died with the coordinator is
+  thus stopped a minute after the next coordinator starts — whichever
+  atelier starts it.
+
+The key reaches whoever can connect to the socket: the user's own
+processes. `status`, which is what `atelier coordinator status` and
+`atelier doctor` ask, does not carry it.

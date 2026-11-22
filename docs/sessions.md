@@ -340,6 +340,10 @@ none, nothing is detected:
 It is not on Windows either, where atelier has neither the coordinator nor
 the process table: there every start proceeds as it always did.
 
+The same switch turns the [model on this machine](local.md) off: its server
+is the coordinator's to run, and `--local` fails with
+`ATELIER_NO_COORDINATOR` set.
+
 The claim is made on a connection of its own, before the session is opened:
 it is not the [instance](coordinator.md#using-it) the same atelier is among
 its peers, has no name and receives no message.
