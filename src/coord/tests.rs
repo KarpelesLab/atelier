@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::ask::Outcome;
 use super::claims::{self, Answer, How, Link};
 use super::client::{self, Client, Options};
+use super::infer;
 use super::{Message, daemon, socket_path};
 
 /// A private directory for one test, removed on drop.
@@ -44,6 +45,7 @@ fn spawn_settling(dir: &Path, idle: Duration, settle: Duration) -> JoinHandle<()
         idle,
         watch_exe: false,
         settle,
+        local_idle: Duration::from_secs(60),
     };
     let handle = std::thread::spawn(move || daemon::run(cfg).expect("daemon"));
     wait_for("the socket", || super::connect(dir).is_ok());
@@ -1137,6 +1139,7 @@ fn only_one_coordinator_serves_and_it_leaves_when_idle() {
         idle: Duration::from_secs(60),
         watch_exe: false,
         settle: Duration::ZERO,
+        local_idle: Duration::from_secs(60),
     };
     let t0 = Instant::now();
     daemon::run(cfg).unwrap();
@@ -1162,5 +1165,103 @@ fn works_when_the_socket_path_is_too_long_for_an_address() {
     assert_eq!(a.send("b", "hi").unwrap(), 1);
     assert_eq!(next_message(&b).body, "hi");
     client::control(&deep, "shutdown").unwrap();
+    daemon.join().unwrap();
+}
+
+/// What an atelier that wants the local model's server meets in a
+/// coordinator from before it ran one: told to say hello first, its hello —
+/// a newer protocol's — makes that coordinator step down.
+#[test]
+fn a_coordinator_without_the_model_server_is_made_to_step_down() {
+    let dir = Dir::new("oldlocal");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(socket_path(&dir.0)).unwrap();
+    let socket = socket_path(&dir.0);
+    let old = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
+        let mut answer = |code: i64, message: &str| {
+            let request: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            let error = json!({ "code": code, "message": message });
+            let reply = json!({"jsonrpc": "2.0", "id": request["id"], "error": error});
+            writeln!(&stream, "{reply}").unwrap();
+            request
+        };
+        let local = answer(-32000, "local: say hello first");
+        let hello = answer(super::ERR_SUPERSEDED, "restarting");
+        std::fs::remove_file(socket).unwrap();
+        (local, hello)
+    });
+    let ask = infer::Ask {
+        bin: "/nonexistent/oxinfer".into(),
+        update: false,
+    };
+    // (No atelier is named to start the next coordinator from.)
+    let err = infer::acquire(&dir.0, None, &ask, &mut |_| {})
+        .err()
+        .expect("nobody to ask");
+    assert!(format!("{err:#}").contains("no coordinator"), "{err:#}");
+    let (local, hello) = old.join().unwrap();
+    assert_eq!(local["method"], "local");
+    assert_eq!(local["params"]["bin"], "/nonexistent/oxinfer");
+    assert_eq!(hello["method"], "hello");
+    assert_eq!(hello["params"]["proto"], super::PROTO);
+}
+
+/// A lease on the local model's server is its connection's, and keeps the
+/// coordinator from leaving; a server that cannot be started is an error
+/// for the one that asked, and nothing the coordinator stays for.
+#[test]
+fn a_lease_keeps_the_coordinator_and_a_failed_start_is_told() {
+    let dir = Dir::new("lease");
+    let daemon = spawn_daemon(&dir.0, Duration::from_millis(300));
+    assert_eq!(infer::status(&dir.0).unwrap()["state"], "down");
+    assert!(!infer::stop(&dir.0), "none to stop");
+
+    // A lease alone (nothing is to be started): the coordinator stays past
+    // its idle time, for as long as the connection does.
+    let mut holder = super::connect(&dir.0).unwrap();
+    let lease = json!({"jsonrpc": "2.0", "id": 1, "method": "local", "params": {
+        "start": false, "pid": 1, "version": crate::update::VERSION, "proto": super::PROTO,
+    }});
+    writeln!(holder, "{lease}").unwrap();
+    let mut line = String::new();
+    BufReader::new(holder.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(answer["result"]["state"], "down");
+    std::thread::sleep(Duration::from_millis(900));
+    let status = client::control(&dir.0, "status").unwrap();
+    assert_eq!(status["local"]["state"], "down");
+    assert_eq!(status["instances"], 0);
+
+    // A program that is no oxinfer: the one that asked is told why, on the
+    // way to a server, and no server is recorded.
+    let ask = infer::Ask {
+        bin: "/nonexistent/oxinfer".into(),
+        update: false,
+    };
+    let mut said = Vec::new();
+    let err = infer::acquire(&dir.0, None, &ask, &mut |l| said.push(l.to_string()))
+        .err()
+        .expect("no such program");
+    assert!(
+        format!("{err:#}").contains("/nonexistent/oxinfer is oxinfer of a version"),
+        "{err:#}"
+    );
+    assert_eq!(said, ["starting the local model's server…"]);
+    assert_eq!(infer::status(&dir.0).unwrap()["state"], "down");
+    assert!(!dir.0.join("oxinfer-server.json").exists());
+    // An older protocol is refused here as anywhere.
+    let r = raw(
+        &dir.0,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "local",
+               "params": {"version": "0.0.1", "proto": super::PROTO - 1}}),
+    );
+    assert_eq!(r["error"]["code"], super::ERR_INCOMPATIBLE);
+
+    // The holder gone, nothing is left to stay for.
+    drop(holder);
     daemon.join().unwrap();
 }

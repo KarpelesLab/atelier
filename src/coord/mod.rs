@@ -5,7 +5,8 @@
 //! coordinator over a Unix socket in a private directory and speaks
 //! newline-delimited JSON-RPC 2.0 with it. The coordinator routes, and
 //! keeps two tables in memory that those who filled them can fill again; it
-//! holds no durable state, so it can go away and come back at any time:
+//! holds no durable state of its own, so it can go away and come back at
+//! any time:
 //!
 //! - **Launch.** There is no service to install. An instance that finds no
 //!   coordinator starts one (`atelier coordinator`, detached) and connects.
@@ -44,6 +45,12 @@
 //! tool), and the session claims, by which it is settled which atelier owns
 //! the session of a project directory ([`claims`], `crate::own`).
 //!
+//! And it runs one thing for all of them: the server of the model on this
+//! machine ([`infer`], `crate::local`), started when an instance asks for
+//! it and stopped when the last one using it is gone. That server outlives
+//! the coordinator; where it is, is the one thing written to disk, for the
+//! next coordinator to find it.
+//!
 //! An idle instance holds what it receives for its user's next prompt,
 //! unless it is set to wake ([`Wake`]; the rules are in `agent::idle`). For
 //! that, every `send`, `publish` and `ask` carries a `wake_depth` — how many
@@ -65,6 +72,8 @@ pub mod client;
 pub mod client;
 #[cfg(unixlike)]
 pub mod daemon;
+#[cfg(unixlike)]
+pub mod infer;
 pub mod locks;
 #[cfg(all(test, unixlike))]
 mod tests;
@@ -91,7 +100,10 @@ pub use client::Client;
 /// notification). What is built on them — one owner per project session —
 /// only holds if the coordinator has them, so one that does not is made to
 /// step down.
-pub const PROTO: u64 = 3;
+///
+/// 4: the local model's server (`local`, `local-status`, `local-stop`): the
+/// coordinator runs oxinfer, and one that does not cannot be asked for it.
+pub const PROTO: u64 = 4;
 /// Set (to anything but `0`) to run without the coordinator: no instance,
 /// no `peer*` tools, and no session claim — an atelier started where
 /// another is running is then not told (see `crate::own`).
@@ -319,6 +331,9 @@ pub fn run_command(args: &[String]) -> Result<()> {
                         );
                         let list = client::control(&dir, "list")?;
                         for line in tools::render_instances(&list) {
+                            println!("{line}");
+                        }
+                        if let Some(line) = infer::render(&s) {
                             println!("{line}");
                         }
                         let claims = client::control(&dir, "claims")?;

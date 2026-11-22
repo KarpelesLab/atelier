@@ -30,11 +30,10 @@ fn exit_code(result: Result<u8>) -> ExitCode {
 }
 
 /// The subcommands atelier runs itself with: the coordinator daemon, the
-/// local model's supervisor, the relay claude launches, a sandboxed command,
-/// a subagent in a process of its own.
-const HELPERS: [&str; 5] = [
+/// relay claude launches, a sandboxed command, a subagent in a process of
+/// its own.
+const HELPERS: [&str; 4] = [
     "coordinator",
-    "local-serve",
     "mcp-serve",
     sandbox::HELPER,
     agent::SUBAGENT_HELPER,
@@ -114,14 +113,10 @@ pub fn run(args: &[String]) -> Result<u8> {
     if args.first().map(String::as_str) == Some("sandbox") {
         return sandbox::run_command(&args[1..]);
     }
-    // `atelier local [status|download|update|stop]`: the model on this machine;
-    // `local-serve` is its server's supervisor, started by atelier itself
-    // (see `local`).
+    // `atelier local [status|download|update|stop]`: the model on this
+    // machine (see `local`; its server is the coordinator's to run).
     if args.first().map(String::as_str) == Some("local") {
         return local::run_command(&args[1..]).map(|()| 0);
-    }
-    if args.first().map(String::as_str) == Some("local-serve") {
-        return local::supervise(&args[1..]).map(|()| 0);
     }
     // `atelier doctor`: check the setup a session here would run with,
     // without starting one (see `doctor`).

@@ -6,7 +6,8 @@
 //! single mutex and is lost when the daemon ends — instances bring it back
 //! when they reconnect (identity, topic subscriptions, the advisory locks
 //! they hold — see [`super::locks`] — and the sessions they own, see
-//! [`super::claims`]).
+//! [`super::claims`]). The one thing that outlives it is the local model's
+//! server, which the next daemon finds again ([`super::infer`]).
 //!
 //! The daemon ends on its own when:
 //! - an instance newer than it says hello (`superseded`): the instance then
@@ -14,7 +15,8 @@
 //! - its executable changes on disk (a self-update or a rebuild), so the
 //!   next one runs the new code;
 //! - no instance has been connected, and no session owned, for
-//!   [`Config::idle`];
+//!   [`Config::idle`] — and the local model's server, which it stops once
+//!   nobody has used it for [`Config::local_idle`], is not running;
 //! - it is asked to (`shutdown`, i.e. `atelier coordinator stop`).
 //!
 //! Exclusivity comes from an advisory lock on `coordinator.lock`, held for
@@ -27,17 +29,20 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
+use super::infer::{self, Phase};
 use super::{ERR_GONE, ERR_INCOMPATIBLE, ERR_SUPERSEDED, ERR_TIMEOUT, PROTO, socket_path};
 use crate::update::{VERSION, parse_version};
 
 /// How long the daemon outlives its last instance.
 const IDLE: Duration = Duration::from_secs(60);
+/// How long the local model's server outlives its last user.
+const LOCAL_IDLE: Duration = Duration::from_secs(60);
 /// How long a starting daemon waits for a dying one to release the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// How often the accept loop looks for a connection, and at whether to stop.
@@ -67,6 +72,11 @@ pub struct Config {
     /// (it finds that one's socket still there), how long a session nobody
     /// has claimed again yet is kept from a newcomer.
     pub settle: Duration,
+    /// How long the local model's server is kept with nobody using it —
+    /// from its start, from the end of the last lease, or from when this
+    /// coordinator found it running, which is the time those that used it
+    /// under the coordinator before have to say so again.
+    pub local_idle: Duration,
 }
 
 impl Config {
@@ -76,6 +86,10 @@ impl Config {
             idle: IDLE,
             watch_exe: true,
             settle: SETTLE,
+            local_idle: std::env::var(crate::local::ENV_IDLE)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .map_or(LOCAL_IDLE, Duration::from_secs),
         }
     }
 }
@@ -159,6 +173,8 @@ struct State {
     /// Until when a session nobody holds is kept for the owner it had under
     /// the coordinator before this one.
     settling: Option<Instant>,
+    /// The local model's server and who uses it (see [`super::infer`]).
+    local: infer::Table,
     /// When the last instance or owner left (or the daemon started).
     last_active: Option<Instant>,
     /// Why the daemon is ending, once it is.
@@ -201,6 +217,11 @@ impl State {
             }
         }
         self.calls.retain(|_, c| c.caller != conn);
+        // Its use of the local model's server ends here too.
+        if self.local.leases.remove(&conn).is_some() {
+            self.local.unused_since = Instant::now();
+            self.last_active = Some(Instant::now());
+        }
         self.drop_claims(conn, None);
     }
 
@@ -321,9 +342,20 @@ fn fail(msg: impl Into<String>) -> Reply {
 }
 
 struct Daemon {
+    /// Itself, for the threads it starts.
+    me: Weak<Daemon>,
     state: Mutex<State>,
     dir: PathBuf,
     started: Instant,
+    local_idle: Duration,
+}
+
+/// How the local model's server is brought up.
+enum Bring {
+    /// Find the one a coordinator before this one left running.
+    Adopt,
+    /// Start one from this program, brought up to date first if allowed.
+    Start { bin: PathBuf, update: bool },
 }
 
 /// Be the coordinator for `cfg.dir` until it ends. Returns `Ok` at once if
@@ -367,15 +399,32 @@ pub fn run(cfg: Config) -> Result<()> {
         socket.display()
     ));
 
-    let daemon = Arc::new(Daemon {
+    // A server the coordinator before this one left running is looked for
+    // (it may still be starting): until that is settled, who asks waits.
+    let adopting = infer::is_recorded(&cfg.dir);
+    let daemon = Arc::new_cyclic(|me| Daemon {
+        me: me.clone(),
         state: Mutex::new(State {
             last_active: Some(Instant::now()),
             settling: follows.then(|| Instant::now() + cfg.settle),
+            local: infer::Table {
+                phase: if adopting {
+                    Phase::Starting
+                } else {
+                    Phase::Down
+                },
+                ..infer::Table::default()
+            },
             ..State::default()
         }),
         dir: cfg.dir.clone(),
         started: Instant::now(),
+        local_idle: cfg.local_idle,
     });
+    if adopting {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.bring_up(Bring::Adopt));
+    }
 
     let ticker = Arc::clone(&daemon);
     let (idle, watch) = (cfg.idle, cfg.watch_exe.then(ExeWatch::new).flatten());
@@ -410,21 +459,33 @@ pub fn run(cfg: Config) -> Result<()> {
     // Tell everyone, close every connection, and give the writers a moment
     // to get that out before the process ends. The socket is left behind
     // when sessions are claimed, for the next coordinator to know of them.
-    {
+    let unused = {
         let mut st = daemon.lock();
         if st.claims.is_empty() {
             let _ = std::fs::remove_file(&socket);
         }
         let reason = st.stopping.clone().unwrap_or_default();
         log(&format!("coordinator stopping: {reason}"));
+        // The local model's server stays for those that use it, who will
+        // bring the next coordinator to it. With nobody using it there may
+        // be no next coordinator: it is stopped here.
+        let unused = match &st.local.phase {
+            Phase::Up(server) if st.local.leases.is_empty() => Some(server.clone()),
+            _ => None,
+        };
         let bye = notification("shutdown", json!({ "reason": reason }));
         let conns: Vec<u64> = st.conns.keys().copied().collect();
         for conn in conns {
             st.send(conn, bye.clone());
             st.drop_conn(conn);
         }
-    }
+        unused
+    };
     std::thread::sleep(Duration::from_millis(100));
+    if let Some(server) = unused {
+        log("stopping the local model's server: nobody is using it");
+        infer::end(&cfg.dir, &server);
+    }
     drop(lock);
     Ok(())
 }
@@ -442,6 +503,101 @@ impl Daemon {
                 return;
             }
             st.stopping = Some(reason.to_string());
+        }
+    }
+
+    /// Bring the local model's server up, on a thread of its own: starting
+    /// one takes seconds, and minutes when oxinfer is updated first.
+    fn bring_up(&self, how: Bring) {
+        let found = match how {
+            Bring::Adopt => Ok(infer::adopt(&self.dir)),
+            Bring::Start { bin, update } => {
+                infer::start(&self.dir, &bin, update, &|line| log(line)).map(Some)
+            }
+        };
+        let mut st = self.lock();
+        st.local.unused_since = Instant::now();
+        st.last_active = Some(Instant::now());
+        st.local.phase = match found {
+            Ok(Some(server)) => {
+                log(&format!(
+                    "local model server: oxinfer {} (pid {}) on 127.0.0.1:{}",
+                    server.version, server.pid, server.port
+                ));
+                Phase::Up(server)
+            }
+            Ok(None) => Phase::Down,
+            Err(e) => {
+                log(&format!("local model server: {e:#}"));
+                Phase::Failed(format!("{e:#}"), Instant::now())
+            }
+        };
+    }
+
+    /// `local`: the server, for a connection that uses it from now on.
+    fn local(&self, st: &mut State, conn: u64, p: &Value) -> Reply {
+        if let Some(refusal) = admit(p) {
+            return refusal;
+        }
+        match &st.local.phase {
+            Phase::Failed(why, at) if at.elapsed() < infer::FAILED_KEEP => {
+                return fail(why.clone());
+            }
+            _ => {}
+        }
+        if p["lease"] != false {
+            st.local
+                .leases
+                .insert(conn, json!({ "pid": p["pid"].clone() }));
+            st.local.unused_since = Instant::now();
+        }
+        if matches!(st.local.phase, Phase::Down | Phase::Failed(..)) && p["start"] != false {
+            let Some(bin) = p["bin"]
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|b| b.is_absolute())
+            else {
+                st.local.leases.remove(&conn);
+                return fail("local: 'bin' must be an absolute path");
+            };
+            let Some(me) = self.me.upgrade() else {
+                return fail("the coordinator is ending");
+            };
+            st.local.phase = Phase::Starting;
+            let update = p["update"] == true;
+            std::thread::spawn(move || me.bring_up(Bring::Start { bin, update }));
+        }
+        Reply::Now(Ok(st.local.describe(true)))
+    }
+
+    /// What the local model's server needs looked at now and then: whether
+    /// anybody still uses it, and (`look`) whether it is still there.
+    fn local_upkeep(&self, look: bool) {
+        let mut st = self.lock();
+        let Phase::Up(server) = &st.local.phase else {
+            return;
+        };
+        let server = server.clone();
+        if !st.local.leases.is_empty() {
+            st.local.unused_since = Instant::now();
+        } else if st.local.unused_since.elapsed() >= self.local_idle {
+            st.local.phase = Phase::Down;
+            st.last_active = Some(Instant::now());
+            drop(st);
+            log("stopping the local model's server: nobody is using it");
+            infer::end(&self.dir, &server);
+            return;
+        }
+        drop(st);
+        if look && !server.running() {
+            let mut st = self.lock();
+            if matches!(&st.local.phase, Phase::Up(now) if *now == server) {
+                st.local.phase = Phase::Down;
+                st.last_active = Some(Instant::now());
+                drop(st);
+                log("the local model's server ended on its own");
+                infer::end(&self.dir, &server);
+            }
         }
     }
 
@@ -467,6 +623,7 @@ impl Daemon {
             }
             let idle_out = st.peers.is_empty()
                 && st.claims.is_empty()
+                && st.local.idle()
                 && st
                     .last_active
                     .is_some_and(|t| now.duration_since(t) >= idle);
@@ -477,7 +634,9 @@ impl Daemon {
             if !super::socket_path(&self.dir).exists() {
                 return self.stop("its socket is gone");
             }
-            if last_exe_check.elapsed() >= EXE_CHECK {
+            let look = last_exe_check.elapsed() >= EXE_CHECK;
+            self.local_upkeep(look);
+            if look {
                 last_exe_check = now;
                 if watch.as_mut().is_some_and(|w| w.changed()) {
                     return self.stop("executable replaced");
@@ -581,6 +740,7 @@ impl Daemon {
                     "uptime_secs": self.started.elapsed().as_secs(),
                     "instances": st.peers.len(),
                     "sessions": st.claims.len(),
+                    "local": st.local.describe(false),
                 })));
             }
             "list" => {
@@ -605,6 +765,20 @@ impl Daemon {
                 return Reply::Now(Ok(json!({ "claims": table })));
             }
             "claim" => return claim(st, conn, p),
+            // The local model's server (see `super::infer`).
+            "local" => return self.local(st, conn, p),
+            "local-status" => return Reply::Now(Ok(st.local.describe(true))),
+            "local-stop" => {
+                let Phase::Up(server) = &st.local.phase else {
+                    // (One that is starting is left to: somebody waits for it.)
+                    return Reply::Now(Ok(json!({ "stopped": false })));
+                };
+                let (dir, server) = (self.dir.clone(), server.clone());
+                st.local.phase = Phase::Down;
+                log("stopping the local model's server: asked to");
+                std::thread::spawn(move || infer::end(&dir, &server));
+                return Reply::Now(Ok(json!({ "stopped": true })));
+            }
             "unclaim" => {
                 let released = st.drop_claims(conn, p["dir"].as_str());
                 return Reply::Now(Ok(json!({ "released": released })));

@@ -64,7 +64,7 @@
 #[cfg(unixlike)]
 mod hub;
 #[cfg(unixlike)]
-mod proc;
+pub(crate) mod proc;
 #[cfg(unixlike)]
 mod prompt;
 #[cfg(unixlike)]

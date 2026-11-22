@@ -7,35 +7,31 @@
 //! talks to it like to any other provider (it becomes the provider named
 //! `local`).
 //!
-//! Three things happen on the way to the first answer, each only once:
+//! Four things happen on the way to the first answer:
 //!
 //! 1. **The program** ([`binary`]): the newest release that has an archive
 //!    for this platform is downloaded, checked (its size, and its SHA-256
 //!    where GitHub lists one), unpacked and test-run, into
-//!    `$XDG_DATA_HOME/atelier/oxinfer/`, and kept up to date in the
-//!    background ([`spawn_update_check`]). `ATELIER_OXINFER_BIN` names a
-//!    program to use instead.
-//! 2. **The weights** ([`download`]) of the model the user names, else of
-//!    the one chosen for the machine ([`choose`]): tens of gigabytes, so
-//!    never fetched without the user saying yes ([`Plan`] carries what to
-//!    tell them). oxinfer does the fetching, into its own cache.
-//! 3. **The server** ([`connect`]): one per user, shared by every atelier
-//!    running — a model of this size is not something to load twice.
+//!    `$XDG_DATA_HOME/atelier/oxinfer/`. That is the one time atelier
+//!    installs it: from then on oxinfer updates itself (`oxinfer --update`),
+//!    when atelier asks it to ([`make_current`]). `ATELIER_OXINFER_BIN`
+//!    names a program to use instead.
+//! 2. **The server** ([`server`]): one per user, run by the coordinator
+//!    (see [`crate::coord::infer`]) for as long as an atelier uses it, and
+//!    started with no model at all.
+//! 3. **The weights** ([`Server::download`]) of the model the user names,
+//!    else of the one chosen for the machine ([`choose`]): tens of
+//!    gigabytes, so never fetched without the user saying yes ([`Plan`]
+//!    carries what to tell them). The server does the fetching, into
+//!    oxinfer's cache.
+//! 4. **The model** ([`Server::load`]): each atelier has the server load
+//!    its own, under a name made from what it is ([`Model::id`]) — so two
+//!    sessions that want the same model share it, and two that want
+//!    different ones are both served, oxinfer unloading the one used least
+//!    recently when its memory budget is short.
 //!
-//! # One server, as long as someone uses it
-//!
-//! The server belongs to a small supervisor, `atelier local-serve`, which
-//! instances start detached when none is running (a lock file keeps it
-//! unique, as for the coordinator). It starts oxinfer on a port of its own
-//! choosing with a key of its own making, and writes both to a private
-//! state file once the server answers.
-//!
-//! Who is using it is told by a lock, not by a list: every instance holds a
-//! *shared* lock on a lease file for as long as it lives, and the supervisor
-//! shuts the server down once it has been able to take that lock
-//! *exclusively* for [`IDLE`] — that is, once nobody holds it. The kernel
-//! drops an instance's lock however it dies, so a crash never leaves the
-//! model in memory.
+//! Without the coordinator (`ATELIER_NO_COORDINATOR`) there is nobody to
+//! run the server, and the local model is not available.
 //!
 //! [oxinfer]: https://github.com/KarpelesLab/oxinfer
 
@@ -52,8 +48,9 @@ const REPO: &str = "KarpelesLab/oxinfer";
 /// tools, at 4 bits (about 19 GB of memory). Otherwise [`choose`] picks
 /// among [`CANDIDATES`].
 pub const DEFAULT_MODEL: &str = "Qwen/Qwen3.8-27B,quant=q4";
-/// The name the server knows the model by, whatever it is.
-pub const MODEL_ID: &str = "local";
+/// The oldest oxinfer that will do: the first whose server starts with no
+/// model and takes them through its management API.
+pub const MIN_VERSION: (u64, u64, u64) = (0, 0, 16);
 /// Names a model to run instead of the one chosen for the machine, as
 /// oxinfer writes them: `SOURCE[,KEY=VALUE...]`.
 pub const ENV_MODEL: &str = "ATELIER_LOCAL_MODEL";
@@ -61,18 +58,20 @@ pub const ENV_MODEL: &str = "ATELIER_LOCAL_MODEL";
 pub const ENV_BIN: &str = "ATELIER_OXINFER_BIN";
 /// `1` agrees to the weights download where nobody can be asked.
 pub const ENV_ACCEPT: &str = "ATELIER_LOCAL_ACCEPT";
+/// How many seconds the server is kept with nobody using it (a minute when
+/// unset): read by the coordinator when it starts.
+pub const ENV_IDLE: &str = "ATELIER_LOCAL_IDLE";
 
-/// How long the server outlives its last user.
-const IDLE: Duration = Duration::from_secs(60);
-/// How long a server gets to start answering.
-const START_WAIT: Duration = Duration::from_secs(180);
 /// The release archives are tens of megabytes.
 const DOWNLOAD_TIME: Duration = Duration::from_secs(900);
+/// How long oxinfer gets to look for a newer release of itself when the
+/// one installed would do.
+const UPDATE_TIME: Duration = Duration::from_secs(90);
 
 /// The model to run: the source oxinfer loads, and its options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
-    /// `SOURCE[,KEY=VALUE...]`, as given to `oxinfer serve --model`.
+    /// `SOURCE[,KEY=VALUE...]`, as `oxinfer serve --model` takes it.
     pub spec: String,
 }
 
@@ -92,6 +91,52 @@ impl Model {
     /// The repository, folder or file, without the options.
     pub fn source(&self) -> &str {
         self.spec.split(',').next().unwrap_or(&self.spec)
+    }
+
+    /// The options, without the source: `KEY=VALUE[,KEY=VALUE...]`.
+    pub fn options(&self) -> &str {
+        self.spec.split_once(',').map_or("", |(_, options)| options)
+    }
+
+    /// The name the server knows this model by: what it is, in the letters
+    /// a model name may have (`provider/model#effort` gives `/` and `#` a
+    /// meaning), and a few digits of the whole specification's hash, so
+    /// that two specifications never share a name. The same model asked for
+    /// by two ateliers has the same name, and is loaded once.
+    pub fn id(&self) -> String {
+        let source = self.source().trim_end_matches('/');
+        let last = source.rsplit('/').next().unwrap_or(source);
+        let readable: String = std::iter::once(last)
+            .chain(
+                self.options()
+                    .split(',')
+                    .filter(|o| !o.is_empty())
+                    .map(|o| {
+                        // `quant=q4` reads as `q4`, a file as its name; the rest
+                        // is in the hash.
+                        let value = o.split_once('=').map_or(o, |(_, value)| value);
+                        value.rsplit('/').next().unwrap_or(value)
+                    }),
+            )
+            .map(|part| {
+                let part: String = part
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .take(40)
+                    .collect();
+                part
+            })
+            .collect::<Vec<_>>()
+            .join("-");
+        let hash = crate::update::hex(&purecrypto::hash::sha256(self.spec.as_bytes()));
+        let readable: String = readable.chars().take(56).collect();
+        format!("{}-{}", readable.trim_matches('-'), &hash[..6])
     }
 
     /// The entry of [`CANDIDATES`] this is, if it is one.
@@ -334,6 +379,16 @@ pub fn resolve(
     }
 }
 
+/// A number of gigabytes as it is said: whole from ten on, to a tenth
+/// below (a small model's download is not "0 GB").
+pub fn gigabytes(gb: f64) -> String {
+    if gb >= 9.95 {
+        format!("{gb:.0}")
+    } else {
+        format!("{gb:.1}")
+    }
+}
+
 /// What starting the model would take, for the user to agree to.
 #[derive(Debug, Default)]
 pub struct Plan {
@@ -361,20 +416,31 @@ impl Plan {
                 .map(|f| format!(" ({f:.0} GB free)"))
                 .unwrap_or_default();
             out.push(format!(
-                "{} is not on this machine yet: a {gb:.0} GB download{free}",
-                model.source()
+                "{} is not on this machine yet: a {} GB download{free}",
+                model.source(),
+                gigabytes(gb)
             ));
             if self.disk_free_gb.is_some_and(|free| free < gb) {
                 out.push("  that is more than the disk has free".to_string());
             }
         }
         if let Some(need) = self.memory_gb {
-            let speed = match (&self.runs_on, self.tokens_per_s) {
-                (Some(on), Some(t)) => format!(", on the {on} at about {t:.0} tokens/s"),
-                (Some(on), None) => format!(", on the {on}"),
+            // Where oxinfer says it would run: a device, or how the
+            // weights are held when it names none.
+            let place = match self.runs_on.as_deref() {
+                Some("memory") => ", held in memory".to_string(),
+                Some("streamed") => ", streamed from storage".to_string(),
+                Some(on) => format!(", on the {on}"),
+                None => String::new(),
+            };
+            let speed = match self.tokens_per_s {
+                Some(t) if self.runs_on.is_some() => format!(" at about {t:.0} tokens/s"),
                 _ => String::new(),
             };
-            out.push(format!("it takes about {need:.0} GB of memory{speed}"));
+            out.push(format!(
+                "it takes about {} GB of memory{place}{speed}",
+                gigabytes(need)
+            ));
             if self.memory_available_gb.is_some_and(|have| have < need) {
                 out.push(format!(
                     "  only {:.0} GB are available: expect it to be very slow, or to fail \
@@ -387,15 +453,17 @@ impl Plan {
     }
 }
 
-/// A running server this process may use, for as long as it keeps this.
+/// The model a session is served by, for as long as it keeps this.
 pub struct Local {
-    /// The model it runs.
+    /// The model, and the name the server knows it by.
     pub model: Model,
+    pub id: String,
     /// `http://127.0.0.1:<port>/v1`.
     pub base_url: String,
     pub key: String,
-    /// The shared lock that tells the supervisor someone is here.
-    _lease: std::fs::File,
+    /// What tells the coordinator the server has a user.
+    #[cfg(unixlike)]
+    _lease: crate::coord::infer::Lease,
 }
 
 /// `$XDG_DATA_HOME/atelier/oxinfer` (else `~/.local/share/…`): the program.
@@ -408,8 +476,8 @@ fn data_dir() -> Result<PathBuf> {
     Ok(base.join("atelier").join("oxinfer"))
 }
 
-/// Where the supervisor's lock, lease, state and log live: next to the
-/// coordinator's socket, in a directory only the user can enter.
+/// Where the coordinator is, and with it the server's record and log.
+#[cfg(unixlike)]
 fn run_dir() -> Result<PathBuf> {
     crate::coord::runtime_dir().context("no runtime directory (set XDG_RUNTIME_DIR or HOME)")
 }
@@ -465,7 +533,7 @@ pub fn binary(say: &mut dyn FnMut(&str)) -> Result<PathBuf> {
         return Ok(bin);
     }
     let api = api_base();
-    if install(&api, &bin, None, say)?.is_none() {
+    if install(&api, &bin, say)?.is_none() {
         bail!("none of oxinfer's recent releases has an archive for this platform");
     }
     Ok(bin)
@@ -485,21 +553,11 @@ fn api_base() -> String {
 }
 
 /// The newest release in `releases` (GitHub's listing, newest first) with
-/// an archive named for `suffix`, and newer than `than` when given: its tag
-/// and that asset. A release is published before its archives are built,
-/// so the newest may have none yet.
-fn pick_release(
-    releases: &Value,
-    suffix: &str,
-    than: Option<(u64, u64, u64)>,
-) -> Option<(String, Value)> {
+/// an archive named for `suffix`: its tag and that asset. A release is
+/// published before its archives are built, so the newest may have none yet.
+fn pick_release(releases: &Value, suffix: &str) -> Option<(String, Value)> {
     releases.as_array()?.iter().find_map(|r| {
         let tag = r["tag_name"].as_str()?;
-        if let Some(than) = than
-            && crate::update::parse_version(tag).is_none_or(|v| v <= than)
-        {
-            return None;
-        }
         let name = format!("oxinfer-{tag}-{suffix}");
         let asset = r["assets"]
             .as_array()?
@@ -510,14 +568,9 @@ fn pick_release(
 }
 
 /// Download, check and unpack as `bin` the newest release of `api` that has
-/// an archive for this platform — only one newer than `than`, when given.
-/// `Ok(None)` when there is none; `Ok(Some(tag))` once installed.
-fn install(
-    api: &str,
-    bin: &Path,
-    than: Option<(u64, u64, u64)>,
-    say: &mut dyn FnMut(&str),
-) -> Result<Option<String>> {
+/// an archive for this platform. `Ok(None)` when there is none;
+/// `Ok(Some(tag))` once installed.
+fn install(api: &str, bin: &Path, say: &mut dyn FnMut(&str)) -> Result<Option<String>> {
     let suffixes = archive_suffixes();
     if suffixes.is_empty() {
         bail!(
@@ -540,7 +593,7 @@ fn install(
     // glibc).
     let mut last = None;
     for suffix in suffixes {
-        let Some((tag, asset)) = pick_release(&releases, suffix, than) else {
+        let Some((tag, asset)) = pick_release(&releases, suffix) else {
             continue;
         };
         say(&format!(
@@ -576,65 +629,130 @@ fn parse_version_line(text: &str) -> Option<(u64, u64, u64)> {
     crate::update::parse_version(version.split_whitespace().next()?)
 }
 
-/// What an update of the installed oxinfer came to.
-#[derive(Debug, PartialEq)]
-enum Updated {
-    UpToDate,
-    Installed { from: String, to: String },
+fn version_text(version: (u64, u64, u64)) -> String {
+    format!("{}.{}.{}", version.0, version.1, version.2)
 }
 
-/// Replace `bin` with the newest release, if it is newer than `bin` says
-/// it is. The new program is written beside it, checked and test-run, then
-/// renamed over it: a server running the old one keeps running it — the
-/// kernel holds on to a file a process runs — and the next server started
-/// is the new one. So nothing in use is stopped or broken, and nothing has
-/// to wait for the server to be idle.
-fn update(api: &str, bin: &Path, say: &mut dyn FnMut(&str)) -> Result<Updated> {
-    let from = version_of(bin).context("the installed oxinfer does not say its version")?;
-    match install(api, bin, Some(from), say)? {
-        None => Ok(Updated::UpToDate),
-        Some(tag) => Ok(Updated::Installed {
-            from: format!("{}.{}.{}", from.0, from.1, from.2),
-            to: tag.trim_start_matches('v').to_string(),
-        }),
-    }
+/// Whether the installed oxinfer may be brought up to date: not when the
+/// user turned updates off (`ATELIER_NO_UPDATE`), nor a program they chose
+/// themselves (`ATELIER_OXINFER_BIN`).
+pub fn update_allowed() -> bool {
+    let own = std::env::var_os(ENV_BIN).is_some_and(|v| !v.is_empty());
+    !own && !crate::update::turned_off()
 }
 
-/// The time of the last check, in atelier's state directory; checks are a
-/// day apart, as for atelier's own.
+/// The time oxinfer was last asked to update itself, in atelier's state
+/// directory; askings are a day apart, as atelier's own check is.
 const UPDATE_STAMP: &str = "last-oxinfer-check";
 
-/// Whether to look for a newer oxinfer in the background: not when the user
-/// turned updates off (`ATELIER_NO_UPDATE`), nor for a program they chose
-/// themselves (`ATELIER_OXINFER_BIN`), nor before one is installed, nor
-/// more than once a day.
-fn update_wanted(turned_off: bool, own_binary: bool, installed: bool, due: bool) -> bool {
-    !turned_off && !own_binary && installed && due
+/// Have the oxinfer at `bin` update itself (`oxinfer --update`: it fetches
+/// its latest release, writes it beside itself and renames it into place),
+/// giving it `time`. Whether it ran to a good end — up to date counts.
+///
+/// The rename leaves a server that runs the old file running it (the
+/// kernel holds on to a file a process runs): nothing in use is disturbed,
+/// and the next server started is the new one.
+fn self_update(bin: &Path, time: Duration, quiet: bool) -> bool {
+    use std::process::Stdio;
+    let out = || {
+        if quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        }
+    };
+    let Ok(mut child) = std::process::Command::new(bin)
+        .arg("--update")
+        .stdin(Stdio::null())
+        .stdout(out())
+        .stderr(out())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + time;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
-/// Check, at most once a day and in the background, for a newer oxinfer
-/// than the one installed, and install it ([`update`]); the interface is
-/// told when one was. Failures stay quiet, as for atelier's own update.
-pub fn spawn_update_check() {
-    let own = std::env::var_os(ENV_BIN).is_some_and(|v| !v.is_empty());
-    let Ok(bin) = installed_path() else { return };
-    let Some(stamp) = crate::update::state_file(UPDATE_STAMP) else {
-        return;
-    };
-    let due = crate::update::due(&stamp, std::time::SystemTime::now());
-    if !update_wanted(crate::update::turned_off(), own, bin.is_file(), due) {
-        return;
-    }
-    // Recorded before, so that the sessions starting together don't all go.
-    let _ = crate::update::record_check(&stamp, std::time::SystemTime::now());
-    std::thread::spawn(move || {
-        if let Ok(Updated::Installed { from, to }) = update(&api_base(), &bin, &mut |_| {}) {
-            crate::update::set_notice(format!(
-                "oxinfer {to} installed for the local model (a server running now keeps \
-                 {from} until it stops)"
-            ));
+/// Make the oxinfer at `bin` one that can serve — [`MIN_VERSION`] or
+/// newer — and say which version it is. Called before a server is started,
+/// which is when a new version takes effect.
+///
+/// With `update` (see [`update_allowed`]) oxinfer is asked to update
+/// itself: once a day at most while it would do as it is, and at once when
+/// it is too old (or does not say what it is, as the oldest ones don't).
+/// One too old that cannot update itself is installed afresh, the way the
+/// first one was. Without `update`, one too old is an error that says so.
+pub fn make_current(bin: &Path, update: bool, say: &mut dyn FnMut(&str)) -> Result<String> {
+    let stamp = crate::update::state_file(UPDATE_STAMP);
+    make_current_with(bin, update, stamp.as_deref(), &api_base(), say)
+}
+
+fn make_current_with(
+    bin: &Path,
+    update: bool,
+    stamp: Option<&Path>,
+    api: &str,
+    say: &mut dyn FnMut(&str),
+) -> Result<String> {
+    let too_old = |v: Option<(u64, u64, u64)>| v.is_none_or(|v| v < MIN_VERSION);
+    let before = version_of(bin);
+    let mut version = before;
+    if update {
+        let now = std::time::SystemTime::now();
+        let due = stamp.is_some_and(|s| crate::update::due(s, now));
+        if too_old(version) || due {
+            // Recorded before, so that it is not asked again at once should
+            // it take long or fail.
+            if let Some(stamp) = stamp {
+                let _ = crate::update::record_check(stamp, now);
+            }
+            if too_old(version) {
+                say("this oxinfer is too old for atelier: updating it…");
+                self_update(bin, DOWNLOAD_TIME, true);
+            } else {
+                self_update(bin, UPDATE_TIME, true);
+            }
+            version = version_of(bin);
+            if too_old(version) {
+                // Its own update did not do it (it has none, or it failed).
+                install(api, bin, say).context("installing a newer oxinfer")?;
+                version = version_of(bin);
+            }
+            if version != before
+                && let Some(now) = version
+            {
+                say(&format!("oxinfer updated itself to {}", version_text(now)));
+            }
         }
-    });
+    }
+    match version {
+        Some(version) if version >= MIN_VERSION => Ok(version_text(version)),
+        _ => bail!(
+            "{} is oxinfer {}, and atelier needs {} or newer{}",
+            bin.display(),
+            version.map_or_else(|| "of a version it does not say".to_string(), version_text),
+            version_text(MIN_VERSION),
+            if update {
+                ""
+            } else {
+                ": atelier leaves alone a program named with ATELIER_OXINFER_BIN, and any \
+                 when ATELIER_NO_UPDATE is set — `oxinfer --update` brings it up to date"
+            }
+        ),
+    }
 }
 
 /// One release archive: downloaded, verified, unpacked to `bin`, test-run.
@@ -826,57 +944,9 @@ fn plan_from(
     }
 }
 
-/// Fetch the model's weights with oxinfer (`--download-only`), passing on a
-/// line of its progress now and then.
-pub fn download(bin: &Path, model: &Model, say: &mut dyn FnMut(&str)) -> Result<()> {
-    use std::io::Read;
-    use std::process::Stdio;
-    let mut child = std::process::Command::new(bin)
-        .args(["--model", model.source(), "--download-only"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting oxinfer")?;
-    let mut stderr = child.stderr.take().expect("piped");
-    // Progress is redrawn in place (carriage returns): cut on either line
-    // ending and say the latest one every so often, the last ones always.
-    let (mut line, mut tail, mut told) = (Vec::new(), String::new(), Instant::now());
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = match stderr.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        for b in &buf[..n] {
-            if matches!(b, b'\r' | b'\n') {
-                let text = String::from_utf8_lossy(&line).trim().to_string();
-                line.clear();
-                if text.is_empty() {
-                    continue;
-                }
-                if told.elapsed() >= Duration::from_secs(20) {
-                    say(&text);
-                    told = Instant::now();
-                }
-                tail = text;
-            } else {
-                line.push(*b);
-            }
-        }
-    }
-    let status = child.wait().context("waiting for oxinfer")?;
-    if !status.success() {
-        bail!("the download failed: {tail}");
-    }
-    Ok(())
-}
-
-/// Whether the server described by `state` answers.
-fn answers(state: &Value) -> bool {
-    let (Some(port), Some(key)) = (state["port"].as_u64(), state["key"].as_str()) else {
-        return false;
-    };
+/// Whether an oxinfer server answers on the loopback `port` to `key`.
+#[cfg(unixlike)]
+pub(crate) fn answers(port: u16, key: &str) -> bool {
     http_get(
         &format!("http://127.0.0.1:{port}/v1/models"),
         Some(key),
@@ -885,287 +955,345 @@ fn answers(state: &Value) -> bool {
     .is_ok()
 }
 
-fn read_state(dir: &Path) -> Option<Value> {
-    serde_json::from_slice(&std::fs::read(dir.join("oxinfer.json")).ok()?).ok()
+/// The server's HTTP interface: oxinfer's management API (`/api/web/…`),
+/// which lists, fetches and loads models. It is on loopback and takes the
+/// key, which only the user's own ateliers are given.
+#[derive(Debug, Clone)]
+pub struct Api {
+    port: u16,
+    key: String,
 }
 
-/// This process's lease: the shared lock that tells the supervisor the
-/// server has a user. Taken before looking for a server, so one found
-/// running is not shut down under us.
-#[cfg(unixlike)]
-fn lease(dir: &Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    let lease = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("oxinfer.lease"))
-        .context("opening the lease")?;
-    lease.lock_shared().context("taking the lease")?;
-    Ok(lease)
-}
+impl Api {
+    /// One request; the answer's JSON, or the error oxinfer gave.
+    fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        let url = format!("http://127.0.0.1:{}{path}", self.port);
+        let mut req = rsurl::Request::new(method, &url)
+            .with_context(|| format!("building request for {url}"))?
+            .header("authorization", &format!("Bearer {}", self.key))
+            .header("accept", "application/json")
+            .connect_timeout(Duration::from_secs(5))
+            // The plan of a download lists a repository over the network.
+            .max_time(Duration::from_secs(120));
+        if let Some(body) = body {
+            req = req
+                .header("content-type", "application/json")
+                .body(body.to_string());
+        }
+        let resp = req
+            .send()
+            .with_context(|| format!("asking the local model's server ({path})"))?;
+        let answer: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
+        if !(200..300).contains(&resp.status) {
+            match answer["error"]["message"].as_str() {
+                Some(message) => bail!("{message}"),
+                None => bail!("the local model's server: HTTP {} ({path})", resp.status),
+            }
+        }
+        Ok(answer)
+    }
 
-/// Whether a server running `running` serves a session that wants `wanted`
-/// (`None`: whatever atelier chose for the machine, which is one of
-/// [`CANDIDATES`]).
-fn serves(running: &str, wanted: Option<&Model>) -> bool {
-    match wanted {
-        Some(model) => running == model.spec,
-        None => CANDIDATES.iter().any(|c| c.spec == running),
+    /// The models the server lists, as it describes them (`id`, `source`,
+    /// `state`, …).
+    pub fn models(&self) -> Result<Vec<Value>> {
+        let listing = self.call("GET", "/api/web/models", None)?;
+        Ok(listing["data"].as_array().cloned().unwrap_or_default())
+    }
+
+    fn model(&self, id: &str) -> Option<Value> {
+        self.models().ok()?.into_iter().find(|m| m["id"] == id)
+    }
+
+    /// oxinfer's report on the machine and the models of its table — what
+    /// `oxinfer --models --json` prints. The first answer comes before the
+    /// CPU has been timed, without speeds: it is asked again for a moment.
+    pub fn report(&self) -> Option<Value> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let report = self.call("GET", "/api/web/catalog", None).ok()?;
+            if report["calibrated"] != false || Instant::now() >= deadline {
+                return Some(report);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
     }
 }
 
-/// The server already running `model` (`None`: one atelier chose for the
-/// machine), if there is one: the quick way in, with nothing to install,
-/// measure or start. An error when a server is running another model for
-/// somebody else.
+/// The server, and — for a session — this process's lease on it.
+pub struct Server {
+    pub api: Api,
+    /// The version of the oxinfer that runs.
+    pub version: String,
+    #[cfg(unixlike)]
+    lease: crate::coord::infer::Lease,
+}
+
+/// The server, started by the coordinator if none is running, with this
+/// process counted among its users from here on. `say` gets a line when it
+/// has to be started.
 #[cfg(unixlike)]
-pub fn join(model: Option<&Model>) -> Result<Option<Local>> {
+pub fn server(bin: &Path, say: &mut dyn FnMut(&str)) -> Result<Server> {
+    use crate::coord::infer;
+    if crate::coord::disabled() {
+        bail!(
+            "the local model's server is run by the coordinator, which {} switches off: unset \
+             it to use the local model",
+            crate::coord::ENV_DISABLE
+        );
+    }
     let dir = run_dir()?;
-    let lease = lease(&dir)?;
-    let Some(state) = read_state(&dir).filter(answers) else {
-        return Ok(None);
+    let exe = crate::app::helper_exe().ok();
+    let ask = infer::Ask {
+        bin: std::path::absolute(bin).unwrap_or_else(|_| bin.to_path_buf()),
+        update: update_allowed(),
     };
-    if !serves(state["model"].as_str().unwrap_or_default(), model) {
-        // Another model. If nobody else holds the lease the server is only
-        // waiting out its idle minute: end it and start the one wanted.
-        lease.unlock().context("releasing the lease")?;
-        if lease.try_lock().is_err() {
-            bail!(
-                "the local server is running {} for another atelier; quit that one, or \
-                 use the same model",
-                state["model"].as_str().unwrap_or("another model")
-            );
-        }
-        stop(&state);
-        let _ = std::fs::remove_file(dir.join("oxinfer.json"));
-        return Ok(None);
+    // The coordinator sees to it before it starts a server; said here,
+    // where the user is, since it is what the wait is for.
+    if ask.update && running_server().is_none() && version_of(bin).is_none_or(|v| v < MIN_VERSION) {
+        say("the installed oxinfer is too old for atelier: it is updated first…");
     }
-    local(&state, lease).map(Some)
-}
-
-#[cfg(not(unixlike))]
-pub fn join(_: Option<&Model>) -> Result<Option<Local>> {
-    bail!("the local model is not supported on this platform")
-}
-
-/// A server running `model`, started if there is none, and this process's
-/// lease on it. `say` gets a line when one has to be started.
-#[cfg(unixlike)]
-pub fn connect(bin: &Path, model: &Model, say: &mut dyn FnMut(&str)) -> Result<Local> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-
-    if let Some(running) = join(Some(model))? {
-        return Ok(running);
-    }
-    let dir = run_dir()?;
-    let lease = lease(&dir)?;
-    let usable = |state: &Value| state["model"] == model.spec.as_str() && answers(state);
-
-    say(&format!(
-        "starting {} (it is loaded on the first request)…",
-        model.source()
-    ));
-    let exe = crate::app::helper_exe().context("locating the atelier executable")?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(dir.join("oxinfer.log"))
-        .map_or_else(|_| Stdio::null(), Stdio::from);
-    let mut child = std::process::Command::new(exe)
-        .arg("local-serve")
-        .arg(bin)
-        .arg(&model.spec)
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log)
-        // Its own process group: the terminal's signals don't reach it.
-        .process_group(0)
-        .spawn()
-        .context("starting the local server's supervisor")?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-
-    let deadline = Instant::now() + START_WAIT;
-    loop {
-        if let Some(state) = read_state(&dir).filter(|s| usable(s)) {
-            return local(&state, lease);
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "the local server did not come up (see {})",
-                dir.join("oxinfer.log").display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-#[cfg(not(unixlike))]
-pub fn connect(_: &Path, _: &Model, _: &mut dyn FnMut(&str)) -> Result<Local> {
-    bail!("the local model is not supported on this platform")
-}
-
-fn local(state: &Value, lease: std::fs::File) -> Result<Local> {
-    Ok(Local {
-        model: Model {
-            spec: state["model"].as_str().unwrap_or_default().to_string(),
+    let (lease, endpoint) = infer::acquire(&dir, exe.as_deref(), &ask, say)
+        .context("the local model's server did not start")?;
+    Ok(Server {
+        api: Api {
+            port: endpoint.port,
+            key: endpoint.key,
         },
-        base_url: format!(
-            "http://127.0.0.1:{}/v1",
-            state["port"]
-                .as_u64()
-                .context("no port in the state file")?
-        ),
-        key: state["key"]
-            .as_str()
-            .context("no key in the state file")?
-            .to_string(),
-        _lease: lease,
+        version: endpoint.version,
+        lease,
     })
 }
 
-/// `atelier local-serve <oxinfer> <model>`: the supervisor. Runs the server,
-/// says where it is, and ends it once nobody has used it for [`IDLE`].
-#[cfg(unixlike)]
-pub fn supervise(args: &[String]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::process::Stdio;
-
-    let [bin, spec] = args else {
-        bail!("usage: atelier local-serve <oxinfer> <model> (started by atelier itself)");
-    };
-    let dir = run_dir()?;
-    let state_file = dir.join("oxinfer.json");
-    let lock =
-        std::fs::File::create(dir.join("oxinfer.lock")).context("opening the supervisor's lock")?;
-    if lock.try_lock().is_err() {
-        return Ok(()); // another supervisor is at it
-    }
-    // A server whose supervisor was killed is still there, holding its
-    // memory: end it, if it really is that server (it answers to its key).
-    if let Some(old) = read_state(&dir) {
-        if answers(&old)
-            && let Some(pid) = old["server_pid"].as_u64()
-        {
-            kill(pid);
-        }
-        let _ = std::fs::remove_file(&state_file);
-    }
-
-    // A free port: bound, read, released for the server to take.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .context("finding a free port")?
-        .port();
-    let key = crate::claude::new_uuid();
-    let mut server = std::process::Command::new(bin)
-        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
-        .args(["--model", &format!("{MODEL_ID}={spec}")])
-        // Screenshots are megabytes once in base64.
-        .args(["--max-body-mb", "64"])
-        // In the environment, not on the command line for `ps` to show.
-        .env("OXINFER_API_KEY", &key)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("starting {bin}"))?;
-
-    let state = json!({
-        "port": port,
-        "key": key,
-        "model": spec,
-        "pid": std::process::id(),
-        "server_pid": server.id(),
-    });
-    let deadline = Instant::now() + START_WAIT;
-    while !answers(&state) {
-        if let Some(status) = server.try_wait()? {
-            bail!("oxinfer ended at once ({status})");
-        }
-        if Instant::now() >= deadline {
-            let _ = server.kill();
-            bail!("oxinfer did not start answering");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Written whole, private (it holds the key), then moved into place.
-    let tmp = dir.join(format!("oxinfer.json.{}", std::process::id()));
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(state.to_string().as_bytes())?;
-    }
-    std::fs::rename(&tmp, &state_file)?;
-    eprintln!("serving {spec} on 127.0.0.1:{port}");
-
-    let lease = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("oxinfer.lease"))?;
-    let mut unused_since = Instant::now();
-    let ended = loop {
-        std::thread::sleep(Duration::from_secs(2));
-        if let Some(status) = server.try_wait()? {
-            break format!("oxinfer ended ({status})");
-        }
-        // Nobody holds the lease if we can have it to ourselves.
-        if lease.try_lock().is_ok() {
-            let _ = lease.unlock();
-            if unused_since.elapsed() >= IDLE {
-                break "nobody is using it".to_string();
-            }
-        } else {
-            unused_since = Instant::now();
-        }
-    };
-    let _ = std::fs::remove_file(&state_file);
-    let _ = server.kill();
-    let _ = server.wait();
-    eprintln!("stopped: {ended}");
-    Ok(())
-}
-
 #[cfg(not(unixlike))]
-pub fn supervise(_: &[String]) -> Result<()> {
+pub fn server(_: &Path, _: &mut dyn FnMut(&str)) -> Result<Server> {
     bail!("the local model is not supported on this platform")
 }
 
-/// End the server `state` describes, and its supervisor: the supervisor
-/// first, which would otherwise see the server gone and say so.
-fn stop(state: &Value) {
-    for pid in [&state["pid"], &state["server_pid"]] {
-        if let Some(pid) = pid.as_u64() {
-            kill(pid);
+/// The server as the coordinator has it, without becoming a user of it and
+/// without starting either: its interface, its version, and how many
+/// ateliers use it. `None` when none is running.
+#[cfg(unixlike)]
+fn running_server() -> Option<(Api, String, u64)> {
+    if crate::coord::disabled() {
+        return None;
+    }
+    let status = crate::coord::infer::status(&run_dir().ok()?)?;
+    (status["state"] == "up").then_some(())?;
+    let api = Api {
+        port: u16::try_from(status["port"].as_u64()?).ok()?,
+        key: status["key"].as_str()?.to_string(),
+    };
+    let version = status["version"].as_str().unwrap_or("?").to_string();
+    Some((api, version, status["leases"].as_u64().unwrap_or(0)))
+}
+
+#[cfg(not(unixlike))]
+fn running_server() -> Option<(Api, String, u64)> {
+    None
+}
+
+/// Whether a model the server lists is one to use as it is: any state but
+/// a load that failed.
+fn usable(listed: &Value) -> bool {
+    listed["state"] != "error"
+}
+
+impl Server {
+    /// The model the server already has that serves a session wanting
+    /// `wanted` (`None`: whatever atelier chose for the machine — any of
+    /// [`CANDIDATES`] will do, so that a session joins the one another
+    /// started whatever the choice would be today).
+    pub fn has(&self, wanted: Option<&Model>) -> Option<Model> {
+        let listed = self.api.models().ok()?;
+        let has = |model: &Model| {
+            let id = model.id();
+            listed.iter().any(|m| m["id"] == id.as_str() && usable(m))
+        };
+        match wanted {
+            Some(model) => has(model).then(|| model.clone()),
+            None => CANDIDATES
+                .iter()
+                .map(|c| Model {
+                    spec: c.spec.to_string(),
+                })
+                .find(has),
         }
     }
-    // The port, and the memory, are free once it no longer answers.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while answers(state) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
+
+    /// What `model` would take: the memory and the speed from oxinfer's
+    /// `report`, and what is left to download from the server, which looks
+    /// at the repository and at its cache. When the repository cannot be
+    /// asked (no network), a model that is here is used, and one whose size
+    /// is known is asked about with that; anything else is an error — what
+    /// cannot be sized is not fetched.
+    pub fn plan(&self, report: Option<&Value>, model: &Model) -> Result<Plan> {
+        let mut plan = plan_from(report, model, || None);
+        let asked = self.api.call(
+            "POST",
+            "/api/web/plan",
+            Some(json!({ "model": model.source() })),
+        );
+        match asked {
+            Ok(answer) => {
+                let missing = answer["missing"].as_f64().unwrap_or(0.0);
+                plan.download_gb = (missing > 0.0).then_some(missing / 1e9);
+                if let Some(free) = answer["free"].as_f64() {
+                    plan.disk_free_gb = Some(free / 1e9);
+                }
+                Ok(plan)
+            }
+            Err(_) if self.cached(report, model) => {
+                plan.download_gb = None;
+                Ok(plan)
+            }
+            Err(_) if plan.download_gb.is_some() => Ok(plan),
+            Err(e) => Err(e.context(format!(
+                "finding out what {} takes to download",
+                model.source()
+            ))),
+        }
+    }
+
+    /// Whether the model's files are on this machine, as far as can be told
+    /// without the network: oxinfer's table says so, or its cache lists
+    /// what loads the model.
+    fn cached(&self, report: Option<&Value>, model: &Model) -> bool {
+        if table_entry(report, model).is_some_and(|e| e["on_disk"] == true) {
+            return true;
+        }
+        let Ok(cache) = self.api.call("GET", "/api/web/cache", None) else {
+            return false;
+        };
+        let have: Vec<&str> = cache["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["usable"] != false)
+            .filter_map(|e| e["specs"].as_array())
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        match model.candidate().map(|c| c.files).filter(|f| !f.is_empty()) {
+            Some(files) => files.iter().all(|f| have.contains(f)),
+            None => have.contains(&model.source()),
+        }
+    }
+
+    /// Fetch the model's weights: a download the server runs (so it goes on
+    /// if this session ends, and another session asking for the same model
+    /// joins it), followed here, with a line of its progress now and then.
+    pub fn download(&self, model: &Model, say: &mut dyn FnMut(&str)) -> Result<()> {
+        let job = self.api.call(
+            "POST",
+            "/api/web/downloads",
+            Some(json!({ "model": model.source() })),
+        )?;
+        let id = job["id"]
+            .as_str()
+            .context("the server did not start the download")?
+            .to_string();
+        let mut told = Instant::now();
+        let mut first = true;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let job = self
+                .api
+                .call("GET", &format!("/api/web/downloads/{id}"), None)
+                .context("following the download")?;
+            match job["status"].as_str() {
+                Some("done") => return Ok(()),
+                Some("error") | Some("cancelled") => bail!(
+                    "the download failed: {}",
+                    job["error"]
+                        .as_str()
+                        .or(job["status"].as_str())
+                        .unwrap_or("?")
+                ),
+                _ => {}
+            }
+            let due = if first { 3 } else { 20 };
+            if told.elapsed() >= Duration::from_secs(due)
+                && let Some(line) = progress(&job)
+            {
+                say(&line);
+                told = Instant::now();
+                first = false;
+            }
+        }
+    }
+
+    /// Have the server load `model` under its name, and make this session
+    /// one it serves. The load goes on in the server; the first request
+    /// waits for it. A model that cannot be loaded at all — no such
+    /// repository, files that are no model — fails here, with why.
+    pub fn load(self, model: &Model, say: &mut dyn FnMut(&str)) -> Result<Local> {
+        let id = model.id();
+        let state = |listed: &Value| listed["state"].as_str().unwrap_or_default().to_string();
+        let listed = self.api.model(&id);
+        if !listed.as_ref().is_some_and(usable) {
+            say(&format!(
+                "loading {} (the first request waits for it)…",
+                model.source()
+            ));
+            self.api.call(
+                "POST",
+                "/api/web/models/load",
+                Some(json!({
+                    "model": model.source(),
+                    "id": id,
+                    "options": model.options(),
+                })),
+            )?;
+        }
+        if !listed.is_some_and(|m| matches!(state(&m).as_str(), "ready" | "busy")) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while let Some(now) = self.api.model(&id) {
+                match state(&now).as_str() {
+                    "error" => bail!(
+                        "oxinfer could not load {}: {}",
+                        model.spec,
+                        now["load"]["error"]
+                            .as_str()
+                            .unwrap_or("it does not say why")
+                    ),
+                    "ready" | "busy" => break,
+                    _ if Instant::now() >= deadline => break,
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+        }
+        Ok(Local {
+            model: model.clone(),
+            id,
+            base_url: format!("http://127.0.0.1:{}/v1", self.api.port),
+            key: self.api.key,
+            #[cfg(unixlike)]
+            _lease: self.lease,
+        })
     }
 }
 
-fn kill(pid: u64) {
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status();
+/// A download job of the server's, in a line.
+fn progress(job: &Value) -> Option<String> {
+    let done = job["done"].as_f64()?;
+    let total = job["total"].as_f64().filter(|t| *t > 0.0)?;
+    let mut line = format!(
+        "downloaded {} of {} GB ({:.0}%)",
+        gigabytes(done / 1e9),
+        gigabytes(total / 1e9),
+        done / total * 100.0
+    );
+    if let Some(speed) = job["speed"].as_f64().filter(|s| *s > 0.0) {
+        line.push_str(&format!(", {:.0} MB/s", speed / 1e6));
+    }
+    if let Some(eta) = job["eta"].as_f64() {
+        line.push_str(&match eta {
+            s if s >= 5400.0 => format!(", about {:.0} h left", s / 3600.0),
+            s if s >= 90.0 => format!(", about {:.0} min left", s / 60.0),
+            s => format!(", about {s:.0} s left"),
+        });
+    }
+    Some(line)
 }
 
 /// `atelier local [status|download|update|stop]`: look at, prepare, update
@@ -1181,7 +1309,17 @@ pub fn run_command(args: &[String]) -> Result<()> {
                 .map(PathBuf::from)
                 .or_else(|| installed_path().ok())
                 .filter(|p| p.is_file());
-            let report = installed.as_deref().and_then(report);
+            let version = installed.as_deref().and_then(version_of);
+            let server = running_server();
+            // The server's word where there is one; else the program's, if
+            // it is one that can say.
+            let report = match &server {
+                Some((api, ..)) => api.report(),
+                None => installed
+                    .as_deref()
+                    .filter(|_| version.is_some_and(|v| v >= MIN_VERSION))
+                    .and_then(report),
+            };
             let (model, why) = resolve(&user, report.as_ref());
             println!("model: {}", model.spec);
             if let Some(why) = why {
@@ -1189,27 +1327,53 @@ pub fn run_command(args: &[String]) -> Result<()> {
             }
             match &installed {
                 Some(bin) => {
-                    let version = version_of(bin)
-                        .map(|(a, b, c)| format!(" ({a}.{b}.{c})"))
-                        .unwrap_or_default();
-                    println!("oxinfer: {}{version}", bin.display());
+                    match version {
+                        Some(v) if v >= MIN_VERSION => {
+                            println!("oxinfer: {} ({})", bin.display(), version_text(v));
+                        }
+                        Some(v) => println!(
+                            "oxinfer: {} ({}: too old, it is updated when the server is next \
+                             started)",
+                            bin.display(),
+                            version_text(v)
+                        ),
+                        None => println!(
+                            "oxinfer: {} (too old to say its version: it is updated when the \
+                             server is next started)",
+                            bin.display()
+                        ),
+                    }
                     for line in plan(bin, report.as_ref(), &model).lines(&model) {
                         println!("{line}");
                     }
                 }
                 None => println!("oxinfer: not installed yet (`atelier local download`)"),
             }
-            match run_dir().ok().and_then(|d| read_state(&d)) {
-                Some(state) if answers(&state) => println!(
-                    "server: running {} on 127.0.0.1:{}",
-                    state["model"].as_str().unwrap_or("?"),
-                    state["port"]
-                ),
-                _ => println!("server: not running"),
+            match &server {
+                Some((api, version, users)) => {
+                    println!(
+                        "server: oxinfer {version} on 127.0.0.1:{}, used by {}",
+                        api.port,
+                        match users {
+                            1 => "1 atelier".to_string(),
+                            n => format!("{n} ateliers"),
+                        }
+                    );
+                    for listed in api.models().unwrap_or_default() {
+                        println!(
+                            "  {} ({}): {}",
+                            listed["source"].as_str().unwrap_or("?"),
+                            listed["id"].as_str().unwrap_or("?"),
+                            listed["state"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                None => println!("server: not running"),
             }
         }
         Some("download") => {
             let bin = binary(&mut say)?;
+            make_current(&bin, update_allowed(), &mut say)?;
             let report = report(&bin);
             let (model, why) = resolve(&user, report.as_ref());
             if let Some(why) = why {
@@ -1232,13 +1396,14 @@ pub fn run_command(args: &[String]) -> Result<()> {
                 bail!("the download failed");
             }
         }
-        Some("stop") => match run_dir().ok().and_then(|d| read_state(&d)) {
-            Some(state) if answers(&state) => {
-                stop(&state);
-                println!("stopped");
-            }
-            _ => println!("not running"),
-        },
+        Some("stop") => {
+            #[cfg(unixlike)]
+            let stopped = !crate::coord::disabled()
+                && run_dir().is_ok_and(|dir| crate::coord::infer::stop(&dir));
+            #[cfg(not(unixlike))]
+            let stopped = false;
+            println!("{}", if stopped { "stopped" } else { "not running" });
+        }
         Some("update") => {
             if std::env::var_os(ENV_BIN).is_some_and(|v| !v.is_empty()) {
                 bail!("{ENV_BIN} names an oxinfer of your own: atelier leaves it alone");
@@ -1248,25 +1413,27 @@ pub fn run_command(args: &[String]) -> Result<()> {
                 binary(&mut say)?;
                 return Ok(());
             }
-            let outcome = update(&api_base(), &bin, &mut say)?;
+            // oxinfer updates itself, and says what it did.
+            let before = version_of(&bin);
+            let done = self_update(&bin, DOWNLOAD_TIME, false);
             if let Some(stamp) = crate::update::state_file(UPDATE_STAMP) {
                 let _ = crate::update::record_check(&stamp, std::time::SystemTime::now());
             }
-            match outcome {
-                Updated::UpToDate => println!("oxinfer is up to date"),
-                Updated::Installed { from, to } => {
-                    println!("updated oxinfer {from} → {to}");
-                    if run_dir()
-                        .ok()
-                        .and_then(|d| read_state(&d))
-                        .is_some_and(|s| answers(&s))
-                    {
-                        println!(
-                            "the server running now keeps {from} until its sessions are done; \
-                             the next one started is {to}"
-                        );
-                    }
-                }
+            let mut after = version_of(&bin);
+            if after.is_none_or(|v| v < MIN_VERSION) {
+                // One too old to update itself: installed afresh.
+                install(&api_base(), &bin, &mut say)?;
+                after = version_of(&bin);
+            } else if !done {
+                bail!("oxinfer could not update itself");
+            }
+            if after != before
+                && let Some((_, running, _)) = running_server()
+            {
+                println!(
+                    "the server running now keeps oxinfer {running} until its sessions are \
+                     done; the next one started is the new version"
+                );
             }
         }
         Some(other) => {
@@ -1558,20 +1725,6 @@ mod tests {
         assert_eq!(plan_from(Some(&report), &other, never).memory_gb, None);
     }
 
-    #[test]
-    fn a_running_server_serves_who_wants_its_model() {
-        let q4 = Model {
-            spec: DEFAULT_MODEL.into(),
-        };
-        assert!(serves(DEFAULT_MODEL, Some(&q4)));
-        assert!(!serves(CANDIDATES[0].spec, Some(&q4)));
-        // Wanting what atelier chooses, any of its choices will do — not a
-        // model somebody named.
-        assert!(serves(CANDIDATES[0].spec, None));
-        assert!(serves(CANDIDATES[2].spec, None));
-        assert!(!serves("google/gemma-4-E4B-it", None));
-    }
-
     fn release(tag: &str, suffixes: &[&str]) -> Value {
         json!({
             "tag_name": tag,
@@ -1580,6 +1733,56 @@ mod tests {
                 "size": 1,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn a_model_s_name_on_the_server_tells_it_from_any_other() {
+        let model = |spec: &str| Model { spec: spec.into() };
+        let q4 = model(DEFAULT_MODEL);
+        assert_eq!(q4.source(), "Qwen/Qwen3.8-27B");
+        assert_eq!(q4.options(), "quant=q4");
+        let id = q4.id();
+        // Readable, and of the letters a model name may have: no `/` (it
+        // follows `local/`), no `#`, `,`, `=` or `:`.
+        assert!(id.starts_with("Qwen3.8-27B-q4-"), "{id}");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "{id}"
+        );
+        // The same model, the same name; another precision, another.
+        assert_eq!(id, model(DEFAULT_MODEL).id());
+        assert_ne!(id, model(CANDIDATES[0].spec).id());
+        // Two that read alike once cleaned are told apart by the hash.
+        assert_ne!(model("a/b,x=1:2").id(), model("a/b,x=1/2").id());
+        assert_ne!(model("org/m").id(), model("other/m").id());
+        // No options, a folder, a GGUF with its image reader: all name
+        // something.
+        assert!(model("org/m").id().starts_with("m-"));
+        assert_eq!(model("org/m").options(), "");
+        assert!(model("/models/mine/").id().starts_with("mine-"));
+        let gguf = model(CANDIDATES[2].spec).id();
+        assert!(gguf.starts_with("Qwen3.8-27B-GGUF-UD-Q3_K_XL-"), "{gguf}");
+        assert!(gguf.len() <= 64, "{gguf}");
+        let ids: std::collections::BTreeSet<String> =
+            CANDIDATES.iter().map(|c| model(c.spec).id()).collect();
+        assert_eq!(ids.len(), CANDIDATES.len());
+    }
+
+    #[test]
+    fn a_download_s_progress_reads_in_a_line() {
+        let job = json!({
+            "status": "downloading", "done": 12.3e9, "total": 55.6e9,
+            "speed": 45.2e6, "eta": 958.0
+        });
+        assert_eq!(
+            progress(&job).unwrap(),
+            "downloaded 12 of 56 GB (22%), 45 MB/s, about 16 min left"
+        );
+        let small = json!({"done": 0.2e9, "total": 0.8e9, "speed": 0.0, "eta": null});
+        assert_eq!(progress(&small).unwrap(), "downloaded 0.2 of 0.8 GB (25%)");
+        // Still planning: nothing to say yet.
+        assert_eq!(progress(&json!({"done": 0, "total": null})), None);
     }
 
     #[test]
@@ -1593,38 +1796,17 @@ mod tests {
             ),
             release("nightly", &["macos-universal.tar.gz"]),
         ]);
-        let tag = |suffix, than| pick_release(&releases, suffix, than).map(|(t, _)| t);
-        assert_eq!(tag("linux-x86_64.tar.gz", None).as_deref(), Some("v0.0.14"));
-        assert_eq!(
-            tag("macos-universal.tar.gz", None).as_deref(),
-            Some("v0.0.13")
-        );
-        // To update: only newer than what is installed, and only by version.
-        assert_eq!(
-            tag("linux-x86_64.tar.gz", Some((0, 0, 13))).as_deref(),
-            Some("v0.0.14")
-        );
-        assert_eq!(tag("linux-x86_64.tar.gz", Some((0, 0, 14))), None);
-        assert_eq!(tag("macos-universal.tar.gz", Some((0, 0, 13))), None);
-        assert_eq!(tag("windows-x86_64.zip", None), None);
-        let (_, asset) = pick_release(&releases, "linux-x86_64.tar.gz", None).unwrap();
+        let tag = |suffix| pick_release(&releases, suffix).map(|(t, _)| t);
+        assert_eq!(tag("linux-x86_64.tar.gz").as_deref(), Some("v0.0.14"));
+        assert_eq!(tag("macos-universal.tar.gz").as_deref(), Some("v0.0.13"));
+        assert_eq!(tag("windows-x86_64.zip"), None);
+        let (_, asset) = pick_release(&releases, "linux-x86_64.tar.gz").unwrap();
         assert_eq!(asset["name"], "oxinfer-v0.0.14-linux-x86_64.tar.gz");
 
         assert_eq!(parse_version_line("oxinfer 0.0.14\n"), Some((0, 0, 14)));
         assert_eq!(parse_version_line("oxinfer 1.2.3 (abc)"), Some((1, 2, 3)));
         assert_eq!(parse_version_line("something 0.0.14"), None);
         assert_eq!(parse_version_line(""), None);
-    }
-
-    #[test]
-    fn the_background_update_asks_leave() {
-        // Off, a program of the user's own, nothing installed, checked today:
-        // each is enough not to look.
-        assert!(update_wanted(false, false, true, true));
-        assert!(!update_wanted(true, false, true, true));
-        assert!(!update_wanted(false, true, true, true));
-        assert!(!update_wanted(false, false, false, true));
-        assert!(!update_wanted(false, false, true, false));
     }
 
     /// Serves the files `make` gives for its base URL (path prefix → body)
@@ -1668,50 +1850,135 @@ mod tests {
         (base, hits)
     }
 
-    /// A stand-in oxinfer: says its version, and that it can serve.
-    fn fake_oxinfer(version: &str) -> Vec<u8> {
+    /// A stand-in oxinfer: says its version (or, like the oldest ones, that
+    /// it does not know the option), says that it can serve, and on
+    /// `--update` leaves a mark and does `on_update`.
+    fn fake_oxinfer(version: Option<&str>, on_update: &str) -> Vec<u8> {
+        let says = match version {
+            Some(v) => format!("echo \"oxinfer {v}\""),
+            None => "echo 'unknown argument --version' >&2; exit 1".to_string(),
+        };
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"oxinfer {version}\"; \
-             else echo 'usage: oxinfer serve [options]'; fi\n"
+            "#!/bin/sh\ncase \"$1\" in\n--version) {says};;\n--update) echo x >> \"$0.asked\"; \
+             {on_update};;\n*) echo 'usage: oxinfer serve [options]';;\nesac\n"
         )
         .into_bytes()
     }
 
     #[cfg(unixlike)]
-    #[test]
-    fn update_replaces_an_older_oxinfer_with_a_checked_newer_one() {
+    fn put(path: &Path, program: &[u8]) {
         use std::os::unix::fs::PermissionsExt;
+        // Written beside and renamed in, as an update does: a file being
+        // run cannot be written to.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, program).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[cfg(unixlike)]
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("atelier-oxinfer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// oxinfer keeps itself up to date: atelier asks it to, once a day and
+    /// before a server is started, and at once when it is too old to serve.
+    #[cfg(unixlike)]
+    #[test]
+    fn oxinfer_is_asked_to_update_itself_daily_and_when_too_old() {
+        let dir = scratch("self");
+        let bin = dir.join("oxinfer");
+        let stamp = dir.join("stamp");
+        let asked =
+            || std::fs::read_to_string(dir.join("oxinfer.asked")).map_or(0, |s| s.lines().count());
+        let nowhere = "http://127.0.0.1:9";
+        let mut said = Vec::new();
+        let run = |bin: &Path, update: bool, said: &mut Vec<String>| {
+            make_current_with(bin, update, Some(&stamp), nowhere, &mut |l| {
+                said.push(l.to_string())
+            })
+        };
+
+        // One that will do, never asked yet: asked now, and not again today.
+        put(&bin, &fake_oxinfer(Some("0.0.16"), "exit 0"));
+        assert_eq!(run(&bin, true, &mut said).unwrap(), "0.0.16");
+        assert_eq!(asked(), 1);
+        assert_eq!(run(&bin, true, &mut said).unwrap(), "0.0.16");
+        assert_eq!(asked(), 1);
+        assert!(said.is_empty(), "{said:?}");
+        // Not at all when atelier is to leave it alone.
+        std::fs::remove_file(&stamp).unwrap();
+        assert_eq!(run(&bin, false, &mut said).unwrap(), "0.0.16");
+        assert_eq!(asked(), 1);
+        // An update that fails (no network) leaves one that will do in use.
+        put(&bin, &fake_oxinfer(Some("0.0.16"), "exit 1"));
+        assert_eq!(run(&bin, true, &mut said).unwrap(), "0.0.16");
+        assert_eq!(asked(), 2);
+
+        // Too old, checked today or not: it updates itself (a new file
+        // renamed over the old one), and that is said.
+        put(
+            &dir.join("oxinfer.next"),
+            &fake_oxinfer(Some("0.0.17"), "exit 0"),
+        );
+        put(&bin, &fake_oxinfer(Some("0.0.10"), "mv \"$0.next\" \"$0\""));
+        assert_eq!(run(&bin, true, &mut said).unwrap(), "0.0.17");
+        assert_eq!(asked(), 3);
+        assert!(said[0].contains("too old"), "{said:?}");
+        assert!(said[1].contains("updated itself to 0.0.17"), "{said:?}");
+
+        // Too old and not atelier's to update: an error that says what is
+        // needed. So is one too old to say its version.
+        put(&bin, &fake_oxinfer(Some("0.0.15"), "exit 0"));
+        let err = run(&bin, false, &mut said).unwrap_err().to_string();
+        assert!(err.contains("is oxinfer 0.0.15"), "{err}");
+        assert!(err.contains("needs 0.0.16 or newer"), "{err}");
+        assert!(err.contains("oxinfer --update"), "{err}");
+        put(&bin, &fake_oxinfer(None, "exit 0"));
+        let err = run(&bin, false, &mut said).unwrap_err().to_string();
+        assert!(err.contains("a version it does not say"), "{err}");
+        assert_eq!(asked(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One too old that cannot update itself is installed afresh, the way
+    /// the first one was: the release's archive, checked.
+    #[cfg(unixlike)]
+    #[test]
+    fn an_oxinfer_that_cannot_update_itself_is_installed_afresh() {
         let Some(suffix) = archive_suffixes().first() else {
             return; // no release archive for this platform to stand in for
         };
-        let dir = std::env::temp_dir().join(format!("atelier-oxinfer-up-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("afresh");
         let bin = dir.join("oxinfer");
-        std::fs::write(&bin, fake_oxinfer("0.0.14")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // It has no `--update` that works, and does not say its version.
+        put(&bin, &fake_oxinfer(None, "exit 1"));
 
-        let new = fake_oxinfer("0.0.15");
+        let new = fake_oxinfer(Some("0.0.16"), "exit 0");
         let archive = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&tar(&[(
-            "oxinfer-v0.0.15/oxinfer",
+            "oxinfer-v0.0.16/oxinfer",
             b'0',
             &new,
         )]))
         .unwrap();
-        let name = format!("oxinfer-v0.0.15-{suffix}");
-        // A release server listing 0.0.15 (with `digest`) and the 0.0.14
-        // installed, and serving the archive.
+        let name = format!("oxinfer-v0.0.16-{suffix}");
+        // A release server listing 0.0.16 (with `digest`) and serving the
+        // archive.
         let releases = |digest: String| {
             let (name, archive) = (name.clone(), archive.clone());
             move |base: &str| {
                 let listing = json!([
-                    {"tag_name": "v0.0.15", "assets": [{
+                    {"tag_name": "v0.0.16", "assets": [{
                         "name": name,
                         "size": archive.len(),
                         "digest": format!("sha256:{digest}"),
                         "browser_download_url": format!("{base}/dl/{name}"),
                     }]},
-                    release("v0.0.14", &[suffix]),
+                    release("v0.0.15", &[suffix]),
                 ]);
                 vec![
                     (
@@ -1723,39 +1990,35 @@ mod tests {
             }
         };
         let digest = crate::update::hex(&purecrypto::hash::sha256(&archive));
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
 
         // A digest that does not match: refused, the old one left in place.
         let (bad, _) = serve(releases("0".repeat(64)));
-        let err = update(&bad, &bin, &mut |_| {}).unwrap_err();
+        let err = make_current_with(&bin, true, None, &bad, &mut |_| {}).unwrap_err();
         assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
-        assert_eq!(version_of(&bin), Some((0, 0, 14)));
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(version_of(&bin), None);
+        assert_eq!(files(), ["oxinfer", "oxinfer.asked"]);
 
         // The right one: installed, and nothing left beside it.
-        let (good, _) = serve(releases(digest.clone()));
+        let (good, _) = serve(releases(digest));
         let mut said = Vec::new();
-        let outcome = update(&good, &bin, &mut |l| said.push(l.to_string())).unwrap();
-        assert_eq!(
-            outcome,
-            Updated::Installed {
-                from: "0.0.14".into(),
-                to: "0.0.15".into()
-            }
-        );
-        assert_eq!(version_of(&bin), Some((0, 0, 15)));
+        let version =
+            make_current_with(&bin, true, None, &good, &mut |l| said.push(l.to_string())).unwrap();
+        assert_eq!(version, "0.0.16");
+        assert_eq!(version_of(&bin), Some((0, 0, 16)));
+        assert!(said[0].contains("too old"), "{said:?}");
         assert!(
-            said[0].starts_with("downloading oxinfer v0.0.15"),
+            said[1].starts_with("downloading oxinfer v0.0.16"),
             "{said:?}"
         );
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-
-        // Up to date now: only the listing is fetched.
-        let (again, hits) = serve(releases(digest));
-        assert_eq!(
-            update(&again, &bin, &mut |_| {}).unwrap(),
-            Updated::UpToDate
-        );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(files(), ["oxinfer", "oxinfer.asked"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1787,5 +2050,19 @@ mod tests {
             ..Plan::default()
         };
         assert_eq!(plan.lines(&model), ["it takes about 19 GB of memory"]);
+        // A small one is not "0 GB", and "memory" is no device.
+        let plan = Plan {
+            download_gb: Some(0.43),
+            memory_gb: Some(0.43),
+            runs_on: Some("memory".into()),
+            ..Plan::default()
+        };
+        assert_eq!(
+            plan.lines(&model),
+            [
+                "Qwen/Qwen3.8-27B is not on this machine yet: a 0.4 GB download",
+                "it takes about 0.4 GB of memory, held in memory"
+            ]
+        );
     }
 }

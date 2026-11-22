@@ -1280,9 +1280,10 @@ impl Session {
 
     /// Drop the ChatGPT backend (back to the configured chat/completions one).
     /// Serve this session from a model on this machine (see
-    /// [`crate::local`]): install oxinfer and fetch the model's weights if
-    /// they are missing — the weights only once the user agrees — start the
-    /// server or join the one already running, and make it the main model.
+    /// [`crate::local`]): install oxinfer if it is missing, have the
+    /// coordinator start its server or join the one already running, fetch
+    /// the model's weights if they are missing — only once the user agrees —
+    /// have the server load the model, and make it the main model.
     pub fn use_local(&mut self, ui: &mut dyn Ui) -> Result<()> {
         use crate::local;
         if self.is_claude() {
@@ -1290,25 +1291,25 @@ impl Session {
         }
         let user = Settings::load_user().unwrap_or_default();
         let wanted = local::Model::configured(&user);
-        // One already running is joined at once (with no model named, any
-        // atelier chose); the rest is what it takes to get the first one
-        // going: the program, the model chosen for the machine, its weights.
-        let running = local::join(wanted.as_ref())?;
-        let (bin, model, plan) = match &running {
-            Some(server) => (None, server.model.clone(), local::Plan::default()),
+        // The program, then the server: one for all the user's ateliers,
+        // the coordinator's to start (and, before that, to have updated).
+        let bin = local::binary(&mut |line| ui.info(line))?;
+        let server = local::server(&bin, &mut |line| ui.info(line))?;
+        // A model the server already has is joined at once (with no model
+        // named, any atelier chose); the rest is what it takes to get one
+        // there: the model chosen for the machine, and its weights.
+        let (model, plan) = match server.has(wanted.as_ref()) {
+            Some(model) => (model, local::Plan::default()),
             None => {
-                let bin = local::binary(&mut |line| ui.info(line))?;
-                let report = local::report(&bin);
+                let report = server.api.report();
                 let (model, why) = local::resolve(&user, report.as_ref());
                 if let Some(why) = why {
                     ui.info(&why);
                 }
-                let plan = local::plan(&bin, report.as_ref(), &model);
-                (Some(bin), model, plan)
+                let plan = server.plan(report.as_ref(), &model)?;
+                (model, plan)
             }
         };
-        // A newer oxinfer, if there is one, is for the next server started.
-        local::spawn_update_check();
         for line in plan.lines(&model) {
             ui.info(&line);
         }
@@ -1317,7 +1318,11 @@ impl Session {
             let agreed = std::env::var(local::ENV_ACCEPT).is_ok_and(|v| v == "1")
                 || matches!(
                     ui.ask_user(&Question {
-                        question: format!("Download {} ({gb:.0} GB) now?", model.source()),
+                        question: format!(
+                            "Download {} ({} GB) now?",
+                            model.source(),
+                            local::gigabytes(gb)
+                        ),
                         options: vec![
                             ask::Choice {
                                 label: "Download".into(),
@@ -1340,18 +1345,13 @@ impl Session {
                     local::ENV_ACCEPT
                 );
             }
-            let bin = bin.as_deref().expect("a plan comes from the program");
-            local::download(bin, &model, &mut |line| ui.info(line))?;
+            server.download(&model, &mut |line| ui.info(line))?;
         }
-        let server = match (running, &bin) {
-            (Some(server), _) => server,
-            (None, Some(bin)) => local::connect(bin, &model, &mut |line| ui.info(line))?,
-            (None, None) => unreachable!("no server running means the program was looked up"),
-        };
-        self.cfg.use_local(provider::Provider::local(
-            server.base_url.clone(),
-            server.key.clone(),
-        ));
+        let server = server.load(&model, &mut |line| ui.info(line))?;
+        self.cfg.use_local(
+            provider::Provider::local(server.base_url.clone(), server.key.clone()),
+            &server.id,
+        );
         // The main model is the local one now, not the ChatGPT plan's.
         self.chatgpt = None;
         self.local = Some(server);
@@ -3587,6 +3587,7 @@ mod tests {
                 idle: std::time::Duration::from_secs(60),
                 watch_exe: false,
                 settle: std::time::Duration::ZERO,
+                local_idle: std::time::Duration::from_secs(60),
             };
             std::thread::spawn(move || coord::daemon::run(cfg));
             Self(dir)

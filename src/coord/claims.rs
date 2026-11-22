@@ -89,9 +89,10 @@ pub enum Answer {
     },
 }
 
-/// One connection to a coordinator.
-struct Conn {
-    out: UnixStream,
+/// One connection to a coordinator, on which nobody says `hello`: what is
+/// asked on it ends with it (a claim here, a lease in [`super::infer`]).
+pub(super) struct Conn {
+    pub(super) out: UnixStream,
     reader: BufReader<UnixStream>,
     /// A line that has not all arrived yet.
     partial: Vec<u8>,
@@ -101,9 +102,44 @@ struct Conn {
 }
 
 impl Conn {
+    /// A connection to the coordinator in `dir`, starting one from `exe`
+    /// if none answers.
+    pub(super) fn open(dir: &Path, exe: Option<&Path>) -> Result<Conn> {
+        let stream = match super::connect(dir) {
+            Ok(stream) => stream,
+            Err(e) => {
+                let Some(exe) = exe else {
+                    return Err(e.context("no coordinator is running"));
+                };
+                super::client::spawn_daemon(exe, dir)?;
+                let deadline = Instant::now() + SPAWN_WAIT;
+                loop {
+                    match super::connect(dir) {
+                        Ok(stream) => break stream,
+                        Err(e) if Instant::now() >= deadline => {
+                            return Err(e.context(format!(
+                                "the coordinator did not come up (see {})",
+                                dir.join("coordinator.log").display()
+                            )));
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(25)),
+                    }
+                }
+            }
+        };
+        stream.set_write_timeout(Some(ANSWER))?;
+        Ok(Conn {
+            reader: BufReader::new(stream.try_clone()?),
+            out: stream,
+            partial: Vec::new(),
+            requests: 0,
+            granted: false,
+        })
+    }
+
     /// The next message, if one arrives before `deadline`. An error is a
     /// connection that is over.
-    fn read(&mut self, deadline: Instant) -> Result<Option<Value>> {
+    pub(super) fn read(&mut self, deadline: Instant) -> Result<Option<Value>> {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             self.out
@@ -136,7 +172,11 @@ impl Conn {
 
     /// One request and its answer: the result, or the error's code and
     /// message.
-    fn request(&mut self, method: &str, params: Value) -> Result<Result<Value, (i64, String)>> {
+    pub(super) fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Result<Value, (i64, String)>> {
         self.requests += 1;
         let id = self.requests;
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
@@ -207,36 +247,7 @@ impl Link {
     /// none answers.
     fn conn(&mut self) -> Result<&mut Conn> {
         if self.conn.is_none() {
-            let stream = match super::connect(&self.dir) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    let Some(exe) = &self.exe else {
-                        return Err(e.context("no coordinator is running"));
-                    };
-                    super::client::spawn_daemon(exe, &self.dir)?;
-                    let deadline = Instant::now() + SPAWN_WAIT;
-                    loop {
-                        match super::connect(&self.dir) {
-                            Ok(stream) => break stream,
-                            Err(e) if Instant::now() >= deadline => {
-                                return Err(e.context(format!(
-                                    "the coordinator did not come up (see {})",
-                                    self.dir.join("coordinator.log").display()
-                                )));
-                            }
-                            Err(_) => std::thread::sleep(Duration::from_millis(25)),
-                        }
-                    }
-                }
-            };
-            stream.set_write_timeout(Some(ANSWER))?;
-            self.conn = Some(Conn {
-                reader: BufReader::new(stream.try_clone()?),
-                out: stream,
-                partial: Vec::new(),
-                requests: 0,
-                granted: false,
-            });
+            self.conn = Some(Conn::open(&self.dir, self.exe.as_deref())?);
         }
         Ok(self.conn.as_mut().expect("just made"))
     }

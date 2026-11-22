@@ -129,10 +129,10 @@ fn arguments(pid: u32) -> Vec<String> {
         .collect()
 }
 
-/// The helpers an atelier starts that are not its own to stop: the
-/// coordinator, which serves every instance, and the local model's
-/// supervisor, which ends its server once nobody uses it.
-const SHARED_HELPERS: [&str; 2] = ["coordinator", "local-serve"];
+/// The helper an atelier starts that is not its own to stop: the
+/// coordinator, which serves every instance — and runs the local model's
+/// server, which it ends once nobody uses it.
+const SHARED_HELPERS: [&str; 1] = ["coordinator"];
 
 /// Everything `root` started, directly or not, that is still running: its
 /// children, theirs, and so on — less the helpers other instances share
